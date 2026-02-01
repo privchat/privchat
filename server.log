@@ -1,0 +1,1144 @@
+warning: `/Users/zoujiaqing/.cargo/config` is deprecated in favor of `config.toml`
+  |
+  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`
+warning: variant `iOS` should have an upper camel case name
+   --> /Users/zoujiaqing/projects/rust/msgtrans-rust/privchat-protocol/src/message.rs:317:5
+    |
+317 |     iOS,
+    |     ^^^ help: convert the identifier to upper camel case (notice the capitalization): `IOs`
+    |
+    = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: ambiguous glob re-exports
+  --> /Users/zoujiaqing/projects/rust/msgtrans-rust/privchat-protocol/src/rpc/group/mod.rs:13:9
+   |
+13 | pub use member_mute::*;
+   |         ^^^^^^^^^^^^^^ the name `GroupMemberMuteRequest` in the type namespace is first re-exported here
+...
+17 | pub use member::*;
+   |         --------- but the name `GroupMemberMuteRequest` in the type namespace is also re-exported here
+   |
+   = note: `#[warn(ambiguous_glob_reexports)]` on by default
+
+warning: ambiguous glob re-exports
+  --> /Users/zoujiaqing/projects/rust/msgtrans-rust/privchat-protocol/src/rpc/group/mod.rs:13:9
+   |
+13 | pub use member_mute::*;
+   |         ^^^^^^^^^^^^^^ the name `GroupMemberUnmuteRequest` in the type namespace is first re-exported here
+...
+17 | pub use member::*;
+   |         --------- but the name `GroupMemberUnmuteRequest` in the type namespace is also re-exported here
+
+warning: `privchat-protocol` (lib) generated 3 warnings
+   Compiling privchat-server v0.1.0 (/Users/zoujiaqing/projects/rust/msgtrans-rust/privchat-server)
+error: cannot find macro `warn` in this scope
+  --> src/rpc/presence/typing.rs:62:17
+   |
+62 |                 warn!("Failed to broadcast typing to user {}: {}", target_user_id, e);
+   |                 ^^^^
+   |
+   = note: `warn` is in scope, but it is an attribute: `#[warn]`
+help: consider importing this macro
+   |
+ 1 + use tracing::warn;
+   |
+
+error: cannot find macro `warn` in this scope
+  --> src/rpc/presence/typing.rs:77:13
+   |
+77 |             warn!("Unknown channel_type: {}", req.channel_type);
+   |             ^^^^
+   |
+   = note: `warn` is in scope, but it is an attribute: `#[warn]`
+help: consider importing this macro
+   |
+ 1 + use tracing::warn;
+   |
+
+warning: unused import: `async_trait::async_trait`
+ --> src/dispatcher/mod.rs:5:5
+  |
+5 | use async_trait::async_trait;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `error` and `info`
+ --> src/dispatcher/mod.rs:6:15
+  |
+6 | use tracing::{info, warn, error};
+  |               ^^^^        ^^^^^
+
+warning: unused import: `crate::context::RequestContext`
+ --> src/dispatcher/middleware.rs:1:5
+  |
+1 | use crate::context::RequestContext;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Result` and `ServerError`
+ --> src/dispatcher/middleware.rs:2:20
+  |
+2 | use crate::error::{Result, ServerError};
+  |                    ^^^^^^  ^^^^^^^^^^^
+
+warning: unused import: `Duration`
+ --> src/dispatcher/middleware.rs:4:17
+  |
+4 | use std::time::{Duration, Instant};
+  |                 ^^^^^^^^
+
+warning: unused import: `tracing::debug`
+ --> src/dispatcher/middleware.rs:5:5
+  |
+5 | use tracing::debug;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/handler/send_message_handler.rs:7:5
+  |
+7 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `Hasher`
+    --> src/handler/send_message_handler.rs:1574:39
+     |
+1574 |                 use std::hash::{Hash, Hasher};
+     |                                       ^^^^^^
+
+warning: unused import: `crate::error_code::ErrorCode`
+ --> src/handler/rpc_message_handler.rs:8:5
+  |
+8 | use crate::error_code::ErrorCode;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `IntoResponse`, `Response`, and `StatusCode`
+ --> src/http/routes/auth.rs:6:23
+  |
+6 |     http::{HeaderMap, StatusCode},
+  |                       ^^^^^^^^^^
+7 |     response::{IntoResponse, Json, Response},
+  |                ^^^^^^^^^^^^        ^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src/http/routes/upload.rs:11:5
+   |
+11 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `crate::service::FileService`
+  --> src/http/routes/upload.rs:14:5
+   |
+14 | use crate::service::FileService;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Response` and `body::Body`
+ --> src/http/routes/download.rs:5:16
+  |
+5 |     response::{Response, IntoResponse},
+  |                ^^^^^^^^
+...
+9 |     body::Body,
+  |     ^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src/http/routes/download.rs:11:5
+   |
+11 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `crate::service::FileService`
+  --> src/http/routes/download.rs:14:5
+   |
+14 | use crate::service::FileService;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src/http/routes/url.rs:10:5
+   |
+10 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `crate::service::FileService`
+  --> src/http/routes/url.rs:13:5
+   |
+13 | use crate::service::FileService;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src/http/routes/delete.rs:10:5
+   |
+10 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `crate::service::FileService`
+  --> src/http/routes/delete.rs:13:5
+   |
+13 | use crate::service::FileService;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `middleware`
+ --> src/http/server.rs:6:5
+  |
+6 |     middleware,
+  |     ^^^^^^^^^^
+
+warning: unused import: `crate::http::middleware::auth`
+  --> src/http/server.rs:14:5
+   |
+14 | use crate::http::middleware::auth;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/infra/cache_manager_simple.rs:6:5
+  |
+6 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `warn`
+ --> src/infra/cache_manager_simple.rs:9:21
+  |
+9 | use tracing::{info, warn};
+  |                     ^^^^
+
+warning: unused import: `warn`
+ --> src/infra/presence_manager.rs:6:28
+  |
+6 | use tracing::{debug, info, warn};
+  |                            ^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/infra/message_router.rs:8:5
+  |
+8 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused imports: `Message`, `Packet`, and `PushBatchRequest`
+  --> src/infra/message_router.rs:13:54
+   |
+13 | use privchat_protocol::message::{PushMessageRequest, PushBatchRequest, Packet, Message};
+   |                                                      ^^^^^^^^^^^^^^^^  ^^^^^^  ^^^^^^^
+
+warning: unexpected `cfg` condition value: `redis`
+  --> src/infra/cache.rs:11:7
+   |
+11 | #[cfg(feature = "redis")]
+   |       ^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`
+   = help: consider adding `redis` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition value: `redis`
+  --> src/infra/cache.rs:43:7
+   |
+43 | #[cfg(feature = "redis")]
+   |       ^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`
+   = help: consider adding `redis` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+  --> src/infra/cache.rs:49:7
+   |
+49 | #[cfg(feature = "redis")]
+   |       ^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`
+   = help: consider adding `redis` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:136:11
+    |
+136 |     #[cfg(feature = "redis")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:151:15
+    |
+151 |         #[cfg(feature = "redis")] redis_cache: Option<Arc<SerializedRedisCache<V>>>,
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:160:19
+    |
+160 |             #[cfg(feature = "redis")]
+    |                   ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:175:19
+    |
+175 |             #[cfg(feature = "redis")]
+    |                   ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:196:15
+    |
+196 |         #[cfg(feature = "redis")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:215:15
+    |
+215 |         #[cfg(feature = "redis")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:228:15
+    |
+228 |         #[cfg(feature = "redis")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:257:15
+    |
+257 |         #[cfg(feature = "redis")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:291:15
+    |
+291 |         #[cfg(feature = "redis")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `redis`
+   --> src/infra/cache.rs:423:11
+    |
+423 |     #[cfg(feature = "redis")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`
+    = help: consider adding `redis` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unused import: `FromRow`
+ --> src/model/channel.rs:5:12
+  |
+5 | use sqlx::{FromRow, Type};
+  |            ^^^^^^^
+
+warning: unused import: `FromRow`
+ --> src/model/device.rs:7:12
+  |
+7 | use sqlx::{FromRow, Type};
+  |            ^^^^^^^
+
+warning: variant `iOS` should have an upper camel case name
+  --> src/model/device.rs:17:5
+   |
+17 |     iOS,
+   |     ^^^ help: convert the identifier to upper camel case (notice the capitalization): `IOs`
+   |
+   = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: unused import: `uuid::Uuid`
+ --> src/model/friend.rs:3:5
+  |
+3 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `FromRow`
+ --> src/model/friend.rs:5:12
+  |
+5 | use sqlx::{FromRow, Type};
+  |            ^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/model/message.rs:4:5
+  |
+4 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `FromRow`
+ --> src/model/message.rs:6:12
+  |
+6 | use sqlx::{FromRow, Type};
+  |            ^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/model/user.rs:4:5
+  |
+4 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `FromRow`
+ --> src/model/user.rs:6:12
+  |
+6 | use sqlx::{FromRow, Type};
+  |            ^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/model/channel.rs:4:5
+  |
+4 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/model/qrcode.rs:3:5
+  |
+3 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sqlx::FromRow`
+ --> src/model/read_receipt.rs:7:5
+  |
+7 | use sqlx::FromRow;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `sqlx::FromRow`
+ --> src/model/user_channel.rs:7:5
+  |
+7 | use sqlx::FromRow;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/model/group.rs:6:5
+  |
+6 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `FromRow`
+ --> src/model/group.rs:8:12
+  |
+8 | use sqlx::{FromRow, Type};
+  |            ^^^^^^^
+
+warning: unused import: `sqlx::FromRow`
+ --> src/model/blacklist.rs:7:5
+  |
+7 | use sqlx::FromRow;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `sqlx::FromRow`
+ --> src/model/device_sync_state.rs:7:5
+  |
+7 | use sqlx::FromRow;
+  |     ^^^^^^^^^^^^^
+
+warning: ambiguous glob re-exports
+  --> src/model/mod.rs:31:9
+   |
+31 | pub use channel::*;
+   |         ^^^^^^^^^^^^^^^ the name `MemberRole` in the type namespace is first re-exported here
+...
+37 | pub use channel::*;
+   |         ---------- but the name `MemberRole` in the type namespace is also re-exported here
+   |
+   = note: `#[warn(ambiguous_glob_reexports)]` on by default
+
+warning: ambiguous glob re-exports
+  --> src/model/mod.rs:32:9
+   |
+32 | pub use device::*;
+   |         ^^^^^^^^^ the name `DeviceInfo` in the type namespace is first re-exported here
+...
+36 | pub use user::*;
+   |         ------- but the name `DeviceInfo` in the type namespace is also re-exported here
+
+warning: ambiguous glob re-exports
+  --> src/model/mod.rs:39:9
+   |
+39 | pub use pts::*;
+   |         ^^^^^^ the name `DeviceSyncState` in the type namespace is first re-exported here
+...
+45 | pub use device_sync_state::*;
+   |         -------------------- but the name `DeviceSyncState` in the type namespace is also re-exported here
+
+warning: unused import: `device_sync_state::*`
+  --> src/model/mod.rs:45:9
+   |
+45 | pub use device_sync_state::*;
+   |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `iOS` should have an upper camel case name
+   --> src/model/mod.rs:118:5
+    |
+118 |     iOS,
+    |     ^^^ help: convert the identifier to upper camel case (notice the capitalization): `IOs`
+
+warning: unused imports: `Duration` and `Instant`
+ --> src/offline/message.rs:1:17
+  |
+1 | use std::time::{Duration, Instant};
+  |                 ^^^^^^^^  ^^^^^^^
+
+warning: unused imports: `HashMap` and `VecDeque`
+ --> src/offline/queue.rs:1:24
+  |
+1 | use std::collections::{HashMap, VecDeque, BinaryHeap};
+  |                        ^^^^^^^  ^^^^^^^^
+
+warning: unused import: `warn`
+ --> src/offline/queue.rs:5:28
+  |
+5 | use tracing::{debug, info, warn, error};
+  |                            ^^^^
+
+warning: unused imports: `error` and `warn`
+ --> src/offline/storage.rs:4:28
+  |
+4 | use tracing::{debug, info, warn, error};
+  |                            ^^^^  ^^^^^
+
+warning: unused imports: `ChannelRepository` and `MessageRepository`
+  --> src/server.rs:21:5
+   |
+21 |     ChannelRepository, MessageRepository,
+   |     ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/service/auth_service.rs:1:5
+  |
+1 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/service/auth_service.rs:2:5
+  |
+2 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `chrono::Utc`
+ --> src/service/auth_service.rs:3:5
+  |
+3 | use chrono::Utc;
+  |     ^^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/service/auth_service.rs:5:5
+  |
+5 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `UserStatus`
+ --> src/service/auth_service.rs:7:32
+  |
+7 | use crate::model::user::{User, UserStatus, DeviceInfo};
+  |                                ^^^^^^^^^^
+
+warning: unused import: `ServerError`
+ --> src/service/auth_service.rs:8:28
+  |
+8 | use crate::error::{Result, ServerError};
+  |                            ^^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/service/channel_service.rs:5:5
+  |
+5 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/service/group_service.rs:9:5
+  |
+9 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `async_trait::async_trait`
+  --> src/service/group_service.rs:11:5
+   |
+11 | use async_trait::async_trait;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `DateTime`
+  --> src/service/group_service.rs:12:14
+   |
+12 | use chrono::{DateTime, Utc};
+   |              ^^^^^^^^
+
+warning: unused imports: `debug` and `warn`
+  --> src/service/group_service.rs:14:15
+   |
+14 | use tracing::{debug, info, warn};
+   |               ^^^^^        ^^^^
+
+warning: unused import: `DeviceType`
+  --> src/service/group_service.rs:18:26
+   |
+18 | use crate::model::{User, DeviceType, Channel};
+   |                          ^^^^^^^^^^
+
+warning: unused imports: `ChannelRepository` and `UserRepository`
+  --> src/service/group_service.rs:20:25
+   |
+20 | use crate::repository::{UserRepository, ChannelRepository, Repository};
+   |                         ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/service/push_service.rs:9:5
+  |
+9 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `ServerError`
+  --> src/service/push_service.rs:15:28
+   |
+15 | use crate::error::{Result, ServerError};
+   |                            ^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/service/user_service.rs:1:5
+  |
+1 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> src/service/channel_service.rs:5:13
+  |
+5 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+  --> src/service/channel_service.rs:60:13
+   |
+60 |         use uuid::Uuid;
+   |             ^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/service/message_history_service.rs:5:5
+  |
+5 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused import: `ServerError`
+ --> src/service/read_receipt_service.rs:8:28
+  |
+8 | use crate::error::{Result, ServerError};
+  |                            ^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/service/qrcode_service.rs:1:5
+  |
+1 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `serde_json::json`
+ --> src/service/qrcode_service.rs:4:5
+  |
+4 | use serde_json::json;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `debug`, `error`, and `warn`
+ --> src/service/approval_service.rs:5:21
+  |
+5 | use tracing::{info, warn, error, debug};
+  |                     ^^^^  ^^^^^  ^^^^^
+
+warning: unused import: `warn`
+  --> src/service/offline_queue_service.rs:17:21
+   |
+17 | use tracing::{info, warn};
+   |                     ^^^^
+
+warning: unused import: `warn`
+  --> src/service/unread_count_service.rs:20:21
+   |
+20 | use tracing::{info, warn};
+   |                     ^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/session/session_manager.rs:2:5
+  |
+2 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `DateTime` and `Utc`
+ --> src/session/session_manager.rs:4:14
+  |
+4 | use chrono::{DateTime, Utc};
+  |              ^^^^^^^^  ^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/sync.rs:2:5
+  |
+2 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/sync.rs:3:5
+  |
+3 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `DateTime`
+ --> src/sync.rs:4:14
+  |
+4 | use chrono::{DateTime, Utc};
+  |              ^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+ --> src/sync.rs:6:5
+  |
+6 | use uuid::Uuid;
+  |     ^^^^^^^^^^
+
+warning: unused doc comment
+  --> src/rpc/router.rs:64:1
+   |
+64 | /// 全局路由器实例
+   | ^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+   |
+   = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `RpcError`
+ --> src/rpc/router.rs:8:20
+  |
+8 | use super::error::{RpcError, RpcResult};
+  |                    ^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/account/user/update.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/account/profile/get.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/account/profile/update.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `super::router::GLOBAL_RPC_ROUTER`
+ --> src/rpc/account/mod.rs:7:5
+  |
+7 | use super::router::GLOBAL_RPC_ROUTER;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/contact/block/add.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/contact/block/list.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `super::super::router::GLOBAL_RPC_ROUTER`
+ --> src/rpc/contact/block/mod.rs:4:5
+  |
+4 | use super::super::router::GLOBAL_RPC_ROUTER;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::router::GLOBAL_RPC_ROUTER`
+ --> src/rpc/contact/mod.rs:5:5
+  |
+5 | use super::router::GLOBAL_RPC_ROUTER;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::router::GLOBAL_RPC_ROUTER`
+ --> src/rpc/group/member/mod.rs:8:5
+  |
+8 | use super::super::router::GLOBAL_RPC_ROUTER;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::router::GLOBAL_RPC_ROUTER`
+ --> src/rpc/group/mod.rs:8:5
+  |
+8 | use super::router::GLOBAL_RPC_ROUTER;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/channel/channel/create.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/channel/channel/list.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/channel/content/publish.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/channel/content/list.rs:2:25
+  |
+2 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `super::router::GLOBAL_RPC_ROUTER`
+ --> src/rpc/channel/mod.rs:4:5
+  |
+4 | use super::router::GLOBAL_RPC_ROUTER;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/rpc/file/request_upload_token.rs:4:5
+  |
+4 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `crate::error::ServerError`
+ --> src/rpc/file/request_upload_token.rs:7:5
+  |
+7 | use crate::error::ServerError;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `UploadTokenService`
+ --> src/rpc/file/request_upload_token.rs:8:22
+  |
+8 | use crate::service::{UploadTokenService, FileType};
+  |                      ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/rpc/file/validate_token.rs:6:5
+  |
+6 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/rpc/file/upload_callback.rs:6:5
+  |
+6 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `crate::service::FileMetadata`
+ --> src/rpc/file/upload_callback.rs:9:5
+  |
+9 | use crate::service::FileMetadata;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `RpcError`
+ --> src/rpc/sticker/package/list.rs:4:25
+  |
+4 | use crate::rpc::error::{RpcError, RpcResult};
+  |                         ^^^^^^^^
+
+warning: unused import: `info`
+ --> src/rpc/presence/typing.rs:2:22
+  |
+2 | use tracing::{debug, info};
+  |                      ^^^^
+
+warning: unused import: `MessageType`
+   --> src/rpc/presence/typing.rs:106:45
+    |
+106 |     use privchat_protocol::{PublishRequest, MessageType};
+    |                                             ^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src/infra/message_router.rs:406:17
+    |
+406 |             for mut offline_msg in messages {
+    |                 ----^^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+   --> src/server.rs:377:22
+    |
+377 |             Arc::new(config.clone()),
+    |             -------- ^^^^^^^^^^^^^^ expected `TokenRevocationService`, found `ServerConfig`
+    |             |
+    |             arguments to this function are incorrect
+    |
+note: associated function defined here
+   --> /Users/zoujiaqing/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/sync.rs:417:12
+    |
+417 |     pub fn new(data: T) -> Arc<T> {
+    |            ^^^
+
+error[E0061]: this function takes 25 arguments but 24 arguments were supplied
+   --> src/server.rs:364:28
+    |
+364 |         let rpc_services = crate::rpc::RpcServiceContext::new(
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+368 |             friend_service.clone(),
+    |             ---------------------- argument #4 of type `Arc<PresenceManager>` is missing
+    |
+note: expected `Arc<ServerConfig>`, found `Arc<TokenRevocationService>`
+   --> src/server.rs:376:13
+    |
+376 |             token_revocation_service.clone(),
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: expected struct `Arc<config::ServerConfig>`
+               found struct `Arc<TokenRevocationService>`
+note: associated function defined here
+   --> src/rpc/mod.rs:103:12
+    |
+103 |     pub fn new(
+    |            ^^^
+...
+107 |         presence_manager: Arc<PresenceManager>,
+    |         --------------------------------------
+...
+117 |         config: Arc<ServerConfig>,
+    |         -------------------------
+help: provide the argument
+    |
+364 ~         let rpc_services = crate::rpc::RpcServiceContext::new(
+365 +             channel_service.clone(),
+366 +             message_history_service.clone(),
+367 +             cache_manager.clone(),
+368 +             /* Arc<PresenceManager> */,
+369 +             friend_service.clone(),
+370 +             privacy_service.clone(),
+371 +             read_receipt_service.clone(),
+372 +             upload_token_service.clone(),
+373 +             file_service.clone(),
+374 +             sticker_service.clone(),
+375 +             channel_service.clone(),
+376 +             device_manager.clone(),
+377 +             Arc::new(config.clone()),
+378 +             /* Arc<config::ServerConfig> */,
+379 +             message_router.clone(),
+380 +             blacklist_service.clone(),
+381 +             qrcode_service.clone(),
+382 +             approval_service.clone(),
+383 +             reaction_service.clone(),
+384 +             pts_generator.clone(),
+385 +             offline_queue_service.clone(),
+386 +             user_message_index.clone(),
+387 +             jwt_service.clone(),
+388 +             user_repository.clone(),
+389 +             message_repository.clone(),
+390 ~         );
+    |
+
+warning: variable does not need to be mutable
+   --> src/service/channel_service.rs:189:13
+    |
+189 |         let mut channel = match request.channel_type {
+    |             ----^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/service/channel_service.rs:415:13
+    |
+415 |         let mut channel = match request.channel_type {
+    |             ----^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/service/message_history_service.rs:217:13
+    |
+217 |         let mut filtered_messages: Vec<MessageHistoryRecord> = messages
+    |             ----^^^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> src/session/session_manager.rs:97:21
+   |
+97 |         if let Some(mut user_session) = self.user_sessions.get_mut(&user_id) {
+   |                     ----^^^^^^^^^^^^
+   |                     |
+   |                     help: remove this `mut`
+
+error[E0308]: mismatched types
+   --> src/rpc/presence/typing.rs:109:21
+    |
+109 |         channel_id: user_id.to_string(),
+    |                     ^^^^^^^^^^^^^^^^^^^ expected `u64`, found `String`
+    |
+help: try removing the method call
+    |
+109 -         channel_id: user_id.to_string(),
+109 +         channel_id: user_id,
+    |
+
+error[E0308]: mismatched types
+   --> src/rpc/presence/typing.rs:110:16
+    |
+110 |         topic: "typing".to_string(),
+    |                ^^^^^^^^^^^^^^^^^^^^ expected `Option<String>`, found `String`
+    |
+    = note: expected enum `std::option::Option<std::string::String>`
+             found struct `std::string::String`
+help: try wrapping the expression in `Some`
+    |
+110 |         topic: Some("typing".to_string()),
+    |                +++++                    +
+
+error[E0063]: missing fields `message_id`, `publisher` and `timestamp` in initializer of `privchat_protocol::PublishRequest`
+   --> src/rpc/presence/typing.rs:108:23
+    |
+108 |     let publish_req = PublishRequest {
+    |                       ^^^^^^^^^^^^^^ missing `message_id`, `publisher` and `timestamp`
+
+error[E0599]: no method named `route_to_user` found for struct `Arc<MessageRouter>` in the current scope
+   --> src/rpc/presence/typing.rs:116:10
+    |
+115 |       if let Err(e) = services.message_router
+    |  _____________________-
+116 | |         .route_to_user(user_id, publish_req)
+    | |_________-^^^^^^^^^^^^^
+    |
+help: there is a method `route_message_to_user` with a similar name
+    |
+116 |         .route_message_to_user(user_id, publish_req)
+    |                ++++++++
+
+warning: unused variable: `e`
+  --> src/auth/jwt_service.rs:67:23
+   |
+67 |             .map_err(|e| ServerError::InvalidToken)?;
+   |                       ^ help: if this is intentional, prefix it with an underscore: `_e`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `log_format`
+   --> src/config.rs:165:19
+    |
+165 |         if let Ok(log_format) = env::var("PRIVCHAT_LOG_FORMAT") {
+    |                   ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_log_format`
+
+warning: unused variable: `ping_request`
+  --> src/handler/ping_message_handler.rs:22:13
+   |
+22 |         let ping_request: privchat_protocol::message::PingRequest = privchat_protocol::decode_message(&context.data)
+   |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_ping_request`
+
+warning: unused variable: `session`
+   --> src/infra/online_status_manager.rs:169:29
+    |
+169 |             if let Some((_, session)) = self.sessions.remove(&session_key) {
+    |                             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session`
+
+warning: variable `success_count` is assigned to, but never used
+   --> src/infra/offline_worker.rs:507:13
+    |
+507 |         let mut success_count = 0;
+    |             ^^^^^^^^^^^^^^^^^
+    |
+    = note: consider using `_success_count` instead
+
+warning: value assigned to `success_count` is never read
+   --> src/infra/offline_worker.rs:516:25
+    |
+516 |                         success_count += 1;
+    |                         ^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ttl_secs`
+   --> src/infra/cache.rs:210:43
+    |
+210 |     async fn put(&self, key: K, value: V, ttl_secs: u64) {
+    |                                           ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_ttl_secs`
+
+warning: unused variable: `ttl_secs`
+   --> src/infra/cache.rs:277:46
+    |
+277 |     async fn mput(&self, pairs: Vec<(K, V)>, ttl_secs: u64) {
+    |                                              ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_ttl_secs`
+
+error[E0080]: compilation was interrupted
+   --> src/model/channel.rs:765:35
+    |
+765 | #[derive(Debug, Clone, Serialize, Deserialize)]
+    |                                   ^^^^^^^^^^^ evaluation of `<model::channel::_::<impl config::_::_serde::Deserialize<'de> for model::channel::JoinMethod>::deserialize::__Visitor<'de> as config::_::_serde::de::Visitor<'de>>::visit_enum::FIELDS` failed here
+    |
+    = note: this error originates in the derive macro `Deserialize` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: compilation was interrupted
+   --> src/model/channel.rs:783:5
+    |
+778 | #[derive(Debug, Clone, Serialize, Deserialize)]
+    |          ----- in this derive macro expansion
+...
+783 |     pub group_id: u64,
+    |     ^^^^^^^^^^^^^^^^^ evaluation of `<model::channel::JoinRequest as std::fmt::Debug>::fmt` failed here
+
+error[E0080]: compilation was interrupted
+   --> src/model/channel.rs:778:35
+    |
+778 | #[derive(Debug, Clone, Serialize, Deserialize)]
+    |                                   ^^^^^^^^^^^ evaluation of `model::channel::_::<impl config::_::_serde::Deserialize<'de> for model::channel::JoinRequest>::deserialize::FIELDS` failed here
+    |
+    = note: this error originates in the derive macro `Deserialize` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: compilation was interrupted
+  --> src/model/device.rs:13:56
+   |
+13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
+   |                                                        ^^^^^^^^^^^ evaluation of `model::device::_::<impl config::_::_serde::Deserialize<'de> for model::device::DeviceType>::deserialize::VARIANTS` failed here
+   |
+   = note: this error originates in the derive macro `Deserialize` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: compilation was interrupted
+  --> src/model/device.rs:13:69
+   |
+13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
+   |                                                                     ^^^^ evaluation of `<model::device::DeviceType as sqlx::Decode<'_, sqlx::Postgres>>::decode` failed here
+   |
+   = note: this error originates in the derive macro `Type` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: compilation was interrupted
+  --> src/model/device.rs:72:5
+   |
+67 | #[derive(Debug, Clone, Serialize, Deserialize)]
+   |          ----- in this derive macro expansion
+...
+72 |     pub user_id: u64,  // 数据库中是 BIGINT
+   |     ^^^^^^^^^^^^^^^^ evaluation of `<model::device::Device as std::fmt::Debug>::fmt` failed here
+
+error[E0080]: compilation was interrupted
+  --> src/model/device.rs:67:35
+   |
+67 | #[derive(Debug, Clone, Serialize, Deserialize)]
+   |                                   ^^^^^^^^^^^ evaluation of `model::device::_::<impl config::_::_serde::Deserialize<'de> for model::device::Device>::deserialize::FIELDS` failed here
+   |
+   = note: this error originates in the derive macro `Deserialize` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `privchat-server` (lib) generated 136 warnings
+error: could not compile `privchat-server` (lib) due to 16 previous errors; 136 warnings emitted

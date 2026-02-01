@@ -1,0 +1,148 @@
+[package]
+name = "privchat-server"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance instant messaging server built on msgtrans"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+repository = "https://github.com/yourusername/privchat-server"
+keywords = ["chat", "messaging", "server", "websocket", "quic"]
+categories = ["network-programming", "web-programming"]
+
+[[bin]]
+name = "privchat-server"
+path = "src/main.rs"
+
+
+
+[dependencies]
+# 传输层
+msgtrans = { path = "../msgtrans", version = "1.0.0" }
+
+# 协议
+privchat-protocol = { path = "../privchat-protocol", version = "0.1.0" }
+
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# ID生成
+snowflake_me = { version = "0.5", features = ["ip-fallback"] }
+
+# 并发数据结构
+dashmap = "5.5"
+parking_lot = "0.12"
+
+# 错误处理
+thiserror = "1.0"
+anyhow = "1.0"
+
+# 配置
+toml = "0.8"
+dotenvy = "0.15"
+
+# CLI 参数解析
+clap = { version = "4.0", features = ["derive"] }
+
+# 工具
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
+url = "2.5"
+num-bigint = "0.4.6"
+redis = "0.32.3"
+bb8 = "0.9.0"
+bb8-redis = "0.24.0"
+moka = { version = "0.12.10", features = ["future"] }
+fastrand = "2.3.0"
+
+# 认证
+jsonwebtoken = "9.3"
+bcrypt = "0.15"  # 密码加密
+
+# 离线消息系统依赖
+bytes = { version = "1.5", features = ["serde"] }
+sled = "0.34"
+bincode = "1.3"
+rand = "0.8"
+rustc-hash = "1.1"
+lazy_static = "1.4"
+
+# HTTP 服务器（文件服务）
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "compression-gzip"] }
+axum-extra = { version = "0.12.5", features = ["multipart"] }
+multer = "3.1.0"  # multipart/form-data 解析
+
+# HTTP 客户端（Push Provider）
+reqwest = { version = "0.12", features = ["json"] }  # ✨ Phase 2: FCM Provider
+
+# 数据库
+sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
+
+# 对象存储抽象层（OpenDAL：本地 FS + S3/OSS/COS/MinIO/Garage 等统一 API）
+opendal = { version = "0.55", default-features = false, features = ["services-fs", "services-s3"] }
+
+[features]
+default = []
+redis = []
+
+[[example]]
+name = "current_status_demo"
+path = "examples/current_status_demo.rs"
+
+[[example]]
+name = "simple_server_demo"
+path = "examples/simple_server_demo.rs"
+
+[[example]]
+name = "logging_demo"
+path = "examples/logging_demo.rs"
+
+[[example]]
+name = "offline_worker_demo"
+path = "examples/offline_worker_demo.rs"
+
+[[example]]
+name = "simple_offline_worker_test"
+path = "examples/simple_offline_worker_test.rs"
+
+[[example]]
+name = "handler_demo"
+path = "examples/handler_demo.rs" 
+
+[[example]]
+name = "core_chat_demo"
+path = "examples/core_chat_demo.rs"
+
+[[example]]
+name = "service_communication_demo"
+path = "examples/service_communication_demo.rs" 
+
+[[example]]
+name = "simple_chat_demo"
+path = "examples/simple_chat_demo.rs" 
+
+[[example]]
+name = "simple_dashmap_demo"
+path = "examples/simple_dashmap_demo.rs" 
+
+[[example]]
+name = "simple_channel_test"
+path = "examples/simple_channel_test.rs"
+
+[[example]]
+name = "channel_architecture_demo"
+path = "examples/channel_architecture_demo.rs" 

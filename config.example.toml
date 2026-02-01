@@ -1,0 +1,333 @@
+# Privchat Server 配置示例
+# 将此文件复制为 config.toml 并修改相应的配置项
+
+[server]
+host = "127.0.0.1"
+port = 8080
+http_file_server_port = 8083  # HTTP 文件服务器端口（用于启动服务）
+file_api_base_url = "https://files.example.com/api/app"  # 文件服务 API 基础 URL（不包含端口号，用于客户端访问）
+max_connections = 1000
+connection_timeout = 300
+heartbeat_interval = 60
+use_internal_auth = true  # 是否启用内置账号系统
+
+[cache]
+cache_type = "memory"  # 缓存类型: memory 或 redis
+l1_max_memory_mb = 256  # L1内存缓存大小（MB）
+l1_ttl_secs = 3600  # L1缓存TTL（秒）
+
+# Redis 配置（可选）
+# [cache.redis]
+# url = "redis://localhost:6379"
+# pool_size = 10
+# connection_timeout = 5
+
+[cache.online_status]
+timeout_seconds = 300  # 在线状态超时时间（秒）
+cleanup_interval_seconds = 60  # 清理间隔（秒）
+
+# 文件存储：必须至少配置一个 storage_source（按 default_storage_source_id 选择）
+# 基于 OpenDAL 统一 API：storage_type 支持 local（Fs）、s3（S3/OSS/COS/MinIO/Garage 等）
+[file]
+default_storage_source_id = 0
+
+# 本地存储示例
+[[file.storage_sources]]
+id = 0
+storage_type = "local"
+storage_root = "./storage/files"
+base_url = "http://localhost:8080/files"
+
+# S3 兼容存储示例（阿里云 OSS / 腾讯云 COS / MinIO / Garage / AWS S3 等）
+# [[file.storage_sources]]
+# id = 1
+# storage_type = "s3"
+# base_url = "https://your-bucket.oss-cn-hongkong.aliyuncs.com"   # 访问的 baseUrl（桶公网或 CDN 根）
+# endpoint = "oss-cn-hongkong.aliyuncs.com"   # 节点，可不带 https://
+# bucket = "privchat"                         # 桶名
+# access_key_id = "your-access-key"
+# secret_access_key = "your-secret-key"
+# path_prefix = ""                            # 可选：桶内存储目录，空则用桶根目录；如 "files" 则 object key = files/xxx
+
+# 多数据中心示例：再增加 id=2 等，不同机房设置不同 default_storage_source_id 即可
+# [[file.storage_sources]]
+# id = 2
+# storage_type = "local"
+# storage_root = "/data/privchat/files-cn"
+# base_url = "https://files-cn.example.com/files"
+
+[logging]
+level = "info"  # 日志级别: trace, debug, info, warn, error
+format = "pretty"  # 日志格式: pretty, json
+# file = "./logs/privchat.log"  # 日志文件路径（可选）
+
+# ==========================================
+# 系统消息配置
+# ==========================================
+# 用户 ID 区间划分：
+#   - 1 ~ 99: 系统功能用户（不在数据库中，代码定义）
+#   - 100,000,000+: 普通用户 + 机器人（用 user_type 字段区分）
+#
+# 系统功能用户（user_id=1）：
+#   - 不存在于数据库中（服务启动时加载到内存数组）
+#   - 服务器返回英文默认名称："System Message"
+#   - 客户端根据语言包替换显示：
+#     * 中文：【系统消息】
+#     * 英文：【System Message】
+#   - 用于发送欢迎消息、系统通知等
+#
+# 用户类型 (user_type)：
+#   - 0: 普通用户
+#   - 1: 系统用户（保留，系统功能用户不实际存储）
+#   - 2: 机器人
+[system_message]
+# 是否启用系统消息用户
+enabled = true
+
+# 新用户注册时的欢迎消息
+welcome_message = """
+👋 欢迎使用 Privchat！
+
+这是一个端到端加密的即时通讯系统，您的隐私安全由我们守护。
+
+🔐 主要特性：
+• 端到端加密通讯
+• 多设备同步
+• 离线消息推送
+• 文件安全传输
+
+如有任何问题，欢迎随时联系我们！
+"""
+
+# 是否在用户注册时自动创建与系统用户的会话
+auto_create_channel = true
+
+# 是否在创建会话后自动发送欢迎消息
+auto_send_welcome = true
+
+# ============================================
+# 🔐 安全防护配置 - 分阶段启用
+# ============================================
+# 参考文档：
+#   - SECURITY_DESIGN.md (完整设计文档)
+#   - SECURITY_ROLLOUT_GUIDE.md (分阶段上线指南)
+#   - QUICKSTART.md (快速开始)
+
+[security]
+# 🔑 安全模式（最重要的配置）
+# 
+# 可选值：
+#   - "observe"        : 只记录，不处罚（✅ 早期推荐，< 1万用户）
+#   - "enforce_light"  : 轻量限流（成长期，1万-5万用户）
+#   - "enforce_full"   : 全部特性（稳定期，> 5万用户）
+#
+# ⚠️ 建议：从 "observe" 开始，运行至少 2 周，收集数据后逐步升级
+# 详见: SECURITY_ROLLOUT_GUIDE.md
+mode = "observe"
+
+# 是否启用 Shadow Ban（影子封禁）
+# 
+# ⚠️ 重要：只在 mode = "enforce_full" 时启用
+# 早期启用会导致 Debug 困难，客户端 bug 会被误判为恶意
+enable_shadow_ban = false
+
+# 是否启用 IP 封禁
+# 推荐：true，但系统会非常保守（现代网络环境 IP 不可信）
+enable_ip_ban = true
+
+# ============================================
+# 速率限制配置
+# ============================================
+
+[security.rate_limit]
+# ---- 用户全局令牌桶 ----
+# 每秒补充的令牌数（决定了用户的整体请求能力）
+# - 早期建议：100（宽松，避免误伤）
+# - 成长期建议：50（正常）
+# - 稳定期建议：30-50（根据实际调整）
+user_tokens_per_second = 100.0
+
+# 令牌桶容量（允许短时突发）
+# 建议是 tokens_per_second 的 2-3 倍
+user_burst_capacity = 200.0
+
+# ---- 单会话消息限流 ----
+# 每秒每用户在单个会话中可发送的消息数
+# 注意：会考虑群大小的 fan-out 成本
+#
+# 为什么这么低？
+# - 小群(≤10人): 5条/秒 → 实际成本 5 * 1 = 5
+# - 中群(11-100人): 3条/秒 → 实际成本 3 * 2 = 6
+# - 大群(101-500人): 2条/秒 → 实际成本 2 * 5 = 10
+# - 超大群(500+人): 1条/秒 → 实际成本 1 * 10 = 10
+#
+# 早期建议：10（宽松）
+# 成长期建议：3-5（正常）
+# 稳定期建议：2-3（严格）
+channel_messages_per_second = 10.0
+
+# 单会话突发容量
+channel_burst_capacity = 30.0
+
+# ---- IP 连接限流 ----
+# 每秒每 IP 可建立的连接数（第一道防线，防止 SYN flood）
+#
+# 典型场景：
+# - 移动客户端重连: 1-2个/秒
+# - 企业网关(NAT): 可能更高
+#
+# 早期建议：10（宽松）
+# 成长期建议：5（正常）
+# 稳定期建议：3-5（严格）
+ip_connections_per_second = 10.0
+
+# IP 连接突发容量
+ip_burst_capacity = 20.0
+
+# ============================================
+# RPC 成本定义（代码中定义，此处仅说明）
+# ============================================
+#
+# RPC 不是按"次数"限流，而是按"成本（tokens）"限流
+#
+# 强状态 RPC（严格控制）：
+#   auth.login              -> 50 tokens  (防暴力破解)
+#   sync.pull               -> 20 tokens  (状态同步，代价高)
+#   messages.ack            -> 2 tokens   (轻量确认)
+#
+# 弱状态 RPC（可放宽）：
+#   users.getProfile        -> 1 token    (轻量查询)
+#   contacts.search         -> 10 tokens  (有一定成本)
+#
+# 写操作：
+#   messages.send           -> 5 tokens   (+ fan-out 成本)
+#   channels.createChannel  -> 20 tokens
+#
+# 禁止高频的重型 RPC：
+#   sync.getFullState       -> 100 tokens (极少允许)
+#   channels.getAllMembers  -> 50 tokens  (极少允许)
+
+# ============================================
+# 状态机说明（代码中定义，此处仅说明）
+# ============================================
+#
+# 四级状态机：Normal → Throttled → WriteDisabled → ShadowBanned → Disconnected
+#
+# Normal -> Throttled:
+#   触发条件：1分钟内3次超限
+#   惩罚：延迟500ms处理
+#   持续时间：60秒
+#
+# Throttled -> WriteDisabled:
+#   触发条件：持续超限
+#   惩罚：禁止所有写操作，只能读
+#   持续时间：300秒（5分钟）
+#
+# WriteDisabled -> ShadowBanned:
+#   触发条件：继续违规
+#   惩罚：所有操作假装成功但不执行
+#   持续时间：3600秒（1小时）
+#
+# 任何状态 -> Disconnected:
+#   触发条件：协议攻击
+#   惩罚：强制断开连接
+#   持续时间：1800秒（30分钟）
+
+# ============================================
+# 信任分系统（代码中定义，此处仅说明）
+# ============================================
+#
+# 信任分范围：0-1000
+#
+# 初始分数：新用户 = 100（低信任）
+#
+# 分数影响限流倍数：
+#   0-100:    限流减半（低信任）
+#   101-300:  限流 0.8x（中低信任）
+#   301-600:  正常限流（正常信任）
+#   601-800:  限流 1.5x（高信任）
+#   801-1000: 限流 2.0x（超高信任）
+#
+# 扣分规则：
+#   速率超限: -5  |  认证失败: -10  |  畸形请求: -20
+#   可疑行为: -30  |  Fan-out滥用: -40  |  Spam: -50  |  协议攻击: -100
+#
+# 加分规则：
+#   正常使用: +1/次  |  每日自动恢复: +10（最大恢复到 500）
+#
+# 时间会洗白（给改过自新的机会）
+
+# ============================================
+# 分阶段配置示例（推荐）
+# ============================================
+
+# --- 🐣 阶段 1: 早期（< 1万用户）---
+# 目标：不被打爆，不误伤自己
+# 
+# [security]
+# mode = "observe"
+# enable_shadow_ban = false
+# 
+# [security.rate_limit]
+# user_tokens_per_second = 100.0
+# channel_messages_per_second = 10.0
+# ip_connections_per_second = 10.0
+
+# --- 🚀 阶段 2: 成长期（1万-5万用户）---
+# 目标：防止恶意，保护正常用户
+# 
+# [security]
+# mode = "enforce_light"
+# enable_shadow_ban = false  # 还不启用
+# 
+# [security.rate_limit]
+# user_tokens_per_second = 50.0
+# channel_messages_per_second = 3.0
+# ip_connections_per_second = 5.0
+
+# --- 💪 阶段 3: 稳定期（> 5万用户）---
+# 目标：对抗攻击，精细化管理
+# 
+# [security]
+# mode = "enforce_full"
+# enable_shadow_ban = true  # 启用！
+# 
+# [security.rate_limit]
+# user_tokens_per_second = 50.0
+# channel_messages_per_second = 3.0
+# ip_connections_per_second = 5.0
+
+# ============================================
+# 环境变量覆盖
+# ============================================
+#
+# 可以通过环境变量快速切换安全模式：
+# SECURITY_MODE=observe cargo run
+# SECURITY_MODE=enforce_light cargo run
+# SECURITY_MODE=enforce_full cargo run
+
+# ============================================
+# ⚠️ 重要注意事项
+# ============================================
+#
+# 1. 【必读】分阶段启用
+#    - 从 "observe" 开始，运行至少 2 周
+#    - 收集数据，修复客户端 bug
+#    - 逐步升级到 "enforce_light"，再到 "enforce_full"
+#    - 详见: SECURITY_ROLLOUT_GUIDE.md
+#
+# 2. 早期不要开 Shadow Ban
+#    - 会导致 Debug 困难
+#    - 客户端 bug 会被误判为恶意
+#    - 只在 mode="enforce_full" 时考虑启用
+#
+# 3. 不要过度依赖 IP 封禁
+#    - 现代网络环境 IP 不可信（NAT/VPN/代理）
+#    - 容易误伤正常用户
+#    - 应该以用户/设备级别的限制为主
+#
+# 4. 持续监控和调优
+#    - 观察限流触发率（目标 < 5%）
+#    - 调整参数，不要一刀切
+#
+# 升级检查清单：详见 SECURITY_ROLLOUT_GUIDE.md

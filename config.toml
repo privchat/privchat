@@ -1,0 +1,73 @@
+# PrivChat Server 配置文件
+# 此文件由 privchat-server --generate-config 生成
+
+[server]
+host = "0.0.0.0"
+port = 8000
+http_file_server_port = 8080
+max_connections = 1000
+connection_timeout = 300
+heartbeat_interval = 60
+
+[cache]
+l1_max_memory_mb = 256
+l1_ttl_secs = 3600
+
+[cache.online_status]
+timeout_seconds = 300
+cleanup_interval_seconds = 60
+
+# 文件存储：必须至少配置一个 storage_source（按 default_storage_source_id 选择）
+[file]
+default_storage_source_id = 0
+
+[[file.storage_sources]]
+id = 0
+storage_type = "local"
+storage_root = "./storage/files"
+base_url = "http://localhost:8080/files"
+
+# 多数据中心示例：再增加 id=1、id=2 等，不同机房设置不同 default_storage_source_id 即可
+# [[file.storage_sources]]
+# id = 1
+# storage_type = "local"
+# storage_root = "/data/privchat/files-cn"
+# base_url = "https://files-cn.example.com/files"
+#
+# [[file.storage_sources]]
+# id = 2
+# storage_type = "local"
+# storage_root = "/data/privchat/files-us"
+# base_url = "https://files-us.example.com/files"
+
+[logging]
+level = "info"
+format = "compact"
+
+# ==========================================
+# 系统消息配置
+# ==========================================
+[system_message]
+# 是否启用系统消息用户
+enabled = true
+
+# 新用户注册时的欢迎消息
+welcome_message = """
+👋 欢迎使用 Privchat！
+
+这是一个端到端加密的即时通讯系统，您的隐私安全由我们守护。
+
+🔐 主要特性：
+• 端到端加密通讯
+• 多设备同步
+• 离线消息推送
+• 文件安全传输
+
+如有任何问题，欢迎随时联系我们！
+"""
+
+# 是否在用户注册时自动创建与系统用户的会话
+auto_create_channel = true
+
+# 是否在创建会话后自动发送欢迎消息
+auto_send_welcome = true
