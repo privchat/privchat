@@ -18,13 +18,13 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
     let message_id = request.server_message_id;
     let emoji = &request.emoji;
     
-    // 调用 Reaction 服务
+    // Handler 只返回 data 负载，外层 code/message 由 RPC 层封装；协议约定 data 为裸 bool
     match services.reaction_service.remove_reaction(
         message_id,
         user_id,
     ).await {
         Ok(()) => {
-            tracing::info!("✅ 成功移除 Reaction: user={}, message={}, emoji={}", 
+            tracing::info!("✅ 成功移除 Reaction: user={}, message={}, emoji={}",
                 user_id, message_id, emoji);
             Ok(json!(true))
         }

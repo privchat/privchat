@@ -50,18 +50,16 @@ pub async fn handle(
         }
     }
     
-    // 5. 返回响应（与 SDK 期望的 presence 结构一致：code + message + initial_statuses）
+    // Handler 只返回 data 负载（仅 initial_statuses），外层 code/message 由 RPC 层封装
     let response = SubscribePresenceResponse {
-        code: 0,
-        message: "OK".to_string(),
         initial_statuses: initial_statuses.clone(),
     };
-    
+
     info!(
         "✅ User {} subscribed to {} users",
         user_id, initial_statuses.len()
     );
-    
+
     serde_json::to_value(response)
         .map_err(|e| RpcError::internal(format!("Serialize response failed: {}", e)))
 }
