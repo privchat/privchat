@@ -133,7 +133,7 @@ impl MessageHandler for SendMessageHandler {
         info!("📢 SendMessageHandler: 处理来自会话 {} 的消息发送请求", context.session_id);
         
         // 1. 解析发送请求
-        let send_message_request: privchat_protocol::message::SendMessageRequest = privchat_protocol::decode_message(&context.data)
+        let send_message_request: privchat_protocol::protocol::SendMessageRequest = privchat_protocol::decode_message(&context.data)
             .map_err(|e| ServerError::Protocol(format!("解码发送请求失败: {}", e)))?;
         
         info!("📤 SendMessageHandler: 处理发送请求 - 用户: {}, 频道: {}, 内容长度: {}", 
@@ -558,19 +558,19 @@ impl MessageHandler for SendMessageHandler {
             return self.create_error_response(&send_message_request, 4, "无权限发送消息").await;
         }
 
-        // 4. 解析 payload 为 message_type + content + metadata + reply_to_message_id + mentioned_user_ids + message_source
-        // （需要在非好友消息检查之前解析，以便获取 message_source）
-        let (message_type, content, metadata, reply_to_message_id, mentioned_user_ids, message_source) = match Self::parse_payload(&send_message_request.payload) {
-            Ok((mt, c, m, r, mu, ms)) => (mt, c, m, r, mu, ms),
+        // 4. 消息类型来自协议层 message_type（u32），payload 仅解析 content + metadata + reply_to_message_id + mentioned_user_ids + message_source
+        let content_message_type = privchat_protocol::ContentMessageType::from_u32(send_message_request.message_type)
+            .ok_or_else(|| ServerError::Validation("无效的 message_type".to_string()))?;
+        let (content, metadata, reply_to_message_id, mentioned_user_ids, message_source) = match Self::parse_payload(&send_message_request.payload) {
+            Ok(t) => t,
             Err(e) => {
                 warn!("⚠️ SendMessageHandler: 解析 payload 失败，使用原始字符串: {}", e);
-                // 如果解析失败，使用原始 payload 作为 text 消息
-                ("text".to_string(), String::from_utf8_lossy(&send_message_request.payload).to_string(), None, None, Vec::new(), None)
+                (String::from_utf8_lossy(&send_message_request.payload).to_string(), None, None, Vec::new(), None)
             }
         };
 
-        info!("📩 SendMessageHandler: 消息类型={}, content={}, metadata={:?}, reply_to={:?}, mentioned={:?}, source={:?}", 
-              message_type, content, metadata, reply_to_message_id, mentioned_user_ids, message_source);
+        info!("📩 SendMessageHandler: message_type={}, content={}, metadata={:?}, reply_to={:?}, mentioned={:?}, source={:?}",
+              send_message_request.message_type, content, metadata, reply_to_message_id, mentioned_user_ids, message_source);
 
         // 3.5. ✅ 检查黑名单和非好友消息权限（仅限私聊）
         if channel.channel_type == crate::model::channel::ChannelType::Direct {
@@ -690,7 +690,7 @@ impl MessageHandler for SendMessageHandler {
 
         // 4.6. 验证消息类型和 metadata（特别是 file_id）
         if let Err(e) = self.validate_message_metadata(
-            &message_type,  // 从 payload JSON 解析的消息类型
+            content_message_type,
             &metadata,
             from_uid
         ).await {
@@ -708,9 +708,9 @@ impl MessageHandler for SendMessageHandler {
             &send_message_request.channel_id,
             &send_message_request.from_uid,
             content.clone(),
-            send_message_request.channel_type as u32, // 使用 channel_type 字段
-            reply_to_message_id.as_ref().and_then(|s| s.parse::<u64>().ok()), // ✨ 解析为 u64
-            metadata.clone(), // 解析后的 metadata
+            send_message_request.message_type,
+            reply_to_message_id.as_ref().and_then(|s| s.parse::<u64>().ok()),
+            metadata.clone(),
         ).await {
             Ok(record) => record,
             Err(e) => {
@@ -747,7 +747,7 @@ impl MessageHandler for SendMessageHandler {
         let pts = self.pts_generator.next_pts(send_message_request.channel_id, send_message_request.channel_type).await;
         
         // 创建 Message 模型
-        use crate::model::message::{Message, MessageType};
+        use crate::model::message::Message;
         let metadata_value = if let Some(ref meta_str) = metadata {
             serde_json::from_str(meta_str).unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
         } else {
@@ -764,10 +764,10 @@ impl MessageHandler for SendMessageHandler {
             message_id,
             channel_id,
             sender_id: from_uid,
-            pts: Some(pts as i64),  // 转换为 i64
+            pts: Some(pts as i64),
             local_message_id: Some(send_message_request.local_message_id),
             content: content.clone(),
-            message_type: MessageType::from_u32(send_message_request.channel_type as u32),
+            message_type: content_message_type,
             metadata: metadata_value,
             reply_to_message_id: reply_to_id,
             created_at: message_record.created_at,
@@ -813,9 +813,9 @@ impl MessageHandler for SendMessageHandler {
                     sender_id: from_uid,
                     recipient_id,
                     content_preview: content.chars().take(50).collect(),
-                    message_type: message_type.clone(),
+                    message_type: content_message_type.as_str().to_string(),
                     timestamp: message_record.created_at.timestamp(),
-                    device_id: None,  // ✨ Phase 3.5: 兼容旧逻辑
+                    device_id: None,
                 };
                 
                 if let Err(e) = event_bus.publish(event) {
@@ -892,8 +892,8 @@ impl MessageHandler for SendMessageHandler {
         let last_message_preview = crate::service::LastMessagePreview {
             message_id: message_record.message_id,
             sender_id: from_uid,
-            content: message_record.content.chars().take(50).collect(), // 截断到 50 字
-            message_type: message_type.clone(),
+            content: message_record.content.chars().take(50).collect(),
+            message_type: content_message_type.as_str().to_string(),
             timestamp: message_record.created_at,
         };
         self.channel_service.update_last_message_preview(channel.id, last_message_preview).await;
@@ -927,42 +927,14 @@ impl MessageHandler for SendMessageHandler {
 }
 
 impl SendMessageHandler {
-    /// 解析 payload 为 message_type + content + metadata + reply_to_message_id + mentioned_user_ids + message_source
-    /// 
-    /// Payload 应该是 JSON 格式：
-    /// ```json
-    /// {
-    ///   "message_type": "text",
-    ///   "content": "消息显示内容（包含 @用户昵称，用于显示）",
-    ///   "reply_to_message_id": "msg_xxx",  // 可选，引用消息ID
-    ///   "mentioned_user_ids": ["user_123", "user_456"],  // 可选，@的用户ID列表（客户端已选择）
-    ///   "message_source": {  // 可选，消息来源（非好友消息时使用）
-    ///     "type": "group",
-    ///     "source_id": "group_xxx"
-    ///   },
-    ///   "metadata": {
-    ///     "message_type_key": { ... }
-    ///   }
-    /// }
-    /// ```
-    /// 
-    /// **@提及设计**（类似 Telegram）：
-    /// - 客户端输入 @ 时，提示选择用户
-    /// - 客户端已经知道@的是哪个用户ID
-    /// - 发送消息时，在 `mentioned_user_ids` 中传递用户ID列表
-    /// - 消息内容中仍然显示 `@用户昵称`，但实际关联的是用户ID
-    /// - 即使同名用户也不会有问题，因为客户端已经选择了具体的用户ID
-    /// 
-    /// 如果 payload 不是 JSON 格式，则返回 ("text", 原始字符串, None, None, [], None)
-    /// 返回：(message_type, content, metadata, reply_to_message_id, mentioned_user_ids, message_source)
-    fn parse_payload(payload: &[u8]) -> crate::Result<(String, String, Option<String>, Option<String>, Vec<u64>, Option<crate::model::privacy::FriendRequestSource>)> {
-        // 尝试解析为 JSON
+    /// 解析 payload 为 content + metadata + reply_to_message_id + mentioned_user_ids + message_source
+    /// 消息类型由协议层 SendMessageRequest.message_type（u32）提供，不在此解析。
+    /// Payload 格式见 protocol 层 MessagePayloadEnvelope。
+    fn parse_payload(payload: &[u8]) -> crate::Result<(String, Option<String>, Option<String>, Vec<u64>, Option<crate::model::privacy::FriendRequestSource>)> {
         let json_value: Value = match serde_json::from_slice(payload) {
             Ok(v) => v,
             Err(_) => {
-                // 如果不是 JSON，返回原始字符串作为 text 消息
                 return Ok((
-                    "text".to_string(),
                     String::from_utf8_lossy(payload).to_string(),
                     None,
                     None,
@@ -971,38 +943,6 @@ impl SendMessageHandler {
                 ));
             }
         };
-
-        // 提取 message_type（必需字段）
-        let message_type = json_value
-            .get("message_type")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                // 如果没有 message_type，尝试从 metadata 推断
-                if let Some(metadata) = json_value.get("metadata").and_then(|v| v.as_object()) {
-                    if metadata.contains_key("image") {
-                        "image".to_string()
-                    } else if metadata.contains_key("video") {
-                        "video".to_string()
-                    } else if metadata.contains_key("audio") {
-                        "audio".to_string()
-                    } else if metadata.contains_key("file") {
-                        "file".to_string()
-                    } else if metadata.contains_key("sticker") {
-                        "sticker".to_string()
-                    } else if metadata.contains_key("contact_card") {
-                        "contact_card".to_string()
-                    } else if metadata.contains_key("location") {
-                        "location".to_string()
-                    } else if metadata.contains_key("forward") {
-                        "forward".to_string()
-                    } else {
-                        "text".to_string() // 默认为 text
-                    }
-                } else {
-                    "text".to_string() // 默认为 text
-                }
-            });
 
         // 提取 content
         let content = json_value
@@ -1074,78 +1014,44 @@ impl SendMessageHandler {
                 }
             });
 
-        Ok((message_type, content, metadata, reply_to_message_id, mentioned_user_ids, message_source))
+        Ok((content, metadata, reply_to_message_id, mentioned_user_ids, message_source))
     }
 
-    /// 验证消息类型和 metadata
-    /// 
-    /// 支持无限扩展的消息类型字符串，如 "text", "image", "red_package" 等
+    /// 验证消息类型和 metadata（按 protocol 层 ContentMessageType 与对应 metadata 结构体）
     async fn validate_message_metadata(
         &self,
-        message_type: &str,
+        message_type: privchat_protocol::ContentMessageType,
         metadata_json: &Option<String>,
         sender_id: u64,
     ) -> crate::Result<()> {
-        // 如果没有 metadata，只有 text 和 system 类型可以接受
         let metadata_json = match metadata_json {
             Some(m) => m,
             None => {
-                // 没有 metadata，验证消息类型
-                if message_type == "text" || message_type == "system" {
-                    return Ok(()); // text 和 system 不需要 metadata
-                } else {
-                    return Err(crate::error::ServerError::Validation(
-                        format!("消息类型 {} 需要 metadata", message_type)
-                    ));
+                if matches!(message_type, privchat_protocol::ContentMessageType::Text | privchat_protocol::ContentMessageType::System) {
+                    return Ok(());
                 }
+                return Err(crate::error::ServerError::Validation(
+                    format!("消息类型 {} 需要 metadata", message_type.as_str())
+                ));
             }
         };
         
-        // 解析 metadata JSON
         let metadata: Value = serde_json::from_str(metadata_json)
             .map_err(|e| crate::error::ServerError::Validation(
                 format!("metadata 不是有效的 JSON: {}", e)
             ))?;
         
-        // 根据消息类型验证 metadata 结构
         match message_type {
-            "text" | "system" => {
-                // text 和 system 不需要特殊验证
-                Ok(())
-            }
-            "image" => {
-                self.validate_file_metadata(&metadata, "image", sender_id).await
-            }
-            "video" => {
-                self.validate_file_metadata(&metadata, "video", sender_id).await
-            }
-            "voice" => {
-                // Voice 消息也需要验证 file_id（语音文件）
-                self.validate_file_metadata(&metadata, "voice", sender_id).await
-            }
-            "audio" => {
-                self.validate_file_metadata(&metadata, "audio", sender_id).await
-            }
-            "file" => {
-                self.validate_file_metadata(&metadata, "file", sender_id).await
-            }
-            "location" => {
-                self.validate_location_metadata(&metadata).await
-            }
-            "contact_card" => {
-                self.validate_contact_card_metadata(&metadata).await
-            }
-            "sticker" => {
-                self.validate_sticker_metadata(&metadata).await
-            }
-            "forward" => {
-                self.validate_forward_metadata(&metadata).await
-            }
-            _ => {
-                // 未知类型或自定义类型，不进行严格验证（支持扩展）
-                warn!("ℹ️ 收到扩展消息类型: {}, 跳过严格验证", message_type);
-                Ok(())
-            }
+            privchat_protocol::ContentMessageType::Text | privchat_protocol::ContentMessageType::System => Ok(()),
+            privchat_protocol::ContentMessageType::Image => self.validate_file_metadata(&metadata, "image", sender_id).await,
+            privchat_protocol::ContentMessageType::Video => self.validate_file_metadata(&metadata, "video", sender_id).await,
+            privchat_protocol::ContentMessageType::Voice => self.validate_file_metadata(&metadata, "voice", sender_id).await,
+            privchat_protocol::ContentMessageType::Audio => self.validate_file_metadata(&metadata, "audio", sender_id).await,
+            privchat_protocol::ContentMessageType::File => self.validate_file_metadata(&metadata, "file", sender_id).await,
+            privchat_protocol::ContentMessageType::Location => self.validate_location_metadata(&metadata).await,
+            privchat_protocol::ContentMessageType::ContactCard => self.validate_contact_card_metadata(&metadata).await,
+            privchat_protocol::ContentMessageType::Sticker => self.validate_sticker_metadata(&metadata).await,
+            privchat_protocol::ContentMessageType::Forward => self.validate_forward_metadata(&metadata).await,
         }
     }
 
@@ -1257,7 +1163,7 @@ impl SendMessageHandler {
     /// 此方法保留用于向后兼容，但不应被调用
     async fn get_or_create_private_channel(
         &self,
-        send_message_request: &privchat_protocol::message::SendMessageRequest,
+        send_message_request: &privchat_protocol::protocol::SendMessageRequest,
     ) -> Result<crate::model::channel::Channel> {
         // channel_id 现在直接是 u64，直接获取频道
         self.channel_service.get_channel(&send_message_request.channel_id).await
@@ -1381,7 +1287,7 @@ impl SendMessageHandler {
                 // 使用一个临时的 message_id，TransportServer 可能会覆盖它
                 let message_id = 0;
                 let mut packet = Packet::one_way(message_id, recv_data);
-                packet.set_biz_type(privchat_protocol::message::MessageType::PushMessageRequest as u8);
+                packet.set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
                 
                 // 对于发送者，使用异步非阻塞发送避免超时
                 if is_sender {
@@ -1542,7 +1448,7 @@ impl SendMessageHandler {
         reply_to_message_preview: Option<&crate::service::ReplyMessagePreview>,
         mentioned_user_ids: &[u64],  // ✨ @提及的用户ID列表
         is_mention_all: bool,           // ✨ 是否@全体成员
-    ) -> Result<privchat_protocol::message::PushMessageRequest> {
+    ) -> Result<privchat_protocol::protocol::PushMessageRequest> {
         use std::time::{SystemTime, UNIX_EPOCH};
         
         // 生成消息键
@@ -1587,8 +1493,8 @@ impl SendMessageHandler {
             .into_bytes();
 
         // 创建 RecvRequest
-        let push_message_request = privchat_protocol::message::PushMessageRequest {
-            setting: privchat_protocol::message::MessageSetting::default(),
+        let push_message_request = privchat_protocol::protocol::PushMessageRequest {
+            setting: privchat_protocol::protocol::MessageSetting::default(),
             msg_key: msg_key.clone(),
             server_message_id: message_record.message_id,
             message_seq: message_record.seq as u32,
@@ -1603,6 +1509,7 @@ impl SendMessageHandler {
                 crate::model::channel::ChannelType::Group => 1u8,
                 crate::model::channel::ChannelType::System => 2u8,
             },
+            message_type: message_record.message_type,
             expire: 0,
             topic: String::new(),
             from_uid: *sender_id,
@@ -1615,11 +1522,11 @@ impl SendMessageHandler {
     /// 创建成功响应
     async fn create_success_response(
         &self,
-        request: &privchat_protocol::message::SendMessageRequest,
+        request: &privchat_protocol::protocol::SendMessageRequest,
         message_record: &crate::service::message_history_service::MessageHistoryRecord,
     ) -> Result<Option<Vec<u8>>> {
         // message_id 现在已经是 u64 类型，直接使用
-        let response = privchat_protocol::message::SendMessageResponse {
+        let response = privchat_protocol::protocol::SendMessageResponse {
             client_seq: request.client_seq,
             server_message_id: message_record.message_id,
             message_seq: message_record.seq as u32,
@@ -1638,7 +1545,7 @@ impl SendMessageHandler {
     /// 创建重复消息响应（幂等性处理）
     async fn create_duplicate_response(
         &self,
-        request: &privchat_protocol::message::SendMessageRequest,
+        request: &privchat_protocol::protocol::SendMessageRequest,
     ) -> Result<Option<Vec<u8>>> {
         // 对于重复消息，我们需要返回一个成功响应，但不处理消息
         // 这里我们需要查询之前处理过的消息记录，但由于去重服务只存储了 (user_id, local_message_id)，
@@ -1647,7 +1554,7 @@ impl SendMessageHandler {
         
         // 注意：这里返回的 message_id 和 message_seq 可能不准确，因为这是重复消息
         // 实际应用中，可以考虑在去重服务中存储完整的消息记录
-        let response = privchat_protocol::message::SendMessageResponse {
+        let response = privchat_protocol::protocol::SendMessageResponse {
             client_seq: request.client_seq,
             server_message_id: 0, // 重复消息，无法获取真实ID
             message_seq: 0,
@@ -1666,11 +1573,11 @@ impl SendMessageHandler {
     /// 创建错误响应
     async fn create_error_response(
         &self, 
-        request: &privchat_protocol::message::SendMessageRequest, 
+        request: &privchat_protocol::protocol::SendMessageRequest, 
         error_code: u8, 
         error_message: &str
     ) -> Result<Option<Vec<u8>>> {
-        let response = privchat_protocol::message::SendMessageResponse {
+        let response = privchat_protocol::protocol::SendMessageResponse {
             client_seq: request.client_seq,
             server_message_id: 0, // 错误时使用0
             message_seq: 0,

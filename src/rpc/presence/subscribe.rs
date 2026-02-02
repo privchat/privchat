@@ -50,8 +50,10 @@ pub async fn handle(
         }
     }
     
-    // 5. 返回响应（只返回数据部分，code/message 由协议层处理）
+    // 5. 返回响应（与 SDK 期望的 presence 结构一致：code + message + initial_statuses）
     let response = SubscribePresenceResponse {
+        code: 0,
+        message: "OK".to_string(),
         initial_statuses: initial_statuses.clone(),
     };
     

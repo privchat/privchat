@@ -19,11 +19,11 @@ impl MessageHandler for PingMessageHandler {
         info!("🏓 PingMessageHandler: 处理来自会话 {} 的Ping请求", context.session_id);
         
         // 解析Ping请求
-        let _ping_request: privchat_protocol::message::PingRequest = privchat_protocol::decode_message(&context.data)
+        let _ping_request: privchat_protocol::protocol::PingRequest = privchat_protocol::decode_message(&context.data)
             .map_err(|e| crate::error::ServerError::Protocol(format!("解码Ping请求失败: {}", e)))?;
         
         // 创建Pong响应
-        let pong_response = privchat_protocol::message::PongResponse {
+        let pong_response = privchat_protocol::protocol::PongResponse {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

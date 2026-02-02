@@ -3,7 +3,7 @@ use crate::handler::MessageHandler;
 use crate::context::RequestContext;
 use crate::Result;
 use tracing::warn;
-use privchat_protocol::message::MessageType;
+use privchat_protocol::protocol::MessageType;
 
 pub mod middleware;
 pub use middleware::*;

@@ -178,7 +178,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
                         pts: Some(pts as i64),
                         local_message_id: Some(message_id),
                         content: content.clone(),
-                        message_type: crate::model::message::MessageType::Text,
+                        message_type: privchat_protocol::ContentMessageType::Text,
                         metadata: serde_json::Value::Object(serde_json::Map::new()),
                         reply_to_message_id: None,
                         created_at: now,
@@ -202,8 +202,8 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
                             let payload = serde_json::to_vec(&payload_json)
                                 .unwrap_or_else(|_| Vec::new());
 
-                            let push_msg = privchat_protocol::message::PushMessageRequest {
-                                setting: privchat_protocol::message::MessageSetting::default(),
+                            let push_msg = privchat_protocol::protocol::PushMessageRequest {
+                                setting: privchat_protocol::protocol::MessageSetting::default(),
                                 msg_key: format!("msg_{}", message_id),
                                 server_message_id: message_id,
                                 message_seq: 1,
@@ -214,6 +214,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
                                 timestamp: now.timestamp().max(0) as u32,
                                 channel_id,
                                 channel_type: 0, // Direct
+                                message_type: privchat_protocol::ContentMessageType::Text.as_u32(),
                                 expire: 0,
                                 topic: String::new(),
                                 from_uid: crate::config::SYSTEM_USER_ID,

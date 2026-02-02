@@ -1324,7 +1324,7 @@ impl ChannelService {
         }
     }
 
-    /// 标记消息已读
+    /// 标记消息已读（单条，兼容旧 RPC）
     pub async fn mark_message_read(
         &self,
         channel_id: u64,
@@ -1341,6 +1341,24 @@ impl ChannelService {
         } else {
             Ok(false)
         }
+    }
+
+    /// 按 pts 推进已读（正确模型，O(1)）：last_read_pts = max(last_read_pts, read_pts)
+    /// 返回更新后的 last_read_pts（若用户不在频道返回 None）
+    pub async fn mark_read_pts(
+        &self,
+        user_id: &u64,
+        channel_id: &u64,
+        read_pts: u64,
+    ) -> Result<Option<u64>> {
+        let mut channels = self.channels.write().await;
+        if let Some(channel) = channels.get_mut(channel_id) {
+            if let Some(member) = channel.members.get_mut(user_id) {
+                member.mark_read_pts(read_pts);
+                return Ok(Some(member.last_read_pts));
+            }
+        }
+        Ok(None)
     }
 
     /// 更新最后消息

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 use msgtrans::{SessionId, packet::Packet};
-use privchat_protocol::message::{PushMessageRequest, MessageType};
+use privchat_protocol::protocol::{PushMessageRequest, MessageType};
 
 use crate::error::{Result, ServerError};
 

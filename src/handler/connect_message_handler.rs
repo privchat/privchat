@@ -83,7 +83,7 @@ impl MessageHandler for ConnectMessageHandler {
         info!("🔗 ConnectMessageHandler: 处理来自会话 {} 的连接请求", context.session_id);
         
         // 解析连接请求
-        let connect_request: privchat_protocol::message::AuthorizationRequest = privchat_protocol::decode_message(&context.data)
+        let connect_request: privchat_protocol::protocol::AuthorizationRequest = privchat_protocol::decode_message(&context.data)
             .map_err(|e| crate::error::ServerError::Protocol(format!("解码连接请求失败: {}", e)))?;
         
         info!("🔗 ConnectMessageHandler: 设备 {} 请求连接，设备类型: {:?}", 
@@ -298,8 +298,8 @@ impl MessageHandler for ConnectMessageHandler {
             let now = chrono::Utc::now();
             let payload = serde_json::to_vec(&json!({ "content": self.welcome_message }))
                 .unwrap_or_else(|_| Vec::new());
-            let push_msg = privchat_protocol::message::PushMessageRequest {
-                setting: privchat_protocol::message::MessageSetting::default(),
+            let push_msg = privchat_protocol::protocol::PushMessageRequest {
+                setting: privchat_protocol::protocol::MessageSetting::default(),
                 msg_key: format!("msg_{}", message_id),
                 server_message_id: message_id,
                 message_seq: 1,
@@ -310,6 +310,7 @@ impl MessageHandler for ConnectMessageHandler {
                 timestamp: now.timestamp().max(0) as u32,
                 channel_id,
                 channel_type: 0, // Direct
+                message_type: privchat_protocol::ContentMessageType::Text.as_u32(),
                 expire: 0,
                 topic: String::new(),
                 from_uid: crate::config::SYSTEM_USER_ID,
@@ -332,14 +333,14 @@ impl MessageHandler for ConnectMessageHandler {
         }
 
         // 9. 创建连接响应
-        let connect_response = privchat_protocol::message::AuthorizationResponse {
+        let connect_response = privchat_protocol::protocol::AuthorizationResponse {
             success: true,
             error_code: None,
             error_message: None,
             session_id: Some(context.session_id.to_string()),
             user_id: Some(user_id),
             connection_id: Some(format!("conn_{}", context.session_id)),
-            server_info: Some(privchat_protocol::message::ServerInfo {
+            server_info: Some(privchat_protocol::protocol::ServerInfo {
                 version: "1.0.0".to_string(),
                 name: "PrivChat Server".to_string(),
                 features: vec!["chat".to_string(), "file_transfer".to_string()],
@@ -366,7 +367,7 @@ impl MessageHandler for ConnectMessageHandler {
 impl ConnectMessageHandler {
     /// 创建错误响应
     fn create_error_response(&self, error_code: &str, error_message: &str) -> Result<Option<Vec<u8>>> {
-        let connect_response = privchat_protocol::message::AuthorizationResponse {
+        let connect_response = privchat_protocol::protocol::AuthorizationResponse {
             success: false,
             error_code: Some(error_code.to_string()),
             error_message: Some(error_message.to_string()),
@@ -391,7 +392,7 @@ impl ConnectMessageHandler {
         user_id: u64,
         device_id: &str,
         claims: &crate::auth::ImTokenClaims,
-        connect_request: &privchat_protocol::message::AuthorizationRequest,
+        connect_request: &privchat_protocol::protocol::AuthorizationRequest,
         context: &RequestContext,
     ) -> anyhow::Result<()> {
         use uuid::Uuid;

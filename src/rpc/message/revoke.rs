@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use chrono::Utc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use privchat_protocol::message::{PushMessageRequest, MessageSetting};
+use privchat_protocol::protocol::{PushMessageRequest, MessageSetting};
 use privchat_protocol::rpc::message::revoke::MessageRevokeRequest;
 use tracing::{info, warn};
 
@@ -155,6 +155,7 @@ async fn distribute_revoke_event(
         timestamp: (now / 1000) as u32,
         channel_id,
         channel_type: 1,
+        message_type: privchat_protocol::ContentMessageType::System.as_u32(),
         expire: 0,
         topic: "message.revoke".to_string(),
         from_uid: revoked_by,

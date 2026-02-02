@@ -60,6 +60,7 @@ pub async fn handle(
                 timestamp: chrono::Utc::now().timestamp() as u32,
                 channel_id: req.channel_id,
                 channel_type: 1, // 私聊
+                message_type: privchat_protocol::ContentMessageType::System.as_u32(),
                 expire: 0,
                 topic: String::new(),
                 from_uid: user_id,

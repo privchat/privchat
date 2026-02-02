@@ -9,7 +9,7 @@ use msgtrans::{
     event::ServerEvent,
 };
 
-use privchat_protocol::message::MessageType;
+use privchat_protocol::protocol::MessageType;
 
 use crate::auth::TokenAuth;
 use crate::error::ServerError;

@@ -2,75 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use sqlx::Type;
-
-/// 消息类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
-#[sqlx(type_name = "smallint")]
-pub enum MessageType {
-    /// 文本消息
-    Text = 0,
-    /// 图片消息
-    Image = 1,
-    /// 文件消息
-    File = 2,
-    /// 语音消息
-    Voice = 3,
-    /// 视频消息
-    Video = 4,
-    /// 系统消息
-    System = 5,
-    /// 音频消息
-    Audio = 6,
-    /// 位置消息
-    Location = 7,
-    /// 名片消息
-    ContactCard = 8,
-    /// 表情包消息
-    Sticker = 9,
-    /// 转发消息
-    Forward = 10,
-    /// 未知类型
-    Unknown = 99,
-}
-
-impl MessageType {
-    /// 从 u32 转换为 MessageType
-    pub fn from_u32(value: u32) -> Self {
-        match value {
-            0 => MessageType::Text,
-            1 => MessageType::Image,
-            2 => MessageType::File,
-            3 => MessageType::Voice,
-            4 => MessageType::Video,
-            5 => MessageType::System,
-            6 => MessageType::Audio,
-            7 => MessageType::Location,
-            8 => MessageType::ContactCard,
-            9 => MessageType::Sticker,
-            10 => MessageType::Forward,
-            _ => MessageType::Unknown,
-        }
-    }
-
-    /// 转换为字符串
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MessageType::Text => "text",
-            MessageType::Image => "image",
-            MessageType::File => "file",
-            MessageType::Voice => "voice",
-            MessageType::Video => "video",
-            MessageType::System => "system",
-            MessageType::Audio => "audio",
-            MessageType::Location => "location",
-            MessageType::ContactCard => "contact_card",
-            MessageType::Sticker => "sticker",
-            MessageType::Forward => "forward",
-            MessageType::Unknown => "unknown",
-        }
-    }
-}
+use privchat_protocol::ContentMessageType;
 
 /// 消息模型
 /// 注意：不使用 FromRow，因为有 sqlx(skip) 字段，使用 from_db_row 方法
@@ -84,7 +16,7 @@ pub struct Message {
     /// 客户端消息编号（用于去重）
     pub local_message_id: Option<u64>,
     pub content: String,
-    pub message_type: MessageType,
+    pub message_type: ContentMessageType,
     pub metadata: Value,
     pub reply_to_message_id: Option<u64>,
     /// 创建时间（数据库存储为 BIGINT 毫秒时间戳，查询时转换为 DateTime）
@@ -123,7 +55,7 @@ pub struct ChannelMessage {
     pub publisher_id: Option<u64>,
     pub title: Option<String>,
     pub content: String,
-    pub message_type: MessageType,
+    pub message_type: ContentMessageType,
     pub metadata: Value,
     pub is_urgent: bool,
     pub expires_at: Option<DateTime<Utc>>,
@@ -175,12 +107,6 @@ pub struct LocationInfo {
     pub name: Option<String>,
 }
 
-impl Default for MessageType {
-    fn default() -> Self {
-        MessageType::Text
-    }
-}
-
 impl Message {
     /// 创建新消息
     /// 
@@ -189,7 +115,7 @@ impl Message {
         channel_id: u64,
         sender_id: u64,
         content: String,
-        message_type: MessageType,
+        message_type: ContentMessageType,
     ) -> Self {
         // 注意：message_id 应该由调用者使用 next_message_id() 生成
         Self {
@@ -238,7 +164,7 @@ impl Message {
             pts: Some(pts),
             local_message_id,
             content,
-            message_type: MessageType::from_u32(message_type as u32),
+            message_type: ContentMessageType::from_u32(message_type as u32).unwrap_or(ContentMessageType::Text),
             metadata,
             reply_to_message_id: reply_to_message_id.map(|id| id as u64),
             created_at: DateTime::from_timestamp_millis(created_at)
@@ -262,7 +188,7 @@ impl Message {
             self.pts.unwrap_or(0),  // 必须提供 pts
             self.local_message_id.map(|v| v as i64),
             self.content.clone(),
-            self.message_type as i16,
+            self.message_type.as_u32() as i16,
             self.metadata.clone(),
             self.reply_to_message_id.map(|id| id as i64),
             self.created_at.timestamp_millis(),
@@ -282,7 +208,7 @@ impl Message {
         channel_id: u64,
         sender_id: u64,
         content: String,
-        message_type: MessageType,
+        message_type: ContentMessageType,
         reply_to_message_id: u64,
     ) -> Self {
         // 注意：message_id 应该由调用者使用 next_message_id() 生成
@@ -320,14 +246,14 @@ impl Message {
 
     /// 检查是否为系统消息
     pub fn is_system_message(&self) -> bool {
-        matches!(self.message_type, MessageType::System)
+        matches!(self.message_type, ContentMessageType::System)
     }
 
     /// 检查是否包含文件
     pub fn has_file(&self) -> bool {
         matches!(
             self.message_type,
-            MessageType::Image | MessageType::File | MessageType::Voice | MessageType::Video
+            ContentMessageType::Image | ContentMessageType::File | ContentMessageType::Voice | ContentMessageType::Video
         )
     }
 
@@ -395,7 +321,7 @@ impl ChannelMessage {
         publisher_id: Option<u64>,
         title: Option<String>,
         content: String,
-        message_type: MessageType,
+        message_type: ContentMessageType,
     ) -> Self {
         // 注意：message_id 应该由调用者使用 next_message_id() 生成
         Self {
@@ -419,7 +345,7 @@ impl ChannelMessage {
         publisher_id: Option<u64>,
         title: Option<String>,
         content: String,
-        message_type: MessageType,
+        message_type: ContentMessageType,
     ) -> Self {
         let mut message = Self::new(channel_id, publisher_id, title, content, message_type);
         message.is_urgent = true;

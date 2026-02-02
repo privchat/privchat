@@ -137,6 +137,7 @@ async fn broadcast_read_receipt(
                 timestamp: chrono::Utc::now().timestamp() as u32,
                 channel_id: channel_id,
                 channel_type: 1,  // DirectMessage
+                message_type: privchat_protocol::ContentMessageType::System.as_u32(),
                 expire: 0,
                 topic: String::new(),
                 from_uid: 0,  // system

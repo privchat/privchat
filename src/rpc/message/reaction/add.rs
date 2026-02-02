@@ -27,10 +27,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
         Ok(_reaction) => {
             tracing::info!("✅ 成功添加 Reaction: user={}, message={}, emoji={}", 
                 user_id, message_id, emoji);
-            Ok(json!({
-                "success": true,
-                "message": "Reaction 添加成功"
-            }))
+            Ok(json!(true))
         }
         Err(e) => {
             tracing::error!("❌ 添加 Reaction 失败: user={}, message={}, error={}", 

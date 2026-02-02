@@ -272,8 +272,10 @@ pub struct ChannelMember {
     pub last_active_at: DateTime<Utc>,
     /// 是否静音
     pub is_muted: bool,
-    /// 是否已读最新消息
+    /// 是否已读最新消息（兼容单条已读，可选）
     pub last_read_message_id: Option<u64>,
+    /// 最后已读 pts（区间语义，主模型）：已读 pts <= last_read_pts 的所有消息
+    pub last_read_pts: u64,
 }
 
 impl ChannelMember {
@@ -294,6 +296,7 @@ impl ChannelMember {
             last_active_at: Utc::now(),
             is_muted: false,
             last_read_message_id: None,
+            last_read_pts: 0,
         }
     }
 
@@ -302,9 +305,15 @@ impl ChannelMember {
         self.last_active_at = Utc::now();
     }
 
-    /// 更新已读消息
+    /// 更新已读消息（单条，兼容旧 RPC）
     pub fn mark_read(&mut self, message_id: u64) {
         self.last_read_message_id = Some(message_id);
+        self.update_last_active();
+    }
+
+    /// 按 pts 推进已读（正确模型，O(1)）：last_read_pts = max(last_read_pts, read_pts)，天然幂等、单调
+    pub fn mark_read_pts(&mut self, read_pts: u64) {
+        self.last_read_pts = self.last_read_pts.max(read_pts);
         self.update_last_active();
     }
 }
@@ -382,6 +391,7 @@ impl ChannelParticipant {
             last_active_at: self.joined_at,  // 默认使用加入时间
             is_muted: self.mute_until.map_or(false, |dt| dt > Utc::now()),
             last_read_message_id: None,  // 需要从其他表查询
+            last_read_pts: 0,
         }
     }
 }

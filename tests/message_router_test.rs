@@ -6,7 +6,7 @@ use privchat_server::infra::{
     SessionManager, TwoLevelCache, SerializedRedisCache, CacheManager,
     UserOnlineStatus, DeviceSession, DeviceStatus, UserId, SessionId, DeviceId,
 };
-use privchat_protocol::message::PushMessageRequest;
+use privchat_protocol::protocol::PushMessageRequest;
 
 /// 创建测试用的消息路由器
 async fn create_test_router() -> (Arc<MessageRouter>, Arc<SimpleSessionManager>) {

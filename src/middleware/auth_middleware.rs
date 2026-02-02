@@ -2,7 +2,7 @@ use std::sync::Arc;
 use msgtrans::SessionId;
 use privchat_protocol::ErrorCode;
 use crate::infra::{SessionManager, auth_whitelist};
-use privchat_protocol::message::MessageType;
+use privchat_protocol::protocol::MessageType;
 
 /// 认证结果类型
 pub type AuthResult<T> = std::result::Result<T, ErrorCode>;

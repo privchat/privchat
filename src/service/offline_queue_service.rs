@@ -12,7 +12,7 @@
 /// - 过期: 7 天
 
 use crate::error::ServerError;
-use privchat_protocol::message::PushMessageRequest;
+use privchat_protocol::protocol::PushMessageRequest;
 use redis::{AsyncCommands, Client as RedisClient};
 use tracing::info;
 

@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use crate::infra::cache::TwoLevelCache;
 // 暂时注释掉 redis 相关导入
 // use crate::infra::redis_cache::SerializedRedisCache;
-use privchat_protocol::message::PushMessageRequest;
+use privchat_protocol::protocol::PushMessageRequest;
 
 /// 用户ID类型
 pub type UserId = u64;

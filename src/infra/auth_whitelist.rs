@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use lazy_static::lazy_static;
-use privchat_protocol::message::MessageType;
+use privchat_protocol::protocol::MessageType;
 
 lazy_static! {
     /// 匿名消息类型白名单

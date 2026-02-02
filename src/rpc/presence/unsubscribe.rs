@@ -32,11 +32,14 @@ pub async fn handle(
         services.presence_manager.unsubscribe(user_id, target_user_id);
     }
     
-    // 4. 返回响应（简单操作，返回 true）
+    // 4. 返回响应（与 SDK 期望的 UnsubscribePresenceResponse 一致：code + message）
     info!(
         "✅ User {} unsubscribed from users",
         user_id
     );
     
-    Ok(json!(true))
+    Ok(json!({
+        "code": 0,
+        "message": "OK"
+    }))
 }

@@ -24,7 +24,7 @@ impl MessageHandler for DisconnectMessageHandler {
         info!("🔌 DisconnectMessageHandler: 处理来自会话 {} 的断开连接请求", context.session_id);
         
         // 解析断开连接请求
-        let disconnect_request: privchat_protocol::message::DisconnectRequest = privchat_protocol::decode_message(&context.data)
+        let disconnect_request: privchat_protocol::protocol::DisconnectRequest = privchat_protocol::decode_message(&context.data)
             .map_err(|e| crate::error::ServerError::Protocol(format!("解码断开连接请求失败: {}", e)))?;
         
         info!("🔌 DisconnectMessageHandler: 用户请求断开连接，原因: {:?}", disconnect_request.reason);
@@ -37,7 +37,7 @@ impl MessageHandler for DisconnectMessageHandler {
         }
         
         // 创建断开连接响应
-        let disconnect_response = privchat_protocol::message::DisconnectResponse {
+        let disconnect_response = privchat_protocol::protocol::DisconnectResponse {
             acknowledged: true,
         };
         

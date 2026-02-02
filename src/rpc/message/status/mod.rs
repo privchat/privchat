@@ -1,4 +1,5 @@
 pub mod read;
+pub mod read_pts;
 pub mod count;
 pub mod read_list;
 pub mod read_stats;
@@ -15,6 +16,14 @@ pub async fn register_routes(services: RpcServiceContext) {
         Box::new(move |body, ctx| {
             let services = services.clone();
             Box::pin(async move { read::handle(body, services, ctx).await })
+        })
+    }).await;
+
+    router.register("message/status/read_pts", {
+        let services = services.clone();
+        Box::new(move |body, ctx| {
+            let services = services.clone();
+            Box::pin(async move { read_pts::handle(body, services, ctx).await })
         })
     }).await;
     
@@ -42,5 +51,5 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
     }).await;
     
-    tracing::debug!("📋 status 模块路由注册完成 (read, count, read_list, read_stats)");
+    tracing::debug!("📋 status 模块路由注册完成 (read, read_pts, count, read_list, read_stats)");
 }

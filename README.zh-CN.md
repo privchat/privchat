@@ -638,7 +638,8 @@ privchat-server/
 - ✅ 加群审批：`group/approval/list`, `handle`
 
 #### 消息状态 (100%)
-- ✅ 已读标记：`message/status/read`（Phase 8 测试通过）
+- ✅ 已读标记：`message/status/read`（单条，兼容，Phase 8 测试通过）
+- ✅ **按 pts 推进已读**：`message/status/read_pts`（推荐，O(1)，见 [READ_RECEIPT_PTS_MODEL](../privchat-docs/design/READ_RECEIPT_PTS_MODEL.md)）
 - ✅ 未读计数：`message/status/count`
 - ✅ 已读列表：`message/status/read_list`
 - ✅ 已读统计：`message/status/read_stats`
@@ -802,10 +803,11 @@ privchat-server/
   - ✅ 自动创建机制：接受好友请求时自动创建私聊会话，加入群组时自动创建群聊会话
   - ✅ 统一 Channel 模型：合并会话列表和频道信息字段
 
-- ⚠️ **批量已读功能** (单条已读完成)
-  - ✅ 单条消息已读 (Phase 8 测试通过)
-  - ❌ 批量标记已读 RPC
-  - ❌ 已读回执批量通知
+- ✅ **读状态（read_pts）模型**（协议层正确模型）
+  - ✅ 单条消息已读 `message/status/read`（兼容，Phase 8 测试通过）
+  - ✅ **按 pts 推进已读** `message/status/read_pts`（O(1) 存储/广播，天然幂等、单调）
+  - ✅ 服务端 per-user per-channel `last_read_pts`，广播 `UserReadEvent`
+  - ❌ 不提供「批量 message_id」RPC（避免 O(n) 负载；本地 UI 可保留批量写本地存储）
 
 - ⚠️ **性能优化** (部分完成)
   - ✅ 两级缓存策略
@@ -828,11 +830,10 @@ privchat-server/
    - ✅ 新增 `channel/mute` - 用户个人通知偏好设置
    - ✅ 统一 Channel 模型 - 合并会话列表和频道信息字段
 
-3. **批量已读功能** ⭐⭐⭐⭐
-   - 批量标记已读 RPC
-   - 按会话批量已读
-   - 已读回执批量通知
-   - 性能优化（批量SQL）
+3. **读状态（read_pts）** ⭐⭐⭐⭐⭐ ✅ 已按正确模型实现
+   - ✅ `message/status/read_pts`：按 pts 推进已读（协议层唯一推荐入口）
+   - ✅ 服务端只维护 `last_read_pts`（per-user per-channel），O(1) 更新
+   - ✅ 广播 `UserReadEvent { user_id, channel_id, read_pts }`，O(1)
 
 #### P1 - 高级功能
 2. **完整监控系统** ⭐⭐⭐
@@ -918,7 +919,7 @@ privchat-server/
 - ✅ 在线状态（测试通过）
 - ✅ 输入状态（测试通过）
 - ⚠️ 表情包（RPC完成，存储待完善）
-- ❌ 批量已读（单条已读已完成）
+- ✅ 读状态 read_pts（`message/status/read_pts` 已实现，不采用批量 message_id RPC）
 - ❌ 消息编辑（安全考虑：不实现，采用"撤回+重发"方案）
 
 ## 🚀 未来规划功能
@@ -927,11 +928,11 @@ privchat-server/
 
 ### 📅 近期计划 (1-2个月) - P0 优先级
 
-#### 1. 批量已读功能 ⭐⭐⭐⭐⭐
-- [ ] 批量标记已读 RPC
-- [ ] 按会话批量已读
-- [ ] 已读回执批量通知
-- [ ] 性能优化（批量SQL）
+#### 1. 读状态（read_pts）✅ 已实现
+- [x] `message/status/read_pts` RPC（按 pts 推进已读）
+- [x] 服务端 `last_read_pts`（per-user per-channel）
+- [x] O(1) 广播 `UserReadEvent`
+- 说明：不采用「批量 message_id」RPC，见 [READ_RECEIPT_PTS_MODEL.md](../privchat-docs/design/READ_RECEIPT_PTS_MODEL.md)
 
 #### 2. 监控系统完善 ⭐⭐⭐⭐
 - [ ] Prometheus metrics 完整接入
@@ -1066,7 +1067,7 @@ privchat-server/
    - ✅ 消息@提及（已完成）
    - ✅ 消息 Reaction（已完成）
    - ✅ 消息撤回（已完成，2分钟限制）
-   - ❌ 批量已读（待实现）
+   - ✅ 读状态 read_pts（`message/status/read_pts` 已实现）
    - ❌ 消息编辑（**不实现**，安全考虑采用"撤回+重发"方案）
 
 2. **监控系统完善**
@@ -1160,7 +1161,7 @@ privchat-server/
 | 时间 | 里程碑 | 目标 | 状态 |
 |------|--------|------|------|
 | **2026 Q1** | ✅ 核心功能完成 | 消息、好友、群组、同步机制、@提及、回复、Reaction 100% 完成 | **已完成** ✅ |
-| **2026 Q2** | 🎯 生产就绪 | 批量已读、监控完善、压力测试、正式上线 | **进行中** 🔄 |
+| **2026 Q2** | 🎯 生产就绪 | read_pts 已读模型、监控完善、压力测试、正式上线 | **进行中** 🔄 |
 | **2026 Q3** | 📱 用户体验提升 | 媒体处理、搜索优化、消息置顶 | **计划中** 📋 |
 | **2026 Q4** | 🔒 企业级功能 | E2EE、音视频、机器人系统 | **计划中** 📋 |
 | **2027 Q1** | 🌍 全球化部署 | 多地域、AI集成、性能优化 | **计划中** 📋 |
@@ -1193,7 +1194,7 @@ privchat-server/
 - ✅ 数据持久化（PostgreSQL + Repository）
 
 ### 下周重点
-1. 实现批量已读功能
+1. 读状态 read_pts 模型已实现（`message/status/read_pts`，不采用批量 message_id RPC）
 2. 完善 Prometheus 监控指标
 3. 添加分布式追踪支持
 4. 进行压力测试和性能调优
@@ -1267,7 +1268,7 @@ privchat-server/
 *已完成功能：消息系统、群组、好友、@提及、回复、Reaction、在线状态、输入状态、系统通知、文件上传/下载（含多存储源 S3/OSS）、会话管理；SDK 图片压缩与缩略图、视频钩子、收到消息后自动下载缩略图*  
 *最新改进：多存储源（OpenDAL）、S3/OSS/COS/MinIO/Garage 支持；SDK 媒体预处理（图片缩略图、视频 Thumbnail/Compress）*  
 *服务器端支持情况：所有 SDK 功能服务器端已实现，同步机制 P0/P1/P2 全部完成，所有 RPC 路由已注册 ✅*  
-*下一步重点：批量已读 RPC、监控系统完善、压力测试*
+*下一步重点：SDK 对接 read_pts、监控系统完善、压力测试*
 
 [快速开始](#-快速开始) • [功能列表](#-功能列表) • [开发文档](docs/) • [贡献指南](../CONTRIBUTING.md)
 
