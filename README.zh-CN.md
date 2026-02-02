@@ -196,15 +196,54 @@ cp config.example.toml config.toml
 
 配置文件使用 TOML 格式，支持嵌套结构。**推荐模式**：配置文件中写非敏感配置，敏感信息（密码、密钥等）通过环境变量提供。
 
+**服务配置拆段**：网关与文件服务拆段为 `[gateway_server]`、`[file_server]`，未来可扩展 `[msg_server]` 等。
+
+**网关配置模型（listeners 数组）**：网关仅支持 **listeners 数组**（`[[gateway_server.listeners]]`），不支持单组 host/port。每项可配置：`protocol`（tcp / websocket / quic）、`host`、`port`；可选：`path`、`compression`（WebSocket）、`tls_cert`、`tls_key`（QUIC/TLS）、`internal`（内网标记）等。便于多监听、per-protocol 参数、未来扩展协议（http2、grpc、unix 等）。
+
+**默认端口规范（PrivChat 官方）**：端口为长期对外契约，不宜随意改动。约定如下：
+
+| 端口 | 协议 | 说明 |
+|------|------|------|
+| **9001** | TCP/UDP | Gateway（msgtrans / QUIC）— TCP 与 QUIC 同端口，客户端只记 `gateway:9001`，QUIC 优先、TCP fallback |
+| **9080** | TCP | WebSocket Gateway（开发环境）；生产可走 9443/wss |
+| **9083** | TCP | File HTTP（上传/下载 + Admin API） |
+| **9090** | TCP | 预留 Admin API 独立端口（当前与 9083 共用） |
+
+设计哲学：**900x** = 核心网关/长连，**908x** = HTTP/Web，**909x** = 管理；避免 8080 等 Web 语义，减少与 nginx/ingress 混淆。
+
 #### 推荐配置模式
 
 **config.toml**（配置文件）：
 ```toml
-[server]
+# 网关：listeners 数组为生产级设计（可多监听、per-protocol 参数）
+[gateway_server]
+max_connections = 100000
+connection_timeout = 300
+heartbeat_interval = 60
+use_internal_auth = true
+
+# TCP/QUIC 同端口 9001（客户端只记 gateway:9001）
+[[gateway_server.listeners]]
+protocol = "tcp"
 host = "0.0.0.0"
-port = 8000
-http_file_server_port = 8080
-max_connections = 1000
+port = 9001
+
+[[gateway_server.listeners]]
+protocol = "quic"
+host = "0.0.0.0"
+port = 9001
+
+[[gateway_server.listeners]]
+protocol = "websocket"
+host = "0.0.0.0"
+port = 9080
+path = "/gate"
+compression = true
+
+# 文件服务（HTTP 上传/下载/Admin API）
+[file_server]
+port = 9083
+api_base_url = "http://localhost:9083/api/app"
 
 [cache]
 l1_max_memory_mb = 256
@@ -222,7 +261,7 @@ default_storage_source_id = 0
 id = 0
 storage_type = "local"
 storage_root = "./storage/files"
-base_url = "http://localhost:8080/files"
+base_url = "http://localhost:9083/files"
 
 [logging]
 level = "info"
@@ -253,6 +292,7 @@ PRIVCHAT_JWT_SECRET=your-super-secret-key-minimum-64-chars
 > - `.env` 文件应添加到 `.gitignore`（包含敏感信息）
 > - 生产环境可以通过容器环境变量或密钥管理系统提供敏感信息
 > - 查看完整配置示例：`privchat-server generate-config config.toml`
+> - 实际配置还包含 `[system_message]`（欢迎消息、自动创建会话）、`[security]`（安全模式、速率限制）等，详见仓库内 `config.example.toml`。
 
 ### 配置优先级
 
@@ -329,15 +369,20 @@ privchat-server --dev
 
 ## 📊 监控
 
-启用监控后，可以访问以下端点：
+- **健康检查**：通过 RPC 调用 `system/health`（无需认证），无独立 HTTP 端点。
+- **Prometheus 指标**：当前为占位实现（`infra/metrics`），尚未提供 HTTP `/metrics` 端点；生产环境需自行接入或等待后续完善。
+- 若需 HTTP 健康检查，可考虑在 HTTP 文件服务同一端口（见 `http_file_server_port`，默认 9083）上扩展路由。
 
-```bash
-# Prometheus 监控指标
-curl http://localhost:9090/metrics
+### Admin API（管理接口）
 
-# 健康检查
-curl http://localhost:9090/health
-```
+与 HTTP 文件服务共用同一端口（`http_file_server_port`，默认 9083），使用 `X-Service-Key` 认证：
+
+- `POST/GET /api/admin/users`、`/api/admin/users/{user_id}` - 用户管理
+- `GET/DELETE /api/admin/groups`、`/api/admin/groups/{group_id}` - 群组管理
+- `POST/GET /api/admin/friendships`、`/api/admin/friendships`、`/api/admin/friendships/user/{user_id}` - 好友关系
+- `GET /api/admin/login-logs`、`/api/admin/devices`、`/api/admin/stats/*`、`/api/admin/messages` 等
+
+详见 `scripts/README.md` 与 `scripts/test_admin_api.py`。
 
 ## 🛡️ 安全最佳实践
 
@@ -396,7 +441,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates
 COPY --from=builder /app/target/release/privchat-server /usr/local/bin/
 COPY config.example.toml /etc/privchat/config.toml
-EXPOSE 8001 8002 9090
+EXPOSE 9001 9080 9083
 CMD ["privchat-server", "--config-file", "/etc/privchat/config.toml"]
 ```
 
@@ -408,9 +453,9 @@ services:
   privchat-server:
     build: .
     ports:
-      - "8001:8001"  # TCP
-      - "8002:8002"  # WebSocket
-      - "9090:9090"  # Metrics
+      - "9001:9001"  # TCP/QUIC Gateway
+      - "9080:9080"  # WebSocket Gateway
+      - "9083:9083"  # HTTP 文件服务（上传/下载/Admin API）
     environment:
       # 敏感信息通过环境变量提供
       - DATABASE_URL=postgresql://user:pass@postgres/privchat
@@ -447,12 +492,12 @@ sysctl -p
 ### 服务器配置
 
 ```bash
-# 高性能配置
+# 高性能配置（端口与默认 config 一致时可省略 --tcp-port/--ws-port）
 privchat-server \
   --max-connections 1000000 \
   --worker-threads 16 \
-  --tcp-port 8001 \
-  --ws-port 8002 \
+  --tcp-port 9001 \
+  --ws-port 9080 \
   --enable-metrics
 ```
 
@@ -466,7 +511,7 @@ privchat-server \
    lsof -i :8001
    
    # 使用不同端口
-   privchat-server --tcp-port 8081
+   privchat-server --tcp-port 9080
    ```
 
 2. **权限问题**
@@ -539,7 +584,7 @@ privchat-server/
 | **消息发送** | ✅ | ✅ | ✅ 100% | send_message, send_attachment 全部支持 |
 | **消息查询** | ✅ | ✅ | ✅ 100% | get_message_history, search_messages 全部支持 |
 | **消息操作** | ✅ | ✅ | ✅ 100% | revoke, add_reaction, remove_reaction 全部支持 |
-| **会话管理** | ✅ | ✅ | ✅ 100% | list, pin, hide, mute 已实现；会话通过好友/群组操作自动创建 |
+| **会话管理** | ✅ | ✅ | ✅ 100% | 列表由 entity/sync_entities 同步、客户端 get_channels；pin, hide, mute, direct/get_or_create 已实现 |
 | **好友管理** | ✅ | ✅ | ✅ 100% | apply, accept, reject, remove, list 全部支持 |
 | **群组管理** | ✅ | ✅ | ✅ 100% | create, invite, remove, leave, settings 全部支持 |
 | **在线状态** | ✅ | ✅ | ✅ 100% | subscribe, unsubscribe, query, batch_query 全部支持 |
@@ -675,7 +720,7 @@ privchat-server/
 - ✅ `file/request_upload_token` - 请求上传令牌（RPC 控制面）
 - ✅ `file/upload_callback` - 上传回调（RPC 控制面）
 - ✅ `file/validate_token` - 验证令牌（内部 RPC）
-- ✅ HTTP 文件服务器 - 文件上传/下载（数据面，端口 8083）
+- ✅ HTTP 文件服务器 - 文件上传/下载（数据面，端口 9083）
 - ✅ **多存储源** - 本地 FS + S3/OSS/COS/MinIO/Garage（OpenDAL 统一 API，按 `default_storage_source_id` 选择）
 - ✅ Token 管理 - 上传令牌生成和验证
 - ✅ URL 验证 - 文件 URL 安全验证
@@ -796,7 +841,8 @@ privchat-server/
   - ✅ **P0/P1/P2 全部完成**：核心功能、性能优化、维护功能全部实现
 
 - ✅ **会话管理功能** (100% 完成)
-  - ✅ `channel/list` - 获取会话列表（已实现）
+  - ✅ 会话列表：由 `entity/sync_entities` 同步，客户端本地 `get_channels`（无 `channel/list` RPC）
+  - ✅ `channel/direct/get_or_create` - 获取或创建私聊会话
   - ✅ `channel/pin` - 置顶会话（已实现）
   - ✅ `channel/hide` - 隐藏会话（本地隐藏操作，已实现）
   - ✅ `channel/mute` - 静音会话（用户个人通知偏好，已实现）
@@ -1202,25 +1248,17 @@ privchat-server/
 
 ## 📚 相关文档
 
-### 核心设计文档
-- **[GROUP_SIMPLE_DESIGN.md](docs/GROUP_SIMPLE_DESIGN.md)** - 群组简化设计（参考微信）
-- **[MESSAGE_STATUS_SYSTEM.md](docs/MESSAGE_STATUS_SYSTEM.md)** - 消息状态系统（11种状态）
-- **[SEARCH_SYSTEM_DESIGN.md](docs/SEARCH_SYSTEM_DESIGN.md)** - 搜索系统设计（服务端+客户端）
-- **[TELEGRAM_SYNC_IMPLEMENTATION.md](docs/TELEGRAM_SYNC_IMPLEMENTATION.md)** - Telegram 式同步实现
-- **[OFFLINE_MESSAGE_SIMPLE_DESIGN.md](docs/OFFLINE_MESSAGE_SIMPLE_DESIGN.md)** - 离线消息简化方案
+### 核心设计文档（见仓库内 privchat-docs）
+- **[GROUP_SIMPLE_DESIGN.md](../privchat-docs/design/GROUP_SIMPLE_DESIGN.md)** - 群组简化设计（参考微信）
+- **[MESSAGE_STATUS_SYSTEM.md](../privchat-docs/design/MESSAGE_STATUS_SYSTEM.md)** - 消息状态系统（若存在）
+- **[SEARCH_SYSTEM_DESIGN.md](../privchat-docs/design/SEARCH_SYSTEM_DESIGN.md)** - 搜索系统设计（若存在）
+- **[TELEGRAM_SYNC_IMPLEMENTATION.md](../privchat-docs/design/TELEGRAM_SYNC_IMPLEMENTATION.md)** - Telegram 式同步实现（若存在）
+- **[OFFLINE_MESSAGE_SIMPLE_DESIGN.md](../privchat-docs/design/OFFLINE_MESSAGE_SIMPLE_DESIGN.md)** - 离线消息简化方案（若存在）
 
-### 实现总结
-- **[AUTH_SYSTEM_COMPLETE.md](docs/AUTH_SYSTEM_COMPLETE.md)** - 认证系统完整实现
-- **[BLACKLIST_DESIGN.md](docs/BLACKLIST_DESIGN.md)** - 黑名单设计
-- **[MESSAGE_REVOKE_IMPLEMENTATION.md](docs/MESSAGE_REVOKE_IMPLEMENTATION.md)** - 消息撤回实现
-- **[READ_RECEIPT_BROADCAST_IMPLEMENTATION.md](docs/READ_RECEIPT_BROADCAST_IMPLEMENTATION.md)** - 已读回执广播实现
+### 实现总结与架构文档
+- 认证、黑名单、消息撤回、已读回执、持久化、RPC、文件存储等设计/实现文档请于 **privchat-docs** 或 **privchat-server/docs** 下查找。
 
-### 架构文档
-- **[PERSISTENCE_ARCHITECTURE.md](docs/PERSISTENCE_ARCHITECTURE.md)** - 持久化架构设计
-- **[RPC_DESIGN.md](docs/RPC_DESIGN.md)** - RPC系统设计
-- **[FILE_STORAGE_ARCHITECTURE.md](docs/FILE_STORAGE_ARCHITECTURE.md)** - 文件存储架构
-
-> 💡 **提示**: 所有设计文档现已集中在 `docs/` 目录下，共45个文档，便于查找和维护。
+> 💡 **提示**: 设计文档分布在 `privchat-docs/` 与 `privchat-server/docs/`，以实际仓库结构为准。
 
 ## 📄 许可证
 

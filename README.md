@@ -162,16 +162,53 @@ cp config.example.toml config.toml
 
 TOML, nested. **Recommendation**: non-sensitive in config, secrets in env.
 
+**Config split**: Gateway and file service use separate sections: `[gateway_server]`, `[file_server]` (future: `[msg_server]`). Gateway uses a **listeners array** (`[[gateway_server.listeners]]`), not a single host/port.
+
+**Default port spec (PrivChat)**:
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| **9001** | TCP/UDP | Gateway (msgtrans/QUIC); same port for TCP and QUIC |
+| **9080** | TCP | WebSocket Gateway (dev); prod may use 9443/wss |
+| **9083** | TCP | File HTTP (upload/download + Admin API) |
+| **9090** | TCP | Reserved for Admin API (currently shared with 9083) |
+
+Design: **900x** = core gateway, **908x** = HTTP/web, **909x** = admin; avoid 8080-style web semantics.
+
 #### Example
 
 **config.toml**:
 
 ```toml
-[server]
+# Gateway: listeners array (production-style)
+[gateway_server]
+max_connections = 100000
+connection_timeout = 300
+heartbeat_interval = 60
+use_internal_auth = true
+
+# TCP/QUIC same port 9001
+[[gateway_server.listeners]]
+protocol = "tcp"
 host = "0.0.0.0"
-port = 8000
-http_file_server_port = 8080
-max_connections = 1000
+port = 9001
+
+[[gateway_server.listeners]]
+protocol = "quic"
+host = "0.0.0.0"
+port = 9001
+
+[[gateway_server.listeners]]
+protocol = "websocket"
+host = "0.0.0.0"
+port = 9080
+path = "/gate"
+compression = true
+
+# File service (HTTP upload/download + Admin API)
+[file_server]
+port = 9083
+api_base_url = "http://localhost:9083/api/app"
 
 [cache]
 l1_max_memory_mb = 256
@@ -189,7 +226,7 @@ default_storage_source_id = 0
 id = 0
 storage_type = "local"
 storage_root = "./storage/files"
-base_url = "http://localhost:8080/files"
+base_url = "http://localhost:9083/files"
 
 [logging]
 level = "info"
@@ -211,7 +248,7 @@ PRIVCHAT_JWT_SECRET=your-super-secret-key-minimum-64-chars
 3. Precedence: env > config > defaults
 4. `.env` is loaded automatically when present
 
-> 💡 Commit config (no secrets); add `.env` to `.gitignore`. Run `privchat-server generate-config config.toml` for full example.
+> 💡 Commit config (no secrets); add `.env` to `.gitignore`. Run `privchat-server generate-config config.toml` for full example. Real config also includes `[system_message]`, `[security]`, etc.; see `config.example.toml`.
 
 ### Config precedence
 
@@ -260,10 +297,20 @@ privchat-server --dev
 
 ## 📊 Monitoring
 
-```bash
-curl http://localhost:9090/metrics
-curl http://localhost:9090/health
-```
+- **Health**: RPC `system/health` (no auth); no dedicated HTTP endpoint.
+- **Prometheus**: Placeholder (`infra/metrics`); no HTTP `/metrics` yet; add your own or wait for implementation.
+- For HTTP health, extend routes on the file server port (`http_file_server_port`, default **9083**).
+
+### Admin API
+
+Same port as the file HTTP server (`http_file_server_port`, default **9083**), authenticated with `X-Service-Key`:
+
+- `POST/GET /api/admin/users`, `/api/admin/users/{user_id}` – user management
+- `GET/DELETE /api/admin/groups`, `/api/admin/groups/{group_id}` – group management
+- `POST/GET /api/admin/friendships`, `/api/admin/friendships`, `/api/admin/friendships/user/{user_id}` – friendships
+- `GET /api/admin/login-logs`, `/api/admin/devices`, `/api/admin/stats/*`, `/api/admin/messages`, etc.
+
+See `scripts/README.md` and `scripts/test_admin_api.py`.
 
 ## 🛡️ Security (production)
 
@@ -285,7 +332,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates
 COPY --from=builder /app/target/release/privchat-server /usr/local/bin/
 COPY config.example.toml /etc/privchat/config.toml
-EXPOSE 8001 8002 9090
+EXPOSE 9001 9080 9083
 CMD ["privchat-server", "--config-file", "/etc/privchat/config.toml"]
 ```
 
@@ -297,9 +344,9 @@ services:
   privchat-server:
     build: .
     ports:
-      - "8001:8001"
-      - "8002:8002"
-      - "9090:9090"
+      - "9001:9001"   # TCP/QUIC Gateway
+      - "9080:9080"   # WebSocket Gateway
+      - "9083:9083"   # HTTP file service (upload/download + Admin API)
     environment:
       - DATABASE_URL=postgresql://user:pass@postgres/privchat
       - REDIS_URL=redis://redis:6379
@@ -322,11 +369,11 @@ services:
 ## 📈 Performance
 
 - Increase `fs.file-max` and `net.core.somaxconn` as needed.
-- Tune `--max-connections`, `--worker-threads`, `--tcp-port`, `--ws-port`, `--enable-metrics`.
+- Tune `--max-connections`, `--worker-threads`, `--tcp-port 9001`, `--ws-port 9080`, `--enable-metrics`.
 
 ## 🚨 Troubleshooting
 
-- **Port in use**: `lsof -i :8001`; use `--tcp-port` / `--ws-port` to change.
+- **Port in use**: `lsof -i :9001` (or `:9080`); use `--tcp-port` / `--ws-port` to change.
 - **Config errors**: `privchat-server validate-config config.toml` and `privchat-server show-config`.
 - **Debug**: `privchat-server --log-level trace --log-format pretty` or `--dev -vv`.
 
@@ -375,7 +422,7 @@ privchat-server/
 | Send message  | ✅  | ✅         | ✅ 100% | send_message, send_attachment |
 | Message query | ✅  | ✅         | ✅ 100% | get_message_history, search_messages |
 | Message ops   | ✅  | ✅         | ✅ 100% | revoke, add/remove_reaction |
-| Conversations | ✅  | ✅         | ✅ 100% | list, pin, hide, mute; auto-created |
+| Conversations | ✅  | ✅         | ✅ 100% | list via entity/sync_entities + get_channels; pin, hide, mute, direct/get_or_create |
 | Friends       | ✅  | ✅         | ✅ 100% | apply, accept, reject, remove, list |
 | Groups        | ✅  | ✅         | ✅ 100% | create, invite, remove, leave, settings |
 | Presence      | ✅  | ✅         | ✅ 100% | subscribe, query, batch_query |
@@ -432,7 +479,7 @@ privchat-server/
 - `account/search/query`, `by-qrcode`, `account/user/detail`, share_card; `account/privacy/get`, `update`; source verification
 
 #### File upload/download (100%)
-- `file/request_upload_token`, `upload_callback`, `validate_token`; HTTP file server (port 8083); **multi-backend** (local FS + S3/OSS/COS/MinIO/Garage via OpenDAL, `default_storage_source_id`); token and URL validation
+- `file/request_upload_token`, `upload_callback`, `validate_token`; HTTP file server (port **9083**); **multi-backend** (local FS + S3/OSS/COS/MinIO/Garage via OpenDAL, `default_storage_source_id`); token and URL validation
 
 #### Devices (100%)
 - list, revoke, revoke_all, update_name, kick_device, kick_other_devices
@@ -543,15 +590,11 @@ privchat-server/
 
 ## 📚 Docs
 
-- [GROUP_SIMPLE_DESIGN.md](docs/GROUP_SIMPLE_DESIGN.md)
-- [MESSAGE_STATUS_SYSTEM.md](docs/MESSAGE_STATUS_SYSTEM.md)
-- [SEARCH_SYSTEM_DESIGN.md](docs/SEARCH_SYSTEM_DESIGN.md)
-- [TELEGRAM_SYNC_IMPLEMENTATION.md](docs/TELEGRAM_SYNC_IMPLEMENTATION.md)
-- [OFFLINE_MESSAGE_SIMPLE_DESIGN.md](docs/OFFLINE_MESSAGE_SIMPLE_DESIGN.md)
-- [AUTH_SYSTEM_COMPLETE.md](docs/AUTH_SYSTEM_COMPLETE.md), [BLACKLIST_DESIGN.md](docs/BLACKLIST_DESIGN.md), [MESSAGE_REVOKE_IMPLEMENTATION.md](docs/MESSAGE_REVOKE_IMPLEMENTATION.md), [READ_RECEIPT_BROADCAST_IMPLEMENTATION.md](docs/READ_RECEIPT_BROADCAST_IMPLEMENTATION.md)
-- [PERSISTENCE_ARCHITECTURE.md](docs/PERSISTENCE_ARCHITECTURE.md), [RPC_DESIGN.md](docs/RPC_DESIGN.md), [FILE_STORAGE_ARCHITECTURE.md](docs/FILE_STORAGE_ARCHITECTURE.md)
+Design docs live under **privchat-docs** or **privchat-server/docs**; see repo layout.
 
-All design docs are under `docs/` (45 documents).
+- [GROUP_SIMPLE_DESIGN.md](../privchat-docs/design/GROUP_SIMPLE_DESIGN.md) (if present)
+- MESSAGE_STATUS_SYSTEM, SEARCH_SYSTEM_DESIGN, TELEGRAM_SYNC_IMPLEMENTATION, OFFLINE_MESSAGE_SIMPLE_DESIGN – under `privchat-docs/design/` or `docs/`
+- Auth, blacklist, message revoke, read receipt, persistence, RPC, file storage – under `privchat-docs` or `docs/`
 
 ## 📄 License
 

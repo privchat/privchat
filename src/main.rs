@@ -83,15 +83,34 @@ async fn main() -> Result<()> {
 /// 生成默认配置文件
 fn generate_config(path: &str) -> Result<()> {
     let default_config = r#"# PrivChat Server 配置文件
-# 此文件由 privchat-server --generate-config 生成
+# 此文件由 privchat-server generate-config 生成
 
-[server]
-host = "0.0.0.0"
-port = 8000
-http_file_server_port = 8080
-max_connections = 1000
+[gateway_server]
+max_connections = 100000
 connection_timeout = 300
 heartbeat_interval = 60
+use_internal_auth = true
+
+[[gateway_server.listeners]]
+protocol = "tcp"
+host = "0.0.0.0"
+port = 9001
+
+[[gateway_server.listeners]]
+protocol = "quic"
+host = "0.0.0.0"
+port = 9001
+
+[[gateway_server.listeners]]
+protocol = "websocket"
+host = "0.0.0.0"
+port = 9080
+path = "/gate"
+compression = true
+
+[file_server]
+port = 9083
+api_base_url = "http://localhost:9083/api/app"
 
 [cache]
 l1_max_memory_mb = 256
@@ -102,8 +121,13 @@ timeout_seconds = 300
 cleanup_interval_seconds = 60
 
 [file]
+default_storage_source_id = 0
+
+[[file.storage_sources]]
+id = 0
+storage_type = "local"
 storage_root = "./storage/files"
-base_url = "http://localhost:8080/files"
+base_url = "http://localhost:9083/files"
 
 [logging]
 level = "info"

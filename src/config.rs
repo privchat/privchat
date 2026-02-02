@@ -35,12 +35,14 @@ pub struct ServerConfig {
     pub cache: CacheConfig,
     /// 启用的协议
     pub enabled_protocols: Vec<String>,
-    /// TCP 监听地址
+    /// TCP 监听地址（由 gateway_listeners 中首个 tcp 推导，供当前 msgtrans 单协议单地址使用）
     pub tcp_bind_address: String,
     /// WebSocket 监听地址
     pub websocket_bind_address: String,
     /// QUIC 监听地址
     pub quic_bind_address: String,
+    /// 网关多监听入口（listeners 数组，生产级可扩展；未来可多实例/多协议多地址）
+    pub gateway_listeners: Vec<GatewayListenerConfig>,
     /// 文件存储根目录（兼容旧配置；若配置了 file.storage_sources 则以此为准）
     pub file_storage_root: String,
     /// 文件基础 URL（兼容旧配置；若配置了 file.storage_sources 则以此为准）
@@ -73,7 +75,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
-            port: 8080,
+            port: 9001,
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/privchat".to_string()),
             jwt_secret: "your_jwt_secret_here".to_string(),
@@ -86,15 +88,16 @@ impl Default for ServerConfig {
             tls_key_path: None,
             cache: CacheConfig::default(),
             enabled_protocols: vec!["tcp".to_string(), "websocket".to_string(), "quic".to_string()],
-            tcp_bind_address: "0.0.0.0:8080".to_string(),
-            websocket_bind_address: "0.0.0.0:8081".to_string(),
-            quic_bind_address: "0.0.0.0:8082".to_string(),
+            tcp_bind_address: "0.0.0.0:9001".to_string(),
+            websocket_bind_address: "0.0.0.0:9080".to_string(),
+            quic_bind_address: "0.0.0.0:9001".to_string(),
+            gateway_listeners: default_gateway_listeners(),
             file_storage_root: "./storage/files".to_string(),
-            file_base_url: Some("http://localhost:8083".to_string()),
+            file_base_url: Some("http://localhost:9083".to_string()),
             file_storage_sources: vec![],
             file_default_storage_source_id: 0,
-            http_file_server_port: 8083,
-            file_api_base_url: Some("http://localhost:8083/api/app".to_string()),
+            http_file_server_port: 9083,
+            file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
             use_internal_auth: true, // 默认启用内置账号系统（方便独立部署和测试）
             system_message: SystemMessageConfig::default(),
             security: SecurityProtectionConfig::default(),
@@ -327,23 +330,127 @@ impl ServerConfig {
 /// TOML 配置文件结构（用于反序列化）
 #[derive(Debug, Deserialize)]
 struct TomlConfig {
-    server: Option<TomlServerConfig>,
+    gateway_server: Option<TomlGatewayServerConfig>,
+    file_server: Option<TomlFileServerConfig>,
     cache: Option<TomlCacheConfig>,
     file: Option<TomlFileConfig>,
     logging: Option<TomlLoggingConfig>,
     system_message: Option<TomlSystemMessageConfig>,
 }
 
+/// 单条网关监听配置（listeners 数组元素，生产级可扩展）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayListenerConfig {
+    /// 协议：tcp / websocket / quic（未来可扩展 http2 / grpc / unix 等）
+    pub protocol: String,
+    /// 监听 host
+    pub host: String,
+    /// 监听 port
+    pub port: u16,
+    /// 绑定地址（host:port），便于直接传给 msgtrans
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_address: Option<String>,
+    /// QUIC/TLS：证书路径
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<String>,
+    /// QUIC/TLS：私钥路径
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<String>,
+    /// WebSocket：path，如 "/gate"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// WebSocket：是否压缩
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression: Option<bool>,
+    /// 是否内网专用（如 127.0.0.1:18080）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal: Option<bool>,
+}
+
+impl GatewayListenerConfig {
+    /// 返回 bind 地址字符串
+    pub fn bind_address(&self) -> String {
+        self.bind_address
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", self.host, self.port))
+    }
+}
+
+/// TOML 单条 listener 反序列化
 #[derive(Debug, Deserialize)]
-struct TomlServerConfig {
-    host: Option<String>,
-    port: Option<u16>,
-    http_file_server_port: Option<u16>,
-    file_api_base_url: Option<String>,  // 文件服务 API 基础 URL
+struct TomlListenerConfig {
+    protocol: String,
+    #[serde(default = "default_listener_host")]
+    host: String,
+    port: u16,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    path: Option<String>,
+    compression: Option<bool>,
+    internal: Option<bool>,
+}
+
+fn default_listener_host() -> String {
+    "0.0.0.0".to_string()
+}
+
+/// 默认网关 listeners：TCP/QUIC 同端口 9001，WebSocket 单独 9080（PrivChat 端口规范）
+fn default_gateway_listeners() -> Vec<GatewayListenerConfig> {
+    vec![
+        GatewayListenerConfig {
+            protocol: "tcp".to_string(),
+            host: "0.0.0.0".to_string(),
+            port: 9001,
+            bind_address: None,
+            tls_cert: None,
+            tls_key: None,
+            path: None,
+            compression: None,
+            internal: None,
+        },
+        GatewayListenerConfig {
+            protocol: "quic".to_string(),
+            host: "0.0.0.0".to_string(),
+            port: 9001,
+            bind_address: None,
+            tls_cert: None,
+            tls_key: None,
+            path: None,
+            compression: None,
+            internal: None,
+        },
+        GatewayListenerConfig {
+            protocol: "websocket".to_string(),
+            host: "0.0.0.0".to_string(),
+            port: 9080,
+            bind_address: None,
+            tls_cert: None,
+            tls_key: None,
+            path: None,
+            compression: None,
+            internal: None,
+        },
+    ]
+}
+
+/// 网关服务配置（TCP/WebSocket/QUIC）；listeners 数组为生产级设计
+#[derive(Debug, Deserialize)]
+struct TomlGatewayServerConfig {
+    /// 多监听入口（核心）：每项 protocol + host + port，可扩展 per-protocol 参数
+    listeners: Option<Vec<TomlListenerConfig>>,
     max_connections: Option<u32>,
     connection_timeout: Option<u64>,
     heartbeat_interval: Option<u64>,
     use_internal_auth: Option<bool>,
+}
+
+/// 文件服务配置（HTTP 上传/下载/Admin API）
+#[derive(Debug, Deserialize)]
+struct TomlFileServerConfig {
+    /// HTTP 文件服务监听端口
+    port: Option<u16>,
+    /// 文件服务 API 基础 URL（客户端访问，不含端口时由客户端拼接）
+    api_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,35 +542,73 @@ struct TomlLoggingConfig {
 impl From<TomlConfig> for ServerConfig {
     fn from(toml: TomlConfig) -> Self {
         let mut config = Self::default();
-        
-        if let Some(server) = toml.server {
-            if let Some(host) = server.host {
-                config.host = host;
-            }
-            if let Some(port) = server.port {
-                config.port = port;
-                config.tcp_bind_address = format!("{}:{}", config.host, port);
-            }
-            if let Some(http_port) = server.http_file_server_port {
-                config.http_file_server_port = http_port;
-            }
-            if let Some(file_api_url) = server.file_api_base_url {
-                config.file_api_base_url = Some(file_api_url);
-            }
-            if let Some(max_conn) = server.max_connections {
+
+        // 网关：仅支持 [[gateway_server.listeners]]
+        if let Some(gw) = toml.gateway_server {
+            if let Some(max_conn) = gw.max_connections {
                 config.max_connections = max_conn;
             }
-            if let Some(timeout) = server.connection_timeout {
+            if let Some(timeout) = gw.connection_timeout {
                 config.connection_timeout = timeout;
             }
-            if let Some(interval) = server.heartbeat_interval {
+            if let Some(interval) = gw.heartbeat_interval {
                 config.heartbeat_interval = interval;
             }
-            if let Some(use_internal) = server.use_internal_auth {
+            if let Some(use_internal) = gw.use_internal_auth {
                 config.use_internal_auth = use_internal;
             }
+            if let Some(ref list) = gw.listeners {
+                if !list.is_empty() {
+                    config.gateway_listeners = list
+                        .iter()
+                        .map(|l| GatewayListenerConfig {
+                            protocol: l.protocol.to_lowercase(),
+                            host: l.host.clone(),
+                            port: l.port,
+                            bind_address: None,
+                            tls_cert: l.tls_cert.clone(),
+                            tls_key: l.tls_key.clone(),
+                            path: l.path.clone(),
+                            compression: l.compression,
+                            internal: l.internal,
+                        })
+                        .collect();
+                    let mut set_tcp = false;
+                    let mut set_ws = false;
+                    let mut set_quic = false;
+                    for l in &config.gateway_listeners {
+                        match l.protocol.as_str() {
+                            "tcp" if !set_tcp => {
+                                config.tcp_bind_address = l.bind_address();
+                                config.host = l.host.clone();
+                                config.port = l.port;
+                                set_tcp = true;
+                            }
+                            "websocket" if !set_ws => {
+                                config.websocket_bind_address = l.bind_address();
+                                set_ws = true;
+                            }
+                            "quic" if !set_quic => {
+                                config.quic_bind_address = l.bind_address();
+                                set_quic = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
-        
+
+        // 文件服务：仅支持 [file_server]
+        if let Some(fs) = toml.file_server {
+            if let Some(port) = fs.port {
+                config.http_file_server_port = port;
+            }
+            if let Some(api_base_url) = fs.api_base_url {
+                config.file_api_base_url = Some(api_base_url);
+            }
+        }
+
         if let Some(cache) = toml.cache {
             if let Some(memory_mb) = cache.l1_max_memory_mb {
                 config.cache.l1_max_memory_mb = memory_mb;
