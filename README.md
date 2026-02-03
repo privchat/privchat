@@ -298,8 +298,10 @@ privchat-server --dev
 ## 📊 Monitoring
 
 - **Health**: RPC `system/health` (no auth); no dedicated HTTP endpoint.
-- **Prometheus**: Placeholder (`infra/metrics`); no HTTP `/metrics` yet; add your own or wait for implementation.
-- For HTTP health, extend routes on the file server port (`http_file_server_port`, default **9083**).
+- **Prometheus**: GET `/metrics` on the file server port (default **9083**), exposing:
+  - `privchat_connections_current`, `privchat_rpc_total{route}`, `privchat_rpc_duration_seconds{route}`, `privchat_messages_sent_total`.
+- Scrape example: `curl http://localhost:9083/metrics`; configure Prometheus and Grafana as needed.
+- For HTTP health, extend routes on port 9083.
 
 ### Admin API
 

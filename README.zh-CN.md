@@ -370,8 +370,13 @@ privchat-server --dev
 ## 📊 监控
 
 - **健康检查**：通过 RPC 调用 `system/health`（无需认证），无独立 HTTP 端点。
-- **Prometheus 指标**：当前为占位实现（`infra/metrics`），尚未提供 HTTP `/metrics` 端点；生产环境需自行接入或等待后续完善。
-- 若需 HTTP 健康检查，可考虑在 HTTP 文件服务同一端口（见 `http_file_server_port`，默认 9083）上扩展路由。
+- **Prometheus 指标**：已实现 HTTP GET `/metrics`（与文件服务同端口，默认 9083），暴露：
+  - `privchat_connections_current`：当前连接数（Gauge）
+  - `privchat_rpc_total{route="..."}`：RPC 调用次数（Counter）
+  - `privchat_rpc_duration_seconds{route="..."}`：RPC 耗时（Histogram）
+  - `privchat_messages_sent_total`：发送消息总数（Counter）
+- 抓取示例：`curl http://localhost:9083/metrics`；生产可配置 Prometheus scrape 与 Grafana 面板。
+- 若需 HTTP 健康检查，可考虑在同一端口 9083 上扩展路由。
 
 ### Admin API（管理接口）
 
@@ -924,7 +929,7 @@ privchat-server/
 | **消息 Reaction** | 100% | ✅✅ 完整 | 完整反应系统 + 测试通过 |
 | **认证系统** | 95% | ✅✅ 优秀 | JWT + 设备管理 + 登录日志 |
 | **会话管理** | 90% | ✅ 优秀 | 基础功能完成 + 测试通过 |
-| **已读回执** | 100% | ✅✅ 完整 | RPC + 广播 + 测试通过 |
+| **已读回执** | 100% | ✅✅ 完整 | RPC + 广播 + read_pts 模型 + 测试通过 |
 | **群组管理** | 100% | ✅✅ 完整 | 完整实现 + 测试通过 |
 | **文件存储** | 98% | ✅✅ 优秀 | 本地 + S3/OSS 多存储源（OpenDAL）+ Token + 上传 + 测试通过 |
 | **好友系统** | 100% | ✅✅ 完整 | 申请 + 黑名单 + 非好友消息 + 测试通过 |
@@ -970,24 +975,24 @@ privchat-server/
 
 ## 🚀 未来规划功能
 
-> **说明**: 以下功能尚未实现，按优先级和时间线规划
+> **说明**: 以下按优先级和时间线规划；已完成的已标注 ✅，未勾选为待办。
 
 ### 📅 近期计划 (1-2个月) - P0 优先级
 
-#### 1. 读状态（read_pts）✅ 已实现
+#### 1. 读状态（read_pts）✅ 已完成
 - [x] `message/status/read_pts` RPC（按 pts 推进已读）
 - [x] 服务端 `last_read_pts`（per-user per-channel）
 - [x] O(1) 广播 `UserReadEvent`
 - 说明：不采用「批量 message_id」RPC，见 [READ_RECEIPT_PTS_MODEL.md](../privchat-docs/design/READ_RECEIPT_PTS_MODEL.md)
 
-#### 2. 监控系统完善 ⭐⭐⭐⭐
-- [ ] Prometheus metrics 完整接入
-- [ ] 关键指标埋点（QPS、延迟、错误率）
+#### 2. 监控系统完善 ⭐⭐⭐⭐（进行中）
+- [x] Prometheus metrics 接入（GET `/metrics`，端口 9083）
+- [x] 关键指标埋点：连接数、RPC 调用量/延迟、消息发送量
 - [ ] Grafana Dashboard
 - [ ] 告警规则配置
 - [ ] 分布式追踪（Jaeger/Zipkin）
 
-#### 3. 压力测试与优化 ⭐⭐⭐⭐
+#### 3. 压力测试与优化 ⭐⭐⭐⭐（待办）
 - [ ] 百万级连接压测
 - [ ] 消息吞吐量测试
 - [ ] 数据库查询优化
@@ -1088,16 +1093,16 @@ privchat-server/
 - ✅ 系统通知 (已完成 100%)
 - ⚠️ 监控和日志 (基础完成 70%)
 
-**下一步**:
+**当前/下一步重点**（read_pts 已实现 ✅）:
 1. 完善监控系统
-   - Prometheus指标完善
+   - Prometheus 指标完善
    - 告警规则配置
-   - 可视化Dashboard
+   - 可视化 Dashboard
 
-2. 日志系统优化
-   - 结构化日志
-   - 日志聚合
-   - 分布式追踪
+2. 日志与追踪
+   - 结构化日志（已使用 Tracing）✅
+   - 日志聚合（待完善）
+   - 分布式追踪（待接入）
 
 3. 压力测试
    - 百万级连接测试
@@ -1108,7 +1113,7 @@ privchat-server/
 **目标**: 生产环境上线准备
 
 **核心任务** (P0):
-1. **消息功能完善**
+1. **消息功能完善** ✅ 已完成
    - ✅ 消息引用/回复（已完成）
    - ✅ 消息@提及（已完成）
    - ✅ 消息 Reaction（已完成）
@@ -1116,13 +1121,12 @@ privchat-server/
    - ✅ 读状态 read_pts（`message/status/read_pts` 已实现）
    - ❌ 消息编辑（**不实现**，安全考虑采用"撤回+重发"方案）
 
-2. **监控系统完善**
-   - Prometheus 全面接入
-   - Grafana Dashboard
-   - 告警规则
-   - 分布式追踪
+2. **监控系统完善**（进行中）
+   - Prometheus 已接入（GET `/metrics`，端口 9083）
+   - 关键指标已埋点（连接数、RPC 量/延迟、消息量）
+   - Grafana Dashboard、告警规则、分布式追踪待完善
 
-3. **压力测试**
+3. **压力测试**（待办）
    - 百万级连接测试
    - 消息吞吐量测试
    - 稳定性长时间测试
@@ -1223,6 +1227,16 @@ privchat-server/
 文档完整度:     █████████████████░░░░ 85%
 ```
 
+### 接下来要做的是什么（摘要）
+
+| 优先级 | 事项 | 状态 |
+|--------|------|------|
+| P0 | 读状态 read_pts | ✅ 已完成 |
+| P0 | 监控系统完善（Prometheus、Grafana、告警、分布式追踪） | 🔄 进行中（/metrics 与埋点已完成） |
+| P0 | 压力测试与优化（百万连接、吞吐量、DB/缓存/连接池调优） | 待办 |
+| P1 | 部署与运维文档 | ✅ 已提供 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+| 可选 | SDK 对接 read_pts 的说明/示例 | 待办 |
+
 ### 最近更新（2026-02-02）
 - ✅ **文件存储**: 多存储源（OpenDAL）— 本地 FS + S3/OSS/COS/MinIO/Garage，按 `[[file.storage_sources]]` 与 `default_storage_source_id` 配置
 - ✅ **媒体处理**: 图片压缩与缩略图、视频钩子（Thumbnail/Compress）— SDK 已实现；收到消息后自动下载缩略图
@@ -1239,12 +1253,11 @@ privchat-server/
 - ✅ pts同步机制（Telegram式同步）
 - ✅ 数据持久化（PostgreSQL + Repository）
 
-### 下周重点
-1. 读状态 read_pts 模型已实现（`message/status/read_pts`，不采用批量 message_id RPC）
-2. 完善 Prometheus 监控指标
-3. 添加分布式追踪支持
-4. 进行压力测试和性能调优
-5. 编写部署文档和运维手册
+### 下一步重点（接下来要做）
+1. ✅ 读状态 read_pts 已实现（`message/status/read_pts`，不采用批量 message_id RPC）
+2. ✅ **监控**：Prometheus GET `/metrics` 与关键指标埋点已完成；待完善 Grafana、告警、分布式追踪
+3. **压测与调优**：百万级连接压测、消息吞吐量测试、DB/缓存/连接池调优（见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)）
+4. ✅ **部署与运维**：见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)；可选补充 SDK read_pts 示例
 
 ## 📚 相关文档
 
@@ -1306,7 +1319,7 @@ privchat-server/
 *已完成功能：消息系统、群组、好友、@提及、回复、Reaction、在线状态、输入状态、系统通知、文件上传/下载（含多存储源 S3/OSS）、会话管理；SDK 图片压缩与缩略图、视频钩子、收到消息后自动下载缩略图*  
 *最新改进：多存储源（OpenDAL）、S3/OSS/COS/MinIO/Garage 支持；SDK 媒体预处理（图片缩略图、视频 Thumbnail/Compress）*  
 *服务器端支持情况：所有 SDK 功能服务器端已实现，同步机制 P0/P1/P2 全部完成，所有 RPC 路由已注册 ✅*  
-*下一步重点：SDK 对接 read_pts、监控系统完善、压力测试*
+*下一步重点：read_pts 已实现 ✅；/metrics 与埋点已完成；压测与 Grafana/告警待完善；部署见 docs/DEPLOYMENT.md*
 
 [快速开始](#-快速开始) • [功能列表](#-功能列表) • [开发文档](docs/) • [贡献指南](../CONTRIBUTING.md)
 

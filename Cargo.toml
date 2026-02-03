@@ -95,6 +95,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "u
 # 对象存储抽象层（OpenDAL：本地 FS + S3/OSS/COS/MinIO/Garage 等统一 API）
 opendal = { version = "0.55", default-features = false, features = ["services-fs", "services-s3"] }
 
+# Prometheus 监控指标
+metrics = "0.22"
+metrics-exporter-prometheus = "0.13"
+
 [features]
 default = []
 redis = []

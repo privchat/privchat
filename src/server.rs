@@ -1109,6 +1109,13 @@ impl ChatServer {
 
     /// 启动 HTTP 文件服务器（在单独的 tokio task 中运行）
     async fn start_http_server(&self) -> Result<(), ServerError> {
+        // 初始化 Prometheus 指标（供 GET /metrics 暴露）
+        if crate::infra::metrics::init().is_err() {
+            // 已初始化或重复调用，忽略
+        } else {
+            info!("📊 Prometheus 指标已启用，GET /metrics 可用");
+        }
+
         // 创建 Service Key 管理器（用于管理 API 认证）
         let service_master_key = std::env::var("SERVICE_MASTER_KEY")
             .unwrap_or_else(|_| "default-service-master-key-please-change-in-production".to_string());

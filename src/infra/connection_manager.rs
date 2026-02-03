@@ -61,13 +61,18 @@ impl ConnectionManager {
             connected_at: now,
         };
 
-        // 更新主映射
-        let mut connections = self.connections.write().await;
-        connections.insert((user_id, device_id.clone()), connection);
+        // 更新主映射（完成后释放锁，再取 session_index 避免死锁）
+        let count = {
+            let mut connections = self.connections.write().await;
+            connections.insert((user_id, device_id.clone()), connection);
+            connections.len()
+        };
 
         // 更新反向映射
         let mut session_index = self.session_index.write().await;
         session_index.insert(session_id, (user_id, device_id.clone()));
+
+        crate::infra::metrics::record_connection_count(count as u64);
 
         debug!(
             "📝 ConnectionManager: 注册连接 user={}, device={}, session={}",
@@ -79,12 +84,17 @@ impl ConnectionManager {
 
     /// 注销设备连接
     pub async fn unregister_connection(&self, session_id: SessionId) -> Result<()> {
-        // 从反向映射中获取 user_id 和 device_id
-        let mut session_index = self.session_index.write().await;
-        if let Some((user_id, device_id)) = session_index.remove(&session_id) {
-            // 从主映射中移除
+        // 从反向映射中获取 user_id 和 device_id，然后释放锁避免与 connections 死锁
+        let removed = {
+            let mut session_index = self.session_index.write().await;
+            session_index.remove(&session_id)
+        };
+        if let Some((user_id, device_id)) = removed {
             let mut connections = self.connections.write().await;
             connections.remove(&(user_id, device_id.clone()));
+            let count = connections.len();
+            drop(connections);
+            crate::infra::metrics::record_connection_count(count as u64);
 
             debug!(
                 "📝 ConnectionManager: 注销连接 user={}, device={}, session={}",
@@ -219,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_and_unregister() {
         let manager = ConnectionManager::new();
-        let session_id = 123;
+        let session_id = SessionId(123);
         
         // 注册连接
         manager
@@ -247,15 +257,15 @@ mod tests {
         
         // 注册多个设备
         manager
-            .register_connection(1, "device-001".to_string(), 101)
+            .register_connection(1, "device-001".to_string(), SessionId(101))
             .await
             .unwrap();
         manager
-            .register_connection(1, "device-002".to_string(), 102)
+            .register_connection(1, "device-002".to_string(), SessionId(102))
             .await
             .unwrap();
         manager
-            .register_connection(1, "device-003".to_string(), 103)
+            .register_connection(1, "device-003".to_string(), SessionId(103))
             .await
             .unwrap();
         

@@ -70,7 +70,10 @@ impl MessageHandler for RPCMessageHandler {
         };
 
         // 处理 RPC 请求
+        let start = std::time::Instant::now();
         let rpc_response = handle_rpc_request(rpc_request.clone(), rpc_context).await;
+        let elapsed = start.elapsed().as_secs_f64();
+        crate::infra::metrics::record_rpc(&rpc_request.route, elapsed);
 
         info!("✅ RPC 调用完成: route={}, code={}, message={}", 
               rpc_request.route, rpc_response.code, rpc_response.message);

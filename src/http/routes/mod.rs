@@ -17,13 +17,15 @@ pub mod upload;
 pub mod download;
 pub mod url;
 pub mod delete;
+pub mod metrics;
 
-use axum::Router;
+use axum::{Router, routing::get};
 use crate::http::HttpServerState;
 
 /// 创建所有路由
 pub fn create_routes() -> Router<HttpServerState> {
     Router::new()
+        .route("/metrics", get(metrics::metrics_handler))
         .merge(admin::create_route())      // /api/admin/* - 管理 API
         .merge(upload::create_route())     // /api/app/files/upload - 文件上传
         .merge(download::create_route())   // /api/app/files/{file_id} - 文件下载

@@ -917,6 +917,8 @@ impl MessageHandler for SendMessageHandler {
         // 7.5. 标记消息为已处理（去重）
         self.message_dedup_service.mark_as_processed(from_uid, send_message_request.local_message_id).await;
 
+        crate::infra::metrics::record_message_sent();
+
         // 8. 创建成功响应
         self.create_success_response(&send_message_request, &message_record).await
     }
