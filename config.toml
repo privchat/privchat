@@ -9,6 +9,30 @@ max_connections = 1000
 connection_timeout = 300
 heartbeat_interval = 60
 
+# 网关：压测时提高 max_connections，QUIC/ TCP 9001, WebSocket 9080
+[gateway_server]
+max_connections = 2000
+connection_timeout = 300
+heartbeat_interval = 60
+use_internal_auth = true
+
+[[gateway_server.listeners]]
+protocol = "tcp"
+host = "0.0.0.0"
+port = 9001
+
+[[gateway_server.listeners]]
+protocol = "quic"
+host = "0.0.0.0"
+port = 9001
+
+[[gateway_server.listeners]]
+protocol = "websocket"
+host = "0.0.0.0"
+port = 9080
+path = "/gate"
+compression = true
+
 [cache]
 l1_max_memory_mb = 256
 l1_ttl_secs = 3600
