@@ -330,8 +330,7 @@ impl ServerConfig {
 /// TOML 配置文件结构（用于反序列化）
 #[derive(Debug, Deserialize)]
 struct TomlConfig {
-    gateway_server: Option<TomlGatewayServerConfig>,
-    file_server: Option<TomlFileServerConfig>,
+    gateway: Option<TomlGatewayConfig>,
     cache: Option<TomlCacheConfig>,
     file: Option<TomlFileConfig>,
     logging: Option<TomlLoggingConfig>,
@@ -433,24 +432,15 @@ fn default_gateway_listeners() -> Vec<GatewayListenerConfig> {
     ]
 }
 
-/// 网关服务配置（TCP/WebSocket/QUIC）；listeners 数组为生产级设计
+/// 网关配置（TCP/WebSocket/QUIC）；gateway.listeners 为多监听入口
 #[derive(Debug, Deserialize)]
-struct TomlGatewayServerConfig {
-    /// 多监听入口（核心）：每项 protocol + host + port，可扩展 per-protocol 参数
+struct TomlGatewayConfig {
+    /// 多监听入口：每项 protocol + host + port
     listeners: Option<Vec<TomlListenerConfig>>,
     max_connections: Option<u32>,
     connection_timeout: Option<u64>,
     heartbeat_interval: Option<u64>,
     use_internal_auth: Option<bool>,
-}
-
-/// 文件服务配置（HTTP 上传/下载/Admin API）
-#[derive(Debug, Deserialize)]
-struct TomlFileServerConfig {
-    /// HTTP 文件服务监听端口
-    port: Option<u16>,
-    /// 文件服务 API 基础 URL（客户端访问，不含端口时由客户端拼接）
-    api_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -513,6 +503,10 @@ struct TomlFileConfig {
     /// 存储源列表，必须至少配置一个 [[file.storage_sources]]
     storage_sources: Option<Vec<TomlFileStorageSource>>,
     default_storage_source_id: Option<u32>,
+    /// HTTP 文件服务监听端口（原 file_server.port）
+    server_port: Option<u16>,
+    /// 文件服务 API 基础 URL，客户端访问（原 file_server.api_base_url）
+    server_api_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -543,8 +537,8 @@ impl From<TomlConfig> for ServerConfig {
     fn from(toml: TomlConfig) -> Self {
         let mut config = Self::default();
 
-        // 网关：仅支持 [[gateway_server.listeners]]
-        if let Some(gw) = toml.gateway_server {
+        // 网关：gateway.listeners
+        if let Some(gw) = toml.gateway {
             if let Some(max_conn) = gw.max_connections {
                 config.max_connections = max_conn;
             }
@@ -599,16 +593,6 @@ impl From<TomlConfig> for ServerConfig {
             }
         }
 
-        // 文件服务：仅支持 [file_server]
-        if let Some(fs) = toml.file_server {
-            if let Some(port) = fs.port {
-                config.http_file_server_port = port;
-            }
-            if let Some(api_base_url) = fs.api_base_url {
-                config.file_api_base_url = Some(api_base_url);
-            }
-        }
-
         if let Some(cache) = toml.cache {
             if let Some(memory_mb) = cache.l1_max_memory_mb {
                 config.cache.l1_max_memory_mb = memory_mb;
@@ -636,6 +620,12 @@ impl From<TomlConfig> for ServerConfig {
         }
         
         if let Some(file) = toml.file {
+            if let Some(port) = file.server_port {
+                config.http_file_server_port = port;
+            }
+            if let Some(api_base_url) = file.server_api_base_url {
+                config.file_api_base_url = Some(api_base_url);
+            }
             if let Some(storage_root) = file.storage_root {
                 config.file_storage_root = storage_root;
             }

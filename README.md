@@ -162,7 +162,7 @@ cp config.example.toml config.toml
 
 TOML, nested. **Recommendation**: non-sensitive in config, secrets in env.
 
-**Config split**: Gateway and file service use separate sections: `[gateway_server]`, `[file_server]` (future: `[msg_server]`). Gateway uses a **listeners array** (`[[gateway_server.listeners]]`), not a single host/port.
+**Config split**: Gateway uses `[gateway]` with a **listeners array** (`[[gateway.listeners]]`). File storage and HTTP file service use `[file]` (including `server_port`, `server_api_base_url`). Future: `[msg_server]` etc.
 
 **Default port spec (PrivChat)**:
 
@@ -181,34 +181,36 @@ Design: **900x** = core gateway, **908x** = HTTP/web, **909x** = admin; avoid 80
 
 ```toml
 # Gateway: listeners array (production-style)
-[gateway_server]
+[gateway]
 max_connections = 100000
 connection_timeout = 300
 heartbeat_interval = 60
 use_internal_auth = true
 
 # TCP/QUIC same port 9001
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "tcp"
 host = "0.0.0.0"
 port = 9001
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "quic"
 host = "0.0.0.0"
 port = 9001
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "websocket"
 host = "0.0.0.0"
 port = 9080
 path = "/gate"
 compression = true
 
-# File service (HTTP upload/download + Admin API)
-[file_server]
-port = 9083
-api_base_url = "http://localhost:9083/api/app"
+# File: storage + HTTP file service (upload/download + Admin API)
+[file]
+server_port = 9083
+server_api_base_url = "http://localhost:9083/api/app"
+default_storage_source_id = 0
+# [[file.storage_sources]] ...
 
 [cache]
 l1_max_memory_mb = 256
@@ -305,7 +307,7 @@ privchat-server --dev
 
 ### Admin API
 
-Same port as the file HTTP server (`http_file_server_port`, default **9083**), authenticated with `X-Service-Key`:
+Same port as the file HTTP server (config `file.server_port`, default **9083**), authenticated with `X-Service-Key`:
 
 - `POST/GET /api/admin/users`, `/api/admin/users/{user_id}` – user management
 - `GET/DELETE /api/admin/groups`, `/api/admin/groups/{group_id}` – group management

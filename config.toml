@@ -1,32 +1,24 @@
 # PrivChat Server 配置文件
 # 此文件由 privchat-server --generate-config 生成
+# 网关：[gateway] 与 gateway.listeners；文件：[file] 含 server_port / server_api_base_url
 
-[server]
-host = "0.0.0.0"
-port = 8000
-http_file_server_port = 8080
-max_connections = 1000
-connection_timeout = 300
-heartbeat_interval = 60
-
-# 网关：压测时提高 max_connections，QUIC/ TCP 9001, WebSocket 9080
-[gateway_server]
+[gateway]
 max_connections = 2000
 connection_timeout = 300
 heartbeat_interval = 60
 use_internal_auth = true
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "tcp"
 host = "0.0.0.0"
 port = 9001
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "quic"
 host = "0.0.0.0"
 port = 9001
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "websocket"
 host = "0.0.0.0"
 port = 9080
@@ -41,9 +33,10 @@ l1_ttl_secs = 3600
 timeout_seconds = 300
 cleanup_interval_seconds = 60
 
-# 文件存储：必须至少配置一个 storage_source（按 default_storage_source_id 选择）
 [file]
 default_storage_source_id = 0
+server_port = 9083
+server_api_base_url = "http://localhost:9083/api/app"
 
 [[file.storage_sources]]
 id = 0

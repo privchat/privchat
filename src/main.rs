@@ -85,32 +85,28 @@ fn generate_config(path: &str) -> Result<()> {
     let default_config = r#"# PrivChat Server 配置文件
 # 此文件由 privchat-server generate-config 生成
 
-[gateway_server]
+[gateway]
 max_connections = 100000
 connection_timeout = 300
 heartbeat_interval = 60
 use_internal_auth = true
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "tcp"
 host = "0.0.0.0"
 port = 9001
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "quic"
 host = "0.0.0.0"
 port = 9001
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "websocket"
 host = "0.0.0.0"
 port = 9080
 path = "/gate"
 compression = true
-
-[file_server]
-port = 9083
-api_base_url = "http://localhost:9083/api/app"
 
 [cache]
 l1_max_memory_mb = 256
@@ -122,6 +118,8 @@ cleanup_interval_seconds = 60
 
 [file]
 default_storage_source_id = 0
+server_port = 9083
+server_api_base_url = "http://localhost:9083/api/app"
 
 [[file.storage_sources]]
 id = 0

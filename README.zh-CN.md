@@ -196,9 +196,9 @@ cp config.example.toml config.toml
 
 配置文件使用 TOML 格式，支持嵌套结构。**推荐模式**：配置文件中写非敏感配置，敏感信息（密码、密钥等）通过环境变量提供。
 
-**服务配置拆段**：网关与文件服务拆段为 `[gateway_server]`、`[file_server]`，未来可扩展 `[msg_server]` 等。
+**服务配置拆段**：网关使用 `[gateway]`，文件存储与 HTTP 文件服务使用 `[file]`（含 `server_port`、`server_api_base_url`）。未来可扩展 `[msg_server]` 等。
 
-**网关配置模型（listeners 数组）**：网关仅支持 **listeners 数组**（`[[gateway_server.listeners]]`），不支持单组 host/port。每项可配置：`protocol`（tcp / websocket / quic）、`host`、`port`；可选：`path`、`compression`（WebSocket）、`tls_cert`、`tls_key`（QUIC/TLS）、`internal`（内网标记）等。便于多监听、per-protocol 参数、未来扩展协议（http2、grpc、unix 等）。
+**网关配置模型（listeners 数组）**：网关使用 **listeners 数组**（`[[gateway.listeners]]`），不支持单组 host/port。每项可配置：`protocol`（tcp / websocket / quic）、`host`、`port`；可选：`path`、`compression`（WebSocket）、`tls_cert`、`tls_key`（QUIC/TLS）、`internal`（内网标记）等。便于多监听、per-protocol 参数、未来扩展协议（http2、grpc、unix 等）。
 
 **默认端口规范（PrivChat 官方）**：端口为长期对外契约，不宜随意改动。约定如下：
 
@@ -215,35 +215,37 @@ cp config.example.toml config.toml
 
 **config.toml**（配置文件）：
 ```toml
-# 网关：listeners 数组为生产级设计（可多监听、per-protocol 参数）
-[gateway_server]
+# 网关：listeners 数组（可多监听、per-protocol 参数）
+[gateway]
 max_connections = 100000
 connection_timeout = 300
 heartbeat_interval = 60
 use_internal_auth = true
 
 # TCP/QUIC 同端口 9001（客户端只记 gateway:9001）
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "tcp"
 host = "0.0.0.0"
 port = 9001
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "quic"
 host = "0.0.0.0"
 port = 9001
 
-[[gateway_server.listeners]]
+[[gateway.listeners]]
 protocol = "websocket"
 host = "0.0.0.0"
 port = 9080
 path = "/gate"
 compression = true
 
-# 文件服务（HTTP 上传/下载/Admin API）
-[file_server]
-port = 9083
-api_base_url = "http://localhost:9083/api/app"
+# 文件：存储 + HTTP 文件服务（上传/下载/Admin API）
+[file]
+server_port = 9083
+server_api_base_url = "http://localhost:9083/api/app"
+default_storage_source_id = 0
+# [[file.storage_sources]] ...
 
 [cache]
 l1_max_memory_mb = 256
@@ -380,7 +382,7 @@ privchat-server --dev
 
 ### Admin API（管理接口）
 
-与 HTTP 文件服务共用同一端口（`http_file_server_port`，默认 9083），使用 `X-Service-Key` 认证：
+与 HTTP 文件服务共用同一端口（配置项 `file.server_port`，默认 9083），使用 `X-Service-Key` 认证：
 
 - `POST/GET /api/admin/users`、`/api/admin/users/{user_id}` - 用户管理
 - `GET/DELETE /api/admin/groups`、`/api/admin/groups/{group_id}` - 群组管理
