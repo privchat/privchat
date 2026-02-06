@@ -80,7 +80,14 @@ impl FileService {
             let op = Self::build_operator(src).await?;
             if src.storage_type == "local" {
                 for d in &subdirs {
-                    let _ = op.create_dir(*d).await;
+                    op.create_dir(*d).await.map_err(|e| {
+                        ServerError::Internal(format!(
+                            "创建存储子目录 \"{}\"（存储源 id={}）失败: {}",
+                            d.trim_end_matches('/'),
+                            src.id,
+                            e
+                        ))
+                    })?;
                 }
             }
             self.operators.write().await.insert(src.id, op);
@@ -96,12 +103,25 @@ impl FileService {
                 return Err(ServerError::Internal("local 存储源缺少 storage_root".to_string()));
             }
             let root_path = std::path::Path::new(root);
+            // 目录不存在时自动创建，创建失败则返回明确错误
+            if !root_path.exists() {
+                tokio::fs::create_dir_all(root_path)
+                    .await
+                    .map_err(|e| {
+                        ServerError::Internal(format!(
+                            "创建文件存储目录失败 \"{}\": {}",
+                            root, e
+                        ))
+                    })?;
+            }
             let abs_root = if root_path.is_absolute() {
                 root.to_string()
             } else {
                 tokio::fs::canonicalize(root_path)
                     .await
-                    .map_err(|e| ServerError::Internal(format!("无法解析 storage_root {}: {}", root, e)))?
+                    .map_err(|e| {
+                        ServerError::Internal(format!("无法解析 storage_root \"{}\": {}", root, e))
+                    })?
                     .to_string_lossy()
                     .to_string()
             };

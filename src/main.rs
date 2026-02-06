@@ -62,10 +62,12 @@ async fn main() -> Result<()> {
     tracing::info!("  - Log Format: {:?}", log_format);
     tracing::info!("  - Protocols: {:?}", config.enabled_protocols);
 
-    // 创建服务器（如果数据库连接失败，会直接退出）
+    // 创建服务器（如果数据库连接或目录创建等失败，会打印错误并退出）
     let server = match ChatServer::new(config).await {
         Ok(server) => server,
-        Err(_) => {
+        Err(e) => {
+            tracing::error!("❌ 服务器初始化失败: {}", e);
+            tracing::error!("💡 请检查配置、数据库连接及文件存储目录等后重试");
             process::exit(1);
         }
     };
