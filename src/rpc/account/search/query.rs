@@ -21,7 +21,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
     request.from_user_id = crate::rpc::get_current_user_id(&ctx)?;
     
     let searcher_id = request.from_user_id;
-    let query = &request.query;
+    let query = request.query.trim().to_lowercase();
     
     if query.is_empty() {
         return Err(RpcError::validation("query cannot be empty".to_string()));
@@ -29,8 +29,14 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
     
     let mut results = Vec::new();
     
-    // ✨ 关键字精确搜索：按用户名查找
-    let user_opt = services.user_repository.find_by_username(query).await.ok().flatten();
+    // ✨ 关键字精确搜索：统一小写后按用户名/邮箱查找
+    let (user_opt, search_type) = match services.user_repository.find_by_username(&query).await.ok().flatten() {
+        Some(user) => (Some(user), SearchType::Username),
+        None => (
+            services.user_repository.find_by_email(&query).await.ok().flatten(),
+            SearchType::Email,
+        ),
+    };
     
     // 处理找到的用户
     if let Some(user) = user_opt {
@@ -40,7 +46,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
         let privacy = services.privacy_service.get_or_create_privacy_settings(user_id).await
             .unwrap_or_else(|_| UserPrivacySettings::new(user_id));
         
-        if privacy.allows_search(SearchType::Username) {
+        if privacy.allows_search(search_type) {
             // 2. 检查好友关系和发消息权限
             let is_friend = services.friend_service.is_friend(searcher_id, user_id).await;
             
@@ -108,9 +114,8 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
     let response = AccountSearchResponse {
         users: results.clone(),
         total: results.len(),
-        query: query.to_string(),
+        query: query.clone(),
     };
     
     Ok(serde_json::to_value(response).unwrap())
 }
-

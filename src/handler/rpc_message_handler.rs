@@ -51,11 +51,13 @@ impl MessageHandler for RPCMessageHandler {
                 crate::rpc::RpcContext::new()
                     .with_user_id(user_id)
                     .with_device_id(context.device_id.clone().unwrap_or_default())
+                    .with_session_id(context.session_id.to_string())
             }
             Ok(None) => {
                 // 匿名访问（白名单）
                 info!("🌐 RPC 匿名访问（白名单）: route={}", rpc_request.route);
                 crate::rpc::RpcContext::new()
+                    .with_session_id(context.session_id.to_string())
             }
             Err(error_code) => {
                 // 认证失败，返回错误码

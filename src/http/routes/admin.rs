@@ -238,21 +238,36 @@ async fn create_user(
     Json(request): Json<CreateUserRequest>,
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
-    
-    info!("创建用户: username={}", request.username);
-    
+
+    let CreateUserRequest {
+        username,
+        display_name,
+        email,
+        phone,
+        avatar_url,
+        user_type,
+    } = request;
+
+    let normalized_username = username.trim().to_lowercase();
+    let normalized_email = email
+        .as_ref()
+        .map(|val| val.trim().to_lowercase())
+        .filter(|val| !val.is_empty());
+
+    info!("创建用户: username={}", normalized_username);
+
     // 验证用户名
-    if request.username.is_empty() {
+    if normalized_username.is_empty() {
         return Err(ServerError::Validation("用户名不能为空".to_string()));
     }
     
     // 检查用户名是否已存在
-    if let Ok(Some(_)) = state.user_repository.find_by_username(&request.username).await {
-        return Err(ServerError::Validation(format!("用户名 {} 已存在", request.username)));
+    if let Ok(Some(_)) = state.user_repository.find_by_username(&normalized_username).await {
+        return Err(ServerError::Validation(format!("用户名 {} 已存在", normalized_username)));
     }
     
     // 检查邮箱是否已存在
-    if let Some(ref email) = request.email {
+    if let Some(ref email) = normalized_email {
         if let Ok(Some(_)) = state.user_repository.find_by_email(email).await {
             return Err(ServerError::Validation(format!("邮箱 {} 已存在", email)));
         }
@@ -261,18 +276,18 @@ async fn create_user(
     // 创建用户对象（user_id 由数据库自动生成）
     let user = crate::model::user::User::new_with_details(
         0,  // 数据库会自动生成
-        request.username,
-        request.display_name,
-        request.email,
-        request.avatar_url,
+        normalized_username,
+        display_name,
+        normalized_email,
+        avatar_url,
     );
     
     // 如果提供了 phone，设置它
     let mut user = user;
-    if let Some(phone) = request.phone {
+    if let Some(phone) = phone {
         user.phone = Some(phone);
     }
-    if let Some(user_type) = request.user_type {
+    if let Some(user_type) = user_type {
         user.user_type = user_type;
     }
     
@@ -412,21 +427,39 @@ async fn update_user(
     let mut user = state.user_repository.find_by_id(user_id).await
         .map_err(|e| ServerError::Database(format!("查询用户失败: {}", e)))?
         .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
-    
+
+    let UpdateUserRequest {
+        display_name,
+        email,
+        phone,
+        avatar_url,
+        status,
+    } = request;
+
     // 更新字段
-    if let Some(display_name) = request.display_name {
+    if let Some(display_name) = display_name {
         user.display_name = Some(display_name);
     }
-    if let Some(email) = request.email {
-        user.email = Some(email);
+    if let Some(email) = email {
+        let normalized_email = email.trim().to_lowercase();
+        if normalized_email.is_empty() {
+            user.email = None;
+        } else {
+            if let Ok(Some(existing_user)) = state.user_repository.find_by_email(&normalized_email).await {
+                if existing_user.id != user_id {
+                    return Err(ServerError::Validation(format!("邮箱 {} 已存在", normalized_email)));
+                }
+            }
+            user.email = Some(normalized_email);
+        }
     }
-    if let Some(phone) = request.phone {
+    if let Some(phone) = phone {
         user.phone = Some(phone);
     }
-    if let Some(avatar_url) = request.avatar_url {
+    if let Some(avatar_url) = avatar_url {
         user.avatar_url = Some(avatar_url);
     }
-    if let Some(status) = request.status {
+    if let Some(status) = status {
         user.status = crate::model::user::UserStatus::from_i16(status);
     }
     

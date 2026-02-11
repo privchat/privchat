@@ -28,9 +28,15 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
     // ✨ 使用协议层类型自动反序列化
     let request: UserRegisterRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
+    let normalized_username = request.username.trim().to_lowercase();
+    let normalized_email = request
+        .email
+        .as_ref()
+        .map(|email| email.trim().to_lowercase())
+        .filter(|email| !email.is_empty());
     
     // 参数验证
-    if request.username.is_empty() {
+    if normalized_username.is_empty() {
         return Err(RpcError::validation("用户名不能为空".to_string()));
     }
     
@@ -46,7 +52,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
     }
     
     // 1. 检查用户名是否已存在
-    if let Ok(Some(_)) = services.user_repository.find_by_username(&request.username).await {
+    if let Ok(Some(_)) = services.user_repository.find_by_username(&normalized_username).await {
         return Err(RpcError::validation("用户名已存在".to_string()));
     }
     
@@ -55,8 +61,8 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
         .map_err(|e| RpcError::internal(format!("密码加密失败: {}", e)))?;
     
     // 3. 创建用户对象
-    let mut user = User::new_with_password(0, request.username.clone(), password_hash);
-    user.email = request.email.clone();
+    let mut user = User::new_with_password(0, normalized_username.clone(), password_hash);
+    user.email = normalized_email;
     user.display_name = request.nickname.clone();
     user.phone = request.phone.clone();
     
@@ -139,7 +145,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
     
     tracing::info!(
         "✅ 用户注册成功: username={}, user_id={}, device_id={}, device_type={}, app_id={}", 
-        request.username, user_id, device_id, device_type_str, app_id
+        normalized_username, user_id, device_id, device_type_str, app_id
     );
     
     // 9. 系统消息功能：创建与系统用户的会话并发送欢迎消息

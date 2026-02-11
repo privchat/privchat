@@ -37,6 +37,8 @@ pub struct RpcContext {
     pub user_id: Option<String>,
     /// 设备ID (可选)
     pub device_id: Option<String>,
+    /// 会话ID (可选，格式: session-<id>)
+    pub session_id: Option<String>,
     /// 请求时间戳
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
@@ -47,6 +49,7 @@ impl RpcContext {
         Self {
             user_id: None,
             device_id: None,
+            session_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -60,6 +63,12 @@ impl RpcContext {
     /// 设置设备ID
     pub fn with_device_id(mut self, device_id: String) -> Self {
         self.device_id = Some(device_id);
+        self
+    }
+
+    /// 设置会话ID
+    pub fn with_session_id(mut self, session_id: String) -> Self {
+        self.session_id = Some(session_id);
         self
     }
     
@@ -105,6 +114,10 @@ pub struct RpcServiceContext {
     pub connection_manager: Arc<ConnectionManager>,  // ✨ 新增
     /// 同步服务 - 用于 pts 同步机制
     pub sync_service: Arc<SyncService>,  // ✨ 新增
+    /// 认证会话管理器 - 用于 READY 闸门
+    pub auth_session_manager: Arc<crate::infra::SessionManager>,
+    /// 离线消息 worker - READY 后触发补差推送
+    pub offline_worker: Arc<crate::infra::OfflineMessageWorker>,
     /// 用户设备仓库 - 用于推送设备管理
     pub user_device_repo: Arc<crate::repository::UserDeviceRepository>,  // ✨ Phase 3.5
     /// 用户设置仓库 - ENTITY_SYNC_V1 user_settings，表为主
@@ -141,6 +154,8 @@ impl RpcServiceContext {
         message_repository: Arc<crate::repository::PgMessageRepository>,
         connection_manager: Arc<ConnectionManager>,  // ✨ 新增参数
         sync_service: Arc<SyncService>,  // ✨ 新增参数
+        auth_session_manager: Arc<crate::infra::SessionManager>,
+        offline_worker: Arc<crate::infra::OfflineMessageWorker>,
         user_device_repo: Arc<crate::repository::UserDeviceRepository>,  // ✨ Phase 3.5
         user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
     ) -> Self {
@@ -173,6 +188,8 @@ impl RpcServiceContext {
             message_repository,
             connection_manager,  // ✨ 新增
             sync_service,  // ✨ 新增
+            auth_session_manager,
+            offline_worker,
             user_device_repo,  // ✨ Phase 3.5
             user_settings_repo,
         }

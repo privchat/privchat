@@ -16,10 +16,10 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as i64;
     
-    let before_message_id = body.get("before_message_id")
+    let before_message_id = body.get("before_server_message_id")
         .and_then(|v| v.as_u64());
     
-    tracing::info!("🔧 从数据库获取历史消息: channel_id={}, limit={}, before_message_id={:?}", 
+    tracing::info!("🔧 从数据库获取历史消息: channel_id={}, limit={}, before_server_message_id={:?}", 
                   channel_id, limit, before_message_id);
     
     // ✨ 从数据库查询消息（channel_id 就是 channel_id）

@@ -20,6 +20,8 @@ pub struct SessionInfo {
     pub jwt_claims: ImTokenClaims,
     /// 客户端 pts（服务器维护，推送离线消息后更新）
     pub client_pts: u64,
+    /// 是否已准备好接收补差和实时推送
+    pub ready_for_push: bool,
 }
 
 /// 会话管理器
@@ -63,6 +65,7 @@ impl SessionManager {
             last_active_at: Utc::now(),
             jwt_claims,
             client_pts: 0, // 初始化为 0，推送离线消息后更新
+            ready_for_push: false, // AUTH 后默认未 READY
         };
         
         self.sessions.write().await.insert(session_id.clone(), info);
@@ -86,6 +89,32 @@ impl SessionManager {
     /// 获取客户端的 client_pts
     pub async fn get_client_pts(&self, session_id: &SessionId) -> Option<u64> {
         self.sessions.read().await.get(session_id).map(|info| info.client_pts)
+    }
+
+    /// 标记会话已 READY（幂等）
+    ///
+    /// 返回值:
+    /// - true: 首次从 not-ready 转为 ready
+    /// - false: 原本已经 ready 或 session 不存在
+    pub async fn mark_ready_for_push(&self, session_id: &SessionId) -> bool {
+        if let Some(info) = self.sessions.write().await.get_mut(session_id) {
+            let transitioned = !info.ready_for_push;
+            info.ready_for_push = true;
+            info.last_active_at = Utc::now();
+            transitioned
+        } else {
+            false
+        }
+    }
+
+    /// 检查会话是否已 READY
+    pub async fn is_ready_for_push(&self, session_id: &SessionId) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|info| info.ready_for_push)
+            .unwrap_or(false)
     }
     
     /// 获取用户 ID

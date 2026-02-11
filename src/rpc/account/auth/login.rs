@@ -27,13 +27,23 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
     let request: AuthLoginRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
     
-    let username = &request.username;
+    let account = request.username.trim().to_lowercase();
+    if account.is_empty() {
+        return Err(RpcError::validation("用户名不能为空".to_string()));
+    }
     let password = &request.password;
     
-    // 1. 从数据库查找用户
-    let user = services.user_repository.find_by_username(username).await
-        .map_err(|e| RpcError::internal(format!("查询用户失败: {}", e)))?
-        .ok_or_else(|| RpcError::unauthorized("用户名或密码错误".to_string()))?;
+    // 1. 从数据库查找用户（支持用户名或邮箱登录，统一按小写比较）
+    let user_by_username = services.user_repository.find_by_username(&account).await
+        .map_err(|e| RpcError::internal(format!("查询用户失败: {}", e)))?;
+    let user = match user_by_username {
+        Some(user) => user,
+        None => services.user_repository
+            .find_by_email(&account)
+            .await
+            .map_err(|e| RpcError::internal(format!("查询用户失败: {}", e)))?
+            .ok_or_else(|| RpcError::unauthorized("账号密码不匹配".to_string()))?,
+    };
     
     // 2. 检查密码哈希是否存在
     let password_hash = user.password_hash
@@ -44,8 +54,8 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
         .map_err(|e| RpcError::internal(format!("密码验证失败: {}", e)))?;
     
     if !valid {
-        tracing::warn!("❌ 密码验证失败: username={}", username);
-        return Err(RpcError::unauthorized("用户名或密码错误".to_string()));
+        tracing::warn!("❌ 密码验证失败: account={}", account);
+        return Err(RpcError::unauthorized("账号密码不匹配".to_string()));
     }
     
     let user_id = user.id;
@@ -141,8 +151,8 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
     let refresh_token = token.clone();
     
     tracing::info!(
-        "✅ 用户登录成功: username={}, user_id={}, device_id={}, device_type={}, app_id={}", 
-        username, user_id, device_id, device_type_str, app_id
+        "✅ 用户登录成功: account={}, user_id={}, device_id={}, device_type={}, app_id={}", 
+        account, user_id, device_id, device_type_str, app_id
     );
     
     // 8. 返回统一的 AuthResponse 格式（包含 device_id）
@@ -156,4 +166,3 @@ pub async fn handle(body: Value, services: RpcServiceContext, _ctx: crate::rpc::
         "message": "登录成功"
     }))
 }
-

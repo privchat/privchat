@@ -9,7 +9,6 @@ use crate::auth::{JwtService, TokenRevocationService, DeviceManager, DeviceManag
 use crate::model::pts::PtsGenerator;
 use crate::service::{OfflineQueueService, UnreadCountService, NotificationService, ChannelService};
 use tracing::{info, warn, debug};
-use serde_json::json;
 
 /// 连接消息处理器
 pub struct ConnectMessageHandler {
@@ -287,50 +286,9 @@ impl MessageHandler for ConnectMessageHandler {
             // 不影响连接流程，继续
         }
         
-        // 8. 触发离线消息推送（基于 client_pts 过滤）
-        // client_pts 初始化为 0，所以会推送所有离线消息
-        info!("📨 ConnectMessageHandler: 触发用户 {} 的离线消息推送", user_id);
-        self.offline_worker.trigger_push(user_id);
-
-        // 8.5. 使用 PushMessageRequest 向当前会话发送欢迎消息（保证客户端落库、UI 可见）
-        if let Some(channel_id) = self.channel_service.get_system_channel_id_for_user(user_id).await {
-            let message_id = crate::infra::next_message_id();
-            let now = chrono::Utc::now();
-            let payload = serde_json::to_vec(&json!({ "content": self.welcome_message }))
-                .unwrap_or_else(|_| Vec::new());
-            let push_msg = privchat_protocol::protocol::PushMessageRequest {
-                setting: privchat_protocol::protocol::MessageSetting::default(),
-                msg_key: format!("msg_{}", message_id),
-                server_message_id: message_id,
-                message_seq: 1,
-                local_message_id: message_id,
-                stream_no: String::new(),
-                stream_seq: 0,
-                stream_flag: 0,
-                timestamp: now.timestamp().max(0) as u32,
-                channel_id,
-                channel_type: 0, // Direct
-                message_type: privchat_protocol::ContentMessageType::Text.as_u32(),
-                expire: 0,
-                topic: String::new(),
-                from_uid: crate::config::SYSTEM_USER_ID,
-                payload,
-            };
-            if let Err(e) = self
-                .notification_service
-                .send_push_to_session(&context.session_id, &push_msg)
-                .await
-            {
-                warn!("⚠️ ConnectMessageHandler: 发送欢迎 PushMessageRequest 失败: {}", e);
-            } else {
-                info!(
-                    "✅ ConnectMessageHandler: 已向会话 {} 发送欢迎 PushMessageRequest (channel_id={})",
-                    context.session_id, channel_id
-                );
-            }
-        } else {
-            debug!("ConnectMessageHandler: 用户 {} 无系统会话，跳过欢迎 PushMessageRequest", user_id);
-        }
+        // 8. READY 闸门：
+        // 连接鉴权成功后仅建立会话，不立即推送离线/实时消息。
+        // 客户端完成 bootstrap 后通过 sync/session_ready 显式开启补差+实时推送。
 
         // 9. 创建连接响应
         let connect_response = privchat_protocol::protocol::AuthorizationResponse {

@@ -110,7 +110,7 @@ impl RedisClient {
     /// ZADD key score member
     pub async fn zadd(&self, key: &str, score: f64, member: &str) -> Result<(), crate::error::ServerError> {
         let mut conn = self.get_conn().await?;
-        conn.zadd::<_, _, _, ()>(key, score, member).await
+        conn.zadd::<_, _, _, ()>(key, member, score).await
             .map_err(|e| crate::error::ServerError::Internal(format!("Redis ZADD failed: {}", e)))?;
         Ok(())
     }

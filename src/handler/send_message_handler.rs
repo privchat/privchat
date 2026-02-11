@@ -11,6 +11,7 @@ use crate::service::message_history_service::MessageHistoryService;
 use crate::model::channel::{UserId, MessageId};
 use crate::error::ServerError;
 use crate::session::SessionManager;
+use crate::infra::SessionManager as AuthSessionManager;
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::service::{OfflineQueueService, UnreadCountService, MessageDedupService};
 use crate::repository::{MessageRepository, PgMessageRepository};
@@ -54,6 +55,8 @@ pub struct SendMessageHandler {
     event_bus: Option<Arc<crate::infra::EventBus>>,
     /// ✨ Phase 3.5: 用户设备仓库（用于推送设备查询）
     user_device_repo: Option<Arc<crate::repository::UserDeviceRepository>>,
+    /// 认证会话管理器（用于 READY 推送闸门）
+    auth_session_manager: Arc<AuthSessionManager>,
 }
 
 // 临时全局 EventBus（MVP 阶段简化方案）
@@ -91,6 +94,7 @@ impl SendMessageHandler {
         friend_service: Arc<crate::service::FriendService>,
         mention_service: Arc<crate::service::MentionService>,
         message_repository: Arc<PgMessageRepository>,
+        auth_session_manager: Arc<AuthSessionManager>,
         user_device_repo: Option<Arc<crate::repository::UserDeviceRepository>>,  // ✨ Phase 3.5
     ) -> Self {
         Self {
@@ -112,6 +116,7 @@ impl SendMessageHandler {
             mention_service,
             message_repository,
             event_bus: None,
+            auth_session_manager,
             user_device_repo,  // ✨ Phase 3.5
         }
     }
@@ -1280,6 +1285,21 @@ impl SendMessageHandler {
                         .map(SessionId::from)
                         .map_err(|e| ServerError::Internal(format!("解析会话ID失败: {} -> {}", session_id_str, e)))?
                 };
+
+                // READY 闸门：未 READY 不进行实时推送，交由离线补差处理
+                if !self.auth_session_manager.is_ready_for_push(&session_id).await {
+                    debug!(
+                        "⏸️ SendMessageHandler: 用户 {} 会话 {} 未 READY，跳过实时推送并加入离线队列",
+                        member_id, session_info.session_id
+                    );
+                    if let Err(queue_err) = self.offline_queue_service.add(member_id, &push_message_request).await {
+                        error!("❌ SendMessageHandler: 添加离线消息失败: {}", queue_err);
+                    } else if let Err(count_err) = self.unread_count_service.increment(member_id, channel.id, 1).await {
+                        warn!("⚠️ SendMessageHandler: 更新未读计数失败: {}", count_err);
+                    }
+                    failed_count += 1;
+                    continue;
+                }
                 
                 // 编码 RecvRequest 消息
                 let recv_data = privchat_protocol::encode_message(&push_message_request)

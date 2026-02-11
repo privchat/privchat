@@ -120,7 +120,7 @@ impl UserRepository {
                 updated_at,
                 last_active_at
             FROM privchat_users
-            WHERE username = $1
+            WHERE LOWER(username) = LOWER($1)
             "#
         )
         .bind(username)
@@ -186,7 +186,7 @@ impl UserRepository {
                 updated_at,
                 last_active_at
             FROM privchat_users
-            WHERE email = $1
+            WHERE LOWER(email) = LOWER($1)
             "#
         )
         .bind(email)
@@ -222,7 +222,7 @@ impl UserRepository {
         
         // 检查用户名是否已存在
         let exists: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM privchat_users WHERE username = $1"
+            "SELECT 1 FROM privchat_users WHERE LOWER(username) = LOWER($1)"
         )
         .bind(&username)
         .fetch_optional(self.pool.as_ref())
@@ -236,7 +236,7 @@ impl UserRepository {
         // 检查邮箱是否已存在
         if let Some(ref email_val) = email {
             let exists: Option<(i32,)> = sqlx::query_as(
-                "SELECT 1 FROM privchat_users WHERE email = $1"
+                "SELECT 1 FROM privchat_users WHERE LOWER(email) = LOWER($1)"
             )
             .bind(email_val)
             .fetch_optional(self.pool.as_ref())
@@ -299,7 +299,7 @@ impl UserRepository {
         
         // 检查用户名是否已存在
         let exists: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM privchat_users WHERE username = $1"
+            "SELECT 1 FROM privchat_users WHERE LOWER(username) = LOWER($1)"
         )
         .bind(&username)
         .fetch_optional(self.pool.as_ref())
@@ -313,7 +313,7 @@ impl UserRepository {
         // 检查邮箱是否已存在
         if let Some(ref email_val) = email {
             let exists: Option<(i32,)> = sqlx::query_as(
-                "SELECT 1 FROM privchat_users WHERE email = $1"
+                "SELECT 1 FROM privchat_users WHERE LOWER(email) = LOWER($1)"
             )
             .bind(email_val)
             .fetch_optional(self.pool.as_ref())

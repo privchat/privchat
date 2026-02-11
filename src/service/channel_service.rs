@@ -1097,6 +1097,7 @@ impl ChannelService {
         let page: Vec<&Channel> = channels.iter().skip(start_idx).take(limit as usize).collect();
         let total_consumed = start_idx + page.len();
         let has_more = total_consumed < channels.len();
+        let last_message_cache = self.last_message_cache.read().await;
 
         let items: Vec<SyncEntityItem> = page
             .iter()
@@ -1155,17 +1156,42 @@ impl ChannelService {
         let page: Vec<&Channel> = channels.iter().skip(start_idx).take(limit as usize).collect();
         let total_consumed = start_idx + page.len();
         let has_more = total_consumed < channels.len();
+        let last_message_cache = self.last_message_cache.read().await;
 
         let items: Vec<SyncEntityItem> = page
             .iter()
             .map(|ch| {
+                let channel_name = if ch.channel_type == ChannelType::Direct {
+                    ch.get_member_ids()
+                        .into_iter()
+                        .find(|uid| *uid != user_id)
+                        .map(|uid| uid.to_string())
+                        .unwrap_or_else(|| ch.metadata.name.clone().unwrap_or_default())
+                } else {
+                    ch.metadata.name.clone().unwrap_or_default()
+                };
+
+                let preview = last_message_cache.get(&ch.id).cloned();
+
+                let last_msg_content = preview
+                    .as_ref()
+                    .map(|p| p.content.clone())
+                    .unwrap_or_default();
+                let last_msg_timestamp = preview
+                    .as_ref()
+                    .map(|p| p.timestamp.timestamp_millis())
+                    .or(ch.last_message_at.map(|ts| ts.timestamp_millis()))
+                    .unwrap_or(0);
+
                 let payload = json!({
                     "channel_type": ch.channel_type.to_i16() as i64,
                     "type": ch.channel_type.to_i16() as i64,
-                    "channel_name": ch.metadata.name.as_deref().unwrap_or(""),
-                    "name": ch.metadata.name.as_deref().unwrap_or(""),
+                    "channel_name": channel_name.clone(),
+                    "name": channel_name,
                     "avatar": ch.metadata.avatar_url.as_deref().unwrap_or(""),
                     "unread_count": 0i64,
+                    "last_msg_content": last_msg_content,
+                    "last_msg_timestamp": last_msg_timestamp,
                 });
                 SyncEntityItem {
                     entity_id: ch.id.to_string(),

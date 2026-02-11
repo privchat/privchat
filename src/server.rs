@@ -419,6 +419,7 @@ impl ChatServer {
             friend_service.clone(),
             mention_service.clone(),
             message_repository.clone(),
+            auth_session_manager.clone(),
             Some(user_device_repo.clone()),  // ✨ Phase 3.5: 传递 user_device_repo
         ));
         
@@ -576,6 +577,8 @@ impl ChatServer {
             message_repository.clone(),
             connection_manager.clone(),  // ✨ 新增
             sync_service.clone(),  // ✨ 新增
+            auth_session_manager.clone(),
+            offline_worker.clone(),
             user_device_repo.clone(),  // ✨ Phase 3.5
             Arc::new(crate::repository::UserSettingsRepository::new((*pool).clone())),  // user_settings 表为主
         );

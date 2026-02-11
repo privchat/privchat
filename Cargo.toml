@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 # 传输层
-msgtrans = { path = "../msgtrans", version = "1.0.0" }
+msgtrans = { path = "../msgtrans", version = "1.0" }
 
 # 协议
 privchat-protocol = { path = "../privchat-protocol", version = "0.1.0" }
@@ -125,7 +125,7 @@ path = "examples/simple_offline_worker_test.rs"
 
 [[example]]
 name = "handler_demo"
-path = "examples/handler_demo.rs" 
+path = "examples/handler_demo.rs"
 
 [[example]]
 name = "core_chat_demo"
@@ -133,15 +133,15 @@ path = "examples/core_chat_demo.rs"
 
 [[example]]
 name = "service_communication_demo"
-path = "examples/service_communication_demo.rs" 
+path = "examples/service_communication_demo.rs"
 
 [[example]]
 name = "simple_chat_demo"
-path = "examples/simple_chat_demo.rs" 
+path = "examples/simple_chat_demo.rs"
 
 [[example]]
 name = "simple_dashmap_demo"
-path = "examples/simple_dashmap_demo.rs" 
+path = "examples/simple_dashmap_demo.rs"
 
 [[example]]
 name = "simple_channel_test"
@@ -149,4 +149,4 @@ path = "examples/simple_channel_test.rs"
 
 [[example]]
 name = "channel_architecture_demo"
-path = "examples/channel_architecture_demo.rs" 
+path = "examples/channel_architecture_demo.rs"
