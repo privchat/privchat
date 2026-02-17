@@ -16,14 +16,14 @@ pub struct ImTokenClaims {
     pub iat: i64,
     /// JWT 标准字段 - JWT ID (用于撤销)
     pub jti: String,
-    
+
     /// 自定义字段 - 设备ID
     pub device_id: String,
     /// 自定义字段 - 业务系统ID
     pub business_system_id: String,
     /// 自定义字段 - 应用ID
     pub app_id: String,
-    
+
     /// 会话版本号（用于设备级撤销）
     /// 只在安全事件时递增（登出、改密、被踢等）
     #[serde(default = "default_session_version")]
@@ -39,16 +39,16 @@ fn default_session_version() -> i64 {
 pub struct DeviceInfo {
     /// 应用ID (ios/android/web/pc)
     pub app_id: String,
-    
+
     /// 设备名称 (用户可修改，如 "我的 iPhone")
     pub device_name: String,
-    
+
     /// 设备型号 (如 "iPhone 15 Pro")
     pub device_model: String,
-    
+
     /// 操作系统 (如 "iOS 17.2")
     pub os_version: String,
-    
+
     /// APP 版本 (如 "1.0.0")
     pub app_version: String,
 }
@@ -98,44 +98,44 @@ impl DeviceType {
 pub struct Device {
     /// 设备唯一ID (UUID)
     pub device_id: String,
-    
+
     /// 所属用户ID
     pub user_id: u64,
-    
+
     /// 业务系统ID (哪个业务系统的用户)
     pub business_system_id: String,
-    
+
     /// 设备信息
     pub device_info: DeviceInfo,
-    
+
     /// 设备类型
     pub device_type: DeviceType,
-    
+
     /// 当前 token 的 JWT ID (用于撤销)
     pub token_jti: String,
-    
+
     /// 会话版本号（用于设备级撤销）
     #[serde(default = "default_session_version")]
     pub session_version: i64,
-    
+
     /// 会话状态
     #[serde(default)]
     pub session_state: crate::auth::SessionState,
-    
+
     /// 被踢时间
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kicked_at: Option<i64>,
-    
+
     /// 被踢原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kicked_reason: Option<String>,
-    
+
     /// 最后活跃时间
     pub last_active_at: DateTime<Utc>,
-    
+
     /// 创建时间 (首次登录)
     pub created_at: DateTime<Utc>,
-    
+
     /// 登录 IP 地址
     pub ip_address: String,
 }
@@ -145,18 +145,18 @@ pub struct Device {
 pub struct IssueTokenRequest {
     /// 用户ID
     pub user_id: u64,
-    
+
     /// 业务系统ID
     pub business_system_id: String,
-    
+
     /// 设备ID（可选，必须是 UUID 格式。如果不提供，服务器会自动生成）
-    /// 
+    ///
     /// **重要**：如果提供，客户端在连接 WebSocket 时必须使用相同的 device_id
     pub device_id: Option<String>,
-    
+
     /// 设备信息
     pub device_info: DeviceInfo,
-    
+
     /// 自定义 TTL (可选，单位：秒)
     pub ttl: Option<i64>,
 }
@@ -166,13 +166,13 @@ pub struct IssueTokenRequest {
 pub struct IssueTokenResponse {
     /// IM token
     pub im_token: String,
-    
+
     /// 设备ID
     pub device_id: String,
-    
+
     /// 过期时间（秒）
     pub expires_in: i64,
-    
+
     /// 过期时间戳
     pub expires_at: DateTime<Utc>,
 }
@@ -204,4 +204,3 @@ pub struct ServiceKeyConfig {
     pub key: String,
     pub name: String,
 }
-

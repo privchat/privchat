@@ -1,9 +1,9 @@
 //! 文件上传记录仓库 - 持久化上传元数据到数据库（有据可查，清理不依赖缓存）
 
-use std::sync::Arc;
-use sqlx::PgPool;
 use crate::error::{Result, ServerError};
 use crate::model::file_upload::{FileMetadata, FileType};
+use sqlx::PgPool;
+use std::sync::Arc;
 
 /// 文件上传记录仓库
 #[derive(Clone)]
@@ -18,12 +18,10 @@ impl FileUploadRepository {
 
     /// 取下一个自增 file_id（BIGSERIAL 序列），用于先得到 id 再落盘、再 insert
     pub async fn next_file_id(&self) -> Result<u64> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT nextval('privchat_file_uploads_id_seq')::BIGINT"
-        )
-        .fetch_one(self.pool.as_ref())
-        .await
-        .map_err(|e| ServerError::Database(format!("获取 next file_id 失败: {}", e)))?;
+        let row: (i64,) = sqlx::query_as("SELECT nextval('privchat_file_uploads_id_seq')::BIGINT")
+            .fetch_one(self.pool.as_ref())
+            .await
+            .map_err(|e| ServerError::Database(format!("获取 next file_id 失败: {}", e)))?;
         Ok(row.0 as u64)
     }
 
@@ -113,7 +111,11 @@ impl FileUploadRepository {
     }
 
     /// 按业务类型+业务ID 查询 file_id 列表（便于随业务数据删除时清理）
-    pub async fn list_file_ids_by_business(&self, business_type: &str, business_id: &str) -> Result<Vec<u64>> {
+    pub async fn list_file_ids_by_business(
+        &self,
+        business_type: &str,
+        business_id: &str,
+    ) -> Result<Vec<u64>> {
         let rows = sqlx::query_scalar::<_, i64>(
             "SELECT file_id FROM privchat_file_uploads WHERE business_type = $1 AND business_id = $2"
         )
@@ -126,7 +128,12 @@ impl FileUploadRepository {
     }
 
     /// 更新文件的业务关联（如消息发送后设置 message_id）
-    pub async fn update_business(&self, file_id: u64, business_type: &str, business_id: &str) -> Result<bool> {
+    pub async fn update_business(
+        &self,
+        file_id: u64,
+        business_type: &str,
+        business_id: &str,
+    ) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE privchat_file_uploads SET business_type = $1, business_id = $2 WHERE file_id = $3"
         )

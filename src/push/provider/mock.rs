@@ -1,11 +1,11 @@
-use async_trait::async_trait;
-use tracing::info;
+use crate::error::Result;
 use crate::push::provider::provider_trait::PushProvider;
 use crate::push::types::{PushTask, PushVendor};
-use crate::error::Result;
+use async_trait::async_trait;
+use tracing::info;
 
 /// Mock Provider（用于测试和 MVP 阶段）
-/// 
+///
 /// 不调用真实 API，只打印日志
 pub struct MockProvider;
 
@@ -26,8 +26,8 @@ impl PushProvider for MockProvider {
         );
         Ok(())
     }
-    
+
     fn vendor(&self) -> PushVendor {
-        PushVendor::Apns  // Mock 返回 Apns，实际不调用
+        PushVendor::Apns // Mock 返回 Apns，实际不调用
     }
 }

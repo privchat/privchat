@@ -12,7 +12,7 @@ pub struct Message {
     pub channel_id: u64,
     pub sender_id: u64,
     /// pts 同步机制（必须保存到数据库）
-    pub pts: Option<i64>,  // 可选，因为从数据库查询时需要转换
+    pub pts: Option<i64>, // 可选，因为从数据库查询时需要转换
     /// 客户端消息编号（用于去重）
     pub local_message_id: Option<u64>,
     pub content: String,
@@ -109,7 +109,7 @@ pub struct LocationInfo {
 
 impl Message {
     /// 创建新消息
-    /// 
+    ///
     /// 注意：message_id 应该由调用者使用 next_message_id() 生成并设置
     pub fn new(
         channel_id: u64,
@@ -119,10 +119,10 @@ impl Message {
     ) -> Self {
         // 注意：message_id 应该由调用者使用 next_message_id() 生成
         Self {
-            message_id: 0,  // 需要调用者设置
+            message_id: 0, // 需要调用者设置
             channel_id,
             sender_id,
-            pts: None,  // 由 PtsGenerator 生成
+            pts: None, // 由 PtsGenerator 生成
             local_message_id: None,
             content,
             message_type,
@@ -140,22 +140,22 @@ impl Message {
 
     /// 从数据库行创建（处理时间戳转换）
     pub fn from_db_row(
-        message_id: i64,  // PostgreSQL BIGINT
-        channel_id: i64,  // PostgreSQL BIGINT
+        message_id: i64, // PostgreSQL BIGINT
+        channel_id: i64, // PostgreSQL BIGINT
         sender_id: i64,  // PostgreSQL BIGINT
         pts: i64,
         local_message_id: Option<u64>,
         content: String,
         message_type: i16,
         metadata: Value,
-        reply_to_message_id: Option<i64>,  // PostgreSQL BIGINT
-        created_at: i64,  // 毫秒时间戳
-        updated_at: i64,  // 毫秒时间戳
+        reply_to_message_id: Option<i64>, // PostgreSQL BIGINT
+        created_at: i64,                  // 毫秒时间戳
+        updated_at: i64,                  // 毫秒时间戳
         deleted: bool,
-        deleted_at: Option<i64>,  // 毫秒时间戳
+        deleted_at: Option<i64>, // 毫秒时间戳
         revoked: bool,
-        revoked_at: Option<i64>,  // 毫秒时间戳
-        revoked_by: Option<i64>,  // PostgreSQL BIGINT
+        revoked_at: Option<i64>, // 毫秒时间戳
+        revoked_by: Option<i64>, // PostgreSQL BIGINT
     ) -> Self {
         Self {
             message_id: message_id as u64,
@@ -164,13 +164,12 @@ impl Message {
             pts: Some(pts),
             local_message_id,
             content,
-            message_type: ContentMessageType::from_u32(message_type as u32).unwrap_or(ContentMessageType::Text),
+            message_type: ContentMessageType::from_u32(message_type as u32)
+                .unwrap_or(ContentMessageType::Text),
             metadata,
             reply_to_message_id: reply_to_message_id.map(|id| id as u64),
-            created_at: DateTime::from_timestamp_millis(created_at)
-                .unwrap_or_else(|| Utc::now()),
-            updated_at: DateTime::from_timestamp_millis(updated_at)
-                .unwrap_or_else(|| Utc::now()),
+            created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
+            updated_at: DateTime::from_timestamp_millis(updated_at).unwrap_or_else(|| Utc::now()),
             deleted,
             deleted_at: deleted_at.and_then(|ts| DateTime::from_timestamp_millis(ts)),
             revoked,
@@ -180,12 +179,31 @@ impl Message {
     }
 
     /// 转换为数据库插入值（返回时间戳）
-    pub fn to_db_values(&self) -> (i64, i64, i64, i64, Option<i64>, String, i16, Value, Option<i64>, i64, i64, bool, Option<i64>, bool, Option<i64>, Option<i64>) {
+    pub fn to_db_values(
+        &self,
+    ) -> (
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        String,
+        i16,
+        Value,
+        Option<i64>,
+        i64,
+        i64,
+        bool,
+        Option<i64>,
+        bool,
+        Option<i64>,
+        Option<i64>,
+    ) {
         (
             self.message_id as i64,
             self.channel_id as i64,
             self.sender_id as i64,
-            self.pts.unwrap_or(0),  // 必须提供 pts
+            self.pts.unwrap_or(0), // 必须提供 pts
             self.local_message_id.map(|v| v as i64),
             self.content.clone(),
             self.message_type.as_u32() as i16,
@@ -202,7 +220,7 @@ impl Message {
     }
 
     /// 创建回复消息
-    /// 
+    ///
     /// 注意：message_id 应该由调用者使用 next_message_id() 生成并设置
     pub fn new_reply(
         channel_id: u64,
@@ -213,10 +231,10 @@ impl Message {
     ) -> Self {
         // 注意：message_id 应该由调用者使用 next_message_id() 生成
         Self {
-            message_id: 0,  // 需要调用者设置
+            message_id: 0, // 需要调用者设置
             channel_id,
             sender_id,
-            pts: None,  // 由 PtsGenerator 生成
+            pts: None, // 由 PtsGenerator 生成
             local_message_id: None,
             content,
             message_type,
@@ -253,7 +271,10 @@ impl Message {
     pub fn has_file(&self) -> bool {
         matches!(
             self.message_type,
-            ContentMessageType::Image | ContentMessageType::File | ContentMessageType::Voice | ContentMessageType::Video
+            ContentMessageType::Image
+                | ContentMessageType::File
+                | ContentMessageType::Voice
+                | ContentMessageType::Video
         )
     }
 
@@ -314,7 +335,7 @@ impl MessageStatus {
 
 impl ChannelMessage {
     /// 创建新的频道消息
-    /// 
+    ///
     /// 注意：message_id 应该由调用者使用 next_message_id() 生成并设置
     pub fn new(
         channel_id: u64,
@@ -325,7 +346,7 @@ impl ChannelMessage {
     ) -> Self {
         // 注意：message_id 应该由调用者使用 next_message_id() 生成
         Self {
-            message_id: 0,  // 需要调用者设置
+            message_id: 0, // 需要调用者设置
             channel_id,
             publisher_id,
             title,
@@ -400,4 +421,4 @@ impl Default for MessageMetadata {
             custom: None,
         }
     }
-} 
+}

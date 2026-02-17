@@ -38,7 +38,7 @@ impl GroupStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     /// 群组ID
-    pub id: u64,  // 数据库中是 BIGINT
+    pub id: u64, // 数据库中是 BIGINT
     /// 群组名称
     pub name: String,
     /// 群组描述
@@ -46,7 +46,7 @@ pub struct Group {
     /// 群组头像URL
     pub avatar_url: Option<String>,
     /// 群主ID
-    pub owner_id: u64,  // 数据库中是 BIGINT
+    pub owner_id: u64, // 数据库中是 BIGINT
     /// 群设置（JSONB）
     pub settings: Value,
     /// 最大成员数
@@ -73,7 +73,7 @@ impl Group {
             owner_id,
             settings: Value::Object(serde_json::Map::new()),
             max_members: 500,
-            member_count: 1,  // 包含群主
+            member_count: 1, // 包含群主
             status: GroupStatus::Active,
             created_at: now,
             updated_at: now,
@@ -82,17 +82,17 @@ impl Group {
 
     /// 从数据库行创建（处理时间戳和类型转换）
     pub fn from_db_row(
-        group_id: i64,  // PostgreSQL BIGINT
+        group_id: i64, // PostgreSQL BIGINT
         name: String,
         description: Option<String>,
         avatar_url: Option<String>,
-        owner_id: i64,  // PostgreSQL BIGINT
+        owner_id: i64, // PostgreSQL BIGINT
         settings: Value,
         max_members: i32,
         member_count: i32,
         status: i16,
-        created_at: i64,  // 毫秒时间戳
-        updated_at: i64,  // 毫秒时间戳
+        created_at: i64, // 毫秒时间戳
+        updated_at: i64, // 毫秒时间戳
     ) -> Self {
         Self {
             id: group_id as u64,
@@ -104,15 +104,27 @@ impl Group {
             max_members,
             member_count,
             status: GroupStatus::from_i16(status),
-            created_at: DateTime::from_timestamp_millis(created_at)
-                .unwrap_or_else(|| Utc::now()),
-            updated_at: DateTime::from_timestamp_millis(updated_at)
-                .unwrap_or_else(|| Utc::now()),
+            created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
+            updated_at: DateTime::from_timestamp_millis(updated_at).unwrap_or_else(|| Utc::now()),
         }
     }
 
     /// 转换为数据库插入值
-    pub fn to_db_values(&self) -> (i64, String, Option<String>, Option<String>, i64, Value, i32, i32, i16, i64, i64) {
+    pub fn to_db_values(
+        &self,
+    ) -> (
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        Value,
+        i32,
+        i32,
+        i16,
+        i64,
+        i64,
+    ) {
         (
             self.id as i64,
             self.name.clone(),
@@ -154,14 +166,14 @@ pub struct GroupMember {
 impl GroupMember {
     /// 从数据库行创建（处理时间戳和类型转换）
     pub fn from_db_row(
-        group_id: i64,  // PostgreSQL BIGINT
+        group_id: i64, // PostgreSQL BIGINT
         user_id: i64,  // PostgreSQL BIGINT
         role: i16,
         nickname: Option<String>,
         permissions: Value,
-        mute_until: Option<i64>,  // 毫秒时间戳
-        joined_at: i64,  // 毫秒时间戳
-        left_at: Option<i64>,  // 毫秒时间戳
+        mute_until: Option<i64>, // 毫秒时间戳
+        joined_at: i64,          // 毫秒时间戳
+        left_at: Option<i64>,    // 毫秒时间戳
     ) -> Self {
         Self {
             group_id: group_id as u64,
@@ -171,20 +183,31 @@ impl GroupMember {
             permissions: serde_json::from_value(permissions)
                 .unwrap_or_else(|_| crate::model::channel::MemberPermissions::default()),
             mute_until: mute_until.and_then(|ts| DateTime::from_timestamp_millis(ts)),
-            joined_at: DateTime::from_timestamp_millis(joined_at)
-                .unwrap_or_else(|| Utc::now()),
+            joined_at: DateTime::from_timestamp_millis(joined_at).unwrap_or_else(|| Utc::now()),
             left_at: left_at.and_then(|ts| DateTime::from_timestamp_millis(ts)),
         }
     }
 
     /// 转换为数据库插入值
-    pub fn to_db_values(&self) -> (i64, i64, i16, Option<String>, Value, Option<i64>, i64, Option<i64>) {
+    pub fn to_db_values(
+        &self,
+    ) -> (
+        i64,
+        i64,
+        i16,
+        Option<String>,
+        Value,
+        Option<i64>,
+        i64,
+        Option<i64>,
+    ) {
         (
             self.group_id as i64,
             self.user_id as i64,
             self.role.to_i16(),
             self.nickname.clone(),
-            serde_json::to_value(&self.permissions).unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+            serde_json::to_value(&self.permissions)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
             self.mute_until.map(|dt| dt.timestamp_millis()),
             self.joined_at.timestamp_millis(),
             self.left_at.map(|dt| dt.timestamp_millis()),

@@ -1,5 +1,5 @@
-use privchat_server::{ChatServer, config::ServerConfig, cli::Cli, logging};
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
+use privchat_server::{cli::Cli, config::ServerConfig, logging, ChatServer};
 use std::fs;
 use std::process;
 
@@ -7,7 +7,7 @@ use std::process;
 async fn main() -> Result<()> {
     // 加载 .env 文件（如果存在）
     let _ = dotenvy::dotenv();
-    
+
     // 解析命令行参数
     let cli = Cli::parse();
 
@@ -39,8 +39,7 @@ async fn main() -> Result<()> {
     tracing::info!("🚀 PrivChat Server starting...");
 
     // 加载配置（按优先级：命令行 > 环境变量 > 配置文件 > 默认值）
-    let config = ServerConfig::load(&cli)
-        .context("加载配置失败")?;
+    let config = ServerConfig::load(&cli).context("加载配置失败")?;
 
     // 如果开发模式，应用开发友好设置
     if cli.dev {
@@ -134,9 +133,8 @@ level = "info"
 format = "compact"
 "#;
 
-    fs::write(path, default_config)
-        .with_context(|| format!("无法写入配置文件: {}", path))?;
-    
+    fs::write(path, default_config).with_context(|| format!("无法写入配置文件: {}", path))?;
+
     println!("✅ 配置文件已生成: {}", path);
     Ok(())
 }
@@ -145,14 +143,14 @@ format = "compact"
 fn validate_config(path: &str) -> Result<()> {
     let config = ServerConfig::from_toml_file(path)
         .with_context(|| format!("配置文件验证失败: {}", path))?;
-    
+
     println!("✅ 配置文件有效: {}", path);
     println!("📊 配置摘要:");
     println!("  - Host: {}", config.host);
     println!("  - Port: {}", config.port);
     println!("  - Max Connections: {}", config.max_connections);
     println!("  - Cache Memory: {}MB", config.cache.l1_max_memory_mb);
-    
+
     Ok(())
 }
 
@@ -160,12 +158,11 @@ fn validate_config(path: &str) -> Result<()> {
 fn show_config(cli: &Cli) -> Result<()> {
     // 初始化基本日志（用于显示配置）
     logging::init_logging("info", None, None, false)?;
-    
-    let config = ServerConfig::load(cli)
-        .context("加载配置失败")?;
-    
+
+    let config = ServerConfig::load(cli).context("加载配置失败")?;
+
     println!("📊 最终配置（合并后的配置）:");
     println!("{}", serde_json::to_string_pretty(&config)?);
-    
+
     Ok(())
 }

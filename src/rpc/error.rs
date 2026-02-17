@@ -1,8 +1,8 @@
-use std::fmt;
 use privchat_protocol::ErrorCode;
+use std::fmt;
 
 /// RPC 错误类型
-/// 
+///
 /// 使用协议层的 ErrorCode 枚举，确保客户端和服务端使用统一的错误码
 #[derive(Debug, Clone)]
 pub struct RpcError {
@@ -84,18 +84,24 @@ pub type RpcResult<T> = Result<T, RpcError>;
 impl From<crate::error::ServerError> for RpcError {
     fn from(err: crate::error::ServerError) -> Self {
         use privchat_protocol::ErrorCode;
-        
+
         match err {
             crate::error::ServerError::Validation(msg) => RpcError::validation(msg),
             crate::error::ServerError::Authentication(msg) => RpcError::unauthorized(msg),
             crate::error::ServerError::Unauthorized(msg) => RpcError::unauthorized(msg),
             crate::error::ServerError::Authorization(msg) => RpcError::forbidden(msg),
             crate::error::ServerError::PermissionDenied(msg) => RpcError::forbidden(msg),
-            crate::error::ServerError::UserNotFound(msg) => RpcError::from_code(ErrorCode::UserNotFound, msg),
+            crate::error::ServerError::UserNotFound(msg) => {
+                RpcError::from_code(ErrorCode::UserNotFound, msg)
+            }
             crate::error::ServerError::NotFound(msg) => RpcError::not_found(msg),
-            crate::error::ServerError::MessageNotFound(msg) => RpcError::from_code(ErrorCode::MessageNotFound, msg),
-            crate::error::ServerError::ChannelNotFound(msg) => RpcError::from_code(ErrorCode::ChannelNotFound, msg),
+            crate::error::ServerError::MessageNotFound(msg) => {
+                RpcError::from_code(ErrorCode::MessageNotFound, msg)
+            }
+            crate::error::ServerError::ChannelNotFound(msg) => {
+                RpcError::from_code(ErrorCode::ChannelNotFound, msg)
+            }
             _ => RpcError::internal(err.to_string()),
         }
     }
-} 
+}

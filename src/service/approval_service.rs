@@ -1,12 +1,12 @@
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::{Utc, DateTime, Duration};
 use tracing::info;
 use uuid::Uuid;
-use serde::{Serialize, Deserialize};
 
-use crate::error::{ServerError, Result};
+use crate::error::{Result, ServerError};
 use crate::model::channel::{ChannelId, UserId};
 
 /// 加群请求状态
@@ -35,12 +35,12 @@ pub struct JoinRequest {
     pub user_id: UserId,
     pub method: JoinMethod,
     pub status: JoinRequestStatus,
-    pub message: Option<String>,         // 申请消息
+    pub message: Option<String>, // 申请消息
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
-    pub handler_id: Option<UserId>,      // 处理人ID
-    pub reject_reason: Option<String>,   // 拒绝原因
+    pub handler_id: Option<UserId>,    // 处理人ID
+    pub reject_reason: Option<String>, // 拒绝原因
 }
 
 /// 加群审批服务
@@ -90,21 +90,30 @@ impl ApprovalService {
         };
 
         // 存储请求
-        self.join_requests.write().await.insert(request_id.clone(), request.clone());
+        self.join_requests
+            .write()
+            .await
+            .insert(request_id.clone(), request.clone());
 
         // 更新索引
-        self.group_requests_index.write().await
+        self.group_requests_index
+            .write()
+            .await
             .entry(group_id.clone())
             .or_default()
             .push(request_id.clone());
 
-        self.user_requests_index.write().await
+        self.user_requests_index
+            .write()
+            .await
             .entry(user_id.clone())
             .or_default()
             .push(request_id.clone());
 
-        info!("✅ 创建加群请求: request_id={}, group_id={}, user_id={}", 
-            request_id, group_id, user_id);
+        info!(
+            "✅ 创建加群请求: request_id={}, group_id={}, user_id={}",
+            request_id, group_id, user_id
+        );
 
         Ok(request)
     }
@@ -115,11 +124,11 @@ impl ApprovalService {
     }
 
     /// 获取群组的所有待审批请求
-    pub async fn get_pending_requests_by_group(
-        &self,
-        group_id: u64,
-    ) -> Result<Vec<JoinRequest>> {
-        let request_ids = self.group_requests_index.read().await
+    pub async fn get_pending_requests_by_group(&self, group_id: u64) -> Result<Vec<JoinRequest>> {
+        let request_ids = self
+            .group_requests_index
+            .read()
+            .await
             .get(&group_id)
             .cloned()
             .unwrap_or_default();
@@ -150,11 +159,11 @@ impl ApprovalService {
     }
 
     /// 获取用户的加群请求历史
-    pub async fn get_requests_by_user(
-        &self,
-        user_id: u64,
-    ) -> Result<Vec<JoinRequest>> {
-        let request_ids = self.user_requests_index.read().await
+    pub async fn get_requests_by_user(&self, user_id: u64) -> Result<Vec<JoinRequest>> {
+        let request_ids = self
+            .user_requests_index
+            .read()
+            .await
             .get(&user_id)
             .cloned()
             .unwrap_or_default();
@@ -182,12 +191,16 @@ impl ApprovalService {
     ) -> Result<JoinRequest> {
         let mut requests_guard = self.join_requests.write().await;
 
-        let request = requests_guard.get_mut(request_id)
+        let request = requests_guard
+            .get_mut(request_id)
             .ok_or_else(|| ServerError::NotFound("加群请求不存在".to_string()))?;
 
         // 检查状态
         if request.status != JoinRequestStatus::Pending {
-            return Err(ServerError::Validation(format!("请求状态不是待审批: {:?}", request.status)));
+            return Err(ServerError::Validation(format!(
+                "请求状态不是待审批: {:?}",
+                request.status
+            )));
         }
 
         // 检查是否过期
@@ -204,7 +217,10 @@ impl ApprovalService {
         request.handler_id = Some(handler_id.clone());
         request.updated_at = Utc::now();
 
-        info!("✅ 同意加群请求: request_id={}, handler_id={}", request_id, handler_id);
+        info!(
+            "✅ 同意加群请求: request_id={}, handler_id={}",
+            request_id, handler_id
+        );
 
         Ok(request.clone())
     }
@@ -218,12 +234,16 @@ impl ApprovalService {
     ) -> Result<JoinRequest> {
         let mut requests_guard = self.join_requests.write().await;
 
-        let request = requests_guard.get_mut(request_id)
+        let request = requests_guard
+            .get_mut(request_id)
             .ok_or_else(|| ServerError::NotFound("加群请求不存在".to_string()))?;
 
         // 检查状态
         if request.status != JoinRequestStatus::Pending {
-            return Err(ServerError::Validation(format!("请求状态不是待审批: {:?}", request.status)));
+            return Err(ServerError::Validation(format!(
+                "请求状态不是待审批: {:?}",
+                request.status
+            )));
         }
 
         // 更新状态
@@ -232,7 +252,10 @@ impl ApprovalService {
         request.reject_reason = reason;
         request.updated_at = Utc::now();
 
-        info!("✅ 拒绝加群请求: request_id={}, handler_id={}", request_id, handler_id);
+        info!(
+            "✅ 拒绝加群请求: request_id={}, handler_id={}",
+            request_id, handler_id
+        );
 
         Ok(request.clone())
     }
@@ -271,13 +294,18 @@ mod tests {
     async fn test_create_and_get_request() {
         let service = ApprovalService::new();
 
-        let request = service.create_join_request(
-            "group_123".to_string(),
-            "alice".to_string(),
-            JoinMethod::QRCode { qr_code_id: "qr_456".to_string() },
-            Some("我想加入".to_string()),
-            Some(24),
-        ).await.unwrap();
+        let request = service
+            .create_join_request(
+                "group_123".to_string(),
+                "alice".to_string(),
+                JoinMethod::QRCode {
+                    qr_code_id: "qr_456".to_string(),
+                },
+                Some("我想加入".to_string()),
+                Some(24),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(request.status, JoinRequestStatus::Pending);
 
@@ -290,16 +318,23 @@ mod tests {
     async fn test_approve_request() {
         let service = ApprovalService::new();
 
-        let request = service.create_join_request(
-            "group_123".to_string(),
-            "alice".to_string(),
-            JoinMethod::QRCode { qr_code_id: "qr_456".to_string() },
-            None,
-            None,
-        ).await.unwrap();
+        let request = service
+            .create_join_request(
+                "group_123".to_string(),
+                "alice".to_string(),
+                JoinMethod::QRCode {
+                    qr_code_id: "qr_456".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
-        let approved = service.approve_request(&request.request_id, "admin1".to_string())
-            .await.unwrap();
+        let approved = service
+            .approve_request(&request.request_id, "admin1".to_string())
+            .await
+            .unwrap();
 
         assert_eq!(approved.status, JoinRequestStatus::Approved);
         assert_eq!(approved.handler_id, Some("admin1".to_string()));
@@ -309,19 +344,27 @@ mod tests {
     async fn test_reject_request() {
         let service = ApprovalService::new();
 
-        let request = service.create_join_request(
-            "group_123".to_string(),
-            "alice".to_string(),
-            JoinMethod::MemberInvite { inviter_id: "bob".to_string() },
-            None,
-            None,
-        ).await.unwrap();
+        let request = service
+            .create_join_request(
+                "group_123".to_string(),
+                "alice".to_string(),
+                JoinMethod::MemberInvite {
+                    inviter_id: "bob".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
-        let rejected = service.reject_request(
-            &request.request_id,
-            "admin1".to_string(),
-            Some("不符合要求".to_string())
-        ).await.unwrap();
+        let rejected = service
+            .reject_request(
+                &request.request_id,
+                "admin1".to_string(),
+                Some("不符合要求".to_string()),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(rejected.status, JoinRequestStatus::Rejected);
         assert_eq!(rejected.reject_reason, Some("不符合要求".to_string()));
@@ -332,24 +375,36 @@ mod tests {
         let service = ApprovalService::new();
 
         // 创建3个请求
-        service.create_join_request(
-            "group_123".to_string(),
-            "alice".to_string(),
-            JoinMethod::QRCode { qr_code_id: "qr_1".to_string() },
-            None,
-            None,
-        ).await.unwrap();
+        service
+            .create_join_request(
+                "group_123".to_string(),
+                "alice".to_string(),
+                JoinMethod::QRCode {
+                    qr_code_id: "qr_1".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
-        service.create_join_request(
-            "group_123".to_string(),
-            "bob".to_string(),
-            JoinMethod::QRCode { qr_code_id: "qr_2".to_string() },
-            None,
-            None,
-        ).await.unwrap();
+        service
+            .create_join_request(
+                "group_123".to_string(),
+                "bob".to_string(),
+                JoinMethod::QRCode {
+                    qr_code_id: "qr_2".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
-        let requests = service.get_pending_requests_by_group("group_123").await.unwrap();
+        let requests = service
+            .get_pending_requests_by_group("group_123")
+            .await
+            .unwrap();
         assert_eq!(requests.len(), 2);
     }
 }
-

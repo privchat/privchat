@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::context::RequestContext;
-use crate::handler::MessageHandler;
 use crate::error::Result;
-use crate::rpc::{handle_rpc_request, types::RPCMessageRequest};
+use crate::handler::MessageHandler;
 use crate::middleware::AuthMiddleware;
+use crate::rpc::{handle_rpc_request, types::RPCMessageRequest};
 
 /// RPC 消息处理器
 pub struct RPCMessageHandler {
@@ -15,9 +15,7 @@ pub struct RPCMessageHandler {
 
 impl RPCMessageHandler {
     pub fn new(auth_middleware: Arc<AuthMiddleware>) -> Self {
-        Self {
-            auth_middleware,
-        }
+        Self { auth_middleware }
     }
 }
 
@@ -40,14 +38,23 @@ impl MessageHandler for RPCMessageHandler {
             }
         };
 
-        info!("🚀 RPC 调用: route={}, session_id={}", 
-              rpc_request.route, context.session_id);
+        info!(
+            "🚀 RPC 调用: route={}, session_id={}",
+            rpc_request.route, context.session_id
+        );
 
         // 🔐 认证检查并构建 RPC 上下文
-        let rpc_context = match self.auth_middleware.check_rpc_route(&rpc_request.route, &context.session_id).await {
+        let rpc_context = match self
+            .auth_middleware
+            .check_rpc_route(&rpc_request.route, &context.session_id)
+            .await
+        {
             Ok(Some(user_id)) => {
                 // 已认证，可以继续
-                info!("🔐 RPC 认证成功: route={}, user={}", rpc_request.route, user_id);
+                info!(
+                    "🔐 RPC 认证成功: route={}, user={}",
+                    rpc_request.route, user_id
+                );
                 crate::rpc::RpcContext::new()
                     .with_user_id(user_id)
                     .with_device_id(context.device_id.clone().unwrap_or_default())
@@ -56,12 +63,14 @@ impl MessageHandler for RPCMessageHandler {
             Ok(None) => {
                 // 匿名访问（白名单）
                 info!("🌐 RPC 匿名访问（白名单）: route={}", rpc_request.route);
-                crate::rpc::RpcContext::new()
-                    .with_session_id(context.session_id.to_string())
+                crate::rpc::RpcContext::new().with_session_id(context.session_id.to_string())
             }
             Err(error_code) => {
                 // 认证失败，返回错误码
-                warn!("❌ RPC 认证失败: route={}, error={}", rpc_request.route, error_code);
+                warn!(
+                    "❌ RPC 认证失败: route={}, error={}",
+                    rpc_request.route, error_code
+                );
                 let error_response = serde_json::json!({
                     "code": error_code.code(),
                     "message": error_code.message(),
@@ -77,8 +86,10 @@ impl MessageHandler for RPCMessageHandler {
         let elapsed = start.elapsed().as_secs_f64();
         crate::infra::metrics::record_rpc(&rpc_request.route, elapsed);
 
-        info!("✅ RPC 调用完成: route={}, code={}, message={}", 
-              rpc_request.route, rpc_response.code, rpc_response.message);
+        info!(
+            "✅ RPC 调用完成: route={}, code={}, message={}",
+            rpc_request.route, rpc_response.code, rpc_response.message
+        );
 
         // 序列化响应
         let response_data = serde_json::to_vec(&rpc_response)?;

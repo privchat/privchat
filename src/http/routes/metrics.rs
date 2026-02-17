@@ -1,7 +1,7 @@
 //! GET /metrics - Prometheus 抓取端点
 
 use axum::{
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
 
@@ -11,15 +11,14 @@ pub async fn metrics_handler() -> Response {
     if let Some(body) = crate::infra::metrics::render_metrics() {
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
             body,
         )
             .into_response()
     } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "metrics not initialized",
-        )
-            .into_response()
+        (StatusCode::SERVICE_UNAVAILABLE, "metrics not initialized").into_response()
     }
 }

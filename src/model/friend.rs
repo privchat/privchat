@@ -15,7 +15,7 @@ pub enum FriendshipStatus {
     /// 已阻止
     Blocked = 2,
     /// 已拒绝（注意：数据库中没有此状态，业务层使用 Blocked 表示）
-    Rejected = 3,  // 业务层使用，数据库存储为 Blocked (2)
+    Rejected = 3, // 业务层使用，数据库存储为 Blocked (2)
 }
 
 impl FriendshipStatus {
@@ -24,7 +24,7 @@ impl FriendshipStatus {
         match value {
             0 => FriendshipStatus::Pending,
             1 => FriendshipStatus::Accepted,
-            2 => FriendshipStatus::Blocked,  // 数据库中使用 2 表示 Blocked
+            2 => FriendshipStatus::Blocked, // 数据库中使用 2 表示 Blocked
             _ => FriendshipStatus::Pending,
         }
     }
@@ -34,7 +34,7 @@ impl FriendshipStatus {
         match self {
             FriendshipStatus::Pending => 0,
             FriendshipStatus::Accepted => 1,
-            FriendshipStatus::Rejected => 2,  // 数据库中使用 Blocked 值
+            FriendshipStatus::Rejected => 2, // 数据库中使用 Blocked 值
             FriendshipStatus::Blocked => 2,
         }
     }
@@ -45,11 +45,11 @@ impl FriendshipStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Friendship {
     /// 关系ID（复合主键，由 user_id 和 friend_id 组成）
-    pub id: String,  // 业务层使用，数据库中是 (user_id, friend_id) 复合主键
+    pub id: String, // 业务层使用，数据库中是 (user_id, friend_id) 复合主键
     /// 用户ID（数据库字段）
-    pub user1_id: u64,  // 数据库中是 BIGINT
+    pub user1_id: u64, // 数据库中是 BIGINT
     /// 好友ID（数据库字段）
-    pub user2_id: u64,  // 数据库中是 BIGINT
+    pub user2_id: u64, // 数据库中是 BIGINT
     /// 关系状态
     pub status: FriendshipStatus,
     /// 来源类型（数据库字段，与添加好友规范一致）
@@ -67,7 +67,7 @@ impl Friendship {
     pub fn new(user1_id: u64, user2_id: u64) -> Self {
         let now = Utc::now();
         Self {
-            id: format!("{}:{}", user1_id, user2_id),  // 复合主键的字符串表示
+            id: format!("{}:{}", user1_id, user2_id), // 复合主键的字符串表示
             user1_id,
             user2_id,
             status: FriendshipStatus::Pending,
@@ -80,13 +80,13 @@ impl Friendship {
 
     /// 从数据库行创建（处理时间戳和类型转换）
     pub fn from_db_row(
-        user_id: i64,  // PostgreSQL BIGINT
-        friend_id: i64,  // PostgreSQL BIGINT
+        user_id: i64,   // PostgreSQL BIGINT
+        friend_id: i64, // PostgreSQL BIGINT
         status: i16,
         source: Option<String>,
         source_id: Option<String>,
-        created_at: i64,  // 毫秒时间戳
-        updated_at: i64,  // 毫秒时间戳
+        created_at: i64, // 毫秒时间戳
+        updated_at: i64, // 毫秒时间戳
     ) -> Self {
         Self {
             id: format!("{}:{}", user_id, friend_id),
@@ -95,10 +95,8 @@ impl Friendship {
             status: FriendshipStatus::from_i16(status),
             source,
             source_id,
-            created_at: DateTime::from_timestamp_millis(created_at)
-                .unwrap_or_else(|| Utc::now()),
-            updated_at: DateTime::from_timestamp_millis(updated_at)
-                .unwrap_or_else(|| Utc::now()),
+            created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
+            updated_at: DateTime::from_timestamp_millis(updated_at).unwrap_or_else(|| Utc::now()),
         }
     }
 
@@ -114,7 +112,7 @@ impl Friendship {
             self.updated_at.timestamp_millis(),
         )
     }
-    
+
     /// 更新状态
     pub fn update_status(&mut self, status: FriendshipStatus) {
         self.status = status;
@@ -148,7 +146,7 @@ impl FriendRequest {
     pub fn new(from_user_id: u64, to_user_id: u64, message: Option<String>) -> Self {
         let now = Utc::now();
         Self {
-            id: 0,  // 需要由数据库或调用方生成
+            id: 0, // 需要由数据库或调用方生成
             from_user_id,
             to_user_id,
             message,
@@ -158,17 +156,17 @@ impl FriendRequest {
             updated_at: now,
         }
     }
-    
+
     /// 创建带来源的好友请求
     pub fn new_with_source(
-        from_user_id: u64, 
-        to_user_id: u64, 
+        from_user_id: u64,
+        to_user_id: u64,
         message: Option<String>,
         source: Option<crate::model::privacy::FriendRequestSource>,
     ) -> Self {
         let now = Utc::now();
         Self {
-            id: 0,  // 需要由数据库或调用方生成
+            id: 0, // 需要由数据库或调用方生成
             from_user_id,
             to_user_id,
             message,
@@ -178,13 +176,13 @@ impl FriendRequest {
             updated_at: now,
         }
     }
-    
+
     /// 接受请求
     pub fn accept(&mut self) {
         self.status = FriendshipStatus::Accepted;
         self.updated_at = Utc::now();
     }
-    
+
     /// 拒绝请求
     pub fn reject(&mut self) {
         self.status = FriendshipStatus::Rejected;

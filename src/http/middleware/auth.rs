@@ -21,10 +21,9 @@ pub async fn auth_middleware(
     // 1. 从 Authorization header 提取 token
     // 2. 验证 token 有效性
     // 3. 提取 user_id 并添加到 request extensions
-    
+
     debug!("🔐 认证中间件（暂时跳过验证）");
-    
+
     // 暂时跳过认证，直接继续
     Ok(next.run(request).await)
 }
-

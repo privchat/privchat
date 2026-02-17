@@ -1,6 +1,6 @@
-use serde::{Serialize, Deserialize};
-use chrono::{DateTime, Utc};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// 消息优先级
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -141,11 +141,11 @@ impl OfflineMessage {
         if self.can_retry() {
             self.retry_count += 1;
             self.status = DeliveryStatus::Pending;
-            
+
             // 计算下次重试时间（指数退避）
             let delay_seconds = 2_u64.pow(self.retry_count as u32).min(300); // 最大5分钟
             self.next_retry_at = Some(Utc::now() + chrono::Duration::seconds(delay_seconds as i64));
-            
+
             true
         } else {
             self.status = DeliveryStatus::Failed;
@@ -190,7 +190,11 @@ impl OfflineMessage {
             + self.sender_id.len()
             + self.channel_id.len()
             + self.message_type.len()
-            + self.metadata.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+            + self
+                .metadata
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
             + 256 // 其他字段的估算大小
     }
 
@@ -256,9 +260,23 @@ mod tests {
 
     #[test]
     fn test_message_priority_ordering() {
-        let mut msg1 = OfflineMessage::new(1, "u1".to_string(), "u2".to_string(), "c1".to_string(), Bytes::from("1"), "text".to_string());
-        let mut msg2 = OfflineMessage::new(2, "u1".to_string(), "u2".to_string(), "c1".to_string(), Bytes::from("2"), "text".to_string());
-        
+        let mut msg1 = OfflineMessage::new(
+            1,
+            "u1".to_string(),
+            "u2".to_string(),
+            "c1".to_string(),
+            Bytes::from("1"),
+            "text".to_string(),
+        );
+        let mut msg2 = OfflineMessage::new(
+            2,
+            "u1".to_string(),
+            "u2".to_string(),
+            "c1".to_string(),
+            Bytes::from("2"),
+            "text".to_string(),
+        );
+
         msg1.priority = MessagePriority::Low;
         msg2.priority = MessagePriority::High;
 
@@ -267,13 +285,20 @@ mod tests {
 
     #[test]
     fn test_retry_logic() {
-        let mut message = OfflineMessage::new(1, "u1".to_string(), "u2".to_string(), "c1".to_string(), Bytes::from("test"), "text".to_string());
-        
+        let mut message = OfflineMessage::new(
+            1,
+            "u1".to_string(),
+            "u2".to_string(),
+            "c1".to_string(),
+            Bytes::from("test"),
+            "text".to_string(),
+        );
+
         assert!(message.can_retry());
         assert!(message.mark_failed_for_retry());
         assert_eq!(message.retry_count, 1);
         assert_eq!(message.status, DeliveryStatus::Pending);
-        
+
         // 重试到最大次数
         message.mark_failed_for_retry();
         message.mark_failed_for_retry();
@@ -283,10 +308,17 @@ mod tests {
 
     #[test]
     fn test_expiry() {
-        let mut message = OfflineMessage::new(1, "u1".to_string(), "u2".to_string(), "c1".to_string(), Bytes::from("test"), "text".to_string());
-        
+        let mut message = OfflineMessage::new(
+            1,
+            "u1".to_string(),
+            "u2".to_string(),
+            "c1".to_string(),
+            Bytes::from("test"),
+            "text".to_string(),
+        );
+
         // 设置1秒后过期
         message = message.with_expiry(chrono::Duration::seconds(-1));
         assert!(message.is_expired());
     }
-} 
+}

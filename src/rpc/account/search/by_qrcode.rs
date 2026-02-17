@@ -1,45 +1,66 @@
-use serde_json::{json, Value};
 use crate::rpc::error::{RpcError, RpcResult};
-use crate::rpc::{RpcServiceContext, helpers};
+use crate::rpc::{helpers, RpcServiceContext};
 use privchat_protocol::rpc::account::search::AccountSearchByQRCodeRequest;
+use serde_json::{json, Value};
 
 /// 处理 扫码查找用户 请求（精确搜索）
-/// 
+///
 /// 通过二维码精确查找用户，用于扫码添加好友等场景
 /// 返回 search_session_id，用于后续查看用户详情
-pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::RpcContext) -> RpcResult<Value> {
-    tracing::info!("🔧 处理扫码查找用户请求: {:?}", body);
-    
+pub async fn handle(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
+    tracing::debug!("🔧 处理扫码查找用户请求: {:?}", body);
+
     // ✨ 使用协议层类型自动反序列化
     let mut request: AccountSearchByQRCodeRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
-    
+
     // 从 ctx 填充 searcher_id
     request.searcher_id = crate::rpc::get_current_user_id(&ctx)?;
-    
+
     let searcher_id = request.searcher_id;
     let qrcode = &request.qr_key; // Protocol 中字段名是 qr_key
-    
+
     // 通过 qrcode 索引查找 user_id
     match services.cache_manager.find_user_by_qrcode(qrcode).await {
         Ok(Some(user_id)) => {
-            
             // 检查隐私设置：是否允许通过二维码搜索
-            let privacy = services.privacy_service.get_or_create_privacy_settings(user_id).await
-                .map_err(|e| RpcError::internal(format!("Failed to get privacy settings: {}", e)))?;
-            
+            let privacy = services
+                .privacy_service
+                .get_or_create_privacy_settings(user_id)
+                .await
+                .map_err(|e| {
+                    RpcError::internal(format!("Failed to get privacy settings: {}", e))
+                })?;
+
             if !privacy.allow_search_by_qrcode {
-                return Err(RpcError::forbidden("User does not allow being searched by qrcode".to_string()));
+                return Err(RpcError::forbidden(
+                    "User does not allow being searched by qrcode".to_string(),
+                ));
             }
-            
+
             // 创建搜索记录（用于后续查看详情）
-            let search_record = services.cache_manager.create_search_record(searcher_id, user_id).await
-                .map_err(|e| RpcError::internal(format!("Failed to create search record: {}", e)))?;
-            
+            let search_record = services
+                .cache_manager
+                .create_search_record(searcher_id, user_id)
+                .await
+                .map_err(|e| {
+                    RpcError::internal(format!("Failed to create search record: {}", e))
+                })?;
+
             // 通过 user_id 获取用户资料（从数据库读取）
-            match helpers::get_user_profile_with_fallback(user_id, &services.user_repository, &services.cache_manager).await {
+            match helpers::get_user_profile_with_fallback(
+                user_id,
+                &services.user_repository,
+                &services.cache_manager,
+            )
+            .await
+            {
                 Ok(Some(user_profile)) => {
-                    tracing::info!("✅ 扫码查找成功: qrcode={} -> user_id={}", qrcode, user_id);
+                    tracing::debug!("✅ 扫码查找成功: qrcode={} -> user_id={}", qrcode, user_id);
                     Ok(json!({
                         "user_id": user_profile.user_id,
                         "username": user_profile.username,
@@ -49,8 +70,15 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
                     }))
                 }
                 Ok(None) => {
-                    tracing::warn!("⚠️ qrcode 索引存在但用户资料不存在: qrcode={}, user_id={}", qrcode, user_id);
-                    Err(RpcError::not_found(format!("User profile not found for qrcode: {}", qrcode)))
+                    tracing::warn!(
+                        "⚠️ qrcode 索引存在但用户资料不存在: qrcode={}, user_id={}",
+                        qrcode,
+                        user_id
+                    );
+                    Err(RpcError::not_found(format!(
+                        "User profile not found for qrcode: {}",
+                        qrcode
+                    )))
                 }
                 Err(e) => {
                     tracing::error!("❌ 获取用户资料失败: {}", e);
@@ -59,8 +87,11 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
             }
         }
         Ok(None) => {
-            tracing::info!("❌ 未找到对应的用户: qrcode={}", qrcode);
-            Err(RpcError::not_found(format!("User not found for qrcode: {}", qrcode)))
+            tracing::debug!("❌ 未找到对应的用户: qrcode={}", qrcode);
+            Err(RpcError::not_found(format!(
+                "User not found for qrcode: {}",
+                qrcode
+            )))
         }
         Err(e) => {
             tracing::error!("❌ 查找 qrcode 失败: {}", e);
@@ -68,4 +99,3 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
         }
     }
 }
-

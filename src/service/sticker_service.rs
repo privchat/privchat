@@ -1,11 +1,11 @@
 //! 表情包服务
-//! 
+//!
 //! 提供表情包库管理功能，包括：
 //! - 内置表情包库
 //! - 表情包查询
 //! - 表情包包详情
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// 表情包
@@ -64,13 +64,13 @@ impl StickerService {
             packages: HashMap::new(),
             stickers: HashMap::new(),
         };
-        
+
         // 初始化内置表情包
         service.init_builtin_stickers();
-        
+
         service
     }
-    
+
     /// 初始化内置表情包库
     fn init_builtin_stickers(&mut self) {
         // 表情包库 1: 经典表情
@@ -176,7 +176,7 @@ impl StickerService {
                 mime_type: "image/png".to_string(),
             },
         ];
-        
+
         let classic_package = StickerPackage {
             package_id: "classic".to_string(),
             name: "经典表情".to_string(),
@@ -186,15 +186,15 @@ impl StickerService {
             sticker_count: classic_stickers.len(),
             stickers: Some(classic_stickers.clone()),
         };
-        
+
         // 存储表情包库
         self.packages.insert("classic".to_string(), classic_package);
-        
+
         // 存储所有表情包
         for sticker in classic_stickers {
             self.stickers.insert(sticker.sticker_id.clone(), sticker);
         }
-        
+
         // 表情包库 2: 动物表情
         let animal_stickers = vec![
             Sticker {
@@ -278,7 +278,7 @@ impl StickerService {
                 mime_type: "image/png".to_string(),
             },
         ];
-        
+
         let animal_package = StickerPackage {
             package_id: "animals".to_string(),
             name: "可爱动物".to_string(),
@@ -288,13 +288,13 @@ impl StickerService {
             sticker_count: animal_stickers.len(),
             stickers: Some(animal_stickers.clone()),
         };
-        
+
         self.packages.insert("animals".to_string(), animal_package);
-        
+
         for sticker in animal_stickers {
             self.stickers.insert(sticker.sticker_id.clone(), sticker);
         }
-        
+
         // 表情包库 3: 食物表情
         let food_stickers = vec![
             Sticker {
@@ -358,7 +358,7 @@ impl StickerService {
                 mime_type: "image/png".to_string(),
             },
         ];
-        
+
         let food_package = StickerPackage {
             package_id: "food".to_string(),
             name: "美食世界".to_string(),
@@ -368,17 +368,18 @@ impl StickerService {
             sticker_count: food_stickers.len(),
             stickers: Some(food_stickers.clone()),
         };
-        
+
         self.packages.insert("food".to_string(), food_package);
-        
+
         for sticker in food_stickers {
             self.stickers.insert(sticker.sticker_id.clone(), sticker);
         }
     }
-    
+
     /// 获取所有表情包库列表（不包含表情包详情）
     pub async fn list_packages(&self) -> Vec<StickerPackage> {
-        self.packages.values()
+        self.packages
+            .values()
             .map(|pkg| {
                 let mut pkg_copy = pkg.clone();
                 pkg_copy.stickers = None; // 列表中不返回具体表情包
@@ -386,20 +387,21 @@ impl StickerService {
             })
             .collect()
     }
-    
+
     /// 获取表情包库详情（包含所有表情包）
     pub async fn get_package_detail(&self, package_id: &str) -> Option<StickerPackage> {
         self.packages.get(package_id).cloned()
     }
-    
+
     /// 获取单个表情包详情
     pub async fn get_sticker(&self, sticker_id: &str) -> Option<Sticker> {
         self.stickers.get(sticker_id).cloned()
     }
-    
+
     /// 获取表情包库中的所有表情包
     pub async fn list_stickers_by_package(&self, package_id: &str) -> Vec<Sticker> {
-        self.stickers.values()
+        self.stickers
+            .values()
             .filter(|s| s.package_id == package_id)
             .cloned()
             .collect()
@@ -411,4 +413,3 @@ impl Default for StickerService {
         Self::new()
     }
 }
-

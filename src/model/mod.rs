@@ -22,31 +22,31 @@ pub mod pts;
 pub mod qrcode;
 
 // 数据库相关模型
-pub mod read_receipt;
-pub mod user_channel;
-pub mod group;
 pub mod blacklist;
 pub mod device_sync_state;
 pub mod file_upload;
+pub mod group;
+pub mod read_receipt;
+pub mod user_channel;
 
 // 重新导出常用类型
+pub use blacklist::*;
 pub use channel::*;
 pub use device::*;
+pub use file_upload::*;
 pub use friend::*;
+pub use group::*;
 pub use message::*;
 pub use notification::*;
-pub use user::*;
 pub use privacy::*;
 pub use pts::*;
 pub use qrcode::*;
 pub use read_receipt::*;
+pub use user::*;
 pub use user_channel::*;
-pub use group::*;
-pub use blacklist::*;
-pub use file_upload::*;
 
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// 领域事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +151,7 @@ impl DeviceType {
             DeviceType::Other(s) => s,
         }
     }
-    
+
     /// 从字符串创建
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
@@ -168,4 +168,4 @@ impl DeviceType {
     }
 }
 
-// 消息类型与 payload 结构体统一使用 protocol 层定义：privchat_protocol::ContentMessageType 与 content_message 模块 
+// 消息类型与 payload 结构体统一使用 protocol 层定义：privchat_protocol::ContentMessageType 与 content_message 模块

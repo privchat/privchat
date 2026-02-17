@@ -1,16 +1,16 @@
+use chrono::Utc;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
-use chrono::Utc;
-use std::collections::{HashMap, HashSet};
 
 // 简化版本的缓存结构定义（避免依赖问题）
 mod cache_test {
     use super::*;
-    use moka::future::Cache;
-    use serde::{Deserialize, Serialize, de::DeserializeOwned};
-    use std::hash::Hash;
     use async_trait::async_trait;
+    use moka::future::Cache;
+    use serde::{de::DeserializeOwned, Deserialize, Serialize};
+    use std::hash::Hash;
 
     /// 两层缓存接口 (L1 + L2)
     #[async_trait]
@@ -152,25 +152,26 @@ use cache_test::*;
 #[tokio::test]
 async fn test_basic_cache_operations() {
     let cache_manager = Arc::new(CacheManager::new());
-    
+
     // 测试用户状态缓存
     let user_id = Uuid::new_v4();
     let user_status = UserStatus {
         user_id,
         status: "online".to_string(),
-        devices: vec![
-            DeviceInfo {
-                device_id: "device-001".to_string(),
-                platform: "iOS".to_string(),
-                session_id: "session-001".to_string(),
-                last_active: Utc::now(),
-            },
-        ],
+        devices: vec![DeviceInfo {
+            device_id: "device-001".to_string(),
+            platform: "iOS".to_string(),
+            session_id: "session-001".to_string(),
+            last_active: Utc::now(),
+        }],
         last_active: Utc::now(),
     };
 
     // 测试设置
-    cache_manager.user_status.put(user_id, user_status.clone(), 3600).await;
+    cache_manager
+        .user_status
+        .put(user_id, user_status.clone(), 3600)
+        .await;
 
     // 测试获取
     let cached_status = cache_manager.user_status.get(&user_id).await;
@@ -186,7 +187,7 @@ async fn test_basic_cache_operations() {
 #[tokio::test]
 async fn test_channel_list_cache() {
     let cache_manager = Arc::new(CacheManager::new());
-    
+
     let user_id = Uuid::new_v4();
     let channel_list = ChannelList {
         user_id,
@@ -210,7 +211,10 @@ async fn test_channel_list_cache() {
     };
 
     // 测试会话列表缓存
-    cache_manager.channel_list.put(user_id, channel_list.clone(), 1800).await;
+    cache_manager
+        .channel_list
+        .put(user_id, channel_list.clone(), 1800)
+        .await;
 
     let cached_list = cache_manager.channel_list.get(&user_id).await;
     assert!(cached_list.is_some());
@@ -226,18 +230,24 @@ async fn test_channel_list_cache() {
 #[tokio::test]
 async fn test_group_members_cache() {
     let cache_manager = Arc::new(CacheManager::new());
-    
+
     let group_id = Uuid::new_v4();
     let members = GroupMembers {
         group_id,
-        member_ids: [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()].iter().cloned().collect(),
+        member_ids: [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()]
+            .iter()
+            .cloned()
+            .collect(),
         admin_ids: [Uuid::new_v4()].iter().cloned().collect(),
         owner_id: Some(Uuid::new_v4()),
         updated_at: Utc::now(),
     };
 
     // 测试群成员缓存
-    cache_manager.group_members.put(group_id, members.clone(), 3600).await;
+    cache_manager
+        .group_members
+        .put(group_id, members.clone(), 3600)
+        .await;
 
     let cached_members = cache_manager.group_members.get(&group_id).await;
     assert!(cached_members.is_some());
@@ -252,31 +262,43 @@ async fn test_group_members_cache() {
 #[tokio::test]
 async fn test_batch_operations() {
     let cache_manager = Arc::new(CacheManager::new());
-    
+
     // 创建多个用户状态
     let user_statuses = vec![
-        (Uuid::new_v4(), UserStatus {
-            user_id: Uuid::new_v4(),
-            status: "online".to_string(),
-            devices: vec![],
-            last_active: Utc::now(),
-        }),
-        (Uuid::new_v4(), UserStatus {
-            user_id: Uuid::new_v4(),
-            status: "away".to_string(),
-            devices: vec![],
-            last_active: Utc::now(),
-        }),
-        (Uuid::new_v4(), UserStatus {
-            user_id: Uuid::new_v4(),
-            status: "offline".to_string(),
-            devices: vec![],
-            last_active: Utc::now(),
-        }),
+        (
+            Uuid::new_v4(),
+            UserStatus {
+                user_id: Uuid::new_v4(),
+                status: "online".to_string(),
+                devices: vec![],
+                last_active: Utc::now(),
+            },
+        ),
+        (
+            Uuid::new_v4(),
+            UserStatus {
+                user_id: Uuid::new_v4(),
+                status: "away".to_string(),
+                devices: vec![],
+                last_active: Utc::now(),
+            },
+        ),
+        (
+            Uuid::new_v4(),
+            UserStatus {
+                user_id: Uuid::new_v4(),
+                status: "offline".to_string(),
+                devices: vec![],
+                last_active: Utc::now(),
+            },
+        ),
     ];
 
     // 批量设置
-    cache_manager.user_status.mput(user_statuses.clone(), 3600).await;
+    cache_manager
+        .user_status
+        .mput(user_statuses.clone(), 3600)
+        .await;
 
     // 批量获取
     let user_ids: Vec<Uuid> = user_statuses.iter().map(|(id, _)| *id).collect();
@@ -296,7 +318,7 @@ async fn test_batch_operations() {
 #[tokio::test]
 async fn test_cache_invalidation() {
     let cache_manager = Arc::new(CacheManager::new());
-    
+
     let user_id = Uuid::new_v4();
     let user_status = UserStatus {
         user_id,
@@ -306,7 +328,10 @@ async fn test_cache_invalidation() {
     };
 
     // 设置缓存
-    cache_manager.user_status.put(user_id, user_status.clone(), 3600).await;
+    cache_manager
+        .user_status
+        .put(user_id, user_status.clone(), 3600)
+        .await;
 
     // 验证缓存存在
     let cached_status = cache_manager.user_status.get(&user_id).await;
@@ -325,7 +350,7 @@ async fn test_cache_invalidation() {
 #[tokio::test]
 async fn test_cache_clear() {
     let cache_manager = Arc::new(CacheManager::new());
-    
+
     // 设置多个用户状态
     for i in 0..5 {
         let user_id = Uuid::new_v4();
@@ -335,7 +360,10 @@ async fn test_cache_clear() {
             devices: vec![],
             last_active: Utc::now(),
         };
-        cache_manager.user_status.put(user_id, user_status, 3600).await;
+        cache_manager
+            .user_status
+            .put(user_id, user_status, 3600)
+            .await;
     }
 
     // 清空缓存
@@ -351,7 +379,7 @@ async fn test_cache_clear() {
 #[tokio::test]
 async fn test_cache_performance() {
     let cache_manager = Arc::new(CacheManager::new());
-    
+
     let user_id = Uuid::new_v4();
     let user_status = UserStatus {
         user_id,
@@ -361,20 +389,23 @@ async fn test_cache_performance() {
     };
 
     // 设置缓存
-    cache_manager.user_status.put(user_id, user_status, 3600).await;
+    cache_manager
+        .user_status
+        .put(user_id, user_status, 3600)
+        .await;
 
     // 性能测试
     let start = std::time::Instant::now();
-    
+
     for _ in 0..1000 {
         let _ = cache_manager.user_status.get(&user_id).await;
     }
-    
+
     let duration = start.elapsed();
-    
+
     println!("✅ 1000 次缓存读取耗时: {:?}", duration);
     println!("✅ 平均每次读取: {:?}", duration / 1000);
-    
+
     // 验证性能合理（每次读取应该在微秒级别）
     assert!(duration.as_millis() < 100, "缓存性能测试失败：耗时过长");
 }
@@ -405,6 +436,6 @@ async fn test_cache_architecture() {
     println!("• 支持缓存穿透、失效、延迟双删等机制");
     println!("• 完全由你控制生命周期和容错策略");
     println!();
-    
+
     assert!(true); // 架构说明测试通过
-} 
+}

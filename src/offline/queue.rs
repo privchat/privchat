@@ -1,14 +1,14 @@
+use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, info, error};
-use serde::{Serialize, Deserialize};
-use rustc_hash::FxHashMap;
+use tracing::{debug, error, info};
 
+use super::message::{DeliveryStatus, MessagePriority, OfflineMessage};
+use super::storage::{MemoryStorage, StorageBackend};
 use crate::error::ServerError;
-use super::message::{OfflineMessage, MessagePriority, DeliveryStatus};
-use super::storage::{StorageBackend, MemoryStorage};
 
 /// 队列配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,27 +93,31 @@ impl UserQueue {
     /// 添加消息到队列
     fn push(&mut self, message: OfflineMessage) -> Result<Option<OfflineMessage>, ServerError> {
         let message_size = message.size_bytes() as u64;
-        
+
         // 检查是否超过大小限制
         if self.messages.len() >= self.max_size {
             // 移除最旧的低优先级消息
             if let Some(removed) = self.remove_oldest_low_priority() {
                 self.total_bytes -= removed.size_bytes() as u64;
             } else {
-                return Err(ServerError::Internal("Queue is full and cannot remove old messages".to_string()));
+                return Err(ServerError::Internal(
+                    "Queue is full and cannot remove old messages".to_string(),
+                ));
             }
         }
 
-        self.message_map.insert(message.message_id, self.messages.len());
+        self.message_map
+            .insert(message.message_id, self.messages.len());
         self.total_bytes += message_size;
         self.messages.push(message.clone());
-        
+
         Ok(Some(message))
     }
 
     /// 获取所有准备投递的消息
     fn get_ready_messages(&self) -> Vec<OfflineMessage> {
-        self.messages.iter()
+        self.messages
+            .iter()
             .filter(|msg| msg.is_ready_for_delivery())
             .cloned()
             .collect()
@@ -122,7 +126,7 @@ impl UserQueue {
     /// 获取指定数量的消息
     fn pop_messages(&mut self, limit: usize) -> Vec<OfflineMessage> {
         let mut messages = Vec::new();
-        
+
         while messages.len() < limit && !self.messages.is_empty() {
             if let Some(message) = self.messages.pop() {
                 if message.is_ready_for_delivery() {
@@ -136,7 +140,7 @@ impl UserQueue {
                 }
             }
         }
-        
+
         messages
     }
 
@@ -145,7 +149,7 @@ impl UserQueue {
         // 由于 BinaryHeap 不支持直接修改，我们需要重建堆
         let mut messages: Vec<_> = self.messages.drain().collect();
         let mut found = false;
-        
+
         for message in &mut messages {
             if message.message_id == message_id {
                 message.status = status.clone();
@@ -153,12 +157,12 @@ impl UserQueue {
                 break;
             }
         }
-        
+
         if found {
             self.messages = messages.into_iter().collect();
             self.rebuild_message_map();
         }
-        
+
         found
     }
 
@@ -166,7 +170,7 @@ impl UserQueue {
     fn remove_message(&mut self, message_id: u64) -> Option<OfflineMessage> {
         let mut messages: Vec<_> = self.messages.drain().collect();
         let mut removed_message = None;
-        
+
         messages.retain(|msg| {
             if msg.message_id == message_id {
                 removed_message = Some(msg.clone());
@@ -176,12 +180,12 @@ impl UserQueue {
                 true
             }
         });
-        
+
         if removed_message.is_some() {
             self.messages = messages.into_iter().collect();
             self.rebuild_message_map();
         }
-        
+
         removed_message
     }
 
@@ -190,7 +194,7 @@ impl UserQueue {
         let original_len = self.messages.len();
         let mut messages: Vec<_> = self.messages.drain().collect();
         let mut removed_bytes = 0u64;
-        
+
         messages.retain(|msg| {
             if msg.is_expired() {
                 removed_bytes += msg.size_bytes() as u64;
@@ -199,26 +203,24 @@ impl UserQueue {
                 true
             }
         });
-        
+
         self.total_bytes -= removed_bytes;
         self.messages = messages.into_iter().collect();
         self.rebuild_message_map();
-        
+
         original_len - self.messages.len()
     }
 
     /// 移除最旧的低优先级消息
     fn remove_oldest_low_priority(&mut self) -> Option<OfflineMessage> {
         let mut messages: Vec<_> = self.messages.drain().collect();
-        
+
         // 按优先级和时间排序，找到最旧的低优先级消息
-        messages.sort_by(|a, b| {
-            match a.priority.cmp(&b.priority) {
-                std::cmp::Ordering::Equal => b.created_at.cmp(&a.created_at),
-                other => other,
-            }
+        messages.sort_by(|a, b| match a.priority.cmp(&b.priority) {
+            std::cmp::Ordering::Equal => b.created_at.cmp(&a.created_at),
+            other => other,
         });
-        
+
         // 移除最旧的低优先级消息
         if let Some(removed) = messages.pop() {
             self.messages = messages.into_iter().collect();
@@ -244,7 +246,7 @@ impl UserQueue {
         let mut delivered = 0;
         let mut failed = 0;
         let mut expired = 0;
-        
+
         for message in &self.messages {
             match message.status {
                 DeliveryStatus::Pending => pending += 1,
@@ -254,8 +256,16 @@ impl UserQueue {
                 DeliveryStatus::Expired => expired += 1,
             }
         }
-        
-        (self.messages.len(), self.total_bytes, pending, delivering, delivered, failed, expired)
+
+        (
+            self.messages.len(),
+            self.total_bytes,
+            pending,
+            delivering,
+            delivered,
+            failed,
+            expired,
+        )
     }
 }
 
@@ -283,12 +293,12 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
             message_id_counter: Arc::new(tokio::sync::Mutex::new(1)),
             running: Arc::new(tokio::sync::Mutex::new(false)),
         };
-        
+
         // 从存储中恢复消息
         if manager.config.enable_persistence {
             manager.restore_from_storage().await?;
         }
-        
+
         Ok(manager)
     }
 
@@ -301,20 +311,22 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
     pub async fn start(&self) -> Result<(), ServerError> {
         let mut running = self.running.lock().await;
         if *running {
-            return Err(ServerError::Internal("Queue manager is already running".to_string()));
+            return Err(ServerError::Internal(
+                "Queue manager is already running".to_string(),
+            ));
         }
         *running = true;
-        
+
         info!("Starting offline queue manager");
-        
+
         // 启动后台任务
         if self.config.enable_persistence {
             self.start_persistence_task().await;
         }
-        
+
         self.start_cleanup_task().await;
         self.start_delivery_retry_task().await;
-        
+
         Ok(())
     }
 
@@ -325,14 +337,14 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
             return Ok(());
         }
         *running = false;
-        
+
         info!("Stopping offline queue manager");
-        
+
         // 最后一次持久化
         if self.config.enable_persistence {
             self.persist_to_storage().await?;
         }
-        
+
         Ok(())
     }
 
@@ -347,7 +359,7 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
         priority: Option<MessagePriority>,
     ) -> Result<u64, ServerError> {
         let message_id = self.generate_message_id().await;
-        
+
         let mut message = OfflineMessage::new(
             message_id,
             user_id.to_string(),
@@ -356,37 +368,46 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
             payload,
             message_type,
         );
-        
+
         if let Some(priority) = priority {
             message.priority = priority;
         }
-        
+
         // 添加到内存队列
         {
             let mut queues = self.user_queues.write().await;
-            let queue = queues.entry(user_id)
+            let queue = queues
+                .entry(user_id)
                 .or_insert_with(|| UserQueue::new(self.config.max_messages_per_user));
-            
+
             queue.push(message.clone())?;
         }
-        
+
         // 持久化到存储
         if self.config.enable_persistence {
             self.storage.store_message(&message).await?;
         }
-        
+
         debug!("Added offline message {} for user {}", message_id, user_id);
         Ok(message_id)
     }
 
     /// 获取用户的离线消息（用于投递）
-    pub async fn get_messages_for_delivery(&self, user_id: u64, limit: Option<usize>) -> Result<Vec<OfflineMessage>, ServerError> {
+    pub async fn get_messages_for_delivery(
+        &self,
+        user_id: u64,
+        limit: Option<usize>,
+    ) -> Result<Vec<OfflineMessage>, ServerError> {
         let limit = limit.unwrap_or(self.config.batch_size);
-        
+
         let mut queues = self.user_queues.write().await;
         if let Some(queue) = queues.get_mut(&user_id) {
             let messages = queue.pop_messages(limit);
-            debug!("Retrieved {} messages for delivery to user {}", messages.len(), user_id);
+            debug!(
+                "Retrieved {} messages for delivery to user {}",
+                messages.len(),
+                user_id
+            );
             Ok(messages)
         } else {
             Ok(Vec::new())
@@ -394,9 +415,13 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
     }
 
     /// 标记消息投递成功
-    pub async fn mark_delivered(&self, user_id: u64, message_ids: &[u64]) -> Result<usize, ServerError> {
+    pub async fn mark_delivered(
+        &self,
+        user_id: u64,
+        message_ids: &[u64],
+    ) -> Result<usize, ServerError> {
         let mut marked_count = 0;
-        
+
         {
             let mut queues = self.user_queues.write().await;
             if let Some(queue) = queues.get_mut(&user_id) {
@@ -407,13 +432,16 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
                 }
             }
         }
-        
+
         // 从持久化存储中删除
         if self.config.enable_persistence && marked_count > 0 {
             self.storage.delete_messages(user_id, message_ids).await?;
         }
-        
-        debug!("Marked {} messages as delivered for user {}", marked_count, user_id);
+
+        debug!(
+            "Marked {} messages as delivered for user {}",
+            marked_count, user_id
+        );
         Ok(marked_count)
     }
 
@@ -423,7 +451,10 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
         if let Some(queue) = queues.get_mut(&user_id) {
             // 这里需要更复杂的逻辑来处理重试
             let updated = queue.update_message_status(message_id, DeliveryStatus::Failed);
-            debug!("Marked message {} as failed for user {}", message_id, user_id);
+            debug!(
+                "Marked message {} as failed for user {}",
+                message_id, user_id
+            );
             Ok(updated)
         } else {
             Ok(false)
@@ -440,12 +471,12 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
                 0
             }
         };
-        
+
         // 从持久化存储中删除
         if self.config.enable_persistence && removed_count > 0 {
             self.storage.delete_all_messages(user_id).await?;
         }
-        
+
         debug!("Cleared {} messages for user {}", removed_count, user_id);
         Ok(removed_count)
     }
@@ -466,12 +497,12 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
             max_queue_length: 0,
             avg_queue_length: 0.0,
         };
-        
+
         let mut total_queue_length = 0;
-        
+
         for queue in queues.values() {
             let (len, bytes, pending, delivering, delivered, failed, expired) = queue.get_stats();
-            
+
             stats.total_messages += len as u64;
             stats.pending_messages += pending as u64;
             stats.delivering_messages += delivering as u64;
@@ -479,22 +510,22 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
             stats.failed_messages += failed as u64;
             stats.expired_messages += expired as u64;
             stats.memory_usage_bytes += bytes;
-            
+
             if len > stats.max_queue_length {
                 stats.max_queue_length = len;
             }
-            
+
             total_queue_length += len;
         }
-        
+
         if stats.user_count > 0 {
             stats.avg_queue_length = total_queue_length as f64 / stats.user_count as f64;
         }
-        
+
         if stats.total_messages > 0 {
             stats.avg_message_size_bytes = stats.memory_usage_bytes / stats.total_messages;
         }
-        
+
         Ok(stats)
     }
 
@@ -508,25 +539,25 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
     /// 从存储中恢复消息
     async fn restore_from_storage(&self) -> Result<(), ServerError> {
         info!("Restoring messages from storage");
-        
+
         // 这里需要实现从存储中恢复所有用户的消息
         // 由于存储后端的限制，我们可能需要维护一个用户列表
         // 暂时跳过这个实现，在实际使用中可以通过其他方式获取用户列表
-        
+
         Ok(())
     }
 
     /// 持久化到存储
     async fn persist_to_storage(&self) -> Result<(), ServerError> {
         debug!("Persisting messages to storage");
-        
+
         let queues = self.user_queues.read().await;
         for (_user_id, queue) in queues.iter() {
             for message in &queue.messages {
                 self.storage.store_message(message).await?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -536,27 +567,29 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
         let queues = self.user_queues.clone();
         let running = self.running.clone();
         let interval = self.config.persistence_interval_secs;
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 {
                     let running = running.lock().await;
                     if !*running {
                         break;
                     }
                 }
-                
+
                 // 持久化消息
                 let queues = queues.read().await;
                 for (user_id, queue) in queues.iter() {
                     for message in &queue.messages {
                         if let Err(e) = storage.store_message(message).await {
-                            error!("Failed to persist message {} for user {}: {}", 
-                                   message.message_id, user_id, e);
+                            error!(
+                                "Failed to persist message {} for user {}: {}",
+                                message.message_id, user_id, e
+                            );
                         }
                     }
                 }
@@ -570,20 +603,20 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
         let storage = self.storage.clone();
         let running = self.running.clone();
         let enable_persistence = self.config.enable_persistence;
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5分钟清理一次
-            
+
             loop {
                 interval.tick().await;
-                
+
                 {
                     let running = running.lock().await;
                     if !*running {
                         break;
                     }
                 }
-                
+
                 // 清理过期消息
                 let mut total_cleaned = 0;
                 {
@@ -595,18 +628,18 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
                             debug!("Cleaned {} expired messages for user {}", cleaned, user_id);
                         }
                     }
-                    
+
                     // 移除空队列
                     queues.retain(|_, queue| !queue.messages.is_empty());
                 }
-                
+
                 // 清理存储中的过期消息
                 if enable_persistence && total_cleaned > 0 {
                     if let Err(e) = storage.cleanup_expired_messages().await {
                         error!("Failed to cleanup expired messages from storage: {}", e);
                     }
                 }
-                
+
                 if total_cleaned > 0 {
                     info!("Cleaned up {} expired messages", total_cleaned);
                 }
@@ -619,20 +652,20 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
         let queues = self.user_queues.clone();
         let running = self.running.clone();
         let interval = self.config.delivery_retry_interval_secs;
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 {
                     let running = running.lock().await;
                     if !*running {
                         break;
                     }
                 }
-                
+
                 // 重试失败的消息
                 let mut queues = queues.write().await;
                 for (user_id, queue) in queues.iter_mut() {
@@ -640,9 +673,15 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
                     let mut messages: Vec<_> = queue.messages.drain().collect();
                     for message in &mut messages {
                         if message.status == DeliveryStatus::Failed && message.can_retry() {
-                            if message.next_retry_at.map_or(true, |retry_at| chrono::Utc::now() >= retry_at) {
+                            if message
+                                .next_retry_at
+                                .map_or(true, |retry_at| chrono::Utc::now() >= retry_at)
+                            {
                                 message.status = DeliveryStatus::Pending;
-                                debug!("Retrying message {} for user {}", message.message_id, user_id);
+                                debug!(
+                                    "Retrying message {} for user {}",
+                                    message.message_id, user_id
+                                );
                             }
                         }
                     }
@@ -655,7 +694,9 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
 }
 
 /// 创建默认的内存队列管理器
-pub async fn create_memory_queue_manager(config: Option<QueueConfig>) -> Result<OfflineQueueManager<MemoryStorage>, ServerError> {
+pub async fn create_memory_queue_manager(
+    config: Option<QueueConfig>,
+) -> Result<OfflineQueueManager<MemoryStorage>, ServerError> {
     let storage = MemoryStorage::new();
     let config = config.unwrap_or_default();
     OfflineQueueManager::new(storage, config).await
@@ -672,22 +713,31 @@ mod tests {
         manager.start().await.unwrap();
 
         // 添加消息
-        let message_id = manager.add_message(
-            "user1".to_string(),
-            "sender1".to_string(),
-            "conv1".to_string(),
-            Bytes::from("Hello"),
-            "text".to_string(),
-            Some(MessagePriority::Normal),
-        ).await.unwrap();
+        let message_id = manager
+            .add_message(
+                "user1".to_string(),
+                "sender1".to_string(),
+                "conv1".to_string(),
+                Bytes::from("Hello"),
+                "text".to_string(),
+                Some(MessagePriority::Normal),
+            )
+            .await
+            .unwrap();
 
         // 获取消息
-        let messages = manager.get_messages_for_delivery("user1", Some(10)).await.unwrap();
+        let messages = manager
+            .get_messages_for_delivery("user1", Some(10))
+            .await
+            .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, message_id);
 
         // 标记投递成功
-        let marked = manager.mark_delivered("user1", &[message_id]).await.unwrap();
+        let marked = manager
+            .mark_delivered("user1", &[message_id])
+            .await
+            .unwrap();
         assert_eq!(marked, 1);
 
         // 获取统计信息
@@ -703,26 +753,35 @@ mod tests {
         manager.start().await.unwrap();
 
         // 添加不同优先级的消息
-        let low_id = manager.add_message(
-            "user1".to_string(),
-            "sender1".to_string(),
-            "conv1".to_string(),
-            Bytes::from("Low priority"),
-            "text".to_string(),
-            Some(MessagePriority::Low),
-        ).await.unwrap();
+        let low_id = manager
+            .add_message(
+                "user1".to_string(),
+                "sender1".to_string(),
+                "conv1".to_string(),
+                Bytes::from("Low priority"),
+                "text".to_string(),
+                Some(MessagePriority::Low),
+            )
+            .await
+            .unwrap();
 
-        let high_id = manager.add_message(
-            "user1".to_string(),
-            "sender1".to_string(),
-            "conv1".to_string(),
-            Bytes::from("High priority"),
-            "text".to_string(),
-            Some(MessagePriority::High),
-        ).await.unwrap();
+        let high_id = manager
+            .add_message(
+                "user1".to_string(),
+                "sender1".to_string(),
+                "conv1".to_string(),
+                Bytes::from("High priority"),
+                "text".to_string(),
+                Some(MessagePriority::High),
+            )
+            .await
+            .unwrap();
 
         // 获取消息，应该按优先级排序
-        let messages = manager.get_messages_for_delivery("user1", Some(10)).await.unwrap();
+        let messages = manager
+            .get_messages_for_delivery("user1", Some(10))
+            .await
+            .unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].message_id, high_id); // 高优先级应该在前面
         assert_eq!(messages[1].message_id, low_id);
@@ -734,25 +793,31 @@ mod tests {
     async fn test_queue_size_limit() {
         let mut config = QueueConfig::default();
         config.max_messages_per_user = 2; // 限制每个用户最多2条消息
-        
+
         let manager = create_memory_queue_manager(Some(config)).await.unwrap();
         manager.start().await.unwrap();
 
         // 添加3条消息，应该只保留2条
         for i in 1..=3 {
-            manager.add_message(
-                "user1".to_string(),
-                "sender1".to_string(),
-                "conv1".to_string(),
-                Bytes::from(format!("Message {}", i)),
-                "text".to_string(),
-                Some(MessagePriority::Normal),
-            ).await.unwrap();
+            manager
+                .add_message(
+                    "user1".to_string(),
+                    "sender1".to_string(),
+                    "conv1".to_string(),
+                    Bytes::from(format!("Message {}", i)),
+                    "text".to_string(),
+                    Some(MessagePriority::Normal),
+                )
+                .await
+                .unwrap();
         }
 
-        let messages = manager.get_messages_for_delivery("user1", Some(10)).await.unwrap();
+        let messages = manager
+            .get_messages_for_delivery("user1", Some(10))
+            .await
+            .unwrap();
         assert_eq!(messages.len(), 2); // 应该只有2条消息
 
         manager.stop().await.unwrap();
     }
-} 
+}

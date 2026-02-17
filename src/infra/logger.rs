@@ -6,4 +6,4 @@ impl Logger {
     pub fn new() -> Self {
         Self
     }
-} 
+}

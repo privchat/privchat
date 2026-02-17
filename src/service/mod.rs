@@ -1,6 +1,6 @@
 // 业务服务层模块
 pub mod auth_service;
-pub mod channel_service;  // ChannelService 在这里
+pub mod channel_service; // ChannelService 在这里
 pub mod friend_service;
 pub mod group_service;
 pub mod message_service;
@@ -42,26 +42,32 @@ pub mod reaction_service;
 // 新增 @提及服务
 pub mod mention_service;
 
+pub use approval_service::{ApprovalService, JoinMethod, JoinRequest, JoinRequestStatus};
 pub use auth_service::AuthService;
-pub use channel_service::{ChannelService, ChannelServiceConfig, ChannelServiceStats, EnhancedChannelItem, EnhancedChannelListResponse, LastMessagePreview};
+pub use blacklist_service::{BlacklistEntry, BlacklistService};
+pub use channel_service::{
+    ChannelService, ChannelServiceConfig, ChannelServiceStats, EnhancedChannelItem,
+    EnhancedChannelListResponse, LastMessagePreview,
+};
+pub use file_service::{FileMetadata, FileService, FileType, FileUrlResponse};
 pub use friend_service::FriendService;
 pub use group_service::GroupService;
+pub use mention_service::MentionService;
+pub use message_dedup_service::MessageDedupService;
+pub use message_history_service::{
+    ChannelMessageStats, MessageHistoryRecord, MessageHistoryService, MessageQueryParams,
+    ReplyMessagePreview,
+};
 pub use message_service::MessageService;
 pub use notification_service::NotificationService;
-pub use presence_service::PresenceService;
-pub use push_service::PushService;
-pub use user_service::UserService;
-pub use message_history_service::{MessageHistoryService, MessageHistoryRecord, MessageQueryParams, ChannelMessageStats, ReplyMessagePreview};
-pub use privacy_service::{PrivacyService, PrivacySettingsUpdate};
-pub use read_receipt_service::{ReadReceiptService, ReadReceipt, GroupReadStats};
-pub use file_service::{FileService, FileMetadata, FileType, FileUrlResponse};
-pub use upload_token_service::{UploadTokenService, UploadToken};
-pub use sticker_service::{StickerService, Sticker, StickerPackage};
-pub use blacklist_service::{BlacklistService, BlacklistEntry};
-pub use qrcode_service::QRCodeService;
-pub use approval_service::{ApprovalService, JoinRequest, JoinRequestStatus, JoinMethod};
 pub use offline_queue_service::OfflineQueueService;
+pub use presence_service::PresenceService;
+pub use privacy_service::{PrivacyService, PrivacySettingsUpdate};
+pub use push_service::PushService;
+pub use qrcode_service::QRCodeService;
+pub use reaction_service::{Reaction, ReactionService, ReactionStats};
+pub use read_receipt_service::{GroupReadStats, ReadReceipt, ReadReceiptService};
+pub use sticker_service::{Sticker, StickerPackage, StickerService};
 pub use unread_count_service::UnreadCountService;
-pub use message_dedup_service::MessageDedupService;
-pub use reaction_service::{ReactionService, Reaction, ReactionStats};
-pub use mention_service::MentionService;
+pub use upload_token_service::{UploadToken, UploadTokenService};
+pub use user_service::UserService;

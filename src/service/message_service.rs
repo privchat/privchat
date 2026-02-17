@@ -6,4 +6,4 @@ impl MessageService {
     pub fn new() -> Self {
         Self
     }
-} 
+}

@@ -6,9 +6,8 @@
 //! - 文件 URL 获取接口
 //! - 文件删除接口
 
-pub mod routes;
 pub mod middleware;
+pub mod routes;
 pub mod server;
 
 pub use server::{FileHttpServer, HttpServerState};
-

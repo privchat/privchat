@@ -1,12 +1,12 @@
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::warn;
 
-use crate::rpc::{RpcContext, RpcServiceContext, RpcResult, RpcError, get_current_user_id};
+use crate::rpc::{get_current_user_id, RpcContext, RpcError, RpcResult, RpcServiceContext};
 use privchat_protocol::presence::*;
 use privchat_protocol::PushMessageRequest;
 
 /// RPC Handler: presence/typing
-/// 
+///
 /// 发送输入状态通知
 pub async fn handle(
     params: Value,
@@ -15,16 +15,19 @@ pub async fn handle(
 ) -> RpcResult<Value> {
     // 1. 获取当前用户ID
     let user_id = get_current_user_id(&ctx)?;
-    
+
     // 2. 解析请求参数
     let req: TypingIndicatorRequest = serde_json::from_value(params)
         .map_err(|e| RpcError::validation(format!("Invalid params: {}", e)))?;
-    
-    debug!(
+
+    tracing::debug!(
         "📥 presence/typing: user {} in channel {} is_typing={} action={:?}",
-        user_id, req.channel_id, req.is_typing, req.action_type
+        user_id,
+        req.channel_id,
+        req.is_typing,
+        req.action_type
     );
-    
+
     // 3. 构造通知消息
     let notification = TypingStatusNotification {
         user_id,
@@ -35,18 +38,18 @@ pub async fn handle(
         action_type: req.action_type.clone(),
         timestamp: chrono::Utc::now().timestamp(),
     };
-    
+
     // 4. 广播给会话中的其他成员
     let notification_payload = serde_json::to_vec(&notification)
         .map_err(|e| RpcError::internal(format!("Serialize notification failed: {}", e)))?;
-    
+
     // 根据会话类型决定广播方式
     match req.channel_type {
         1 => {
             // 私聊：channel_id 就是对方的 user_id
             // 推送给对方（如果对方在线）
             let target_user_id = req.channel_id;
-            
+
             // 构造 PushMessageRequest
             let push_msg = PushMessageRequest {
                 setting: Default::default(),
@@ -66,15 +69,19 @@ pub async fn handle(
                 from_uid: user_id,
                 payload: notification_payload,
             };
-            
+
             // 使用 MessageRouter 推送
-            if let Err(e) = services.message_router
+            if let Err(e) = services
+                .message_router
                 .route_message_to_user(&target_user_id, push_msg)
                 .await
             {
-                warn!("Failed to broadcast typing to user {}: {}", target_user_id, e);
+                warn!(
+                    "Failed to broadcast typing to user {}: {}",
+                    target_user_id, e
+                );
             } else {
-                debug!("✅ Broadcasted typing status to user {}", target_user_id);
+                tracing::debug!("✅ Broadcasted typing status to user {}", target_user_id);
             }
         }
         2 => {
@@ -83,26 +90,26 @@ pub async fn handle(
             // 1. 查询群成员列表
             // 2. 过滤掉当前用户
             // 3. 推送给所有在线成员
-            
-            debug!("TODO: Broadcast typing status to group {}", req.channel_id);
+
+            tracing::debug!("TODO: Broadcast typing status to group {}", req.channel_id);
         }
         _ => {
             warn!("Unknown channel_type: {}", req.channel_type);
         }
     }
-    
-    debug!(
+
+    tracing::debug!(
         "📢 Broadcasting typing status to channel {} (type={})",
-        req.channel_id, req.channel_type
+        req.channel_id,
+        req.channel_type
     );
-    
+
     // 5. 返回响应
     let response = TypingIndicatorResponse {
         code: 0,
         message: "OK".to_string(),
     };
-    
+
     serde_json::to_value(response)
         .map_err(|e| RpcError::internal(format!("Serialize response failed: {}", e)))
 }
-

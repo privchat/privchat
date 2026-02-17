@@ -10,12 +10,15 @@ pub struct SyncService {
 impl SyncService {
     /// 创建新的同步服务
     pub fn new() -> Self {
-        Self {
-        }
+        Self {}
     }
-    
+
     /// 同步消息
-    pub async fn sync_messages(&self, _user_id: u64, _last_sync_time: Option<u64>) -> Result<SyncData> {
+    pub async fn sync_messages(
+        &self,
+        _user_id: u64,
+        _last_sync_time: Option<u64>,
+    ) -> Result<SyncData> {
         // 这里应该实现实际的同步逻辑
         // 暂时返回空结果
         Ok(SyncData {
@@ -24,9 +27,13 @@ impl SyncService {
             last_sync_time: Utc::now().timestamp_millis() as u64,
         })
     }
-    
+
     /// 同步离线消息
-    pub async fn sync_offline_messages(&self, _user_id: u64, _device_id: &str) -> Result<Vec<OfflineMessage>> {
+    pub async fn sync_offline_messages(
+        &self,
+        _user_id: u64,
+        _device_id: &str,
+    ) -> Result<Vec<OfflineMessage>> {
         // 这里应该实现实际的离线消息同步逻辑
         // 暂时返回空结果
         Ok(Vec::new())
@@ -107,4 +114,4 @@ pub enum MessageDeliveryStrategy {
 }
 
 /// 同步结果别名
-pub type SyncServiceResult<T> = Result<T>; 
+pub type SyncServiceResult<T> = Result<T>;

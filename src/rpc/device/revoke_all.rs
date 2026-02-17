@@ -20,7 +20,7 @@ use tracing::{debug, info};
 /// }
 /// ```
 pub async fn handle(ctx: &RpcServiceContext, params: Value) -> RpcResult<Value> {
-    debug!("RPC device/revoke_all 请求: {:?}", params);
+    tracing::debug!("RPC device/revoke_all 请求: {:?}", params);
     
     // 1. 提取用户ID
     let user_id = params
@@ -36,7 +36,7 @@ pub async fn handle(ctx: &RpcServiceContext, params: Value) -> RpcResult<Value> 
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
     
-    info!(
+    tracing::debug!(
         "✅ device/revoke_all 成功: user_id={}, revoked_count={}",
         user_id, revoked_count
     );

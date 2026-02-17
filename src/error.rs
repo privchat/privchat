@@ -1,10 +1,10 @@
-use std::fmt;
-use std::error::Error as StdError;
-use serde::{Serialize, Deserialize};
 use axum::{
     http::StatusCode,
-    response::{IntoResponse, Response, Json},
+    response::{IntoResponse, Json, Response},
 };
+use serde::{Deserialize, Serialize};
+use std::error::Error as StdError;
+use std::fmt;
 
 /// 服务器错误类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,16 +119,25 @@ impl StdError for ServerError {}
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let status_code = match &self {
-            ServerError::Authentication(_) | ServerError::InvalidToken | ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-            ServerError::Authorization(_) | ServerError::PermissionDenied(_) | ServerError::Forbidden(_) => StatusCode::FORBIDDEN,
-            ServerError::Validation(_) | ServerError::InvalidRequest(_) | ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ServerError::UserNotFound(_) | ServerError::ChannelNotFound(_) | ServerError::MessageNotFound(_) | ServerError::NotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::Authentication(_)
+            | ServerError::InvalidToken
+            | ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ServerError::Authorization(_)
+            | ServerError::PermissionDenied(_)
+            | ServerError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ServerError::Validation(_)
+            | ServerError::InvalidRequest(_)
+            | ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ServerError::UserNotFound(_)
+            | ServerError::ChannelNotFound(_)
+            | ServerError::MessageNotFound(_)
+            | ServerError::NotFound(_) => StatusCode::NOT_FOUND,
             ServerError::Duplicate(_) | ServerError::DuplicateEntry(_) => StatusCode::CONFLICT,
             ServerError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ServerError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        
+
         let error_response = ErrorResponse::new(&self);
         (status_code, Json(error_response)).into_response()
     }
@@ -292,7 +301,7 @@ impl ErrorResponse {
             timestamp: chrono::Utc::now().timestamp() as u64,
         }
     }
-    
+
     /// 创建带详细信息的错误响应
     pub fn with_details(error: &ServerError, details: String) -> Self {
         Self {
@@ -302,4 +311,4 @@ impl ErrorResponse {
             timestamp: chrono::Utc::now().timestamp() as u64,
         }
     }
-} 
+}

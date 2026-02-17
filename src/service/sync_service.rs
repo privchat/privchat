@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::model::pts::{PtsGenerator, ChannelKey};
+use crate::model::pts::PtsGenerator;
 use crate::infra::database::Database;
 use crate::infra::redis::RedisClient;
 
@@ -76,7 +76,7 @@ impl SyncService {
         // self.validate_permission(req.channel_id, sender_id).await?;
         
         // 3. 获取服务器当前 pts
-        let server_pts = self.pts_generator.current_pts(req.channel_id, req.channel_type).await;
+        let server_pts = self.pts_generator.current_pts(req.channel_id).await;
         
         // 4. 检测间隙
         let has_gap = req.last_pts < server_pts.saturating_sub(1);
@@ -89,7 +89,7 @@ impl SyncService {
         }
         
         // 5. 分配新的 pts
-        let new_pts = self.pts_generator.next_pts(req.channel_id, req.channel_type).await;
+        let new_pts = self.pts_generator.next_pts(req.channel_id).await;
         
         // 6. 生成 server_msg_id（TODO: 使用 snowflake）
         let server_msg_id = self.generate_msg_id().await;
@@ -162,7 +162,7 @@ impl SyncService {
         ).await?;
         
         // 2. 获取当前 pts
-        let current_pts = self.pts_generator.current_pts(req.channel_id, req.channel_type).await;
+        let current_pts = self.pts_generator.current_pts(req.channel_id).await;
         
         // 3. 检查是否还有更多
         let has_more = if let Some(last_commit) = commits.last() {
@@ -190,7 +190,7 @@ impl SyncService {
         &self,
         req: GetChannelPtsRequest,
     ) -> Result<GetChannelPtsResponse> {
-        let current_pts = self.pts_generator.current_pts(req.channel_id, req.channel_type).await;
+        let current_pts = self.pts_generator.current_pts(req.channel_id).await;
         
         debug!(
             "获取频道 pts: channel_id={}, channel_type={}, pts={}",
@@ -213,7 +213,7 @@ impl SyncService {
         
         for channel in &req.channels {
             let current_pts = self.pts_generator
-                .current_pts(channel.channel_id, channel.channel_type)
+                .current_pts(channel.channel_id)
                 .await;
             
             channel_pts_list.push(ChannelPtsInfo {
@@ -314,28 +314,28 @@ mod tests {
         let generator = PtsGenerator::new();
         
         // 频道 1 的 pts
-        let pts1_ch1 = generator.next_pts(1001, 1).await;
+        let pts1_ch1 = generator.next_pts(1001).await;
         assert_eq!(pts1_ch1, 1);
         
-        let pts2_ch1 = generator.next_pts(1001, 1).await;
+        let pts2_ch1 = generator.next_pts(1001).await;
         assert_eq!(pts2_ch1, 2);
         
         // 频道 2 的 pts（独立递增）
-        let pts1_ch2 = generator.next_pts(1002, 1).await;
+        let pts1_ch2 = generator.next_pts(1002).await;
         assert_eq!(pts1_ch2, 1); // 从 1 开始，不是 3
         
         // 群聊频道的 pts（独立递增）
-        let pts1_group = generator.next_pts(2001, 2).await;
+        let pts1_group = generator.next_pts(2001).await;
         assert_eq!(pts1_group, 1);
         
         // 验证独立性
-        let current_ch1 = generator.current_pts(1001, 1).await;
+        let current_ch1 = generator.current_pts(1001).await;
         assert_eq!(current_ch1, 2);
         
-        let current_ch2 = generator.current_pts(1002, 1).await;
+        let current_ch2 = generator.current_pts(1002).await;
         assert_eq!(current_ch2, 1);
         
-        let current_group = generator.current_pts(2001, 2).await;
+        let current_group = generator.current_pts(2001).await;
         assert_eq!(current_group, 1);
         
         println!("✅ per-channel pts 测试通过");

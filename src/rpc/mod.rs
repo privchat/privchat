@@ -1,34 +1,38 @@
-pub mod types;
 pub mod error;
-pub mod router;
 pub mod helpers;
+pub mod router;
+pub mod types;
 
 // 系统模块
 pub mod account;
+pub mod channel;
+pub mod channel_broadcast;
 pub mod contact;
 pub mod device;
-pub mod group;
-pub mod channel_broadcast;
-pub mod message;
-pub mod file;
-pub mod sticker;
-pub mod channel;
-pub mod qrcode;
-pub mod user;
-pub mod presence;
-pub mod sync;
 pub mod entity;
+pub mod file;
+pub mod group;
+pub mod message;
+pub mod presence;
+pub mod qrcode;
+pub mod sticker;
+pub mod sync;
+pub mod user;
 
-use std::sync::Arc;
-use router::GLOBAL_RPC_ROUTER;
-use types::{RPCMessageRequest, RPCMessageResponse};
-use crate::service::{ChannelService, MessageHistoryService, FriendService, PrivacyService, ReadReceiptService, UploadTokenService, FileService, StickerService, BlacklistService, QRCodeService, ApprovalService, ReactionService, OfflineQueueService};
-use crate::service::sync::SyncService;
 use crate::auth::{DeviceManager, DeviceManagerDb, TokenRevocationService};
-use crate::infra::{CacheManager, MessageRouter, PresenceManager, ConnectionManager};  // ✨ 新增 ConnectionManager
 use crate::config::ServerConfig;
+use crate::infra::{CacheManager, ConnectionManager, MessageRouter, PresenceManager}; // ✨ 新增 ConnectionManager
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::UserRepository;
+use crate::service::sync::SyncService;
+use crate::service::{
+    ApprovalService, BlacklistService, ChannelService, FileService, FriendService,
+    MessageHistoryService, OfflineQueueService, PrivacyService, QRCodeService, ReactionService,
+    ReadReceiptService, StickerService, UploadTokenService,
+};
+use router::GLOBAL_RPC_ROUTER;
+use std::sync::Arc;
+use types::{RPCMessageRequest, RPCMessageResponse};
 
 /// RPC 请求上下文 - 包含请求相关的上下文信息
 #[derive(Debug, Clone)]
@@ -53,13 +57,13 @@ impl RpcContext {
             timestamp: chrono::Utc::now(),
         }
     }
-    
+
     /// 设置用户ID
     pub fn with_user_id(mut self, user_id: String) -> Self {
         self.user_id = Some(user_id);
         self
     }
-    
+
     /// 设置设备ID
     pub fn with_device_id(mut self, device_id: String) -> Self {
         self.device_id = Some(device_id);
@@ -71,7 +75,7 @@ impl RpcContext {
         self.session_id = Some(session_id);
         self
     }
-    
+
     /// 是否已认证
     pub fn is_authenticated(&self) -> bool {
         self.user_id.is_some()
@@ -93,7 +97,7 @@ pub struct RpcServiceContext {
     pub sticker_service: Arc<StickerService>,
     pub channel_service: Arc<ChannelService>,
     pub device_manager: Arc<DeviceManager>,
-    pub device_manager_db: Arc<DeviceManagerDb>,  // ✨ 新增：数据库版设备管理器
+    pub device_manager_db: Arc<DeviceManagerDb>, // ✨ 新增：数据库版设备管理器
     pub token_revocation_service: Arc<TokenRevocationService>,
     pub config: Arc<ServerConfig>,
     pub message_router: Arc<MessageRouter>,
@@ -111,15 +115,15 @@ pub struct RpcServiceContext {
     /// 消息仓库 - 用于从数据库读取消息数据
     pub message_repository: Arc<crate::repository::PgMessageRepository>,
     /// 连接管理器 - 用于管理活跃连接和设备断连
-    pub connection_manager: Arc<ConnectionManager>,  // ✨ 新增
+    pub connection_manager: Arc<ConnectionManager>, // ✨ 新增
     /// 同步服务 - 用于 pts 同步机制
-    pub sync_service: Arc<SyncService>,  // ✨ 新增
+    pub sync_service: Arc<SyncService>, // ✨ 新增
     /// 认证会话管理器 - 用于 READY 闸门
     pub auth_session_manager: Arc<crate::infra::SessionManager>,
     /// 离线消息 worker - READY 后触发补差推送
     pub offline_worker: Arc<crate::infra::OfflineMessageWorker>,
     /// 用户设备仓库 - 用于推送设备管理
-    pub user_device_repo: Arc<crate::repository::UserDeviceRepository>,  // ✨ Phase 3.5
+    pub user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
     /// 用户设置仓库 - ENTITY_SYNC_V1 user_settings，表为主
     pub user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
 }
@@ -138,7 +142,7 @@ impl RpcServiceContext {
         sticker_service: Arc<StickerService>,
         channel_service: Arc<ChannelService>,
         device_manager: Arc<DeviceManager>,
-        device_manager_db: Arc<DeviceManagerDb>,  // ✨ 新增参数
+        device_manager_db: Arc<DeviceManagerDb>, // ✨ 新增参数
         token_revocation_service: Arc<TokenRevocationService>,
         config: Arc<ServerConfig>,
         message_router: Arc<MessageRouter>,
@@ -152,11 +156,11 @@ impl RpcServiceContext {
         jwt_service: Arc<crate::auth::JwtService>,
         user_repository: Arc<UserRepository>,
         message_repository: Arc<crate::repository::PgMessageRepository>,
-        connection_manager: Arc<ConnectionManager>,  // ✨ 新增参数
-        sync_service: Arc<SyncService>,  // ✨ 新增参数
+        connection_manager: Arc<ConnectionManager>, // ✨ 新增参数
+        sync_service: Arc<SyncService>,             // ✨ 新增参数
         auth_session_manager: Arc<crate::infra::SessionManager>,
         offline_worker: Arc<crate::infra::OfflineMessageWorker>,
-        user_device_repo: Arc<crate::repository::UserDeviceRepository>,  // ✨ Phase 3.5
+        user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
         user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
     ) -> Self {
         Self {
@@ -172,7 +176,7 @@ impl RpcServiceContext {
             sticker_service,
             channel_service,
             device_manager,
-            device_manager_db,  // ✨ 新增
+            device_manager_db, // ✨ 新增
             token_revocation_service,
             config,
             message_router,
@@ -186,11 +190,11 @@ impl RpcServiceContext {
             jwt_service,
             user_repository,
             message_repository,
-            connection_manager,  // ✨ 新增
-            sync_service,  // ✨ 新增
+            connection_manager, // ✨ 新增
+            sync_service,       // ✨ 新增
             auth_session_manager,
             offline_worker,
-            user_device_repo,  // ✨ Phase 3.5
+            user_device_repo, // ✨ Phase 3.5
             user_settings_repo,
         }
     }
@@ -212,8 +216,8 @@ pub async fn init_rpc_system(services: RpcServiceContext) {
     qrcode::register_routes(services.clone()).await;
     user::register_routes(services.clone()).await;
     presence::register_routes(services.clone()).await;
-    
-    tracing::info!("🔧 RPC 系统初始化完成 (所有模块已启用: account, contact, device, group, channel, entity, message, file, sticker, qrcode, user, presence)");
+
+    tracing::debug!("🔧 RPC 系统初始化完成 (所有模块已启用: account, contact, device, group, channel, entity, message, file, sticker, qrcode, user, presence)");
 }
 
 /// 处理 RPC 请求的入口函数
@@ -231,22 +235,25 @@ pub use error::{RpcError, RpcResult};
 pub use router::RpcRouter;
 
 /// 从 RpcContext 中获取已认证的 user_id (u64)
-/// 
+///
 /// # 错误
 /// - 如果用户未认证，返回 Unauthorized 错误
 /// - 如果 user_id 格式无效，返回 ValidationError 错误
 pub fn get_current_user_id(ctx: &RpcContext) -> RpcResult<u64> {
-    let user_id_str = ctx.user_id
+    let user_id_str = ctx
+        .user_id
         .as_ref()
         .ok_or_else(|| RpcError::unauthorized("User not authenticated".to_string()))?;
-    
-    user_id_str.parse::<u64>()
+
+    user_id_str
+        .parse::<u64>()
         .map_err(|_| RpcError::validation("Invalid user_id format".to_string()))
 }
 
 /// 从 JSON Value 中解析 u64 ID（仅支持数字格式）
 pub fn parse_u64_param(value: &serde_json::Value, field_name: &str) -> RpcResult<u64> {
-    value.get(field_name)
+    value
+        .get(field_name)
         .and_then(|v| v.as_u64())
         .ok_or_else(|| RpcError::validation(format!("{} is required (must be u64)", field_name)))
-} 
+}

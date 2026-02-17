@@ -1,11 +1,11 @@
-use serde_json::{json, Value};
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use serde_json::{json, Value};
 
 /// 处理 获取群设置 请求
-/// 
+///
 /// RPC: group/settings/get
-/// 
+///
 /// 请求参数：
 /// ```json
 /// {
@@ -13,7 +13,7 @@ use crate::rpc::RpcServiceContext;
 ///   "user_id": "alice"  // 请求者ID（需验证是否为群成员）
 /// }
 /// ```
-/// 
+///
 /// 响应：
 /// ```json
 /// {
@@ -30,27 +30,37 @@ use crate::rpc::RpcServiceContext;
 ///   }
 /// }
 /// ```
-pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::RpcContext) -> RpcResult<Value> {
-    tracing::info!("🔧 处理 获取群设置 请求: {:?}", body);
-    
+pub async fn handle(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
+    tracing::debug!("🔧 处理 获取群设置 请求: {:?}", body);
+
     // 解析参数
-    let group_id_str = body.get("group_id").and_then(|v| v.as_str())
+    let group_id_str = body
+        .get("group_id")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("group_id is required".to_string()))?;
-    let group_id = group_id_str.parse::<u64>()
+    let group_id = group_id_str
+        .parse::<u64>()
         .map_err(|_| RpcError::validation(format!("Invalid group_id: {}", group_id_str)))?;
-    
+
     // 从 ctx 获取当前用户 ID
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
-    
+
     // 1. 获取群组信息
-    let channel = services.channel_service.get_channel(&group_id).await
+    let channel = services
+        .channel_service
+        .get_channel(&group_id)
+        .await
         .map_err(|e| RpcError::not_found(format!("群组不存在: {}", e)))?;
-    
+
     // 2. 验证用户是否为群成员
     if !channel.members.contains_key(&user_id) {
         return Err(RpcError::forbidden("您不是群组成员".to_string()));
     }
-    
+
     // 3. 返回群设置（从 channel.settings 转换）
     // 注意：当前 Channel.settings 是 ChannelSettings，我们需要映射到 GroupSettings
     let settings = json!({
@@ -72,12 +82,11 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
         "created_at": channel.created_at.to_rfc3339(),
         "updated_at": channel.updated_at.to_rfc3339()
     });
-    
-    tracing::info!("✅ 获取群设置成功: group_id={}", group_id);
-    
+
+    tracing::debug!("✅ 获取群设置成功: group_id={}", group_id);
+
     Ok(json!({
         "group_id": group_id,
         "settings": settings
     }))
 }
-

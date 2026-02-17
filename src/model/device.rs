@@ -68,9 +68,9 @@ impl DeviceType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Device {
     /// 设备ID
-    pub id: String,  // 数据库中是 Uuid，查询时转换为 String
+    pub id: String, // 数据库中是 Uuid，查询时转换为 String
     /// 用户ID
-    pub user_id: u64,  // 数据库中是 BIGINT
+    pub user_id: u64, // 数据库中是 BIGINT
     /// 设备类型
     pub device_type: DeviceType,
     /// 设备名称
@@ -112,14 +112,14 @@ impl Device {
     /// 从数据库行创建（处理时间戳和类型转换）
     pub fn from_db_row(
         device_id: Uuid,
-        user_id: i64,  // PostgreSQL BIGINT
+        user_id: i64, // PostgreSQL BIGINT
         device_type: String,
         device_name: Option<String>,
         device_model: Option<String>,
         os_version: Option<String>,
         app_version: Option<String>,
-        last_active_at: Option<i64>,  // 毫秒时间戳
-        created_at: i64,  // 毫秒时间戳
+        last_active_at: Option<i64>, // 毫秒时间戳
+        created_at: i64,             // 毫秒时间戳
     ) -> Self {
         Self {
             id: device_id.to_string(),
@@ -130,13 +130,24 @@ impl Device {
             os_version,
             app_version,
             last_active_at: last_active_at.and_then(|ts| DateTime::from_timestamp_millis(ts)),
-            created_at: DateTime::from_timestamp_millis(created_at)
-                .unwrap_or_else(|| Utc::now()),
+            created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
         }
     }
 
     /// 转换为数据库插入值
-    pub fn to_db_values(&self) -> (Uuid, i64, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, i64) {
+    pub fn to_db_values(
+        &self,
+    ) -> (
+        Uuid,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        i64,
+    ) {
         (
             Uuid::parse_str(&self.id).unwrap_or_else(|_| Uuid::new_v4()),
             self.user_id as i64,
@@ -183,7 +194,7 @@ impl DeviceInfo {
             last_activity: now,
         }
     }
-    
+
     /// 更新活动时间
     pub fn update_activity(&mut self) {
         self.last_activity = Utc::now();

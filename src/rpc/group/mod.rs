@@ -1,9 +1,9 @@
+pub mod approval;
 pub mod group;
 pub mod member;
 pub mod qrcode;
-pub mod settings;
 pub mod role;
-pub mod approval;
+pub mod settings;
 
 use super::RpcServiceContext;
 
@@ -15,6 +15,6 @@ pub async fn register_routes(services: RpcServiceContext) {
     settings::register_routes(services.clone()).await;
     role::register_routes(services.clone()).await;
     approval::register_routes(services.clone()).await;
-    
-    tracing::info!("📋 Group 系统路由注册完成 (group, member, qrcode, settings, role, approval)");
-} 
+
+    tracing::debug!("📋 Group 系统路由注册完成 (group, member, qrcode, settings, role, approval)");
+}

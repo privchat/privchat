@@ -1,8 +1,8 @@
 //! 数据库连接管理
 
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
-use tracing::{info, error};
+use tracing::{error, info};
 
 /// 数据库连接池管理器
 #[derive(Clone)]
@@ -12,11 +12,14 @@ pub struct Database {
 
 impl Database {
     /// 创建新的数据库连接池
-    /// 
+    ///
     /// 如果连接失败，会返回错误，调用方应该直接退出程序
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
-        info!("🔌 正在连接 PostgreSQL 数据库: {}", mask_database_url(database_url));
-        
+        info!(
+            "🔌 正在连接 PostgreSQL 数据库: {}",
+            mask_database_url(database_url)
+        );
+
         let pool = PgPoolOptions::new()
             .max_connections(20)
             .min_connections(5)
@@ -29,18 +32,15 @@ impl Database {
                 error!("错误详情: {}", e);
                 e
             })?;
-        
+
         // 测试连接
-        sqlx::query("SELECT 1")
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("错误详情: {}", e);
-                e
-            })?;
-        
+        sqlx::query("SELECT 1").execute(&pool).await.map_err(|e| {
+            error!("错误详情: {}", e);
+            e
+        })?;
+
         info!("✅ PostgreSQL 数据库连接成功");
-        
+
         Ok(Self { pool })
     }
 
@@ -51,9 +51,7 @@ impl Database {
 
     /// 检查数据库连接
     pub async fn check_connection(&self) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT 1")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
 }

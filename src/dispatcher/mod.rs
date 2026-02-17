@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use crate::handler::MessageHandler;
 use crate::context::RequestContext;
+use crate::handler::MessageHandler;
 use crate::Result;
-use tracing::warn;
 use privchat_protocol::protocol::MessageType;
+use std::collections::HashMap;
+use tracing::warn;
 
 pub mod middleware;
 pub use middleware::*;
@@ -20,11 +20,19 @@ impl MessageDispatcher {
         }
     }
 
-    pub fn register_handler(&mut self, message_type: MessageType, handler: Box<dyn MessageHandler>) {
+    pub fn register_handler(
+        &mut self,
+        message_type: MessageType,
+        handler: Box<dyn MessageHandler>,
+    ) {
         self.handlers.insert(message_type, handler);
     }
 
-    pub async fn dispatch(&self, message_type: MessageType, context: RequestContext) -> Result<Option<Vec<u8>>> {
+    pub async fn dispatch(
+        &self,
+        message_type: MessageType,
+        context: RequestContext,
+    ) -> Result<Option<Vec<u8>>> {
         // 查找处理器
         if let Some(handler) = self.handlers.get(&message_type) {
             handler.handle(context).await
@@ -47,7 +55,11 @@ impl MessageDispatcherBuilder {
         }
     }
 
-    pub fn with_handler(mut self, message_type: MessageType, handler: Box<dyn MessageHandler>) -> Self {
+    pub fn with_handler(
+        mut self,
+        message_type: MessageType,
+        handler: Box<dyn MessageHandler>,
+    ) -> Self {
         self.handlers.insert(message_type, handler);
         self
     }
@@ -57,4 +69,4 @@ impl MessageDispatcherBuilder {
             handlers: self.handlers,
         }
     }
-} 
+}

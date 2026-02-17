@@ -2,7 +2,7 @@ use crate::error::ServerError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
@@ -94,7 +94,9 @@ where
 
     pub async fn mget_bytes(&self, keys: &[String]) -> Vec<Option<Vec<u8>>> {
         if let Ok(mut conn) = self.get_connection().await {
-            conn.mget(keys).await.unwrap_or_else(|_| vec![None; keys.len()])
+            conn.mget(keys)
+                .await
+                .unwrap_or_else(|_| vec![None; keys.len()])
         } else {
             vec![None; keys.len()]
         }
@@ -114,7 +116,7 @@ where
 }
 
 /// L1 + L2 缓存实现 (Moka + Redis)
-/// 
+///
 /// 架构图：
 /// ┌────────────┐
 /// │  Moka (L1) │ ←─ 本地高速缓存，低延迟，短TTL
@@ -215,7 +217,8 @@ where
         #[cfg(feature = "redis")]
         if let Some(l2) = &self.l2 {
             if let Ok(value_bytes) = serde_json::to_vec(&value) {
-                l2.set_bytes(key.to_string(), value_bytes, _ttl_secs as usize).await;
+                l2.set_bytes(key.to_string(), value_bytes, _ttl_secs as usize)
+                    .await;
             }
         }
     }
@@ -388,7 +391,7 @@ pub struct FriendRelations {
 pub struct CacheManager {
     // 用户在线状态缓存
     pub user_status: Arc<L1L2Cache<u64, UserStatus>>,
-    // 用户设备会话缓存  
+    // 用户设备会话缓存
     pub user_sessions: Arc<L1L2Cache<u64, UserSessions>>,
     // 会话列表缓存
     pub channel_list: Arc<L1L2Cache<u64, ChannelList>>,
@@ -422,7 +425,7 @@ impl CacheManager {
     /// 创建带 Redis 的混合缓存管理器
     #[cfg(feature = "redis")]
     pub fn with_redis(redis_url: &str) -> Result<Self, ServerError> {
-        let l1_ttl = Duration::from_secs(300);  // L1: 5分钟
+        let l1_ttl = Duration::from_secs(300); // L1: 5分钟
         let l2_ttl = Duration::from_secs(3600); // L2: 1小时
         let capacity = 10000;
 
@@ -436,24 +439,63 @@ impl CacheManager {
         let friend_relations_redis = Arc::new(SerializedRedisCache::new(redis_url)?);
 
         Ok(Self {
-            user_status: Arc::new(L1L2Cache::new(capacity, l1_ttl, l2_ttl, Some(user_status_redis))),
-            user_sessions: Arc::new(L1L2Cache::new(capacity, l1_ttl, l2_ttl, Some(user_sessions_redis))),
-            channel_list: Arc::new(L1L2Cache::new(capacity, l1_ttl, l2_ttl, Some(channel_list_redis))),
-            unread_counts: Arc::new(L1L2Cache::new(capacity, l1_ttl, l2_ttl, Some(unread_counts_redis))),
-            group_members: Arc::new(L1L2Cache::new(capacity, l1_ttl, l2_ttl, Some(group_members_redis))),
-            channel_subscribers: Arc::new(L1L2Cache::new(capacity, l1_ttl, l2_ttl, Some(channel_subscribers_redis))),
-            friend_relations: Arc::new(L1L2Cache::new(capacity, l1_ttl, l2_ttl, Some(friend_relations_redis))),
+            user_status: Arc::new(L1L2Cache::new(
+                capacity,
+                l1_ttl,
+                l2_ttl,
+                Some(user_status_redis),
+            )),
+            user_sessions: Arc::new(L1L2Cache::new(
+                capacity,
+                l1_ttl,
+                l2_ttl,
+                Some(user_sessions_redis),
+            )),
+            channel_list: Arc::new(L1L2Cache::new(
+                capacity,
+                l1_ttl,
+                l2_ttl,
+                Some(channel_list_redis),
+            )),
+            unread_counts: Arc::new(L1L2Cache::new(
+                capacity,
+                l1_ttl,
+                l2_ttl,
+                Some(unread_counts_redis),
+            )),
+            group_members: Arc::new(L1L2Cache::new(
+                capacity,
+                l1_ttl,
+                l2_ttl,
+                Some(group_members_redis),
+            )),
+            channel_subscribers: Arc::new(L1L2Cache::new(
+                capacity,
+                l1_ttl,
+                l2_ttl,
+                Some(channel_subscribers_redis),
+            )),
+            friend_relations: Arc::new(L1L2Cache::new(
+                capacity,
+                l1_ttl,
+                l2_ttl,
+                Some(friend_relations_redis),
+            )),
         })
     }
 
     /// 获取用户在线状态缓存（用于消息路由器）
-    pub fn get_user_status_cache(&self) -> Arc<dyn TwoLevelCache<u64, crate::infra::UserOnlineStatus>> {
+    pub fn get_user_status_cache(
+        &self,
+    ) -> Arc<dyn TwoLevelCache<u64, crate::infra::UserOnlineStatus>> {
         // 创建一个适配器来转换类型
         Arc::new(UserStatusCacheAdapter::new(self.user_status.clone()))
     }
 
     /// 获取离线消息缓存（用于消息路由器）
-    pub fn get_offline_message_cache(&self) -> Arc<dyn TwoLevelCache<u64, Vec<crate::infra::OfflineMessage>>> {
+    pub fn get_offline_message_cache(
+        &self,
+    ) -> Arc<dyn TwoLevelCache<u64, Vec<crate::infra::OfflineMessage>>> {
         let l1_ttl = Duration::from_secs(3600); // 1小时
         let capacity = 10000;
         Arc::new(L1L2Cache::local_only(capacity, l1_ttl))
@@ -465,31 +507,36 @@ impl CacheManager {
 pub trait BusinessCacheService: Send + Sync {
     /// 获取用户在线状态
     async fn get_user_status(&self, user_id: &u64) -> Result<Option<UserStatus>, ServerError>;
-    
+
     /// 设置用户在线状态
     async fn set_user_status(&self, status: UserStatus) -> Result<(), ServerError>;
-    
+
     /// 获取用户会话列表
     async fn get_channel_list(&self, user_id: &u64) -> Result<Option<ChannelList>, ServerError>;
-    
+
     /// 更新用户会话列表
     async fn update_channel_list(&self, list: ChannelList) -> Result<(), ServerError>;
-    
+
     /// 获取群成员列表
     async fn get_group_members(&self, group_id: &u64) -> Result<Option<GroupMembers>, ServerError>;
-    
+
     /// 更新群成员列表
     async fn update_group_members(&self, members: GroupMembers) -> Result<(), ServerError>;
-    
+
     /// 检查是否为好友
     async fn is_friend(&self, user_id: &u64, friend_id: &u64) -> Result<bool, ServerError>;
-    
+
     /// 获取未读消息数
     async fn get_unread_count(&self, user_id: &u64, channel_id: &u64) -> Result<i32, ServerError>;
-    
+
     /// 更新未读消息数
-    async fn update_unread_count(&self, user_id: &u64, channel_id: &u64, count: i32) -> Result<(), ServerError>;
-    
+    async fn update_unread_count(
+        &self,
+        user_id: &u64,
+        channel_id: &u64,
+        count: i32,
+    ) -> Result<(), ServerError>;
+
     /// 清理用户所有缓存
     async fn clear_user_cache(&self, user_id: &u64) -> Result<(), ServerError>;
 }
@@ -512,7 +559,10 @@ impl BusinessCacheService for ChatCacheService {
     }
 
     async fn set_user_status(&self, status: UserStatus) -> Result<(), ServerError> {
-        self.cache_manager.user_status.put(status.user_id, status, 3600).await;
+        self.cache_manager
+            .user_status
+            .put(status.user_id, status, 3600)
+            .await;
         Ok(())
     }
 
@@ -521,7 +571,10 @@ impl BusinessCacheService for ChatCacheService {
     }
 
     async fn update_channel_list(&self, list: ChannelList) -> Result<(), ServerError> {
-        self.cache_manager.channel_list.put(list.user_id, list, 1800).await;
+        self.cache_manager
+            .channel_list
+            .put(list.user_id, list, 1800)
+            .await;
         Ok(())
     }
 
@@ -530,7 +583,10 @@ impl BusinessCacheService for ChatCacheService {
     }
 
     async fn update_group_members(&self, members: GroupMembers) -> Result<(), ServerError> {
-        self.cache_manager.group_members.put(members.group_id, members, 3600).await;
+        self.cache_manager
+            .group_members
+            .put(members.group_id, members, 3600)
+            .await;
         Ok(())
     }
 
@@ -550,8 +606,17 @@ impl BusinessCacheService for ChatCacheService {
         }
     }
 
-    async fn update_unread_count(&self, user_id: &u64, channel_id: &u64, count: i32) -> Result<(), ServerError> {
-        let mut counts = self.cache_manager.unread_counts.get(user_id).await
+    async fn update_unread_count(
+        &self,
+        user_id: &u64,
+        channel_id: &u64,
+        count: i32,
+    ) -> Result<(), ServerError> {
+        let mut counts = self
+            .cache_manager
+            .unread_counts
+            .get(user_id)
+            .await
             .unwrap_or_else(|| UnreadCounts {
                 user_id: *user_id,
                 counts: HashMap::new(),
@@ -561,7 +626,10 @@ impl BusinessCacheService for ChatCacheService {
         counts.counts.insert(*channel_id, count);
         counts.updated_at = Utc::now();
 
-        self.cache_manager.unread_counts.put(*user_id, counts, 3600).await;
+        self.cache_manager
+            .unread_counts
+            .put(*user_id, counts, 3600)
+            .await;
         Ok(())
     }
 
@@ -570,10 +638,13 @@ impl BusinessCacheService for ChatCacheService {
         self.cache_manager.user_sessions.invalidate(user_id).await;
         self.cache_manager.channel_list.invalidate(user_id).await;
         self.cache_manager.unread_counts.invalidate(user_id).await;
-        self.cache_manager.friend_relations.invalidate(user_id).await;
+        self.cache_manager
+            .friend_relations
+            .invalidate(user_id)
+            .await;
         Ok(())
     }
-} 
+}
 
 /// 用户状态缓存适配器
 pub struct UserStatusCacheAdapter {
@@ -591,41 +662,45 @@ impl TwoLevelCache<u64, crate::infra::UserOnlineStatus> for UserStatusCacheAdapt
     async fn get(&self, key: &u64) -> Option<crate::infra::UserOnlineStatus> {
         if let Some(user_status) = self.inner.get(key).await {
             // 转换UserStatus到UserOnlineStatus
-            let devices = user_status.devices.into_iter().map(|device| {
-                // 将 String platform 转换为 privchat_protocol::DeviceType
-                let device_type = match device.platform.as_str() {
-                    "iOS" | "Mobile" => privchat_protocol::DeviceType::iOS,
-                    "Android" => privchat_protocol::DeviceType::Android,
-                    "Web" => privchat_protocol::DeviceType::Web,
-                    "Desktop" | "MacOS" => privchat_protocol::DeviceType::MacOS,
-                    "Windows" => privchat_protocol::DeviceType::Windows,
-                    "Linux" | "FreeBSD" | "Unix" => privchat_protocol::DeviceType::Linux,
-                    "Tablet" => privchat_protocol::DeviceType::Android, // 平板归类为 Android
-                    "IoT" => privchat_protocol::DeviceType::IoT,
-                    _ => privchat_protocol::DeviceType::Unknown,
-                };
-                
-                crate::infra::DeviceSession {
-                    session_id: device.session_id.clone(),
-                    user_id: *key,
-                    device_id: device.device_id.clone(),
-                    device_type,
-                    device_name: device.device_name.clone(),
-                    client_version: String::new(),
-                    platform: device.platform.clone(),
-                    status: if user_status.status == "online" {
-                        crate::infra::DeviceStatus::Online
-                    } else {
-                        crate::infra::DeviceStatus::Offline
-                    },
-                    connected_at: device.connected_at.timestamp() as u64,
-                    last_activity_at: device.last_active.timestamp() as u64,
-                    push_token: None,
-                    push_enabled: false,
-                    device_metadata: None,
-                    connection_properties: None,
-                }
-            }).collect();
+            let devices = user_status
+                .devices
+                .into_iter()
+                .map(|device| {
+                    // 将 String platform 转换为 privchat_protocol::DeviceType
+                    let device_type = match device.platform.as_str() {
+                        "iOS" | "Mobile" => privchat_protocol::DeviceType::iOS,
+                        "Android" => privchat_protocol::DeviceType::Android,
+                        "Web" => privchat_protocol::DeviceType::Web,
+                        "Desktop" | "MacOS" => privchat_protocol::DeviceType::MacOS,
+                        "Windows" => privchat_protocol::DeviceType::Windows,
+                        "Linux" | "FreeBSD" | "Unix" => privchat_protocol::DeviceType::Linux,
+                        "Tablet" => privchat_protocol::DeviceType::Android, // 平板归类为 Android
+                        "IoT" => privchat_protocol::DeviceType::IoT,
+                        _ => privchat_protocol::DeviceType::Unknown,
+                    };
+
+                    crate::infra::DeviceSession {
+                        session_id: device.session_id.clone(),
+                        user_id: *key,
+                        device_id: device.device_id.clone(),
+                        device_type,
+                        device_name: device.device_name.clone(),
+                        client_version: String::new(),
+                        platform: device.platform.clone(),
+                        status: if user_status.status == "online" {
+                            crate::infra::DeviceStatus::Online
+                        } else {
+                            crate::infra::DeviceStatus::Offline
+                        },
+                        connected_at: device.connected_at.timestamp() as u64,
+                        last_activity_at: device.last_active.timestamp() as u64,
+                        push_token: None,
+                        push_enabled: false,
+                        device_metadata: None,
+                        connection_properties: None,
+                    }
+                })
+                .collect();
 
             return Some(crate::infra::UserOnlineStatus {
                 user_id: *key,
@@ -638,25 +713,32 @@ impl TwoLevelCache<u64, crate::infra::UserOnlineStatus> for UserStatusCacheAdapt
 
     async fn put(&self, key: u64, value: crate::infra::UserOnlineStatus, ttl_secs: u64) {
         // 转换UserOnlineStatus到UserStatus
-        let devices = value.devices.into_iter().map(|device| {
-            // 将 privchat_protocol::DeviceType 转换为 String
-            let platform = format!("{:?}", device.device_type);
-            
-            DeviceInfo {
-                device_id: device.device_id,
-                platform,
-                session_id: device.session_id,
-                device_name: device.device_name,
-                connected_at: DateTime::from_timestamp(device.connected_at as i64, 0).unwrap_or_else(Utc::now),
-                last_active: DateTime::from_timestamp(device.last_activity_at as i64, 0).unwrap_or_else(Utc::now),
-            }
-        }).collect();
+        let devices = value
+            .devices
+            .into_iter()
+            .map(|device| {
+                // 将 privchat_protocol::DeviceType 转换为 String
+                let platform = format!("{:?}", device.device_type);
+
+                DeviceInfo {
+                    device_id: device.device_id,
+                    platform,
+                    session_id: device.session_id,
+                    device_name: device.device_name,
+                    connected_at: DateTime::from_timestamp(device.connected_at as i64, 0)
+                        .unwrap_or_else(Utc::now),
+                    last_active: DateTime::from_timestamp(device.last_activity_at as i64, 0)
+                        .unwrap_or_else(Utc::now),
+                }
+            })
+            .collect();
 
         let user_status = UserStatus {
             user_id: key,
             status: "online".to_string(),
             devices,
-            last_active: DateTime::from_timestamp(value.last_activity_at as i64, 0).unwrap_or_else(Utc::now),
+            last_active: DateTime::from_timestamp(value.last_activity_at as i64, 0)
+                .unwrap_or_else(Utc::now),
         };
 
         self.inner.put(key, user_status, ttl_secs).await;
@@ -685,4 +767,4 @@ impl TwoLevelCache<u64, crate::infra::UserOnlineStatus> for UserStatusCacheAdapt
             self.put(key, value, ttl_secs).await;
         }
     }
-} 
+}

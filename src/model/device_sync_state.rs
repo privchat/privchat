@@ -42,7 +42,7 @@ impl DeviceSyncState {
         channel_id: Uuid,
         local_pts: i64,
         server_pts: i64,
-        last_sync_at: i64,  // 毫秒时间戳
+        last_sync_at: i64, // 毫秒时间戳
     ) -> Self {
         Self {
             user_id,

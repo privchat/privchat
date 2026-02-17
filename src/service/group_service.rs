@@ -1,20 +1,19 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 /// 群组服务 - 处理群组管理
-/// 
+///
 /// 提供完整的群组系统功能：
 /// - 群组创建/解散
 /// - 成员管理（邀请/踢出/离开）
 /// - 权限管理（管理员/普通成员）
 /// - 群组信息管理
-
 use std::sync::Arc;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::model::{User, Channel};
 use crate::infra::CacheManager;
+use crate::model::{Channel, User};
 use crate::repository::Repository;
 
 /// 群组服务
@@ -33,7 +32,7 @@ impl GroupService {
             channel_repository: None,
         }
     }
-    
+
     /// 创建群组
     pub async fn create_group(&self, creator_id: &str, group_info: &GroupInfo) -> Result<Group> {
         // 这里应该实现实际的群组创建逻辑
@@ -50,14 +49,14 @@ impl GroupService {
             settings: group_info.settings.clone(),
         })
     }
-    
+
     /// 获取群组信息
     pub async fn get_group(&self, _group_id: &str) -> Result<Option<Group>> {
         // 这里应该实现实际的群组查询逻辑
         // 暂时返回 None
         Ok(None)
     }
-    
+
     /// 加入群组
     pub async fn join_group(&self, group_id: &str, user_id: u64) -> Result<()> {
         // 这里应该实现实际的加入群组逻辑
@@ -65,7 +64,7 @@ impl GroupService {
         info!("User {} joined group {}", user_id, group_id);
         Ok(())
     }
-    
+
     /// 离开群组
     pub async fn leave_group(&self, group_id: &str, user_id: u64) -> Result<()> {
         // 这里应该实现实际的离开群组逻辑
@@ -125,4 +124,4 @@ pub struct GroupSettings {
 }
 
 /// 群组结果别名
-pub type GroupServiceResult<T> = Result<T>; 
+pub type GroupServiceResult<T> = Result<T>;

@@ -21,7 +21,7 @@ impl DeviceManagerDb {
     pub fn new(db_pool: Arc<PgPool>) -> Self {
         Self { db_pool }
     }
-    
+
     /// 获取数据库连接池（用于管理 API）
     pub fn pool(&self) -> &PgPool {
         &self.db_pool
@@ -65,10 +65,7 @@ impl DeviceManagerDb {
         let device = match device {
             Some(d) => d,
             None => {
-                debug!(
-                    "设备不存在: user={}, device={}",
-                    user_id, device_id
-                );
+                debug!("设备不存在: user={}, device={}", user_id, device_id);
                 return Ok(SessionVerifyResult::DeviceNotFound);
             }
         };
@@ -164,10 +161,7 @@ impl DeviceManagerDb {
 
         // 2. 批量更新设备状态
         let now = chrono::Utc::now().timestamp_millis();
-        let kicked_device_ids: Vec<Uuid> = devices_to_kick
-            .iter()
-            .map(|d| d.device_id)
-            .collect();
+        let kicked_device_ids: Vec<Uuid> = devices_to_kick.iter().map(|d| d.device_id).collect();
 
         let updated = sqlx::query!(
             r#"
@@ -265,9 +259,7 @@ impl DeviceManagerDb {
                 );
                 Ok(())
             }
-            None => Err(ServerError::NotFound(
-                "设备不存在或已被踢出".to_string(),
-            )),
+            None => Err(ServerError::NotFound("设备不存在或已被踢出".to_string())),
         }
     }
 
@@ -480,8 +472,12 @@ impl DeviceManagerDb {
                     device_model: d.device_model.unwrap_or_default(),
                     app_id: d.app_version.unwrap_or_default(),
                     device_type,
-                    last_active_at: chrono::DateTime::from_timestamp_millis(d.last_active_at.unwrap_or(0)).unwrap_or_else(|| Utc::now()),
-                    created_at: chrono::DateTime::from_timestamp_millis(d.created_at).unwrap_or_else(|| Utc::now()),
+                    last_active_at: chrono::DateTime::from_timestamp_millis(
+                        d.last_active_at.unwrap_or(0),
+                    )
+                    .unwrap_or_else(|| Utc::now()),
+                    created_at: chrono::DateTime::from_timestamp_millis(d.created_at)
+                        .unwrap_or_else(|| Utc::now()),
                     ip_address: d.ip_address.unwrap_or_default(),
                     is_current: false,
                 }
@@ -517,15 +513,20 @@ impl DeviceManagerDb {
 
         Ok(())
     }
-    
+
     // =====================================================
     // 管理 API 方法
     // =====================================================
-    
+
     /// 获取设备列表（管理 API）
-    pub async fn list_devices_admin(&self, page: u32, page_size: u32, user_id_filter: Option<u64>) -> Result<(Vec<DeviceItem>, u32)> {
+    pub async fn list_devices_admin(
+        &self,
+        page: u32,
+        page_size: u32,
+        user_id_filter: Option<u64>,
+    ) -> Result<(Vec<DeviceItem>, u32)> {
         let offset = (page - 1) * page_size;
-        
+
         let devices = if let Some(user_id) = user_id_filter {
             // 查询指定用户的设备
             self.get_user_devices(user_id).await?
@@ -554,25 +555,30 @@ impl DeviceManagerDb {
             .fetch_all(&*self.db_pool)
             .await
             .map_err(|e| ServerError::Database(format!("查询设备列表失败: {}", e)))?;
-            
-            device_rows.into_iter().map(|d| {
-                let device_type = DeviceType::from_str(&d.device_type);
-                DeviceItem {
-                    device_id: d.device_id.to_string(),
-                    device_name: d.device_name.unwrap_or_default(),
-                    device_model: d.device_model.unwrap_or_default(),
-                    app_id: d.app_version.unwrap_or_default(),  // 注意：数据库字段是 app_version
-                    device_type,
-                    last_active_at: chrono::DateTime::from_timestamp_millis(d.last_active_at.unwrap_or(0))
+
+            device_rows
+                .into_iter()
+                .map(|d| {
+                    let device_type = DeviceType::from_str(&d.device_type);
+                    DeviceItem {
+                        device_id: d.device_id.to_string(),
+                        device_name: d.device_name.unwrap_or_default(),
+                        device_model: d.device_model.unwrap_or_default(),
+                        app_id: d.app_version.unwrap_or_default(), // 注意：数据库字段是 app_version
+                        device_type,
+                        last_active_at: chrono::DateTime::from_timestamp_millis(
+                            d.last_active_at.unwrap_or(0),
+                        )
                         .unwrap_or_else(|| Utc::now()),
-                    created_at: chrono::DateTime::from_timestamp_millis(d.created_at)
-                        .unwrap_or_else(|| Utc::now()),
-                    ip_address: d.ip_address.unwrap_or_default(),
-                    is_current: false,
-                }
-            }).collect()
+                        created_at: chrono::DateTime::from_timestamp_millis(d.created_at)
+                            .unwrap_or_else(|| Utc::now()),
+                        ip_address: d.ip_address.unwrap_or_default(),
+                        is_current: false,
+                    }
+                })
+                .collect()
         };
-        
+
         let total = if user_id_filter.is_some() {
             devices.len() as u32
         } else {
@@ -587,15 +593,15 @@ impl DeviceManagerDb {
             .map_err(|e| ServerError::Database(format!("统计设备数失败: {}", e)))?;
             result.count.unwrap_or(0) as u32
         };
-        
+
         Ok((devices, total))
     }
-    
+
     /// 获取设备详情（管理 API）
     pub async fn get_device_admin(&self, device_id: &str) -> Result<DeviceItem> {
         let device_uuid = Uuid::parse_str(device_id)
             .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
-        
+
         let device = sqlx::query!(
             r#"
             SELECT 
@@ -619,19 +625,22 @@ impl DeviceManagerDb {
         .fetch_optional(&*self.db_pool)
         .await
         .map_err(|e| ServerError::Database(format!("查询设备详情失败: {}", e)))?;
-        
-        let device = device.ok_or_else(|| ServerError::NotFound(format!("设备 {} 不存在", device_id)))?;
-        
+
+        let device =
+            device.ok_or_else(|| ServerError::NotFound(format!("设备 {} 不存在", device_id)))?;
+
         let device_type = DeviceType::from_str(&device.device_type);
-        
+
         Ok(DeviceItem {
             device_id: device.device_id.to_string(),
             device_name: device.device_name.unwrap_or_default(),
             device_model: device.device_model.unwrap_or_default(),
-            app_id: device.app_version.unwrap_or_default(),  // 注意：数据库字段是 app_version
+            app_id: device.app_version.unwrap_or_default(), // 注意：数据库字段是 app_version
             device_type,
-            last_active_at: chrono::DateTime::from_timestamp_millis(device.last_active_at.unwrap_or(0))
-                .unwrap_or_else(|| Utc::now()),
+            last_active_at: chrono::DateTime::from_timestamp_millis(
+                device.last_active_at.unwrap_or(0),
+            )
+            .unwrap_or_else(|| Utc::now()),
             created_at: chrono::DateTime::from_timestamp_millis(device.created_at)
                 .unwrap_or_else(|| Utc::now()),
             ip_address: device.ip_address.unwrap_or_default(),

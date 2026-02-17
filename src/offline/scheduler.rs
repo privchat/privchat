@@ -1,12 +1,12 @@
+use super::queue::OfflineQueueManager;
+use super::storage::StorageBackend;
+use crate::error::ServerError;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use chrono::{DateTime, Utc};
 use tokio::time::interval;
-use tracing::{debug, info, warn, error};
-use crate::error::ServerError;
-use super::storage::StorageBackend;
-use super::queue::OfflineQueueManager;
+use tracing::{debug, error, info, warn};
 
 /// 调度器配置
 #[derive(Debug, Clone)]
@@ -63,12 +63,20 @@ pub struct SchedulerStats {
 #[async_trait::async_trait]
 pub trait MessageDeliverer: Send + Sync + 'static {
     /// 投递消息到用户
-    async fn deliver_message(&self, user_id: u64, message: &super::message::OfflineMessage) -> Result<(), ServerError>;
-    
+    async fn deliver_message(
+        &self,
+        user_id: u64,
+        message: &super::message::OfflineMessage,
+    ) -> Result<(), ServerError>;
+
     /// 批量投递消息
-    async fn deliver_messages(&self, user_id: u64, messages: &[super::message::OfflineMessage]) -> Vec<DeliveryResult> {
+    async fn deliver_messages(
+        &self,
+        user_id: u64,
+        messages: &[super::message::OfflineMessage],
+    ) -> Vec<DeliveryResult> {
         let mut results = Vec::new();
-        
+
         for message in messages {
             let result = match self.deliver_message(user_id, message).await {
                 Ok(()) => DeliveryResult {
@@ -84,7 +92,7 @@ pub trait MessageDeliverer: Send + Sync + 'static {
             };
             results.push(result);
         }
-        
+
         results
     }
 }
@@ -95,18 +103,26 @@ pub struct LogMessageDeliverer;
 
 #[async_trait::async_trait]
 impl MessageDeliverer for LogMessageDeliverer {
-    async fn deliver_message(&self, user_id: u64, message: &super::message::OfflineMessage) -> Result<(), ServerError> {
-        info!("Delivering message {} to user {} (from: {}, type: {})", 
-              message.message_id, user_id, message.sender_id, message.message_type);
-        
+    async fn deliver_message(
+        &self,
+        user_id: u64,
+        message: &super::message::OfflineMessage,
+    ) -> Result<(), ServerError> {
+        info!(
+            "Delivering message {} to user {} (from: {}, type: {})",
+            message.message_id, user_id, message.sender_id, message.message_type
+        );
+
         // 模拟投递延迟
         tokio::time::sleep(Duration::from_millis(10)).await;
-        
+
         // 模拟 10% 的失败率
         if rand::random::<f32>() < 0.1 {
-            return Err(ServerError::Internal("Simulated delivery failure".to_string()));
+            return Err(ServerError::Internal(
+                "Simulated delivery failure".to_string(),
+            ));
         }
-        
+
         Ok(())
     }
 }
@@ -154,18 +170,20 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
     pub async fn start(&self) -> Result<(), ServerError> {
         let mut running = self.running.lock().await;
         if *running {
-            return Err(ServerError::Internal("Scheduler is already running".to_string()));
+            return Err(ServerError::Internal(
+                "Scheduler is already running".to_string(),
+            ));
         }
         *running = true;
 
         info!("Starting offline message scheduler");
-        
+
         // 启动主投递循环
         self.start_delivery_loop().await;
-        
+
         // 启动统计报告任务
         self.start_stats_reporter().await;
-        
+
         // 启动重试任务
         self.start_retry_loop().await;
 
@@ -181,7 +199,7 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
         *running = false;
 
         info!("Stopping offline message scheduler");
-        
+
         // 等待所有活跃投递完成
         let mut deliveries = self.active_deliveries.lock().await;
         for (user_id, handle) in deliveries.drain() {
@@ -194,8 +212,11 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
 
     /// 手动触发用户消息投递
     pub async fn trigger_delivery_for_user(&self, user_id: u64) -> Result<usize, ServerError> {
-        let messages = self.queue_manager.get_messages_for_delivery(user_id, Some(self.config.batch_delivery_size)).await?;
-        
+        let messages = self
+            .queue_manager
+            .get_messages_for_delivery(user_id, Some(self.config.batch_delivery_size))
+            .await?;
+
         if messages.is_empty() {
             return Ok(0);
         }
@@ -210,14 +231,21 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
     }
 
     /// 投递消息给指定用户
-    async fn deliver_messages_to_user(&self, user_id: u64, messages: &[super::message::OfflineMessage]) -> Result<usize, ServerError> {
+    async fn deliver_messages_to_user(
+        &self,
+        user_id: u64,
+        messages: &[super::message::OfflineMessage],
+    ) -> Result<usize, ServerError> {
         if messages.is_empty() {
             return Ok(0);
         }
 
         let start_time = std::time::Instant::now();
-        let results = self.message_deliverer.deliver_messages(user_id, messages).await;
-        
+        let results = self
+            .message_deliverer
+            .deliver_messages(user_id, messages)
+            .await;
+
         let mut delivered_ids = Vec::new();
         let mut failed_count = 0;
 
@@ -226,17 +254,25 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                 delivered_ids.push(result.message_id);
             } else {
                 failed_count += 1;
-                warn!("Failed to deliver message {} to user {}: {:?}", 
-                      result.message_id, user_id, result.error);
-                
+                warn!(
+                    "Failed to deliver message {} to user {}: {:?}",
+                    result.message_id, user_id, result.error
+                );
+
                 // 标记失败（这里简化处理，实际应该有重试逻辑）
-                let _ = self.queue_manager.mark_failed(user_id, result.message_id).await;
+                let _ = self
+                    .queue_manager
+                    .mark_failed(user_id, result.message_id)
+                    .await;
             }
         }
 
         // 标记成功投递的消息
         if !delivered_ids.is_empty() {
-            let _ = self.queue_manager.mark_delivered(user_id, &delivered_ids).await;
+            let _ = self
+                .queue_manager
+                .mark_delivered(user_id, &delivered_ids)
+                .await;
         }
 
         // 更新统计信息
@@ -248,8 +284,12 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
         }
 
         let _delivery_time = start_time.elapsed();
-        debug!("Delivered {} messages to user {} ({} failed)", 
-               delivered_ids.len(), user_id, failed_count);
+        debug!(
+            "Delivered {} messages to user {} ({} failed)",
+            delivered_ids.len(),
+            user_id,
+            failed_count
+        );
 
         Ok(delivered_ids.len())
     }
@@ -265,10 +305,10 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(config.delivery_check_interval_secs));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // 检查是否还在运行
                 {
                     let running_guard = running.lock().await;
@@ -279,10 +319,10 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
 
                 // 获取有消息的用户列表（这里简化，实际应该从队列管理器获取）
                 let users_with_messages: Vec<u64> = vec![]; // TODO: 从队列管理器获取实际用户列表
-                
+
                 for user_id in users_with_messages {
                     let mut deliveries = active_deliveries.lock().await;
-                    
+
                     // 检查是否已经有该用户的投递任务在运行
                     if deliveries.contains_key(&user_id) {
                         continue;
@@ -301,11 +341,16 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                     let batch_size = config.batch_delivery_size;
 
                     let task = tokio::spawn(async move {
-                        match queue_manager_clone.get_messages_for_delivery(user_id_clone, Some(batch_size)).await {
+                        match queue_manager_clone
+                            .get_messages_for_delivery(user_id_clone, Some(batch_size))
+                            .await
+                        {
                             Ok(messages) => {
                                 if !messages.is_empty() {
-                                    let results = deliverer_clone.deliver_messages(user_id_clone, &messages).await;
-                                    
+                                    let results = deliverer_clone
+                                        .deliver_messages(user_id_clone, &messages)
+                                        .await;
+
                                     let mut delivered_ids = Vec::new();
                                     let mut failed_count = 0;
 
@@ -314,12 +359,16 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                                             delivered_ids.push(result.message_id);
                                         } else {
                                             failed_count += 1;
-                                            let _ = queue_manager_clone.mark_failed(user_id_clone, result.message_id).await;
+                                            let _ = queue_manager_clone
+                                                .mark_failed(user_id_clone, result.message_id)
+                                                .await;
                                         }
                                     }
 
                                     if !delivered_ids.is_empty() {
-                                        let _ = queue_manager_clone.mark_delivered(user_id_clone, &delivered_ids).await;
+                                        let _ = queue_manager_clone
+                                            .mark_delivered(user_id_clone, &delivered_ids)
+                                            .await;
                                     }
 
                                     // 更新统计
@@ -330,9 +379,12 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                                         stats_guard.last_delivery_time = Some(Utc::now());
                                     }
                                 }
-                            },
+                            }
                             Err(e) => {
-                                error!("Failed to get messages for user {}: {:?}", user_id_clone, e);
+                                error!(
+                                    "Failed to get messages for user {}: {:?}",
+                                    user_id_clone, e
+                                );
                             }
                         }
                     });
@@ -356,10 +408,10 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(interval_secs));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 {
                     let running_guard = running.lock().await;
                     if !*running_guard {
@@ -368,11 +420,13 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                 }
 
                 let stats_snapshot = stats.lock().await.clone();
-                info!("Scheduler stats: delivered={}, failed={}, active={}, pending_retries={}", 
-                      stats_snapshot.total_delivered,
-                      stats_snapshot.total_failed,
-                      stats_snapshot.active_deliveries,
-                      stats_snapshot.pending_retries);
+                info!(
+                    "Scheduler stats: delivered={}, failed={}, active={}, pending_retries={}",
+                    stats_snapshot.total_delivered,
+                    stats_snapshot.total_failed,
+                    stats_snapshot.active_deliveries,
+                    stats_snapshot.pending_retries
+                );
             }
         });
     }
@@ -386,10 +440,10 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(interval_secs));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 {
                     let running_guard = running.lock().await;
                     if !*running_guard {
@@ -400,7 +454,7 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                 // 这里可以实现重试逻辑
                 // 例如：查找失败的消息，重新尝试投递
                 debug!("Checking for messages to retry...");
-                
+
                 // 示例：获取失败消息并重试
                 // let failed_messages = queue_manager.get_failed_messages().await;
                 // for message in failed_messages {
@@ -414,8 +468,8 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::offline::queue::create_memory_queue_manager;
     use crate::infra::OnlineStatusManager;
+    use crate::offline::queue::create_memory_queue_manager;
     use bytes::Bytes;
 
     #[tokio::test]
@@ -424,18 +478,18 @@ mod tests {
         let online_status_manager = Arc::new(OnlineStatusManager::new());
         let message_deliverer = Arc::new(LogMessageDeliverer);
         let config = SchedulerConfig::default();
-        
+
         let scheduler = OfflineScheduler::new(
             queue_manager.clone(),
             online_status_manager.clone(),
             message_deliverer,
             config,
         );
-        
+
         // 启动队列管理器和调度器
         queue_manager.start().await.unwrap();
         scheduler.start().await.unwrap();
-        
+
         // 模拟用户上线
         online_status_manager.simple_user_online(
             "session1".to_string(),
@@ -444,26 +498,29 @@ mod tests {
             privchat_protocol::DeviceType::iOS,
             "127.0.0.1".to_string(),
         );
-        
+
         // 添加离线消息
-        let message_id = queue_manager.add_message(
-            "user1".to_string(),
-            "sender1".to_string(),
-            "conv1".to_string(),
-            Bytes::from("Hello"),
-            "text".to_string(),
-            None,
-        ).await.unwrap();
-        
+        let message_id = queue_manager
+            .add_message(
+                "user1".to_string(),
+                "sender1".to_string(),
+                "conv1".to_string(),
+                Bytes::from("Hello"),
+                "text".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
         // 手动触发投递
         let delivered = scheduler.trigger_delivery_for_user("user1").await.unwrap();
         assert_eq!(delivered, 1);
-        
+
         // 检查统计信息
         let stats = scheduler.get_stats().await;
         assert_eq!(stats.total_delivered, 1);
         assert_eq!(stats.total_failed, 0);
-        
+
         scheduler.stop().await.unwrap();
         queue_manager.stop().await.unwrap();
     }
@@ -474,17 +531,17 @@ mod tests {
         let online_status_manager = Arc::new(OnlineStatusManager::new());
         let message_deliverer = Arc::new(LogMessageDeliverer);
         let config = SchedulerConfig::default();
-        
+
         let scheduler = OfflineScheduler::new(
             queue_manager.clone(),
             online_status_manager.clone(),
             message_deliverer,
             config,
         );
-        
+
         queue_manager.start().await.unwrap();
         scheduler.start().await.unwrap();
-        
+
         // 模拟用户上线
         online_status_manager.simple_user_online(
             "session1".to_string(),
@@ -493,29 +550,32 @@ mod tests {
             privchat_protocol::DeviceType::iOS,
             "127.0.0.1".to_string(),
         );
-        
+
         // 添加多条消息
         for i in 1..=10 {
-            queue_manager.add_message(
-                "user1".to_string(),
-                "sender1".to_string(),
-                "conv1".to_string(),
-                Bytes::from(format!("Message {}", i)),
-                "text".to_string(),
-                None,
-            ).await.unwrap();
+            queue_manager
+                .add_message(
+                    "user1".to_string(),
+                    "sender1".to_string(),
+                    "conv1".to_string(),
+                    Bytes::from(format!("Message {}", i)),
+                    "text".to_string(),
+                    None,
+                )
+                .await
+                .unwrap();
         }
-        
+
         // 手动触发投递
         let delivered = scheduler.trigger_delivery_for_user("user1").await.unwrap();
-        
+
         // 检查统计信息
         let stats = scheduler.get_stats().await;
         assert!(stats.total_delivered > 0);
         assert!(stats.total_failed > 0);
         assert_eq!(stats.total_delivered + stats.total_failed, 10);
-        
+
         scheduler.stop().await.unwrap();
         queue_manager.stop().await.unwrap();
     }
-} 
+}

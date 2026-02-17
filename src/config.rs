@@ -1,10 +1,10 @@
-use std::time::Duration;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use tracing::info;
-use serde::{Deserialize, Serialize};
-use anyhow::{Result, Context};
 
 /// 服务器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,14 +54,14 @@ pub struct ServerConfig {
     /// HTTP 文件服务器端口（用于启动服务）
     pub http_file_server_port: u16,
     /// 文件服务 API 基础 URL（用于客户端访问，不包含端口号）
-    /// 
+    ///
     /// 文件服务的 HTTP 服务器是独立的，客户端通过此 URL 访问文件相关接口。
     /// 例如：https://files.example.com/api/app
-    /// 
+    ///
     /// 注意：此 URL 不包含端口号，生产环境通常通过域名访问（80/443 端口）
     pub file_api_base_url: Option<String>,
     /// 是否启用内置账号系统
-    /// 
+    ///
     /// - true: 使用服务器内置的注册/登录功能（适合独立部署）
     /// - false: 使用外部账号系统（适合企业集成，token 由外部系统签发）
     pub use_internal_auth: bool,
@@ -76,8 +76,9 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 9001,
-            database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/privchat".to_string()),
+            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://postgres:postgres@localhost:5432/privchat".to_string()
+            }),
             jwt_secret: "your_jwt_secret_here".to_string(),
             max_connections: 1000,
             connection_timeout: 300,
@@ -87,7 +88,11 @@ impl Default for ServerConfig {
             tls_cert_path: None,
             tls_key_path: None,
             cache: CacheConfig::default(),
-            enabled_protocols: vec!["tcp".to_string(), "websocket".to_string(), "quic".to_string()],
+            enabled_protocols: vec![
+                "tcp".to_string(),
+                "websocket".to_string(),
+                "quic".to_string(),
+            ],
             tcp_bind_address: "0.0.0.0:9001".to_string(),
             websocket_bind_address: "0.0.0.0:9080".to_string(),
             quic_bind_address: "0.0.0.0:9001".to_string(),
@@ -157,10 +162,10 @@ impl ServerConfig {
     pub fn from_toml_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path.as_ref())
             .with_context(|| format!("无法读取配置文件: {:?}", path.as_ref()))?;
-        
-        let toml_config: TomlConfig = toml::from_str(&content)
-            .with_context(|| "配置文件格式错误")?;
-        
+
+        let toml_config: TomlConfig =
+            toml::from_str(&content).with_context(|| "配置文件格式错误")?;
+
         Ok(toml_config.into())
     }
 
@@ -188,7 +193,7 @@ impl ServerConfig {
         if let Ok(_log_format) = env::var("PRIVCHAT_LOG_FORMAT") {
             // 将在日志初始化时使用
         }
-        
+
         // Redis 配置
         if let Ok(redis_url) = env::var("REDIS_URL") {
             self.cache.redis = Some(RedisConfig {
@@ -197,7 +202,7 @@ impl ServerConfig {
                 connection_timeout_secs: 5,
             });
         }
-        
+
         // 文件配置
         if let Ok(storage_root) = env::var("PRIVCHAT_FILE_STORAGE_ROOT") {
             self.file_storage_root = storage_root;
@@ -208,7 +213,7 @@ impl ServerConfig {
         if let Ok(file_api_url) = env::var("PRIVCHAT_FILE_API_BASE_URL") {
             self.file_api_base_url = Some(file_api_url);
         }
-        
+
         Ok(())
     }
 
@@ -279,7 +284,7 @@ impl ServerConfig {
                     info!("🔧 Development 环境");
                     Self::default()
                 }
-                _ => Self::default()
+                _ => Self::default(),
             }
         } else if let Ok(server_mode) = env::var("SERVER_MODE") {
             match server_mode.as_str() {
@@ -618,7 +623,7 @@ impl From<TomlConfig> for ServerConfig {
                 }
             }
         }
-        
+
         if let Some(file) = toml.file {
             if let Some(port) = file.server_port {
                 config.http_file_server_port = port;
@@ -652,7 +657,7 @@ impl From<TomlConfig> for ServerConfig {
                 config.file_default_storage_source_id = id;
             }
         }
-        
+
         if let Some(system_msg) = toml.system_message {
             if let Some(enabled) = system_msg.enabled {
                 config.system_message.enabled = enabled;
@@ -667,7 +672,7 @@ impl From<TomlConfig> for ServerConfig {
                 config.system_message.auto_send_welcome = auto_send;
             }
         }
-        
+
         config
     }
 }
@@ -747,24 +752,24 @@ impl Default for OnlineStatusConfig {
 // =====================================================
 // 系统用户管理
 // =====================================================
-// 
+//
 // 系统用户定义在服务启动时加载到内存中
 // 不存在于数据库，通过预定义数组管理
-// 
+//
 // 用户 ID 区间划分：
 // - 1 ~ 99: 保留给系统功能用户
 // - 100,000,000+: 普通用户 + 机器人（用 user_type 区分）
 // =====================================================
 
-use std::sync::OnceLock;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// 系统用户定义（与普通用户使用相同结构，仅 user_type = 1）
 #[derive(Debug, Clone)]
 pub struct SystemUserDef {
     pub user_id: u64,
     pub username: String,
-    pub display_name: String,  // 英文默认名（客户端根据语言包替换）
+    pub display_name: String, // 英文默认名（客户端根据语言包替换）
     pub description: String,
 }
 
@@ -795,10 +800,10 @@ pub fn init_system_users() {
         //     description: "自己和自己的文件传输".to_string(),
         // },
     ];
-    
+
     // 构建 ID 集合用于快速查询
     let ids: HashSet<u64> = users.iter().map(|u| u.user_id).collect();
-    
+
     let _ = SYSTEM_USERS.set(users);
     let _ = SYSTEM_USER_IDS.set(ids);
 }
@@ -840,7 +845,8 @@ impl Default for SystemMessageConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            welcome_message: "👋 欢迎使用 Privchat！\n\n这是一个端到端加密的即时通讯系统。".to_string(),
+            welcome_message: "👋 欢迎使用 Privchat！\n\n这是一个端到端加密的即时通讯系统。"
+                .to_string(),
             auto_create_channel: true,
             auto_send_welcome: true,
         }
@@ -868,13 +874,13 @@ pub struct SecurityProtectionConfig {
     /// - "enforce_full": 全部特性
     #[serde(default = "default_security_mode")]
     pub mode: String,
-    
+
     /// 是否启用 Shadow Ban
     pub enable_shadow_ban: bool,
-    
+
     /// 是否启用 IP 封禁
     pub enable_ip_ban: bool,
-    
+
     /// 速率限制配置
     pub rate_limit: RateLimitProtectionConfig,
 }
@@ -886,8 +892,8 @@ fn default_security_mode() -> String {
 impl Default for SecurityProtectionConfig {
     fn default() -> Self {
         Self {
-            mode: "observe".to_string(),  // 默认观察模式
-            enable_shadow_ban: false,     // 默认不启用
+            mode: "observe".to_string(), // 默认观察模式
+            enable_shadow_ban: false,    // 默认不启用
             enable_ip_ban: true,
             rate_limit: RateLimitProtectionConfig::default(),
         }
@@ -901,12 +907,12 @@ pub struct RateLimitProtectionConfig {
     pub user_tokens_per_second: f64,
     /// 用户全局：桶容量（允许突发）
     pub user_burst_capacity: f64,
-    
+
     /// 单会话：每秒消息数
     pub channel_messages_per_second: f64,
     /// 单会话：桶容量
     pub channel_burst_capacity: f64,
-    
+
     /// IP 连接：每秒连接数
     pub ip_connections_per_second: f64,
     /// IP 连接：桶容量
@@ -919,11 +925,11 @@ impl Default for RateLimitProtectionConfig {
             // 用户全局：基础 50 tokens/s，突发 100
             user_tokens_per_second: 50.0,
             user_burst_capacity: 100.0,
-            
+
             // 单会话：3条消息/秒（考虑到大群的 fan-out）
             channel_messages_per_second: 3.0,
             channel_burst_capacity: 10.0,
-            
+
             // IP 连接：5个/秒
             ip_connections_per_second: 5.0,
             ip_burst_capacity: 10.0,
@@ -947,7 +953,7 @@ impl From<RateLimitProtectionConfig> for crate::security::RateLimitConfig {
 impl From<SecurityProtectionConfig> for crate::security::SecurityConfig {
     fn from(config: SecurityProtectionConfig) -> Self {
         use crate::security::SecurityMode;
-        
+
         let mode = match config.mode.as_str() {
             "observe" | "observe_only" => SecurityMode::ObserveOnly,
             "enforce_light" | "light" => SecurityMode::EnforceLight,
@@ -957,7 +963,7 @@ impl From<SecurityProtectionConfig> for crate::security::SecurityConfig {
                 SecurityMode::ObserveOnly
             }
         };
-        
+
         crate::security::SecurityConfig {
             mode,
             enable_shadow_ban: config.enable_shadow_ban,
@@ -965,4 +971,4 @@ impl From<SecurityProtectionConfig> for crate::security::SecurityConfig {
             rate_limit: config.rate_limit.into(),
         }
     }
-} 
+}

@@ -15,15 +15,15 @@ pub struct DeviceConnection {
 }
 
 /// 连接管理器
-/// 
+///
 /// 负责跟踪活跃的 WebSocket/TCP 连接，并提供设备断连功能
 pub struct ConnectionManager {
     /// 连接映射：(user_id, device_id) -> DeviceConnection
     connections: Arc<RwLock<HashMap<(u64, String), DeviceConnection>>>,
-    
+
     /// 反向映射：session_id -> (user_id, device_id)
     session_index: Arc<RwLock<HashMap<SessionId, (u64, String)>>>,
-    
+
     /// TransportServer 引用（用于实际断开连接）
     transport_server: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
 }
@@ -53,7 +53,7 @@ impl ConnectionManager {
         session_id: SessionId,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        
+
         let connection = DeviceConnection {
             user_id,
             device_id: device_id.clone(),
@@ -83,13 +83,13 @@ impl ConnectionManager {
     }
 
     /// 注销设备连接
-    pub async fn unregister_connection(&self, session_id: SessionId) -> Result<()> {
+    pub async fn unregister_connection(&self, session_id: SessionId) -> Result<Option<(u64, String)>> {
         // 从反向映射中获取 user_id 和 device_id，然后释放锁避免与 connections 死锁
         let removed = {
             let mut session_index = self.session_index.write().await;
             session_index.remove(&session_id)
         };
-        if let Some((user_id, device_id)) = removed {
+        if let Some((user_id, device_id)) = removed.clone() {
             let mut connections = self.connections.write().await;
             connections.remove(&(user_id, device_id.clone()));
             let count = connections.len();
@@ -102,19 +102,17 @@ impl ConnectionManager {
             );
         }
 
-        Ok(())
+        Ok(removed)
     }
 
     /// 断开指定设备的连接
-    /// 
+    ///
     /// 用于 "踢设备" 功能：立即断开指定设备的 WebSocket 连接
     pub async fn disconnect_device(&self, user_id: u64, device_id: &str) -> Result<()> {
         // 1. 查找该设备的连接
         let connections = self.connections.read().await;
-        let connection = connections
-            .get(&(user_id, device_id.to_string()))
-            .cloned();
-        
+        let connection = connections.get(&(user_id, device_id.to_string())).cloned();
+
         drop(connections); // 释放读锁
 
         if let Some(conn) = connection {
@@ -139,13 +137,11 @@ impl ConnectionManager {
                     );
                 }
             } else {
-                warn!(
-                    "⚠️ ConnectionManager: TransportServer 未设置，无法断开连接"
-                );
+                warn!("⚠️ ConnectionManager: TransportServer 未设置，无法断开连接");
             }
 
             // 4. 清理连接映射
-            self.unregister_connection(conn.session_id).await?;
+            let _ = self.unregister_connection(conn.session_id).await?;
         } else {
             debug!(
                 "📝 ConnectionManager: 设备未连接 user={}, device={}",
@@ -166,12 +162,10 @@ impl ConnectionManager {
         let connections = self.connections.read().await;
         let devices_to_disconnect: Vec<String> = connections
             .iter()
-            .filter(|((uid, device_id), _)| {
-                *uid == user_id && device_id != current_device_id
-            })
+            .filter(|((uid, device_id), _)| *uid == user_id && device_id != current_device_id)
             .map(|((_, device_id), _)| device_id.clone())
             .collect();
-        
+
         drop(connections); // 释放读锁
 
         info!(
@@ -220,6 +214,53 @@ impl ConnectionManager {
         let connections = self.connections.read().await;
         connections.contains_key(&(user_id, device_id.to_string()))
     }
+
+    /// 实时推送一条 PushMessageRequest 到用户当前所有在线连接
+    pub async fn send_push_to_user(
+        &self,
+        user_id: u64,
+        message: &privchat_protocol::protocol::PushMessageRequest,
+    ) -> Result<usize> {
+        let sessions: Vec<SessionId> = self
+            .get_user_connections(user_id)
+            .await
+            .into_iter()
+            .map(|c| c.session_id)
+            .collect();
+
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+
+        let transport = self.transport_server.read().await;
+        let Some(server) = transport.as_ref() else {
+            warn!("⚠️ ConnectionManager: TransportServer 未设置，无法实时推送");
+            return Ok(0);
+        };
+
+        let payload = privchat_protocol::encode_message(message)
+            .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
+
+        let mut success = 0usize;
+        for sid in sessions {
+            let mut packet = msgtrans::packet::Packet::one_way(0u32, payload.clone());
+            packet.set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
+            match server.send_to_session(sid, packet).await {
+                Ok(_) => success += 1,
+                Err(e) => {
+                    warn!(
+                        "⚠️ ConnectionManager: 实时推送失败 user={}, session={}, server_message_id={}, error={}",
+                        user_id,
+                        sid,
+                        message.server_message_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(success)
+    }
 }
 
 #[cfg(test)]
@@ -230,22 +271,22 @@ mod tests {
     async fn test_register_and_unregister() {
         let manager = ConnectionManager::new();
         let session_id = SessionId(123);
-        
+
         // 注册连接
         manager
             .register_connection(1, "device-001".to_string(), session_id)
             .await
             .unwrap();
-        
+
         // 检查是否在线
         assert!(manager.is_device_online(1, "device-001").await);
-        
+
         // 检查连接数
         assert_eq!(manager.get_connection_count().await, 1);
-        
+
         // 注销连接
         manager.unregister_connection(session_id).await.unwrap();
-        
+
         // 检查是否离线
         assert!(!manager.is_device_online(1, "device-001").await);
         assert_eq!(manager.get_connection_count().await, 0);
@@ -254,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_devices() {
         let manager = ConnectionManager::new();
-        
+
         // 注册多个设备
         manager
             .register_connection(1, "device-001".to_string(), SessionId(101))
@@ -268,10 +309,10 @@ mod tests {
             .register_connection(1, "device-003".to_string(), SessionId(103))
             .await
             .unwrap();
-        
+
         // 检查连接数
         assert_eq!(manager.get_connection_count().await, 3);
-        
+
         // 获取用户连接
         let connections = manager.get_user_connections(1).await;
         assert_eq!(connections.len(), 3);

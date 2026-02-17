@@ -10,12 +10,12 @@ pub struct LoginLog {
     pub log_id: i64,
     pub user_id: i64,
     pub device_id: Uuid,
-    
+
     // Token 信息
     pub token_jti: String,
     pub token_created_at: i64,
     pub token_first_used_at: i64,
-    
+
     // 设备信息
     pub device_type: String,
     pub device_name: Option<String>,
@@ -23,29 +23,29 @@ pub struct LoginLog {
     pub os_version: Option<String>,
     pub app_id: String,
     pub app_version: Option<String>,
-    
+
     // 网络信息
     pub ip_address: String,
     pub user_agent: Option<String>,
-    
+
     // 登录方式
     pub login_method: String,
     pub auth_source: Option<String>,
-    
+
     // 安全信息
-    pub status: i16,  // 0: Success, 1: Suspicious, 2: Blocked
+    pub status: i16, // 0: Success, 1: Suspicious, 2: Blocked
     pub risk_score: i16,
-    pub risk_factors: Option<serde_json::Value>,  // JSONB
+    pub risk_factors: Option<serde_json::Value>, // JSONB
     pub is_new_device: bool,
     pub is_new_location: bool,
-    
+
     // 通知状态
     pub notification_sent: bool,
     pub notification_method: Option<String>,
     pub notification_sent_at: Option<i64>,
-    
+
     // 其他
-    pub metadata: Option<serde_json::Value>,  // JSONB
+    pub metadata: Option<serde_json::Value>, // JSONB
     pub created_at: i64,
 }
 
@@ -73,7 +73,7 @@ pub struct CreateLoginLogRequest {
     pub user_agent: Option<String>,
     pub login_method: String,
     pub auth_source: Option<String>,
-    pub status: i16,  // 0: Success, 1: Suspicious, 2: Blocked
+    pub status: i16, // 0: Success, 1: Suspicious, 2: Blocked
     pub risk_score: i16,
     pub is_new_device: bool,
     pub is_new_location: bool,
@@ -87,7 +87,7 @@ pub struct LoginLogQuery {
     pub user_id: Option<i64>,
     pub device_id: Option<Uuid>,
     pub ip_address: Option<String>,
-    pub status: Option<i16>,  // 0: Success, 1: Suspicious, 2: Blocked
+    pub status: Option<i16>, // 0: Success, 1: Suspicious, 2: Blocked
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub limit: Option<i64>,
@@ -103,7 +103,7 @@ impl LoginLogRepository {
     pub fn new(db_pool: Arc<PgPool>) -> Self {
         Self { db_pool }
     }
-    
+
     /// 获取数据库连接池（用于管理 API）
     pub fn pool(&self) -> &PgPool {
         &self.db_pool
@@ -293,10 +293,10 @@ impl LoginLogRepository {
         )
         .fetch_optional(&*self.db_pool)
         .await?;
-        
+
         Ok(log)
     }
-    
+
     /// 标记通知已发送
     pub async fn mark_notification_sent(
         &self,
@@ -323,11 +323,7 @@ impl LoginLogRepository {
     }
 
     /// 获取最近的登录 IP（用于判断是否为新 IP）
-    pub async fn get_recent_login_ips(
-        &self,
-        user_id: i64,
-        days: i32,
-    ) -> Result<Vec<String>> {
+    pub async fn get_recent_login_ips(&self, user_id: i64, days: i32) -> Result<Vec<String>> {
         let since = chrono::Utc::now().timestamp_millis() - (days as i64 * 24 * 3600 * 1000);
 
         let records = sqlx::query!(
@@ -344,10 +340,7 @@ impl LoginLogRepository {
         .fetch_all(&*self.db_pool)
         .await?;
 
-        Ok(records
-            .into_iter()
-            .map(|r| r.ip_address)
-            .collect())
+        Ok(records.into_iter().map(|r| r.ip_address).collect())
     }
 
     /// 获取可疑登录（用于安全监控）

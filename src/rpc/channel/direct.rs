@@ -1,14 +1,17 @@
 //! channel/direct/get_or_create RPC 处理
 
-use serde_json::{json, Value};
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use privchat_protocol::rpc::channel::{
-    GetOrCreateDirectChannelRequest,
-    GetOrCreateDirectChannelResponse,
+    GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
 };
+use serde_json::{json, Value};
 
-pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::RpcContext) -> RpcResult<Value> {
+pub async fn handle(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
     let mut request: GetOrCreateDirectChannelRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 

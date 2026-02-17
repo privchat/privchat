@@ -1,6 +1,6 @@
-use privchat_server::infra::cache::*;
-use privchat_server::error::ServerError;
 use chrono::Utc;
+use privchat_server::error::ServerError;
+use privchat_server::infra::cache::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,9 +77,10 @@ async fn demo_local_cache() -> Result<(), ServerError> {
 
     println!("获取用户在线状态...");
     if let Some(cached_status) = cache_service.get_user_status(&user_id).await? {
-        println!("✅ 缓存命中: 用户 {} 状态 {}, 设备数量: {}", 
-            cached_status.user_id, 
-            cached_status.status, 
+        println!(
+            "✅ 缓存命中: 用户 {} 状态 {}, 设备数量: {}",
+            cached_status.user_id,
+            cached_status.status,
             cached_status.devices.len()
         );
     } else {
@@ -117,13 +118,16 @@ async fn demo_local_cache() -> Result<(), ServerError> {
         updated_at: Utc::now(),
     };
 
-    cache_service.update_channel_list(channel_list.clone()).await?;
+    cache_service
+        .update_channel_list(channel_list.clone())
+        .await?;
 
     if let Some(cached_list) = cache_service.get_channel_list(&user_id).await? {
         println!("✅ 会话列表缓存命中: {} 个会话", cached_list.channels.len());
         for conv in &cached_list.channels {
-            println!("  - {}: {} (未读: {})", 
-                conv.channel_type, 
+            println!(
+                "  - {}: {} (未读: {})",
+                conv.channel_type,
                 conv.title.as_deref().unwrap_or("无标题"),
                 conv.unread_count
             );
@@ -139,23 +143,21 @@ async fn demo_redis_cache() -> Result<(), ServerError> {
     println!("创建 Redis 缓存管理器...");
     // 注意：实际使用时请设置正确的 Redis URL
     let redis_url = "redis://localhost:6379";
-    
+
     match CacheManager::with_redis(redis_url) {
         Ok(cache_manager) => {
             let cache_service = Arc::new(ChatCacheService::new(Arc::new(cache_manager)));
-            
+
             let user_id = Uuid::new_v4();
             let user_status = UserStatus {
                 user_id,
                 status: "online".to_string(),
-                devices: vec![
-                    DeviceInfo {
-                        device_id: "device-redis-001".to_string(),
-                        platform: "Android".to_string(),
-                        session_id: "session-redis-001".to_string(),
-                        last_active: Utc::now(),
-                    },
-                ],
+                devices: vec![DeviceInfo {
+                    device_id: "device-redis-001".to_string(),
+                    platform: "Android".to_string(),
+                    session_id: "session-redis-001".to_string(),
+                    last_active: Utc::now(),
+                }],
                 last_active: Utc::now(),
             };
 
@@ -164,9 +166,9 @@ async fn demo_redis_cache() -> Result<(), ServerError> {
 
             println!("从 Redis 获取用户状态...");
             if let Some(cached_status) = cache_service.get_user_status(&user_id).await? {
-                println!("✅ Redis 缓存命中: 用户 {} 状态 {}", 
-                    cached_status.user_id, 
-                    cached_status.status
+                println!(
+                    "✅ Redis 缓存命中: 用户 {} 状态 {}",
+                    cached_status.user_id, cached_status.status
                 );
             }
 
@@ -174,17 +176,23 @@ async fn demo_redis_cache() -> Result<(), ServerError> {
             let group_id = Uuid::new_v4();
             let group_members = GroupMembers {
                 group_id,
-                member_ids: [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()].iter().cloned().collect(),
+                member_ids: [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()]
+                    .iter()
+                    .cloned()
+                    .collect(),
                 admin_ids: [Uuid::new_v4()].iter().cloned().collect(),
                 owner_id: Some(Uuid::new_v4()),
                 updated_at: Utc::now(),
             };
 
             println!("设置群成员列表到 Redis...");
-            cache_service.update_group_members(group_members.clone()).await?;
+            cache_service
+                .update_group_members(group_members.clone())
+                .await?;
 
             if let Some(cached_members) = cache_service.get_group_members(&group_id).await? {
-                println!("✅ 群成员缓存命中: {} 个成员, {} 个管理员", 
+                println!(
+                    "✅ 群成员缓存命中: {} 个成员, {} 个管理员",
                     cached_members.member_ids.len(),
                     cached_members.admin_ids.len()
                 );
@@ -220,25 +228,41 @@ async fn demo_business_cache() -> Result<(), ServerError> {
     };
 
     println!("设置好友关系...");
-    cache_manager.friend_relations.put(user_id, friend_relations, 3600).await;
+    cache_manager
+        .friend_relations
+        .put(user_id, friend_relations, 3600)
+        .await;
 
     // 检查好友关系
     println!("检查好友关系...");
     let is_friend = cache_service.is_friend(&user_id, &friend_id).await?;
-    println!("✅ 好友关系检查: {}", if is_friend { "是好友" } else { "不是好友" });
+    println!(
+        "✅ 好友关系检查: {}",
+        if is_friend {
+            "是好友"
+        } else {
+            "不是好友"
+        }
+    );
 
     // 设置未读消息数
     println!("设置未读消息数...");
-    cache_service.update_unread_count(&user_id, &channel_id, 42).await?;
+    cache_service
+        .update_unread_count(&user_id, &channel_id, 42)
+        .await?;
 
-    let unread_count = cache_service.get_unread_count(&user_id, &channel_id).await?;
+    let unread_count = cache_service
+        .get_unread_count(&user_id, &channel_id)
+        .await?;
     println!("✅ 未读消息数: {}", unread_count);
 
     // 清理用户缓存
     println!("清理用户缓存...");
     cache_service.clear_user_cache(&user_id).await?;
 
-    let unread_count_after_clear = cache_service.get_unread_count(&user_id, &channel_id).await?;
+    let unread_count_after_clear = cache_service
+        .get_unread_count(&user_id, &channel_id)
+        .await?;
     println!("✅ 清理后未读消息数: {}", unread_count_after_clear);
 
     Ok(())
@@ -251,28 +275,40 @@ async fn demo_batch_operations() -> Result<(), ServerError> {
 
     // 创建多个用户状态
     let user_statuses = vec![
-        (Uuid::new_v4(), UserStatus {
-            user_id: Uuid::new_v4(),
-            status: "online".to_string(),
-            devices: vec![],
-            last_active: Utc::now(),
-        }),
-        (Uuid::new_v4(), UserStatus {
-            user_id: Uuid::new_v4(),
-            status: "away".to_string(),
-            devices: vec![],
-            last_active: Utc::now(),
-        }),
-        (Uuid::new_v4(), UserStatus {
-            user_id: Uuid::new_v4(),
-            status: "offline".to_string(),
-            devices: vec![],
-            last_active: Utc::now(),
-        }),
+        (
+            Uuid::new_v4(),
+            UserStatus {
+                user_id: Uuid::new_v4(),
+                status: "online".to_string(),
+                devices: vec![],
+                last_active: Utc::now(),
+            },
+        ),
+        (
+            Uuid::new_v4(),
+            UserStatus {
+                user_id: Uuid::new_v4(),
+                status: "away".to_string(),
+                devices: vec![],
+                last_active: Utc::now(),
+            },
+        ),
+        (
+            Uuid::new_v4(),
+            UserStatus {
+                user_id: Uuid::new_v4(),
+                status: "offline".to_string(),
+                devices: vec![],
+                last_active: Utc::now(),
+            },
+        ),
     ];
 
     println!("批量设置用户状态...");
-    cache_manager.user_status.mput(user_statuses.clone(), 3600).await;
+    cache_manager
+        .user_status
+        .mput(user_statuses.clone(), 3600)
+        .await;
 
     println!("批量获取用户状态...");
     let user_ids: Vec<Uuid> = user_statuses.iter().map(|(id, _)| *id).collect();
@@ -304,7 +340,9 @@ async fn demo_cache_consistency() -> Result<(), ServerError> {
     };
 
     println!("设置初始用户状态...");
-    cache_service.set_user_status(initial_status.clone()).await?;
+    cache_service
+        .set_user_status(initial_status.clone())
+        .await?;
 
     println!("第一次获取用户状态...");
     if let Some(status) = cache_service.get_user_status(&user_id).await? {
@@ -319,7 +357,9 @@ async fn demo_cache_consistency() -> Result<(), ServerError> {
         devices: vec![],
         last_active: Utc::now(),
     };
-    cache_service.set_user_status(updated_status.clone()).await?;
+    cache_service
+        .set_user_status(updated_status.clone())
+        .await?;
 
     println!("再次获取用户状态...");
     if let Some(status) = cache_service.get_user_status(&user_id).await? {
@@ -360,11 +400,11 @@ async fn demo_cache_performance() -> Result<(), ServerError> {
     // 性能测试
     println!("进行性能测试...");
     let start = std::time::Instant::now();
-    
+
     for _ in 0..10000 {
         let _ = cache_service.get_user_status(&user_id).await?;
     }
-    
+
     let duration = start.elapsed();
     println!("✅ 10000 次缓存读取耗时: {:?}", duration);
     println!("✅ 平均每次读取: {:?}", duration / 10000);
@@ -398,4 +438,4 @@ fn print_cache_architecture() {
     println!("• 支持缓存穿透、失效、延迟双删等机制");
     println!("• 完全由你控制生命周期和容错策略");
     println!();
-} 
+}

@@ -1,15 +1,19 @@
+use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use serde_json::Value;
 use tokio::sync::RwLock;
 
 use super::error::RpcResult;
 use super::types::{RPCMessageRequest, RPCMessageResponse};
 
 /// RPC 处理函数类型
-pub type RpcHandler = Arc<dyn Fn(Value, super::RpcContext) -> Pin<Box<dyn Future<Output = RpcResult<Value>> + Send>> + Send + Sync>;
+pub type RpcHandler = Arc<
+    dyn Fn(Value, super::RpcContext) -> Pin<Box<dyn Future<Output = RpcResult<Value>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// RPC 路由器
 #[derive(Clone)]
@@ -36,9 +40,13 @@ impl RpcRouter {
     }
 
     /// 处理 RPC 请求
-    pub async fn handle(&self, request: RPCMessageRequest, ctx: super::RpcContext) -> RPCMessageResponse {
+    pub async fn handle(
+        &self,
+        request: RPCMessageRequest,
+        ctx: super::RpcContext,
+    ) -> RPCMessageResponse {
         let routes = self.routes.read().await;
-        
+
         if let Some(handler) = routes.get(&request.route) {
             match handler(request.body, ctx).await {
                 Ok(data) => RPCMessageResponse::success(data),
@@ -47,7 +55,7 @@ impl RpcRouter {
         } else {
             RPCMessageResponse::error(
                 privchat_protocol::ErrorCode::ResourceNotFound.code() as i32,
-                format!("Route '{}' not found", request.route)
+                format!("Route '{}' not found", request.route),
             )
         }
     }
@@ -66,4 +74,4 @@ impl Default for RpcRouter {
 
 lazy_static::lazy_static! {
     pub static ref GLOBAL_RPC_ROUTER: RpcRouter = RpcRouter::new();
-} 
+}

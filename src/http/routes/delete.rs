@@ -1,9 +1,9 @@
 //! 文件删除路由
-//! 
+//!
 //! 路由：DELETE /api/app/files/{file_id}
 
 use axum::{
-    extract::{State, Path},
+    extract::{Path, State},
     response::Json,
     routing::delete,
     Router,
@@ -25,12 +25,15 @@ async fn delete_file(
     Path(file_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>> {
-    let file_id = file_id.parse::<u64>()
+    let file_id = file_id
+        .parse::<u64>()
         .map_err(|_| ServerError::Validation("file_id 必须为数字".to_string()))?;
     let file_service = &state.file_service;
-    let user_id_str = params.get("user_id")
+    let user_id_str = params
+        .get("user_id")
         .ok_or_else(|| ServerError::Validation("缺少 user_id 参数".to_string()))?;
-    let user_id = user_id_str.parse::<u64>()
+    let user_id = user_id_str
+        .parse::<u64>()
         .map_err(|_| ServerError::Validation(format!("无效的 user_id: {}", user_id_str)))?;
 
     info!("🗑️ 删除文件: {} (用户: {})", file_id, user_id);
@@ -42,4 +45,3 @@ async fn delete_file(
         "file_id": file_id,
     })))
 }
-

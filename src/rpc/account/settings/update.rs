@@ -3,14 +3,14 @@
 //! RPC: account/settings/update
 //! 支持单条 { "key": "theme", "value": "dark" } 或批量 { "settings": { "theme": "dark", "language": "zh-CN" } }
 
-use serde_json::{json, Value};
 use crate::rpc::error::{RpcError, RpcResult};
-use crate::rpc::{RpcServiceContext, get_current_user_id};
 use crate::rpc::RpcContext;
+use crate::rpc::{get_current_user_id, RpcServiceContext};
+use serde_json::{json, Value};
 
 /// 处理 account/settings/update 请求
 pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -> RpcResult<Value> {
-    tracing::info!("🔧 处理 account/settings/update 请求");
+    tracing::debug!("🔧 处理 account/settings/update 请求");
 
     let user_id = get_current_user_id(&ctx)?;
 
@@ -27,10 +27,9 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
             .set_batch(user_id, &map)
             .await
             .map_err(|e| RpcError::internal(format!("批量更新设置失败: {}", e)))?
-    } else if let (Some(key), Some(value)) = (
-        body.get("key").and_then(|v| v.as_str()),
-        body.get("value"),
-    ) {
+    } else if let (Some(key), Some(value)) =
+        (body.get("key").and_then(|v| v.as_str()), body.get("value"))
+    {
         services
             .user_settings_repo
             .set(user_id, key, value)

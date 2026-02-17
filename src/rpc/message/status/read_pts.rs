@@ -3,27 +3,42 @@
 //! 语义：本用户已读该频道内 pts <= read_pts 的所有消息。
 //! O(1) 存储、O(1) 广播，天然幂等、单调。
 
-use serde_json::{json, Value};
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use privchat_protocol::PushMessageRequest;
-use tracing::{info, warn, debug};
+use serde_json::{json, Value};
+use tracing::warn;
 
 /// 处理 按 pts 推进已读 请求
-pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::RpcContext) -> RpcResult<Value> {
+pub async fn handle(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
 
-    let channel_id = body.get("channel_id")
+    let channel_id = body
+        .get("channel_id")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| RpcError::validation("channel_id is required (must be u64)".to_string()))?;
 
-    let read_pts = body.get("read_pts")
+    let read_pts = body
+        .get("read_pts")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| RpcError::validation("read_pts is required (must be u64)".to_string()))?;
 
-    info!("🔧 处理 read_pts 请求: user_id={}, channel_id={}, read_pts={}", user_id, channel_id, read_pts);
+    tracing::debug!(
+        "🔧 处理 read_pts 请求: user_id={}, channel_id={}, read_pts={}",
+        user_id,
+        channel_id,
+        read_pts
+    );
 
-    let new_last_read_pts = match services.channel_service.mark_read_pts(&user_id, &channel_id, read_pts).await {
+    let new_last_read_pts = match services
+        .channel_service
+        .mark_read_pts(&user_id, &channel_id, read_pts)
+        .await
+    {
         Ok(Some(pts)) => pts,
         Ok(None) => {
             warn!("用户 {} 不在频道 {} 或频道不存在", user_id, channel_id);
@@ -34,7 +49,8 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
         }
     };
 
-    if let Err(e) = broadcast_user_read_pts(&services, user_id, channel_id, new_last_read_pts).await {
+    if let Err(e) = broadcast_user_read_pts(&services, user_id, channel_id, new_last_read_pts).await
+    {
         warn!("⚠️ 广播 UserReadEvent 失败: {}，但已读 pts 已更新", e);
     }
 
@@ -56,7 +72,11 @@ async fn broadcast_user_read_pts(
     let channel = match services.channel_service.get_channel(&channel_id).await {
         Ok(ch) => ch,
         Err(e) => {
-            debug!("频道不存在，跳过 read_pts 广播: channel_id={}, error={}", channel_id, e);
+            tracing::debug!(
+                "频道不存在，跳过 read_pts 广播: channel_id={}, error={}",
+                channel_id,
+                e
+            );
             return Ok(());
         }
     };
@@ -94,17 +114,25 @@ async fn broadcast_user_read_pts(
                     expire: 0,
                     topic: String::new(),
                     from_uid: 0,
-                    payload: serde_json::to_vec(&payload).map_err(|e| format!("序列化失败: {}", e))?,
+                    payload: serde_json::to_vec(&payload)
+                        .map_err(|e| format!("序列化失败: {}", e))?,
                 };
-                services.message_router
+                services
+                    .message_router
                     .route_message_to_user(&uid, notification)
                     .await
                     .map_err(|e| format!("发送失败: {}", e))?;
-                info!("✅ UserReadEvent(reader={}, channel={}, read_pts={}) 已发给 {}", reader_id, channel_id, read_pts, uid);
+                tracing::debug!(
+                    "✅ UserReadEvent(reader={}, channel={}, read_pts={}) 已发给 {}",
+                    reader_id,
+                    channel_id,
+                    read_pts,
+                    uid
+                );
             }
         }
         ChannelKind::GroupChat => {
-            debug!("群聊 read_pts 不主动广播，避免 O(n) 爆炸；发送者可按需查询");
+            tracing::debug!("群聊 read_pts 不主动广播，避免 O(n) 爆炸；发送者可按需查询");
         }
         _ => {}
     }

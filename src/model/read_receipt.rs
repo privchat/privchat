@@ -34,14 +34,13 @@ impl ReadReceipt {
         message_id: Uuid,
         user_id: Uuid,
         channel_id: Uuid,
-        read_at: i64,  // 毫秒时间戳
+        read_at: i64, // 毫秒时间戳
     ) -> Self {
         Self {
             message_id,
             user_id,
             channel_id,
-            read_at: DateTime::from_timestamp_millis(read_at)
-                .unwrap_or_else(|| Utc::now()),
+            read_at: DateTime::from_timestamp_millis(read_at).unwrap_or_else(|| Utc::now()),
         }
     }
 

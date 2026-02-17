@@ -4,11 +4,11 @@
 //! UI 通过 get_channels / get_messages 从 SQLite 读取。
 //! 未来可扩展：其他联系用户的功能（如系统通知、提醒等）均可通过本服务下发。
 
+use msgtrans::{packet::Packet, SessionId};
+use privchat_protocol::protocol::{MessageType, PushMessageRequest};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
-use msgtrans::{SessionId, packet::Packet};
-use privchat_protocol::protocol::{PushMessageRequest, MessageType};
 
 use crate::error::{Result, ServerError};
 

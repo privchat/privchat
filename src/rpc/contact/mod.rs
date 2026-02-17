@@ -1,6 +1,6 @@
-pub mod friend;
+pub mod blacklist;
 pub mod block;
-pub mod blacklist;  // ✅ 新增黑名单模块
+pub mod friend; // ✅ 新增黑名单模块
 
 use super::RpcServiceContext;
 
@@ -8,7 +8,7 @@ use super::RpcServiceContext;
 pub async fn register_routes(services: RpcServiceContext) {
     friend::register_routes(services.clone()).await;
     block::register_routes(services.clone()).await;
-    blacklist::register_routes(services.clone()).await;  // ✅ 注册黑名单路由
-    
-    tracing::info!("📋 Contact 系统路由注册完成 (friend, block, blacklist)");
-} 
+    blacklist::register_routes(services.clone()).await; // ✅ 注册黑名单路由
+
+    tracing::debug!("📋 Contact 系统路由注册完成 (friend, block, blacklist)");
+}

@@ -1,7 +1,7 @@
 //! 用户设置 Repository（ENTITY_SYNC_V1 user_settings，表为主）
 
-use sqlx::PgPool;
 use crate::error::{Result, ServerError};
+use sqlx::PgPool;
 
 /// 用户设置 Repository（表 privchat_user_settings）
 pub struct UserSettingsRepository {
@@ -35,7 +35,7 @@ impl UserSettingsRepository {
             WHERE user_id = $1 AND version > $2
             ORDER BY version
             LIMIT $3
-            "#
+            "#,
         )
         .bind(user_id as i64)
         .bind(since_version as i64)

@@ -1,14 +1,13 @@
+use parking_lot::Mutex;
 /// 多维度速率限制器
-/// 
+///
 /// 核心特性：
 /// 1. 基于 cost 而不是简单计数
 /// 2. 支持 (user, msg_type), (user, channel), (channel) 三层限流
 /// 3. 考虑 fan-out 成本
 /// 4. 使用 sharded token bucket 保证高并发性能
-
 use std::collections::HashMap;
 use std::time::Instant;
-use parking_lot::Mutex;
 
 use super::client_state::{TrustScore, ViolationType};
 
@@ -25,15 +24,27 @@ pub struct RpcCost {
 
 impl RpcCost {
     pub const fn light(tokens: u32) -> Self {
-        Self { tokens, is_stateful: false, is_sensitive: false }
+        Self {
+            tokens,
+            is_stateful: false,
+            is_sensitive: false,
+        }
     }
-    
+
     pub const fn stateful(tokens: u32) -> Self {
-        Self { tokens, is_stateful: true, is_sensitive: false }
+        Self {
+            tokens,
+            is_stateful: true,
+            is_sensitive: false,
+        }
     }
-    
+
     pub const fn sensitive(tokens: u32) -> Self {
-        Self { tokens, is_stateful: true, is_sensitive: true }
+        Self {
+            tokens,
+            is_stateful: true,
+            is_sensitive: true,
+        }
     }
 }
 
@@ -49,21 +60,21 @@ impl RpcCostTable {
             "sync.pull" | "sync.getDifference" => RpcCost::stateful(20),
             "messages.readHistory" | "messages.ack" => RpcCost::stateful(2),
             "account.updateStatus" => RpcCost::stateful(10),
-            
+
             // === 弱状态 RPC（可放宽）===
             "users.getProfile" | "users.getInfo" => RpcCost::light(1),
             "contacts.getList" => RpcCost::light(5),
             "contacts.search" => RpcCost::light(10),
-            
+
             // === 写操作 ===
             "messages.send" => RpcCost::stateful(5),
             "channels.createChannel" => RpcCost::stateful(20),
             "channels.inviteMembers" => RpcCost::stateful(15),
-            
+
             // === 禁止高频的重型 RPC ===
             "sync.getFullState" => RpcCost::stateful(100),
             "channels.getAllMembers" => RpcCost::stateful(50),
-            
+
             // 默认
             _ => RpcCost::light(5),
         }
@@ -92,11 +103,11 @@ impl TokenBucket {
             last_update: Instant::now(),
         }
     }
-    
+
     /// 尝试消耗令牌
     fn try_consume(&mut self, cost: f64) -> bool {
         self.refill();
-        
+
         if self.tokens >= cost {
             self.tokens -= cost;
             true
@@ -104,7 +115,7 @@ impl TokenBucket {
             false
         }
     }
-    
+
     /// 补充令牌
     fn refill(&mut self) {
         let now = Instant::now();
@@ -112,7 +123,7 @@ impl TokenBucket {
         self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
         self.last_update = now;
     }
-    
+
     /// 获取剩余令牌
     fn remaining(&mut self) -> f64 {
         self.refill();
@@ -142,11 +153,11 @@ pub struct RateLimitConfig {
     pub user_tokens_per_second: f64,
     /// 用户全局：桶容量（允许突发）
     pub user_burst_capacity: f64,
-    
+
     /// 单会话：每秒消息数
     pub channel_messages_per_second: f64,
     pub channel_burst_capacity: f64,
-    
+
     /// IP 连接：每秒连接数
     pub ip_connections_per_second: f64,
     pub ip_burst_capacity: f64,
@@ -158,11 +169,11 @@ impl Default for RateLimitConfig {
             // 用户全局：基础 50 tokens/s，突发 100
             user_tokens_per_second: 50.0,
             user_burst_capacity: 100.0,
-            
+
             // 单会话：3条消息/秒（考虑到大群的 fan-out）
             channel_messages_per_second: 3.0,
             channel_burst_capacity: 10.0,
-            
+
             // IP 连接：5个/秒
             ip_connections_per_second: 5.0,
             ip_burst_capacity: 10.0,
@@ -181,27 +192,35 @@ impl ShardedBuckets {
     fn new() -> Self {
         Self {
             shards: [
-                Mutex::new(HashMap::new()), Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()), Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()), Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()), Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()), Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()), Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()), Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()), Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
+                Mutex::new(HashMap::new()),
             ],
         }
     }
-    
+
     fn get_shard(&self, key: &RateLimitKey) -> &Mutex<HashMap<RateLimitKey, TokenBucket>> {
         let hash = self.hash_key(key);
         &self.shards[hash % SHARD_COUNT]
     }
-    
+
     fn hash_key(&self, key: &RateLimitKey) -> usize {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         hasher.finish() as usize
@@ -221,9 +240,9 @@ impl MultiDimensionRateLimiter {
             buckets: ShardedBuckets::new(),
         }
     }
-    
+
     /// 检查并消耗限流配额
-    /// 
+    ///
     /// 返回：(是否允许, 违规类型)
     pub fn check_and_consume(
         &self,
@@ -234,7 +253,7 @@ impl MultiDimensionRateLimiter {
     ) -> (bool, Option<ViolationType>) {
         let cost = RpcCostTable::get_cost(rpc_method);
         let multiplier = trust_score.get_rate_multiplier();
-        
+
         // 1. 用户全局限流
         let user_key = RateLimitKey::User(user_id);
         if !self.try_consume_internal(
@@ -245,7 +264,7 @@ impl MultiDimensionRateLimiter {
         ) {
             return (false, Some(ViolationType::RateLimit));
         }
-        
+
         // 2. 用户 + RPC 方法限流
         let user_rpc_key = RateLimitKey::UserRpc(user_id, rpc_method.to_string());
         let rpc_specific_rate = self.get_rpc_specific_rate(rpc_method, multiplier);
@@ -257,7 +276,7 @@ impl MultiDimensionRateLimiter {
         ) {
             return (false, Some(ViolationType::RateLimit));
         }
-        
+
         // 3. 会话级限流（如果是发消息操作）
         if let Some(conv_id) = channel_id {
             if rpc_method.starts_with("messages.send") {
@@ -271,7 +290,7 @@ impl MultiDimensionRateLimiter {
                 ) {
                     return (false, Some(ViolationType::FanoutAbuse));
                 }
-                
+
                 // 会话全局（防止单个群被刷爆）
                 let conv_key = RateLimitKey::Channel(conv_id);
                 if !self.try_consume_internal(
@@ -284,10 +303,10 @@ impl MultiDimensionRateLimiter {
                 }
             }
         }
-        
+
         (true, None)
     }
-    
+
     /// 内部消耗方法
     fn try_consume_internal(
         &self,
@@ -298,34 +317,34 @@ impl MultiDimensionRateLimiter {
     ) -> bool {
         let shard = self.buckets.get_shard(key);
         let mut buckets = shard.lock();
-        
+
         let bucket = buckets
             .entry(key.clone())
             .or_insert_with(|| TokenBucket::new(capacity, rate));
-        
+
         bucket.try_consume(cost)
     }
-    
+
     /// 获取 RPC 特定的速率配置
     fn get_rpc_specific_rate(&self, rpc_method: &str, multiplier: f64) -> (f64, f64) {
         match rpc_method {
             // 认证：严格限制
             "auth.login" | "auth.register" => (1.0 * multiplier, 3.0 * multiplier),
-            
+
             // 同步：中等限制
             "sync.pull" => (2.0 * multiplier, 5.0 * multiplier),
-            
+
             // 搜索：中等限制
             "contacts.search" => (5.0 * multiplier, 10.0 * multiplier),
-            
+
             // 轻量读操作：宽松
             "users.getProfile" => (50.0 * multiplier, 100.0 * multiplier),
-            
+
             // 默认
             _ => (10.0 * multiplier, 20.0 * multiplier),
         }
     }
-    
+
     /// IP 连接限流（连接层使用）
     pub fn check_ip_connection(&self, ip: &str) -> bool {
         let key = RateLimitKey::Ip(ip.to_string());
@@ -343,7 +362,7 @@ pub struct FanoutCostCalculator;
 
 impl FanoutCostCalculator {
     /// 计算消息的实际成本
-    /// 
+    ///
     /// 考虑因素：
     /// - 接收者数量（fan-out）
     /// - 消息大小
@@ -354,28 +373,29 @@ impl FanoutCostCalculator {
         is_media: bool,
     ) -> u32 {
         let base_cost = 1u32;
-        
+
         // Fan-out 成本（核心！）
         let fanout_multiplier = match recipient_count {
-            1..=10 => 1.0,           // 小群：正常
-            11..=100 => 2.0,         // 中群：翻倍
-            101..=500 => 5.0,        // 大群：5倍
-            501..=1000 => 10.0,      // 超大群：10倍
-            _ => 20.0,               // 频道：20倍
+            1..=10 => 1.0,      // 小群：正常
+            11..=100 => 2.0,    // 中群：翻倍
+            101..=500 => 5.0,   // 大群：5倍
+            501..=1000 => 10.0, // 超大群：10倍
+            _ => 20.0,          // 频道：20倍
         };
-        
+
         // 消息大小成本
         let size_multiplier = match message_size_bytes {
-            0..=1024 => 1.0,         // < 1KB
-            1025..=10240 => 1.5,     // 1-10KB
-            10241..=102400 => 2.0,   // 10-100KB
-            _ => 3.0,                // > 100KB
+            0..=1024 => 1.0,       // < 1KB
+            1025..=10240 => 1.5,   // 1-10KB
+            10241..=102400 => 2.0, // 10-100KB
+            _ => 3.0,              // > 100KB
         };
-        
+
         // 媒体成本
         let media_multiplier = if is_media { 2.0 } else { 1.0 };
-        
-        let total_cost = (base_cost as f64) * fanout_multiplier * size_multiplier * media_multiplier;
+
+        let total_cost =
+            (base_cost as f64) * fanout_multiplier * size_multiplier * media_multiplier;
         total_cost.ceil() as u32
     }
 }
@@ -384,37 +404,38 @@ impl FanoutCostCalculator {
 mod tests {
     use super::*;
     use crate::security::client_state::TrustScore;
-    
+
     #[test]
     fn test_rate_limiter() {
         let config = RateLimitConfig::default();
         let limiter = MultiDimensionRateLimiter::new(config);
         let trust = TrustScore::new(1001, "device_1".to_string());
-        
+
         // 正常请求
         let (allowed, _) = limiter.check_and_consume(1001, "users.getProfile", None, &trust);
         assert!(allowed);
-        
+
         // 高频请求
         for _ in 0..200 {
-            let (allowed, violation) = limiter.check_and_consume(1001, "users.getProfile", None, &trust);
+            let (allowed, violation) =
+                limiter.check_and_consume(1001, "users.getProfile", None, &trust);
             if !allowed {
                 assert_eq!(violation, Some(ViolationType::RateLimit));
                 break;
             }
         }
     }
-    
+
     #[test]
     fn test_fanout_cost() {
         // 小群文本
         let cost1 = FanoutCostCalculator::calculate_message_cost(5, 100, false);
         assert_eq!(cost1, 1);
-        
+
         // 大群文本
         let cost2 = FanoutCostCalculator::calculate_message_cost(200, 100, false);
         assert!(cost2 > 5);
-        
+
         // 大群媒体
         let cost3 = FanoutCostCalculator::calculate_message_cost(200, 50000, true);
         assert!(cost3 > cost2);

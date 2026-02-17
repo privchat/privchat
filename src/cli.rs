@@ -19,7 +19,11 @@ pub struct Cli {
     pub config_file: Option<String>,
 
     /// 运行环境
-    #[arg(long, value_name = "ENV", help = "运行环境: production, development, test")]
+    #[arg(
+        long,
+        value_name = "ENV",
+        help = "运行环境: production, development, test"
+    )]
     pub env: Option<String>,
 
     /// 服务器监听地址
@@ -47,7 +51,11 @@ pub struct Cli {
     pub worker_threads: Option<u32>,
 
     /// 日志级别
-    #[arg(long, value_name = "LEVEL", help = "日志级别: trace, debug, info, warn, error")]
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        help = "日志级别: trace, debug, info, warn, error"
+    )]
     pub log_level: Option<String>,
 
     /// 日志格式
@@ -119,15 +127,15 @@ impl Cli {
         if self.quiet {
             return Some("error".to_string());
         }
-        
+
         if self.dev {
             return Some("debug".to_string());
         }
-        
+
         if let Some(level) = &self.log_level {
             return Some(level.clone());
         }
-        
+
         // 根据 verbose 级别设置
         match self.verbose {
             0 => None, // 使用默认或配置文件

@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 测试会话模型创建
     test_channel_model().await;
-    
+
     // 测试会话服务
     test_channel_service().await;
 
@@ -24,9 +24,7 @@ async fn test_channel_model() {
     println!("📋 测试1: 会话模型创建");
 
     // 使用完整的模块路径来避免导入问题
-    use privchat_server::model::channel::{
-        Channel, ChannelType, MemberRole
-    };
+    use privchat_server::model::channel::{Channel, ChannelType, MemberRole};
 
     // 创建私聊会话
     let direct_conv = Channel::new_direct(
@@ -65,7 +63,10 @@ async fn test_channel_model() {
     // 测试权限检查
     let can_send = test_group.check_permission("alice", |perms| perms.can_send_message);
     let can_manage = test_group.check_permission("alice", |perms| perms.can_manage_permissions);
-    println!("✅ 权限检查 - alice 可发消息: {}, 可管理权限: {}", can_send, can_manage);
+    println!(
+        "✅ 权限检查 - alice 可发消息: {}, 可管理权限: {}",
+        can_send, can_manage
+    );
 
     println!("✅ 会话模型测试完成\n");
 }
@@ -73,12 +74,8 @@ async fn test_channel_model() {
 async fn test_channel_service() {
     println!("🔧 测试2: 会话服务功能");
 
-    use privchat_server::service::channel_service::{
-        ChannelService, ChannelServiceConfig
-    };
-    use privchat_server::model::channel::{
-        ChannelType, CreateChannelRequest
-    };
+    use privchat_server::model::channel::{ChannelType, CreateChannelRequest};
+    use privchat_server::service::channel_service::{ChannelService, ChannelServiceConfig};
 
     // 创建服务配置
     let config = ChannelServiceConfig {
@@ -102,7 +99,10 @@ async fn test_channel_service() {
     };
 
     // 测试创建私聊
-    match service.create_channel("alice".to_string(), direct_request).await {
+    match service
+        .create_channel("alice".to_string(), direct_request)
+        .await
+    {
         Ok(response) => {
             if response.success {
                 println!("✅ 私聊创建成功: {}", response.channel.id);
@@ -128,7 +128,10 @@ async fn test_channel_service() {
 
     // 测试创建群聊
     let mut test_group_id = String::new();
-    match service.create_channel("alice".to_string(), group_request).await {
+    match service
+        .create_channel("alice".to_string(), group_request)
+        .await
+    {
         Ok(response) => {
             if response.success {
                 test_group_id = response.channel.id.clone();
@@ -147,7 +150,10 @@ async fn test_channel_service() {
 
     // 测试加入群聊
     if !test_group_id.is_empty() {
-        match service.join_channel(&test_group_id, "david".to_string(), None).await {
+        match service
+            .join_channel(&test_group_id, "david".to_string(), None)
+            .await
+        {
             Ok(success) => {
                 if success {
                     println!("✅ david 成功加入群聊");
@@ -166,8 +172,13 @@ async fn test_channel_service() {
     println!("✅ alice 的会话列表:");
     println!("   - 总数: {}", channels.total);
     for (i, conv) in channels.channels.iter().enumerate() {
-        println!("   {}. {} (类型: {:?}, 成员数: {})", 
-                 i + 1, conv.id, conv.channel_type, conv.members.len());
+        println!(
+            "   {}. {} (类型: {:?}, 成员数: {})",
+            i + 1,
+            conv.id,
+            conv.channel_type,
+            conv.members.len()
+        );
     }
 
     // 测试查找私聊
@@ -185,7 +196,10 @@ async fn test_channel_service() {
     println!("   - 私聊会话数: {}", stats.direct_channels);
     println!("   - 群聊会话数: {}", stats.group_channels);
     println!("   - 总成员数: {}", stats.total_members);
-    println!("   - 平均每会话成员数: {:.2}", stats.avg_members_per_channel);
+    println!(
+        "   - 平均每会话成员数: {:.2}",
+        stats.avg_members_per_channel
+    );
 
     println!("✅ 会话服务测试完成\n");
-} 
+}

@@ -3,11 +3,11 @@
 
 pub mod message;
 pub mod queue;
-pub mod storage;
 pub mod scheduler;
+pub mod storage;
 
 // 重新导出主要类型
-pub use message::{OfflineMessage, MessagePriority, DeliveryStatus};
+pub use message::{DeliveryStatus, MessagePriority, OfflineMessage};
 pub use queue::{OfflineQueueManager, QueueStats};
-pub use storage::{StorageBackend, SledStorage};
-pub use scheduler::{OfflineScheduler, SchedulerConfig}; 
+pub use scheduler::{OfflineScheduler, SchedulerConfig};
+pub use storage::{SledStorage, StorageBackend};

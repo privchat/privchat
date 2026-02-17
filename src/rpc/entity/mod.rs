@@ -12,11 +12,14 @@ use privchat_protocol::rpc::routes;
 pub async fn register_routes(services: RpcServiceContext) {
     let services_clone = services.clone();
     GLOBAL_RPC_ROUTER
-        .register(routes::entity::SYNC_ENTITIES, move |body: serde_json::Value, ctx: crate::rpc::RpcContext| {
-            let services = services_clone.clone();
-            async move { sync_entities::handle(body, services, ctx).await }
-        })
+        .register(
+            routes::entity::SYNC_ENTITIES,
+            move |body: serde_json::Value, ctx: crate::rpc::RpcContext| {
+                let services = services_clone.clone();
+                async move { sync_entities::handle(body, services, ctx).await }
+            },
+        )
         .await;
 
-    tracing::info!("📋 Entity 路由注册完成 (entity/sync_entities)");
+    tracing::debug!("📋 Entity 路由注册完成 (entity/sync_entities)");
 }

@@ -1,9 +1,9 @@
-pub mod provider_trait;
+pub mod apns;
+pub mod fcm; // ✨ Phase 2: FCM Provider
 pub mod mock;
-pub mod fcm;  // ✨ Phase 2: FCM Provider
-pub mod apns;  // ✨ Phase 3: APNs Provider
+pub mod provider_trait; // ✨ Phase 3: APNs Provider
 
-pub use provider_trait::PushProvider;
+pub use apns::ApnsProvider;
+pub use fcm::FcmProvider; // ✨ Phase 2
 pub use mock::MockProvider;
-pub use fcm::FcmProvider;  // ✨ Phase 2
-pub use apns::ApnsProvider;  // ✨ Phase 3
+pub use provider_trait::PushProvider; // ✨ Phase 3

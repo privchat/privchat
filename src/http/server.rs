@@ -1,15 +1,15 @@
 //! HTTP 服务器 - 使用 Axum 提供文件服务
 
-use std::sync::Arc;
 use axum::Router;
+use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use crate::service::{FileService, UploadTokenService, ChannelService};
-use crate::auth::{TokenIssueService, ServiceKeyManager};
-use crate::http::routes;
-use crate::repository::{UserRepository, LoginLogRepository, PgMessageRepository};
 use crate::auth::DeviceManagerDb;
+use crate::auth::{ServiceKeyManager, TokenIssueService};
+use crate::http::routes;
+use crate::repository::{LoginLogRepository, PgMessageRepository, UserRepository};
+use crate::service::{ChannelService, FileService, UploadTokenService};
 
 /// HTTP 文件服务器共享状态
 #[derive(Clone)]
@@ -73,14 +73,13 @@ impl FileHttpServer {
         // 绑定地址
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        
+
         info!("🌐 HTTP 文件服务器启动在端口 {}", self.port);
-        
+
         // 启动服务器
         let server = axum::serve(listener, app);
         server.await?;
-        
+
         Ok(())
     }
 }
-

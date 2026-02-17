@@ -30,13 +30,12 @@ impl Blacklist {
     pub fn from_db_row(
         user_id: Uuid,
         blocked_user_id: Uuid,
-        created_at: i64,  // 毫秒时间戳
+        created_at: i64, // 毫秒时间戳
     ) -> Self {
         Self {
             user_id,
             blocked_user_id,
-            created_at: DateTime::from_timestamp_millis(created_at)
-                .unwrap_or_else(|| Utc::now()),
+            created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
         }
     }
 

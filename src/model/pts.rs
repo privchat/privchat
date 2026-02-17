@@ -1,42 +1,25 @@
 /// pts (Persistent Timestamp Sequence) 相关数据结构
-/// 
-/// ⚠️ 关键修正（2026-01-21）：
+///
+/// ⚠️ 关键修正（2026-02-11）：
 /// - pts 是 **per-channel** 单调递增（NOT per-user）
-/// - 每个频道（channel_id + channel_type）有独立的 pts 序列
+/// - key 仅使用 channel_id（u64），channel_type 不参与 key
 /// - 设备通过比对 local_pts 和 server_pts 实现增量同步
-/// 
+///
 /// 为什么是 per-channel？
 /// 1. 群聊场景：群聊的消息顺序应该独立于其他群
 /// 2. 分片扩展：不同频道可以分布在不同服务器
 /// 3. 隔离性：一个频道的消息不影响其他频道的 pts
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// 频道标识符（channel_id + channel_type）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChannelKey {
-    pub channel_id: u64,
-    pub channel_type: u8, // 1=私聊，2=群聊
-}
-
-impl ChannelKey {
-    pub fn new(channel_id: u64, channel_type: u8) -> Self {
-        Self {
-            channel_id,
-            channel_type,
-        }
-    }
-}
-
 /// pts 生成器（per-channel）⭐
 #[derive(Debug, Clone)]
 pub struct PtsGenerator {
     /// 每个频道的 pts 计数器
-    counters: Arc<RwLock<HashMap<ChannelKey, Arc<AtomicU64>>>>,
+    counters: Arc<RwLock<HashMap<u64, Arc<AtomicU64>>>>,
 }
 
 impl PtsGenerator {
@@ -48,44 +31,40 @@ impl PtsGenerator {
     }
 
     /// 生成下一个 pts（原子操作，线程安全）⭐
-    /// 
+    ///
     /// # 参数
     /// - channel_id: 频道 ID
-    /// - channel_type: 频道类型（1=私聊，2=群聊）
-    pub async fn next_pts(&self, channel_id: u64, channel_type: u8) -> u64 {
-        let key = ChannelKey::new(channel_id, channel_type);
+    pub async fn next_pts(&self, channel_id: u64) -> u64 {
         let mut counters = self.counters.write().await;
         let counter = counters
-            .entry(key)
+            .entry(channel_id)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)));
         counter.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// 获取当前 pts（不递增）
-    pub async fn current_pts(&self, channel_id: u64, channel_type: u8) -> u64 {
-        let key = ChannelKey::new(channel_id, channel_type);
+    pub async fn current_pts(&self, channel_id: u64) -> u64 {
         let counters = self.counters.read().await;
         counters
-            .get(&key)
+            .get(&channel_id)
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0)
     }
 
     /// 设置 pts（用于初始化或恢复）
-    pub async fn set_pts(&self, channel_id: u64, channel_type: u8, pts: u64) {
-        let key = ChannelKey::new(channel_id, channel_type);
+    pub async fn set_pts(&self, channel_id: u64, pts: u64) {
         let mut counters = self.counters.write().await;
         let counter = counters
-            .entry(key)
+            .entry(channel_id)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)));
         counter.store(pts, Ordering::SeqCst);
     }
 
     /// 批量初始化（从数据库恢复）
-    pub async fn init_from_db(&self, channel_pts_map: HashMap<ChannelKey, u64>) {
+    pub async fn init_from_db(&self, channel_pts_map: HashMap<u64, u64>) {
         let mut counters = self.counters.write().await;
-        for (key, pts) in channel_pts_map {
-            counters.insert(key, Arc::new(AtomicU64::new(pts)));
+        for (channel_id, pts) in channel_pts_map {
+            counters.insert(channel_id, Arc::new(AtomicU64::new(pts)));
         }
     }
 }
@@ -101,34 +80,34 @@ impl Default for PtsGenerator {
 pub struct MessageWithPts {
     /// pts 指针（全局唯一递增）
     pub pts: u64,
-    
+
     /// 消息 ID
     pub message_id: String,
-    
+
     /// 发送者 ID
     pub from_user_id: String,
-    
+
     /// 接收者 ID
     pub to_user_id: String,
-    
+
     /// 频道 ID
     pub channel_id: String,
-    
+
     /// 消息序号（客户端生成）
     pub local_message_id: String,
-    
+
     /// 消息类型
     pub message_type: String,
-    
+
     /// 消息内容
     pub content: String,
-    
+
     /// 元数据（JSON）
     pub metadata: Option<serde_json::Value>,
-    
+
     /// 创建时间（Unix 时间戳）
     pub created_at: i64,
-    
+
     /// 是否已撤回
     pub is_revoked: bool,
 }
@@ -138,22 +117,22 @@ pub struct MessageWithPts {
 pub struct DeviceSyncState {
     /// 用户 ID
     pub user_id: String,
-    
+
     /// 设备 ID
     pub device_id: String,
-    
+
     /// 设备本地 pts
     pub local_pts: u64,
-    
+
     /// 服务端最新 pts
     pub server_pts: u64,
-    
+
     /// gap（待同步消息数）
     pub gap: u64,
-    
+
     /// 最后同步时间
     pub last_sync_time: i64,
-    
+
     /// 最后在线时间
     pub last_online_time: i64,
 }
@@ -223,7 +202,7 @@ impl UserMessageIndex {
             Vec::new()
         }
     }
-    
+
     /// 获取 pts > min_pts 的所有消息 ID 列表
     pub async fn get_message_ids_above(&self, user_id: u64, min_pts: u64) -> Vec<u64> {
         let index = self.index.read().await;
@@ -239,9 +218,13 @@ impl UserMessageIndex {
             Vec::new()
         }
     }
-    
+
     /// 获取 pts > min_pts 的所有消息 ID 和 pts 的映射
-    pub async fn get_message_ids_with_pts_above(&self, user_id: u64, min_pts: u64) -> std::collections::HashMap<u64, u64> {
+    pub async fn get_message_ids_with_pts_above(
+        &self,
+        user_id: u64,
+        min_pts: u64,
+    ) -> std::collections::HashMap<u64, u64> {
         let index = self.index.read().await;
         if let Some(user_index) = index.get(&user_id) {
             let mut map = std::collections::HashMap::new();
@@ -264,7 +247,7 @@ impl UserMessageIndex {
                 // 获取所有 pts 并排序
                 let mut pts_list: Vec<u64> = user_index.keys().copied().collect();
                 pts_list.sort_unstable();
-                
+
                 // 保留最新的 N 条，删除旧的
                 let remove_count = pts_list.len() - keep_latest;
                 for pts in pts_list.iter().take(remove_count) {
@@ -286,10 +269,10 @@ impl Default for UserMessageIndex {
 pub struct OfflineQueueConfig {
     /// 最大队列长度
     pub max_queue_size: usize,
-    
+
     /// 批量推送大小
     pub batch_size: usize,
-    
+
     /// 过期时间（秒）
     pub expire_seconds: i64,
 }
@@ -297,9 +280,9 @@ pub struct OfflineQueueConfig {
 impl Default for OfflineQueueConfig {
     fn default() -> Self {
         Self {
-            max_queue_size: 5000,  // 最多 5000 条
-            batch_size: 50,        // 每批 50 条
-            expire_seconds: 7 * 24 * 3600,  // 7 天
+            max_queue_size: 5000,          // 最多 5000 条
+            batch_size: 50,                // 每批 50 条
+            expire_seconds: 7 * 24 * 3600, // 7 天
         }
     }
 }
@@ -322,9 +305,7 @@ impl UnreadCounter {
     /// 增加未读计数
     pub async fn increment(&self, user_id: u64, channel_id: u64, count: u64) {
         let mut counters = self.counters.write().await;
-        let user_counters = counters
-            .entry(user_id)
-            .or_insert_with(HashMap::new);
+        let user_counters = counters.entry(user_id).or_insert_with(HashMap::new);
         *user_counters.entry(channel_id).or_insert(0) += count;
     }
 
@@ -362,18 +343,18 @@ mod tests {
     #[tokio::test]
     async fn test_pts_generator() {
         let generator = PtsGenerator::new();
-        
+
         // 测试生成 pts
         let pts1 = generator.next_pts("alice").await;
         assert_eq!(pts1, 1);
-        
+
         let pts2 = generator.next_pts("alice").await;
         assert_eq!(pts2, 2);
-        
+
         // 不同用户的 pts 独立
         let pts3 = generator.next_pts("bob").await;
         assert_eq!(pts3, 1);
-        
+
         // 获取当前 pts
         let current = generator.current_pts("alice").await;
         assert_eq!(current, 2);
@@ -381,12 +362,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_device_sync_state() {
-        let mut state = DeviceSyncState::new(
-            "alice".to_string(),
-            "device_001".to_string(),
-            100,
-        );
-        
+        let mut state = DeviceSyncState::new("alice".to_string(), "device_001".to_string(), 100);
+
         // 更新同步状态
         state.update(150);
         assert_eq!(state.server_pts, 150);
@@ -396,12 +373,12 @@ mod tests {
     #[tokio::test]
     async fn test_user_message_index() {
         let index = UserMessageIndex::new();
-        
+
         // 添加消息
         index.add_message("alice", 1, "msg_001".to_string()).await;
         index.add_message("alice", 2, "msg_002".to_string()).await;
         index.add_message("alice", 3, "msg_003".to_string()).await;
-        
+
         // 获取范围内的消息
         let message_ids = index.get_message_ids("alice", 1, 2).await;
         assert_eq!(message_ids.len(), 2);
@@ -412,17 +389,17 @@ mod tests {
     #[tokio::test]
     async fn test_unread_counter() {
         let counter = UnreadCounter::new();
-        
+
         // 增加未读计数
         counter.increment("alice", "channel_001", 1).await;
         counter.increment("alice", "channel_001", 1).await;
         counter.increment("alice", "channel_002", 3).await;
-        
+
         // 获取未读计数
         let unread = counter.get("alice").await;
         assert_eq!(unread.get("channel_001"), Some(&2));
         assert_eq!(unread.get("channel_002"), Some(&3));
-        
+
         // 清空特定会话
         counter.clear_channel("alice", "channel_001").await;
         let unread = counter.get("alice").await;
@@ -430,4 +407,3 @@ mod tests {
         assert_eq!(unread.get("channel_002"), Some(&3));
     }
 }
-

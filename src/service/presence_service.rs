@@ -6,4 +6,4 @@ impl PresenceService {
     pub fn new() -> Self {
         Self
     }
-} 
+}

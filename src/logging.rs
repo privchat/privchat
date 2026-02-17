@@ -1,23 +1,18 @@
-use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use anyhow::Result;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// 初始化日志系统
 pub fn init_logging(
     log_level: &str,
     log_format: Option<&str>,
-    _log_file: Option<&str>,  // TODO: 实现文件输出功能
+    _log_file: Option<&str>, // TODO: 实现文件输出功能
     quiet: bool,
 ) -> Result<()> {
     // 如果静默模式，只输出错误
-    let level = if quiet {
-        "error"
-    } else {
-        log_level
-    };
+    let level = if quiet { "error" } else { log_level };
 
     // 解析日志级别
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     // 根据格式选择不同的输出方式
     match log_format {

@@ -1,11 +1,11 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
-use crate::model::channel::{UserId, MessageId, ChannelId};
 use crate::error::Result;
+use crate::model::channel::{ChannelId, MessageId, UserId};
 
 /// 已读回执记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ impl ReadReceiptService {
         user_id: UserId,
     ) -> Result<ReadReceipt> {
         let read_at = Utc::now();
-        
+
         let receipt = ReadReceipt {
             message_id: message_id.clone(),
             channel_id: channel_id.clone(),
@@ -83,11 +83,7 @@ impl ReadReceiptService {
     }
 
     /// 查询消息是否已读（私聊）
-    pub async fn is_message_read(
-        &self,
-        message_id: &MessageId,
-        user_id: &UserId,
-    ) -> Result<bool> {
+    pub async fn is_message_read(&self, message_id: &MessageId, user_id: &UserId) -> Result<bool> {
         let read_receipts = self.read_receipts.read().await;
         Ok(read_receipts.contains_key(&(message_id.clone(), user_id.clone())))
     }
@@ -112,10 +108,7 @@ impl ReadReceiptService {
         total_members: u32,
     ) -> Result<GroupReadStats> {
         let message_readers = self.message_readers.read().await;
-        let readers = message_readers
-            .get(message_id)
-            .cloned()
-            .unwrap_or_default();
+        let readers = message_readers.get(message_id).cloned().unwrap_or_default();
 
         Ok(GroupReadStats {
             message_id: message_id.clone(),
@@ -175,7 +168,9 @@ impl ReadReceiptService {
                 receipts.push(receipt);
 
                 // 更新消息已读索引
-                let readers = message_readers.entry(message_id.clone()).or_insert_with(Vec::new);
+                let readers = message_readers
+                    .entry(message_id.clone())
+                    .or_insert_with(Vec::new);
                 if !readers.contains(&user_id) {
                     readers.push(user_id.clone());
                 }
@@ -184,5 +179,34 @@ impl ReadReceiptService {
 
         Ok(receipts)
     }
-}
 
+    /// 用于 entity/sync_entities(message_status) 的分页拉取
+    pub async fn sync_message_status_page(
+        &self,
+        user_id: UserId,
+        since_version: u64,
+        scope_channel_id: Option<ChannelId>,
+        limit: u32,
+    ) -> Result<(Vec<ReadReceipt>, u64, bool)> {
+        let page_limit = limit.min(200).max(1) as usize;
+        let read_receipts = self.read_receipts.read().await;
+
+        let mut rows: Vec<ReadReceipt> = read_receipts
+            .values()
+            .filter(|r| r.user_id == user_id)
+            .filter(|r| scope_channel_id.map(|cid| cid == r.channel_id).unwrap_or(true))
+            .filter(|r| (r.read_at.timestamp_millis().max(1) as u64) > since_version)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| (r.read_at.timestamp_millis().max(1) as u64, r.message_id));
+
+        let has_more = rows.len() > page_limit;
+        rows.truncate(page_limit);
+        let next_version = rows
+            .last()
+            .map(|r| r.read_at.timestamp_millis().max(1) as u64)
+            .unwrap_or(since_version);
+
+        Ok((rows, next_version, has_more))
+    }
+}

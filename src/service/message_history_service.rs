@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
-use dashmap::DashMap;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::model::channel::{ChannelId, UserId, MessageId};
 use crate::error::{Result, ServerError};
+use crate::model::channel::{ChannelId, MessageId, UserId};
 
 /// 引用消息预览（用于消息回复）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ impl Default for MessageQueryParams {
 }
 
 /// 消息历史服务
-/// 
+///
 /// 性能优化：
 /// - 使用 BTreeMap 按 seq 排序，支持高效的范围查询
 /// - 使用 DashMap 替代 Arc<RwLock<HashMap>>，减少锁竞争
@@ -134,10 +134,11 @@ impl MessageHistoryService {
         // 使用 Snowflake 生成消息ID
         use crate::infra::next_message_id;
         let message_id = next_message_id();
-        
+
         // 获取下一个序号（使用原子操作，无需锁）
         let seq = {
-            let counter = self.seq_generators
+            let counter = self
+                .seq_generators
                 .entry(*channel_id)
                 .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
@@ -162,10 +163,11 @@ impl MessageHistoryService {
         };
 
         // 存储消息（使用 DashMap，无需显式锁）
-        let mut messages = self.channel_messages
+        let mut messages = self
+            .channel_messages
             .entry(*channel_id)
             .or_insert_with(BTreeMap::new);
-        
+
         // 如果超过最大消息数量，删除最旧的消息（BTreeMap 按 seq 排序，第一个是最旧的）
         if messages.len() >= self.max_messages_per_channel {
             if let Some((_, old_message)) = messages.pop_first() {
@@ -184,12 +186,16 @@ impl MessageHistoryService {
     }
 
     /// 查询消息历史
-    /// 
+    ///
     /// 性能优化：
     /// - 使用 BTreeMap 的范围查询，避免全量遍历
     /// - 支持按 seq 范围查询，高效获取指定范围的消息
-    pub async fn query_messages(&self, params: MessageQueryParams) -> Result<Vec<MessageHistoryRecord>> {
-        let messages = self.channel_messages
+    pub async fn query_messages(
+        &self,
+        params: MessageQueryParams,
+    ) -> Result<Vec<MessageHistoryRecord>> {
+        let messages = self
+            .channel_messages
             .get(&params.channel_id)
             .ok_or_else(|| ServerError::NotFound("Channel not found".to_string()))?;
 
@@ -259,34 +265,41 @@ impl MessageHistoryService {
     }
 
     /// 获取消息详情
-    /// 
+    ///
     /// 支持两种格式的 message_id：
     /// 1. UUID 格式的字符串（如 "msg_xxx"）
     /// 2. 数字字符串（seq，如 "123"），需要通过频道ID和seq查找
     pub async fn get_message(&self, message_id: &MessageId) -> Result<MessageHistoryRecord> {
         // 通过 message_index 查找 (channel_id, seq)
-        let (channel_id, seq) = self.message_index
+        let (channel_id, seq) = self
+            .message_index
             .get(message_id)
             .ok_or_else(|| ServerError::NotFound("Message not found".to_string()))?
             .clone();
-        
+
         // 通过 channel_id 和 seq 从 BTreeMap 中获取消息
-        let messages = self.channel_messages
+        let messages = self
+            .channel_messages
             .get(&channel_id)
             .ok_or_else(|| ServerError::NotFound("Channel not found".to_string()))?;
-        
+
         messages
             .get(&seq)
             .cloned()
             .ok_or_else(|| ServerError::NotFound("Message not found".to_string()))
     }
-    
+
     /// 通过频道ID和序号查找消息
-    pub async fn get_message_by_seq(&self, channel_id: &ChannelId, seq: u64) -> Result<MessageHistoryRecord> {
-        let messages = self.channel_messages
+    pub async fn get_message_by_seq(
+        &self,
+        channel_id: &ChannelId,
+        seq: u64,
+    ) -> Result<MessageHistoryRecord> {
+        let messages = self
+            .channel_messages
             .get(channel_id)
             .ok_or_else(|| ServerError::NotFound("Channel not found".to_string()))?;
-        
+
         messages
             .get(&seq)
             .cloned()
@@ -295,12 +308,14 @@ impl MessageHistoryService {
 
     /// 删除消息
     pub async fn delete_message(&self, message_id: &MessageId, user_id: &UserId) -> Result<()> {
-        let (channel_id, seq) = self.message_index
+        let (channel_id, seq) = self
+            .message_index
             .get(message_id)
             .ok_or_else(|| ServerError::NotFound("Message not found".to_string()))?
             .clone();
 
-        let mut messages = self.channel_messages
+        let mut messages = self
+            .channel_messages
             .get_mut(&channel_id)
             .ok_or_else(|| ServerError::NotFound("Channel not found".to_string()))?;
 
@@ -310,7 +325,9 @@ impl MessageHistoryService {
 
         // 只有发送者可以删除消息
         if message.sender_id != *user_id {
-            return Err(ServerError::Forbidden("Only sender can delete message".to_string()));
+            return Err(ServerError::Forbidden(
+                "Only sender can delete message".to_string(),
+            ));
         }
 
         message.is_deleted = true;
@@ -328,12 +345,14 @@ impl MessageHistoryService {
         new_content: String,
         metadata: Option<String>,
     ) -> Result<()> {
-        let (channel_id, seq) = self.message_index
+        let (channel_id, seq) = self
+            .message_index
             .get(message_id)
             .ok_or_else(|| ServerError::NotFound("Message not found".to_string()))?
             .clone();
 
-        let mut messages = self.channel_messages
+        let mut messages = self
+            .channel_messages
             .get_mut(&channel_id)
             .ok_or_else(|| ServerError::NotFound("Channel not found".to_string()))?;
 
@@ -343,12 +362,14 @@ impl MessageHistoryService {
 
         // 只有发送者可以编辑消息
         if message.sender_id != *user_id {
-            return Err(ServerError::Forbidden("Only sender can edit message".to_string()));
+            return Err(ServerError::Forbidden(
+                "Only sender can edit message".to_string(),
+            ));
         }
 
         message.content = new_content;
         message.updated_at = Utc::now();
-        
+
         if let Some(metadata) = metadata {
             message.metadata = Some(metadata);
         }
@@ -357,8 +378,12 @@ impl MessageHistoryService {
     }
 
     /// 获取频道消息统计
-    pub async fn get_channel_message_stats(&self, channel_id: &ChannelId) -> Result<ChannelMessageStats> {
-        let messages = self.channel_messages
+    pub async fn get_channel_message_stats(
+        &self,
+        channel_id: &ChannelId,
+    ) -> Result<ChannelMessageStats> {
+        let messages = self
+            .channel_messages
             .get(channel_id)
             .ok_or_else(|| ServerError::NotFound("Channel not found".to_string()))?;
 
@@ -403,7 +428,8 @@ impl MessageHistoryService {
 
     /// 清理频道消息历史
     pub async fn clear_channel_messages(&self, channel_id: &ChannelId) -> Result<u64> {
-        let messages = self.channel_messages
+        let messages = self
+            .channel_messages
             .remove(channel_id)
             .ok_or_else(|| ServerError::NotFound("Channel not found".to_string()))?;
 
@@ -421,7 +447,11 @@ impl MessageHistoryService {
     }
 
     /// 获取频道最新消息
-    pub async fn get_latest_messages(&self, channel_id: &ChannelId, limit: u32) -> Result<Vec<MessageHistoryRecord>> {
+    pub async fn get_latest_messages(
+        &self,
+        channel_id: &ChannelId,
+        limit: u32,
+    ) -> Result<Vec<MessageHistoryRecord>> {
         let params = MessageQueryParams {
             channel_id: *channel_id,
             limit,
@@ -430,13 +460,13 @@ impl MessageHistoryService {
 
         self.query_messages(params).await
     }
-    
+
     /// 撤回消息
-    /// 
+    ///
     /// # 参数
     /// - `message_id`: 消息ID
     /// - `revoker_id`: 撤回者ID
-    /// 
+    ///
     /// # 返回
     /// - 成功返回撤回后的消息记录
     pub async fn revoke_message(
@@ -444,47 +474,46 @@ impl MessageHistoryService {
         message_id: &MessageId,
         revoker_id: &UserId,
     ) -> Result<MessageHistoryRecord> {
-        let (channel_id, seq) = self.message_index
+        let (channel_id, seq) = self
+            .message_index
             .get(message_id)
             .ok_or_else(|| ServerError::NotFound("消息不存在".to_string()))?
             .clone();
-        
-        let mut messages = self.channel_messages
+
+        let mut messages = self
+            .channel_messages
             .get_mut(&channel_id)
             .ok_or_else(|| ServerError::NotFound("频道不存在".to_string()))?;
-        
+
         let message = messages
             .get_mut(&seq)
             .ok_or_else(|| ServerError::NotFound("消息不存在".to_string()))?;
-        
+
         // 检查是否已撤回
         if message.is_revoked {
             return Err(ServerError::InvalidRequest("消息已被撤回".to_string()));
         }
-        
+
         // 检查是否已删除
         if message.is_deleted {
             return Err(ServerError::InvalidRequest("消息已被删除".to_string()));
         }
-        
+
         // 标记为已撤回
         message.is_revoked = true;
         message.revoked_at = Some(Utc::now());
         message.revoker_id = Some(revoker_id.clone());
         message.updated_at = Utc::now();
-        
+
         Ok(message.clone())
     }
 
     /// 批量存储消息（性能优化：为持久化做准备）
-    /// 
+    ///
     /// 批量操作可以减少锁竞争和数据库写入次数
-    pub async fn store_messages_batch(
-        &self,
-        records: Vec<MessageHistoryRecord>,
-    ) -> Result<usize> {
+    pub async fn store_messages_batch(&self, records: Vec<MessageHistoryRecord>) -> Result<usize> {
         let mut count = 0;
-        
+
         // 按频道分组，减少 DashMap 的访问次数
         let mut by_channel: HashMap<ChannelId, Vec<MessageHistoryRecord>> = HashMap::new();
         for record in records {
@@ -493,13 +522,14 @@ impl MessageHistoryService {
                 .or_insert_with(Vec::new)
                 .push(record);
         }
-        
+
         // 批量处理每个频道的消息
         for (channel_id, channel_records) in by_channel {
-            let mut messages = self.channel_messages
+            let mut messages = self
+                .channel_messages
                 .entry(channel_id.clone())
                 .or_insert_with(BTreeMap::new);
-            
+
             for record in channel_records {
                 // 如果超过最大消息数量，删除最旧的消息
                 if messages.len() >= self.max_messages_per_channel {
@@ -507,19 +537,20 @@ impl MessageHistoryService {
                         self.message_index.remove(&old_message.message_id);
                     }
                 }
-                
+
                 // 添加新消息
                 messages.insert(record.seq, record.clone());
-                self.message_index.insert(record.message_id.clone(), (channel_id.clone(), record.seq));
+                self.message_index
+                    .insert(record.message_id.clone(), (channel_id.clone(), record.seq));
                 count += 1;
             }
         }
-        
+
         Ok(count)
     }
 
     /// 批量查询消息（性能优化：支持范围查询）
-    /// 
+    ///
     /// 通过 seq 范围查询，高效获取指定范围的消息
     pub async fn query_messages_by_seq_range(
         &self,
@@ -528,10 +559,11 @@ impl MessageHistoryService {
         end_seq: u64,
         limit: u32,
     ) -> Result<Vec<MessageHistoryRecord>> {
-        let messages = self.channel_messages
+        let messages = self
+            .channel_messages
             .get(channel_id)
             .ok_or_else(|| ServerError::NotFound("Channel not found".to_string()))?;
-        
+
         // 使用 BTreeMap 的范围查询，高效获取指定范围的消息
         let result: Vec<MessageHistoryRecord> = messages
             .range(start_seq..=end_seq)
@@ -539,7 +571,7 @@ impl MessageHistoryService {
             .take(limit as usize)
             .map(|(_, msg)| msg.clone())
             .collect();
-        
+
         Ok(result)
     }
 }
@@ -563,4 +595,4 @@ pub struct ChannelMessageStats {
     pub last_message: Option<MessageHistoryRecord>,
     /// 统计时间
     pub stats_time: DateTime<Utc>,
-} 
+}

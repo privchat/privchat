@@ -7,6 +7,6 @@ use super::RpcServiceContext;
 pub async fn register_routes(services: RpcServiceContext) {
     channel::register_routes(services.clone()).await;
     content::register_routes(services.clone()).await;
-    
-    tracing::info!("📋 Channel 系统路由注册完成");
-} 
+
+    tracing::debug!("📋 Channel 系统路由注册完成");
+}

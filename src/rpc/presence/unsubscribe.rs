@@ -1,7 +1,6 @@
 use serde_json::{json, Value};
-use tracing::{debug, info};
 
-use crate::rpc::{RpcContext, RpcServiceContext, RpcResult, RpcError, get_current_user_id};
+use crate::rpc::{get_current_user_id, RpcContext, RpcError, RpcResult, RpcServiceContext};
 use privchat_protocol::rpc::presence::UnsubscribePresenceRequest;
 
 /// RPC Handler: presence/unsubscribe
@@ -17,19 +16,22 @@ pub async fn handle(
     let req: UnsubscribePresenceRequest = serde_json::from_value(params)
         .map_err(|e| RpcError::validation(format!("Invalid params: {}", e)))?;
 
-    debug!(
+    tracing::debug!(
         "📥 presence/unsubscribe: user {} unsubscribing from {} users",
-        user_id, req.user_ids.len()
+        user_id,
+        req.user_ids.len()
     );
 
     for target_user_id in req.user_ids {
         if target_user_id == 0 || user_id == target_user_id {
             continue;
         }
-        services.presence_manager.unsubscribe(user_id, target_user_id);
+        services
+            .presence_manager
+            .unsubscribe(user_id, target_user_id);
     }
 
-    info!("✅ User {} unsubscribed from users", user_id);
+    tracing::debug!("✅ User {} unsubscribed from users", user_id);
 
     Ok(json!(true))
 }

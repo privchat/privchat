@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use std::time::Duration;
-use std::hash::Hash;
 use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
+use serde::{Deserialize, Serialize};
+use std::hash::Hash;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 use crate::error::ServerError;
@@ -37,7 +37,7 @@ where
             .max_capacity(max_capacity)
             .time_to_live(ttl)
             .build();
-        
+
         Self { cache }
     }
 }
@@ -51,17 +51,17 @@ where
     async fn get(&self, key: &K) -> Result<Option<V>, ServerError> {
         Ok(self.cache.get(key).await)
     }
-    
+
     async fn set(&self, key: K, value: V, _ttl: Duration) -> Result<(), ServerError> {
         self.cache.insert(key, value).await;
         Ok(())
     }
-    
+
     async fn delete(&self, key: &K) -> Result<(), ServerError> {
         self.cache.invalidate(key).await;
         Ok(())
     }
-    
+
     async fn clear(&self) -> Result<(), ServerError> {
         self.cache.invalidate_all();
         Ok(())
@@ -130,46 +130,73 @@ impl SimpleBusinessCacheManager {
         let user_status = Arc::new(SimpleCache::new(config.max_capacity, config.ttl()));
         let user_sessions = Arc::new(SimpleCache::new(config.max_capacity, config.ttl()));
         let offline_messages = Arc::new(SimpleCache::new(config.max_capacity, config.ttl()));
-        
+
         info!("Simple business cache manager initialized (local-only mode)");
-        
+
         Self {
             user_status,
             user_sessions,
             offline_messages,
         }
     }
-    
+
     /// 获取用户在线状态
-    pub async fn get_user_status(&self, user_id: u64) -> Result<Option<SimpleUserOnlineStatus>, ServerError> {
+    pub async fn get_user_status(
+        &self,
+        user_id: u64,
+    ) -> Result<Option<SimpleUserOnlineStatus>, ServerError> {
         self.user_status.get(&user_id).await
     }
-    
+
     /// 设置用户在线状态
-    pub async fn set_user_status(&self, user_id: u64, status: SimpleUserOnlineStatus) -> Result<(), ServerError> {
-        self.user_status.set(user_id, status, Duration::from_secs(3600)).await
+    pub async fn set_user_status(
+        &self,
+        user_id: u64,
+        status: SimpleUserOnlineStatus,
+    ) -> Result<(), ServerError> {
+        self.user_status
+            .set(user_id, status, Duration::from_secs(3600))
+            .await
     }
-    
+
     /// 获取用户会话
-    pub async fn get_user_sessions(&self, user_id: u64) -> Result<Option<SimpleUserSessions>, ServerError> {
+    pub async fn get_user_sessions(
+        &self,
+        user_id: u64,
+    ) -> Result<Option<SimpleUserSessions>, ServerError> {
         self.user_sessions.get(&user_id).await
     }
-    
+
     /// 设置用户会话
-    pub async fn set_user_sessions(&self, user_id: u64, sessions: SimpleUserSessions) -> Result<(), ServerError> {
-        self.user_sessions.set(user_id, sessions, Duration::from_secs(3600)).await
+    pub async fn set_user_sessions(
+        &self,
+        user_id: u64,
+        sessions: SimpleUserSessions,
+    ) -> Result<(), ServerError> {
+        self.user_sessions
+            .set(user_id, sessions, Duration::from_secs(3600))
+            .await
     }
-    
+
     /// 获取离线消息
-    pub async fn get_offline_messages(&self, user_id: u64) -> Result<Option<Vec<SimpleOfflineMessage>>, ServerError> {
+    pub async fn get_offline_messages(
+        &self,
+        user_id: u64,
+    ) -> Result<Option<Vec<SimpleOfflineMessage>>, ServerError> {
         self.offline_messages.get(&user_id).await
     }
-    
+
     /// 设置离线消息
-    pub async fn set_offline_messages(&self, user_id: u64, messages: Vec<SimpleOfflineMessage>) -> Result<(), ServerError> {
-        self.offline_messages.set(user_id, messages, Duration::from_secs(86400)).await // 24小时
+    pub async fn set_offline_messages(
+        &self,
+        user_id: u64,
+        messages: Vec<SimpleOfflineMessage>,
+    ) -> Result<(), ServerError> {
+        self.offline_messages
+            .set(user_id, messages, Duration::from_secs(86400))
+            .await // 24小时
     }
-    
+
     /// 清理用户缓存
     pub async fn clear_user_cache(&self, user_id: u64) -> Result<(), ServerError> {
         let _ = self.user_status.delete(&user_id).await;
@@ -177,4 +204,4 @@ impl SimpleBusinessCacheManager {
         let _ = self.offline_messages.delete(&user_id).await;
         Ok(())
     }
-} 
+}

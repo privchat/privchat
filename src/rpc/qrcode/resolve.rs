@@ -1,12 +1,12 @@
-use serde_json::{json, Value};
+use crate::model::QRType;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use crate::model::QRType;
+use serde_json::{json, Value};
 
 /// 处理 解析 QR 码 请求
-/// 
+///
 /// RPC: qrcode/resolve
-/// 
+///
 /// 请求参数：
 /// ```json
 /// {
@@ -15,7 +15,7 @@ use crate::model::QRType;
 ///   "token": "xyz"              // 可选：群组邀请时需要
 /// }
 /// ```
-/// 
+///
 /// 响应：
 /// ```json
 /// {
@@ -30,27 +30,36 @@ use crate::model::QRType;
 ///   "used_count": 5
 /// }
 /// ```
-pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::RpcContext) -> RpcResult<Value> {
-    tracing::info!("🔧 处理 解析 QR 码 请求: {:?}", body);
-    
+pub async fn handle(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
+    tracing::debug!("🔧 处理 解析 QR 码 请求: {:?}", body);
+
     // 解析参数
-    let qr_key = body.get("qr_key").and_then(|v| v.as_str())
+    let qr_key = body
+        .get("qr_key")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("qr_key is required".to_string()))?;
-    
+
     // 从 ctx 获取当前用户 ID
     let scanner_id = crate::rpc::get_current_user_id(&ctx)?;
-    
+
     let token = body.get("token").and_then(|v| v.as_str());
-    
+
     // 解析 QR Key
-    let record = services.qrcode_service.resolve(qr_key, scanner_id, token).await
+    let record = services
+        .qrcode_service
+        .resolve(qr_key, scanner_id, token)
+        .await
         .map_err(|e| match e {
             crate::error::ServerError::NotFound(_) => RpcError::not_found(format!("{}", e)),
             crate::error::ServerError::BadRequest(_) => RpcError::validation(format!("{}", e)),
             crate::error::ServerError::Unauthorized(_) => RpcError::unauthorized(format!("{}", e)),
             _ => RpcError::internal(format!("解析 QR 码失败: {}", e)),
         })?;
-    
+
     // 根据类型获取详细信息和建议的操作
     let (data, action) = match record.qr_type {
         QRType::User => {
@@ -62,16 +71,20 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
             });
             (user_data, "show_profile")
         }
-        
+
         QRType::Group => {
             // 解析群组ID
-            let group_id = record.target_id.parse::<u64>()
-                .map_err(|_| RpcError::validation(format!("Invalid group_id in QR code: {}", record.target_id)))?;
-            
+            let group_id = record.target_id.parse::<u64>().map_err(|_| {
+                RpcError::validation(format!("Invalid group_id in QR code: {}", record.target_id))
+            })?;
+
             // 获取群组信息
-            let group = services.channel_service.get_channel(&group_id).await
+            let group = services
+                .channel_service
+                .get_channel(&group_id)
+                .await
                 .map_err(|e| RpcError::not_found(format!("群组不存在: {}", e)))?;
-            
+
             let group_data = json!({
                 "group_id": group.id,
                 "name": group.metadata.name,
@@ -85,7 +98,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
             });
             (group_data, "show_group")
         }
-        
+
         QRType::Auth => {
             // 扫码登录
             let auth_data = json!({
@@ -94,7 +107,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
             });
             (auth_data, "confirm_login")
         }
-        
+
         QRType::Feature => {
             // 其他功能
             let feature_data = json!({
@@ -104,15 +117,15 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
             (feature_data, "handle_feature")
         }
     };
-    
-    tracing::info!(
+
+    tracing::debug!(
         "✅ QR 码解析成功: qr_key={}, type={}, target={}, scanner={}",
         qr_key,
         record.qr_type.as_str(),
         record.target_id,
         scanner_id
     );
-    
+
     Ok(json!({
         "qr_type": record.qr_type.as_str(),
         "target_id": record.target_id,

@@ -46,11 +46,11 @@ impl UserChannel {
         user_id: Uuid,
         channel_id: Uuid,
         last_read_message_id: Option<Uuid>,
-        last_read_at: Option<i64>,  // 毫秒时间戳
+        last_read_at: Option<i64>, // 毫秒时间戳
         unread_count: i32,
         is_pinned: bool,
         is_muted: bool,
-        updated_at: i64,  // 毫秒时间戳
+        updated_at: i64, // 毫秒时间戳
     ) -> Self {
         Self {
             user_id,
@@ -60,8 +60,7 @@ impl UserChannel {
             unread_count,
             is_pinned,
             is_muted,
-            updated_at: DateTime::from_timestamp_millis(updated_at)
-                .unwrap_or_else(|| Utc::now()),
+            updated_at: DateTime::from_timestamp_millis(updated_at).unwrap_or_else(|| Utc::now()),
         }
     }
 

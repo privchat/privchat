@@ -2,8 +2,8 @@
 //!
 //! 通过 `init()` 安装全局 Recorder，通过 HTTP GET `/metrics` 暴露抓取端点。
 
-use std::sync::OnceLock;
 use metrics_exporter_prometheus::PrometheusHandle;
+use std::sync::OnceLock;
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -16,9 +16,10 @@ const COUNTER_MESSAGES_SENT: &str = "privchat_messages_sent_total";
 /// 初始化 Prometheus 指标（安装全局 Recorder，返回 Handle 用于 HTTP 暴露）。
 /// 仅需在进程内调用一次；重复调用会返回 Err。
 pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .install_recorder()?;
-    HANDLE.set(handle).map_err(|_| "metrics already initialized")?;
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+    HANDLE
+        .set(handle)
+        .map_err(|_| "metrics already initialized")?;
     Ok(())
 }
 

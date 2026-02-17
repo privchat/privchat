@@ -1,11 +1,7 @@
 use crate::auth::verify_password;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use crate::repository::MessageRepository;
-use crate::service::channel_service::LastMessagePreview;
-use chrono::Utc;
 use privchat_protocol::rpc::auth::AuthLoginRequest;
-use privchat_protocol::ContentMessageType;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -186,10 +182,6 @@ pub async fn handle(
         app_id
     );
 
-    if let Err(e) = send_login_notice_message(&services, user_id, &request, device_type_str).await {
-        tracing::warn!("⚠️ 发送登录通知系统消息失败: user_id={}, error={}", user_id, e);
-    }
-
     // 8. 返回统一的 AuthResponse 格式（包含 device_id）
     Ok(json!({
         "success": true,
@@ -200,137 +192,4 @@ pub async fn handle(
         "device_id": device_id,
         "message": "登录成功"
     }))
-}
-
-async fn send_login_notice_message(
-    services: &RpcServiceContext,
-    user_id: u64,
-    request: &AuthLoginRequest,
-    device_type_str: &str,
-) -> Result<(), String> {
-    if !services.config.system_message.enabled {
-        return Ok(());
-    }
-
-    let channel_id = if let Some(cid) = services
-        .channel_service
-        .get_system_channel_id_for_user(user_id)
-        .await
-    {
-        cid
-    } else {
-        if !services.config.system_message.auto_create_channel {
-            return Ok(());
-        }
-        let create_request = crate::model::CreateChannelRequest {
-            channel_type: crate::model::ChannelType::Direct,
-            name: None,
-            description: None,
-            member_ids: vec![crate::config::SYSTEM_USER_ID],
-            is_public: Some(false),
-            max_members: None,
-        };
-        let response = services
-            .channel_service
-            .create_channel(user_id, create_request)
-            .await
-            .map_err(|e| format!("create system channel failed: {e}"))?;
-        if !response.success {
-            return Err(format!(
-                "create system channel rejected: {:?}",
-                response.error
-            ));
-        }
-        response.channel.id
-    };
-
-    let now = Utc::now();
-    let message_id = crate::infra::next_message_id();
-    let pts = services.pts_generator.next_pts(channel_id).await;
-    let device_label = request
-        .device_info
-        .as_ref()
-        .and_then(|d| {
-            let name = d.device_name.trim();
-            if name.is_empty() {
-                None
-            } else {
-                Some(name.to_string())
-            }
-        })
-        .unwrap_or_else(|| device_type_str.to_string());
-    let content = format!("您的账号在 {} 设备登录了。", device_label);
-
-    let login_notice_msg = crate::model::message::Message {
-        message_id,
-        channel_id,
-        sender_id: crate::config::SYSTEM_USER_ID,
-        pts: Some(pts as i64),
-        local_message_id: Some(message_id),
-        content: content.clone(),
-        message_type: ContentMessageType::Text,
-        metadata: serde_json::Value::Object(serde_json::Map::new()),
-        reply_to_message_id: None,
-        created_at: now,
-        updated_at: now,
-        deleted: false,
-        deleted_at: None,
-        revoked: false,
-        revoked_at: None,
-        revoked_by: None,
-    };
-    services
-        .message_repository
-        .create(&login_notice_msg)
-        .await
-        .map_err(|e| format!("persist login notice failed: {e}"))?;
-
-    services
-        .user_message_index
-        .add_message(user_id, pts, message_id)
-        .await;
-
-    let payload = serde_json::to_vec(&json!({ "content": content }))
-        .map_err(|e| format!("encode login notice payload failed: {e}"))?;
-    let push_msg = privchat_protocol::protocol::PushMessageRequest {
-        setting: privchat_protocol::protocol::MessageSetting::default(),
-        msg_key: format!("msg_{}", message_id),
-        server_message_id: message_id,
-        message_seq: 1,
-        local_message_id: message_id,
-        stream_no: String::new(),
-        stream_seq: 0,
-        stream_flag: 0,
-        timestamp: now.timestamp().max(0) as u32,
-        channel_id,
-        channel_type: 1,
-        message_type: ContentMessageType::Text.as_u32(),
-        expire: 0,
-        topic: String::new(),
-        from_uid: crate::config::SYSTEM_USER_ID,
-        payload,
-    };
-    if let Err(e) = services.offline_queue_service.add(user_id, &push_msg).await {
-        tracing::warn!("⚠️ 登录通知加入离线队列失败: {:?}", e);
-    }
-
-    let _ = services
-        .channel_service
-        .update_last_message(channel_id, message_id)
-        .await;
-    services
-        .channel_service
-        .update_last_message_preview(
-            channel_id,
-            LastMessagePreview {
-                message_id,
-                sender_id: crate::config::SYSTEM_USER_ID,
-                content,
-                message_type: "text".to_string(),
-                timestamp: now,
-            },
-        )
-        .await;
-
-    Ok(())
 }

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 use crate::infra::cache::TwoLevelCache;
 // 暂时注释掉 redis 相关导入
@@ -18,7 +19,7 @@ pub type SessionId = String;
 /// 消息ID类型
 pub type MessageId = u64;
 /// 设备ID类型
-pub type DeviceId = String;  // 保留UUID字符串
+pub type DeviceId = String; // 保留UUID字符串
 
 /// 用户在线状态
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -51,7 +52,8 @@ pub struct DeviceSession {
 /// 设备状态
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum DeviceStatus {
-    #[default] Online,
+    #[default]
+    Online,
     Away,
     Busy,
     Offline,
@@ -82,7 +84,8 @@ pub struct OfflineMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum MessagePriority {
     Low = 0,
-    #[default] Normal = 1,
+    #[default]
+    Normal = 1,
     High = 2,
     Urgent = 3,
 }
@@ -160,17 +163,29 @@ pub struct MessageRouterStats {
 #[async_trait::async_trait]
 pub trait SessionManager: Send + Sync {
     /// 向指定会话发送消息
-    async fn send_to_session(&self, session_id: &SessionId, message: &PushMessageRequest) -> Result<()>;
-    
+    async fn send_to_session(
+        &self,
+        session_id: &SessionId,
+        message: &PushMessageRequest,
+    ) -> Result<()>;
+
     /// 批量向多个会话发送消息
-    async fn send_to_sessions(&self, sessions: &[SessionId], message: &PushMessageRequest) -> Result<Vec<Result<()>>>;
-    
+    async fn send_to_sessions(
+        &self,
+        sessions: &[SessionId],
+        message: &PushMessageRequest,
+    ) -> Result<Vec<Result<()>>>;
+
     /// 批量向会话发送多条消息
-    async fn send_batch_to_session(&self, session_id: &SessionId, messages: &[PushMessageRequest]) -> Result<()>;
-    
+    async fn send_batch_to_session(
+        &self,
+        session_id: &SessionId,
+        messages: &[PushMessageRequest],
+    ) -> Result<()>;
+
     /// 检查会话是否在线
     async fn is_session_online(&self, session_id: &SessionId) -> bool;
-    
+
     /// 获取在线会话列表
     async fn get_online_sessions(&self) -> Vec<SessionId>;
 }
@@ -199,10 +214,10 @@ impl MessageRouter {
         message: PushMessageRequest,
     ) -> Result<RouteResult> {
         let start_time = SystemTime::now();
-        
+
         // 检查用户在线状态
         let user_status = self.user_status_cache.get(user_id).await;
-        
+
         match user_status {
             Some(status) => {
                 // 用户在线，路由到所有在线设备
@@ -211,7 +226,7 @@ impl MessageRouter {
             None => {
                 // 用户不在线，存储为离线消息
                 self.store_offline_message(user_id, message).await?;
-                
+
                 let elapsed = start_time.elapsed().unwrap_or_default();
                 Ok(RouteResult {
                     success_count: 0,
@@ -231,17 +246,40 @@ impl MessageRouter {
         message: PushMessageRequest,
     ) -> Result<RouteResult> {
         let start_time = SystemTime::now();
-        
+
         // 检查用户在线状态
         let user_status = self.user_status_cache.get(user_id).await;
-        
+
         match user_status {
             Some(status) => {
                 // 查找指定设备
                 if let Some(device) = status.devices.iter().find(|d| d.device_id == *device_id) {
                     if matches!(device.status, DeviceStatus::Online) {
+                        if !self.session_manager.is_session_online(&device.session_id).await {
+                            // 缓存中残留了失效会话，先清理再按离线消息处理
+                            self.register_device_offline(
+                                user_id,
+                                device_id,
+                                Some(&device.session_id),
+                            )
+                            .await?;
+                            self.store_offline_message_with_device(user_id, device_id, message)
+                                .await?;
+                            let elapsed = start_time.elapsed().unwrap_or_default();
+                            return Ok(RouteResult {
+                                success_count: 0,
+                                failed_count: 0,
+                                offline_count: 1,
+                                latency_ms: elapsed.as_millis() as u64,
+                            });
+                        }
+
                         // 设备在线，直接发送
-                        match self.session_manager.send_to_session(&device.session_id, &message).await {
+                        match self
+                            .session_manager
+                            .send_to_session(&device.session_id, &message)
+                            .await
+                        {
                             Ok(_) => {
                                 let elapsed = start_time.elapsed().unwrap_or_default();
                                 Ok(RouteResult {
@@ -251,9 +289,27 @@ impl MessageRouter {
                                     latency_ms: elapsed.as_millis() as u64,
                                 })
                             }
-                            Err(_) => {
+                            Err(e) => {
+                                warn!(
+                                    "❌ route_message_to_device send failed: user_id={}, device_id={}, session_id={}, server_message_id={}, channel_id={}, error={}",
+                                    user_id,
+                                    device_id,
+                                    device.session_id,
+                                    message.server_message_id,
+                                    message.channel_id,
+                                    e
+                                );
+                                if !self.session_manager.is_session_online(&device.session_id).await {
+                                    self.register_device_offline(
+                                        user_id,
+                                        device_id,
+                                        Some(&device.session_id),
+                                    )
+                                    .await?;
+                                }
                                 // 发送失败，存储为离线消息
-                                self.store_offline_message_with_device(user_id, device_id, message).await?;
+                                self.store_offline_message_with_device(user_id, device_id, message)
+                                    .await?;
                                 let elapsed = start_time.elapsed().unwrap_or_default();
                                 Ok(RouteResult {
                                     success_count: 0,
@@ -265,7 +321,8 @@ impl MessageRouter {
                         }
                     } else {
                         // 设备不在线，存储为离线消息
-                        self.store_offline_message_with_device(user_id, device_id, message).await?;
+                        self.store_offline_message_with_device(user_id, device_id, message)
+                            .await?;
                         let elapsed = start_time.elapsed().unwrap_or_default();
                         Ok(RouteResult {
                             success_count: 0,
@@ -276,7 +333,8 @@ impl MessageRouter {
                     }
                 } else {
                     // 设备不存在，存储为离线消息
-                    self.store_offline_message_with_device(user_id, device_id, message).await?;
+                    self.store_offline_message_with_device(user_id, device_id, message)
+                        .await?;
                     let elapsed = start_time.elapsed().unwrap_or_default();
                     Ok(RouteResult {
                         success_count: 0,
@@ -288,12 +346,59 @@ impl MessageRouter {
             }
             None => {
                 // 用户不在线，存储为离线消息
-                self.store_offline_message_with_device(user_id, device_id, message).await?;
+                self.store_offline_message_with_device(user_id, device_id, message)
+                    .await?;
                 let elapsed = start_time.elapsed().unwrap_or_default();
                 Ok(RouteResult {
                     success_count: 0,
                     failed_count: 0,
                     offline_count: 1,
+                    latency_ms: elapsed.as_millis() as u64,
+                })
+            }
+        }
+    }
+
+    /// 直接按 session_id 路由消息（绕过 user_status_cache 的 device 映射）
+    pub async fn route_message_to_session(
+        &self,
+        session_id: &SessionId,
+        message: PushMessageRequest,
+    ) -> Result<RouteResult> {
+        let start_time = SystemTime::now();
+        if !self.session_manager.is_session_online(session_id).await {
+            let elapsed = start_time.elapsed().unwrap_or_default();
+            return Ok(RouteResult {
+                success_count: 0,
+                failed_count: 0,
+                offline_count: 1,
+                latency_ms: elapsed.as_millis() as u64,
+            });
+        }
+
+        match self.session_manager.send_to_session(session_id, &message).await {
+            Ok(_) => {
+                let elapsed = start_time.elapsed().unwrap_or_default();
+                Ok(RouteResult {
+                    success_count: 1,
+                    failed_count: 0,
+                    offline_count: 0,
+                    latency_ms: elapsed.as_millis() as u64,
+                })
+            }
+            Err(e) => {
+                warn!(
+                    "❌ route_message_to_session send failed: session_id={}, server_message_id={}, channel_id={}, error={}",
+                    session_id,
+                    message.server_message_id,
+                    message.channel_id,
+                    e
+                );
+                let elapsed = start_time.elapsed().unwrap_or_default();
+                Ok(RouteResult {
+                    success_count: 0,
+                    failed_count: 1,
+                    offline_count: 0,
                     latency_ms: elapsed.as_millis() as u64,
                 })
             }
@@ -307,7 +412,7 @@ impl MessageRouter {
         message: PushMessageRequest,
     ) -> Result<HashMap<UserId, RouteResult>> {
         let mut results = HashMap::new();
-        
+
         // 并发路由到所有用户
         let futures = user_ids.iter().map(|user_id| {
             let router = self;
@@ -318,36 +423,46 @@ impl MessageRouter {
                 (user_id, result)
             }
         });
-        
+
         let route_results = futures::future::join_all(futures).await;
-        
+
         for (user_id, result) in route_results {
-            results.insert(user_id, result.unwrap_or_else(|_| RouteResult {
-                success_count: 0,
-                failed_count: 1,
-                offline_count: 0,
-                latency_ms: 0,
-            }));
+            results.insert(
+                user_id,
+                result.unwrap_or_else(|_| RouteResult {
+                    success_count: 0,
+                    failed_count: 1,
+                    offline_count: 0,
+                    latency_ms: 0,
+                }),
+            );
         }
-        
+
         Ok(results)
     }
 
     /// 用户上线时投递离线消息
-    pub async fn deliver_offline_messages(&self, user_id: &UserId, device_id: &DeviceId) -> Result<usize> {
+    pub async fn deliver_offline_messages(
+        &self,
+        user_id: &UserId,
+        device_id: &DeviceId,
+    ) -> Result<usize> {
         let offline_messages = self.offline_queue.get(user_id).await;
-        
+
         if let Some(messages) = offline_messages {
             let mut delivered_count = 0;
             let mut remaining_messages = Vec::new();
-            
+
             for mut offline_msg in messages {
                 // 检查消息是否过期
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
                 if now > offline_msg.expires_at {
                     continue; // 跳过过期消息
                 }
-                
+
                 // 检查是否是发送给特定设备的消息
                 if let Some(target_device) = &offline_msg.target_device_id {
                     if target_device != device_id {
@@ -355,12 +470,20 @@ impl MessageRouter {
                         continue;
                     }
                 }
-                
+
                 // 获取用户在线状态
                 if let Some(user_status) = self.user_status_cache.get(user_id).await {
-                    if let Some(device) = user_status.devices.iter().find(|d| d.device_id == *device_id) {
+                    if let Some(device) = user_status
+                        .devices
+                        .iter()
+                        .find(|d| d.device_id == *device_id)
+                    {
                         // 尝试发送消息
-                        match self.session_manager.send_to_session(&device.session_id, &offline_msg.message).await {
+                        match self
+                            .session_manager
+                            .send_to_session(&device.session_id, &offline_msg.message)
+                            .await
+                        {
                             Ok(_) => {
                                 delivered_count += 1;
                             }
@@ -379,14 +502,16 @@ impl MessageRouter {
                     remaining_messages.push(offline_msg);
                 }
             }
-            
+
             // 更新离线消息队列
             if remaining_messages.is_empty() {
                 self.offline_queue.invalidate(user_id).await;
             } else {
-                self.offline_queue.put(*user_id, remaining_messages, 3600).await;
+                self.offline_queue
+                    .put(*user_id, remaining_messages, 3600)
+                    .await;
             }
-            
+
             Ok(delivered_count)
         } else {
             Ok(0)
@@ -394,21 +519,29 @@ impl MessageRouter {
     }
 
     /// 批量投递离线消息
-    pub async fn deliver_offline_messages_batch(&self, user_id: &UserId, device_id: &DeviceId, batch_size: usize) -> Result<usize> {
+    pub async fn deliver_offline_messages_batch(
+        &self,
+        user_id: &UserId,
+        device_id: &DeviceId,
+        batch_size: usize,
+    ) -> Result<usize> {
         let offline_messages = self.offline_queue.get(user_id).await;
-        
+
         if let Some(messages) = offline_messages {
             let mut delivered_count = 0;
             let mut remaining_messages = Vec::new();
             let mut batch_messages = Vec::new();
-            
+
             for offline_msg in messages {
                 // 检查消息是否过期
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
                 if now > offline_msg.expires_at {
                     continue; // 跳过过期消息
                 }
-                
+
                 // 检查是否是发送给特定设备的消息
                 if let Some(target_device) = &offline_msg.target_device_id {
                     if target_device != device_id {
@@ -416,32 +549,38 @@ impl MessageRouter {
                         continue;
                     }
                 }
-                
+
                 batch_messages.push(offline_msg);
-                
+
                 // 当达到批处理大小时，发送批量消息
                 if batch_messages.len() >= batch_size {
-                    let (delivered, remaining) = self.send_batch_messages(user_id, device_id, batch_messages).await?;
+                    let (delivered, remaining) = self
+                        .send_batch_messages(user_id, device_id, batch_messages)
+                        .await?;
                     delivered_count += delivered;
                     remaining_messages.extend(remaining);
                     batch_messages = Vec::new();
                 }
             }
-            
+
             // 发送剩余的消息
             if !batch_messages.is_empty() {
-                let (delivered, remaining) = self.send_batch_messages(user_id, device_id, batch_messages).await?;
+                let (delivered, remaining) = self
+                    .send_batch_messages(user_id, device_id, batch_messages)
+                    .await?;
                 delivered_count += delivered;
                 remaining_messages.extend(remaining);
             }
-            
+
             // 更新离线消息队列
             if remaining_messages.is_empty() {
                 self.offline_queue.invalidate(user_id).await;
             } else {
-                self.offline_queue.put(*user_id, remaining_messages, 3600).await;
+                self.offline_queue
+                    .put(*user_id, remaining_messages, 3600)
+                    .await;
             }
-            
+
             Ok(delivered_count)
         } else {
             Ok(0)
@@ -456,19 +595,28 @@ impl MessageRouter {
         session_id: &SessionId,
         device_type: &str,
     ) -> Result<()> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
-        let mut user_status = self.user_status_cache.get(user_id).await
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut user_status = self
+            .user_status_cache
+            .get(user_id)
+            .await
             .unwrap_or_else(|| UserOnlineStatus {
                 user_id: user_id.clone(),
                 devices: Vec::new(),
                 last_active: now,
             });
-        
-        // 按 session_id 更新或添加：同一 device 可能有多条连接（如 session-4 与 session-5），
-        // 不能按 device_id 覆盖，否则后连上的 session 会覆盖先前的，导致离线推送找不到「先前的 session」对应设备。
-        if let Some(device) = user_status.devices.iter_mut().find(|d| d.session_id == *session_id) {
-            device.device_id = device_id.clone();
+
+        // 一个 device_id 在路由层只保留一个在线会话，后登录覆盖旧会话，避免向已失效 session 发包。
+        if let Some(device) = user_status
+            .devices
+            .iter_mut()
+            .find(|d| d.device_id == *device_id)
+        {
+            device.session_id = session_id.clone();
             device.device_type = device_type.to_string();
             device.online_time = now;
             device.last_active = now;
@@ -483,33 +631,53 @@ impl MessageRouter {
                 status: DeviceStatus::Online,
             });
         }
-        
+
         user_status.last_active = now;
-        self.user_status_cache.put(*user_id, user_status, 3600).await;
-        
+        self.user_status_cache
+            .put(*user_id, user_status, 3600)
+            .await;
+
         Ok(())
     }
 
     /// 注册用户设备离线
-    pub async fn register_device_offline(&self, user_id: &UserId, device_id: &DeviceId) -> Result<()> {
+    pub async fn register_device_offline(
+        &self,
+        user_id: &UserId,
+        device_id: &DeviceId,
+        expected_session_id: Option<&SessionId>,
+    ) -> Result<()> {
         if let Some(mut user_status) = self.user_status_cache.get(user_id).await {
-            // 移除设备或更新状态
-            user_status.devices.retain(|d| d.device_id != *device_id);
-            
+            // 仅在 session 匹配时移除设备，避免旧连接断开误删新连接在线态
+            user_status.devices.retain(|d| {
+                if d.device_id != *device_id {
+                    return true;
+                }
+                match expected_session_id {
+                    Some(sid) => d.session_id != *sid,
+                    None => false,
+                }
+            });
+
             if user_status.devices.is_empty() {
                 // 用户完全离线
                 self.user_status_cache.invalidate(user_id).await;
             } else {
                 // 更新用户状态
-                self.user_status_cache.put(*user_id, user_status, 3600).await;
+                self.user_status_cache
+                    .put(*user_id, user_status, 3600)
+                    .await;
             }
         }
-        
+
         Ok(())
     }
 
     /// 获取用户在线状态
-    pub async fn get_user_online_status(&self, user_id: &UserId) -> Result<Option<UserOnlineStatus>> {
+    pub async fn get_user_online_status(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Option<UserOnlineStatus>> {
         Ok(self.user_status_cache.get(user_id).await)
     }
 
@@ -544,15 +712,18 @@ impl MessageRouter {
         let start_time = SystemTime::now();
         let mut success_count = 0;
         let mut failed_count = 0;
-        
+
         // 获取在线设备
-        let online_devices: Vec<_> = user_status.devices.iter()
+        let online_devices: Vec<_> = user_status
+            .devices
+            .iter()
             .filter(|d| matches!(d.status, DeviceStatus::Online))
             .collect();
-        
+
         if online_devices.is_empty() {
             // 没有在线设备，存储为离线消息
-            self.store_offline_message(&user_status.user_id, message).await?;
+            self.store_offline_message(&user_status.user_id, message)
+                .await?;
             let elapsed = start_time.elapsed().unwrap_or_default();
             return Ok(RouteResult {
                 success_count: 0,
@@ -561,31 +732,78 @@ impl MessageRouter {
                 latency_ms: elapsed.as_millis() as u64,
             });
         }
-        
-        // 并发发送到所有在线设备
-        let session_ids: Vec<_> = online_devices.iter().map(|d| d.session_id.clone()).collect();
-        let results = self.session_manager.send_to_sessions(&session_ids, &message).await?;
-        
-        for result in results {
-            match result {
-                Ok(_) => success_count += 1,
-                Err(_) => failed_count += 1,
+
+        let mut stale_device_ids: Vec<DeviceId> = Vec::new();
+        for device in online_devices {
+            if !self.session_manager.is_session_online(&device.session_id).await {
+                stale_device_ids.push(device.device_id.clone());
+                self.store_offline_message_with_device(
+                    &user_status.user_id,
+                    &device.device_id,
+                    message.clone(),
+                )
+                .await?;
+                continue;
+            }
+
+            match self
+                .session_manager
+                .send_to_session(&device.session_id, &message)
+                .await
+            {
+                Ok(_) => {
+                    success_count += 1;
+                }
+                Err(_) => {
+                    failed_count += 1;
+                    if !self.session_manager.is_session_online(&device.session_id).await {
+                        stale_device_ids.push(device.device_id.clone());
+                        self.store_offline_message_with_device(
+                            &user_status.user_id,
+                            &device.device_id,
+                            message.clone(),
+                        )
+                        .await?;
+                    }
+                }
             }
         }
-        
+
+        if !stale_device_ids.is_empty() {
+            if let Some(mut latest_status) = self.user_status_cache.get(&user_status.user_id).await {
+                latest_status
+                    .devices
+                    .retain(|d| !stale_device_ids.contains(&d.device_id));
+                if latest_status.devices.is_empty() {
+                    self.user_status_cache.invalidate(&user_status.user_id).await;
+                } else {
+                    self.user_status_cache
+                        .put(user_status.user_id, latest_status, 3600)
+                        .await;
+                }
+            }
+        }
+
         let elapsed = start_time.elapsed().unwrap_or_default();
         Ok(RouteResult {
             success_count,
             failed_count,
-            offline_count: 0,
+            offline_count: stale_device_ids.len(),
             latency_ms: elapsed.as_millis() as u64,
         })
     }
 
     /// 存储离线消息
-    async fn store_offline_message(&self, user_id: &UserId, message: PushMessageRequest) -> Result<()> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
+    async fn store_offline_message(
+        &self,
+        user_id: &UserId,
+        message: PushMessageRequest,
+    ) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
         use crate::infra::next_message_id;
         let offline_msg = OfflineMessage {
             message_id: next_message_id(),
@@ -597,7 +815,7 @@ impl MessageRouter {
             retry_count: 0,
             priority: MessagePriority::Normal,
         };
-        
+
         self.add_offline_message(user_id, offline_msg).await
     }
 
@@ -608,8 +826,11 @@ impl MessageRouter {
         device_id: &DeviceId,
         message: PushMessageRequest,
     ) -> Result<()> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
         use crate::infra::next_message_id;
         let offline_msg = OfflineMessage {
             message_id: next_message_id(),
@@ -621,24 +842,31 @@ impl MessageRouter {
             retry_count: 0,
             priority: MessagePriority::Normal,
         };
-        
+
         self.add_offline_message(user_id, offline_msg).await
     }
 
     /// 添加离线消息到队列
-    async fn add_offline_message(&self, user_id: &UserId, offline_msg: OfflineMessage) -> Result<()> {
-        let mut offline_messages = self.offline_queue.get(user_id).await
-            .unwrap_or_default();
-        
+    async fn add_offline_message(
+        &self,
+        user_id: &UserId,
+        offline_msg: OfflineMessage,
+    ) -> Result<()> {
+        let mut offline_messages = self.offline_queue.get(user_id).await.unwrap_or_default();
+
         // 检查队列大小限制
         if offline_messages.len() >= self.config.max_offline_queue_size {
             // 移除最旧的消息
-            offline_messages.retain(|msg| msg.created_at > offline_msg.created_at - self.config.offline_message_ttl);
+            offline_messages.retain(|msg| {
+                msg.created_at > offline_msg.created_at - self.config.offline_message_ttl
+            });
         }
-        
+
         offline_messages.push(offline_msg);
-        self.offline_queue.put(*user_id, offline_messages, 3600).await;
-        
+        self.offline_queue
+            .put(*user_id, offline_messages, 3600)
+            .await;
+
         Ok(())
     }
 
@@ -651,15 +879,23 @@ impl MessageRouter {
     ) -> Result<(usize, Vec<OfflineMessage>)> {
         let mut delivered_count = 0;
         let mut remaining_messages = Vec::new();
-        
+
         // 获取用户在线状态
         if let Some(user_status) = self.user_status_cache.get(user_id).await {
-            if let Some(device) = user_status.devices.iter().find(|d| d.device_id == *device_id) {
+            if let Some(device) = user_status
+                .devices
+                .iter()
+                .find(|d| d.device_id == *device_id)
+            {
                 // 准备批量消息
                 let batch_msgs: Vec<_> = messages.iter().map(|m| m.message.clone()).collect();
-                
+
                 // 发送批量消息
-                match self.session_manager.send_batch_to_session(&device.session_id, &batch_msgs).await {
+                match self
+                    .session_manager
+                    .send_batch_to_session(&device.session_id, &batch_msgs)
+                    .await
+                {
                     Ok(_) => {
                         delivered_count = messages.len();
                     }
@@ -679,7 +915,7 @@ impl MessageRouter {
         } else {
             remaining_messages = messages;
         }
-        
+
         Ok((delivered_count, remaining_messages))
     }
 }
@@ -688,40 +924,127 @@ impl MessageRouter {
 /// 将 crate::session::SessionManager 适配为 message_router::SessionManager trait
 pub struct SessionManagerAdapter {
     inner: Arc<crate::session::SessionManager>,
+    transport: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
 }
 
 impl SessionManagerAdapter {
     pub fn new(inner: Arc<crate::session::SessionManager>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            transport: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub async fn set_transport(&self, transport: Arc<msgtrans::transport::TransportServer>) {
+        *self.transport.write().await = Some(transport);
+    }
+
+    fn parse_session_id(session_id: &str) -> Result<msgtrans::SessionId> {
+        let raw = session_id
+            .strip_prefix("session-")
+            .unwrap_or(session_id)
+            .parse::<u64>()
+            .map_err(|e| {
+                warn!(
+                    "❌ SessionManagerAdapter parse_session_id failed: raw_session_id={}, error={}",
+                    session_id, e
+                );
+                anyhow::anyhow!("invalid session id '{}': {}", session_id, e)
+            })?;
+        Ok(msgtrans::SessionId::from(raw))
+    }
+
+    async fn get_transport(&self) -> Result<Arc<msgtrans::transport::TransportServer>> {
+        self.transport
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("TransportServer not set in SessionManagerAdapter"))
     }
 }
 
 #[async_trait::async_trait]
 impl SessionManager for SessionManagerAdapter {
-    async fn send_to_session(&self, _session_id: &SessionId, _message: &PushMessageRequest) -> Result<()> {
-        // TODO: 实现通过 session_id 发送消息的逻辑
-        // 这需要访问 TransportServer，暂时返回 Ok
+    async fn send_to_session(
+        &self,
+        session_id: &SessionId,
+        message: &PushMessageRequest,
+    ) -> Result<()> {
+        let transport = self.get_transport().await?;
+        let sid = Self::parse_session_id(session_id)?;
+        let recv_data = privchat_protocol::encode_message(message)
+            .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
+        let mut packet = msgtrans::packet::Packet::one_way(0u32, recv_data);
+        packet.set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
+        transport
+            .send_to_session(sid, packet)
+            .await
+            .map(|_| {
+                info!(
+                    "📤 SessionManagerAdapter send_to_session ok: session_id={}, server_message_id={}, channel_id={}, from_uid={}",
+                    session_id,
+                    message.server_message_id,
+                    message.channel_id,
+                    message.from_uid
+                );
+            })
+            .map_err(|e| {
+                warn!(
+                    "❌ SessionManagerAdapter send_to_session failed: session_id={}, server_message_id={}, channel_id={}, error={}",
+                    session_id, message.server_message_id, message.channel_id, e
+                );
+                anyhow::anyhow!("send_to_session({}) failed: {}", session_id, e)
+            })
+    }
+
+    async fn send_to_sessions(
+        &self,
+        sessions: &[SessionId],
+        message: &PushMessageRequest,
+    ) -> Result<Vec<Result<()>>> {
+        let mut out = Vec::with_capacity(sessions.len());
+        for sid in sessions {
+            out.push(self.send_to_session(sid, message).await);
+        }
+        Ok(out)
+    }
+
+    async fn send_batch_to_session(
+        &self,
+        session_id: &SessionId,
+        messages: &[PushMessageRequest],
+    ) -> Result<()> {
+        for message in messages {
+            self.send_to_session(session_id, message).await?;
+        }
         Ok(())
     }
-    
-    async fn send_to_sessions(&self, _sessions: &[SessionId], _message: &PushMessageRequest) -> Result<Vec<Result<()>>> {
-        // TODO: 实现批量发送逻辑
-        Ok(vec![])
+
+    async fn is_session_online(&self, session_id: &SessionId) -> bool {
+        let Ok(transport) = self.get_transport().await else {
+            return false;
+        };
+        let Ok(target) = Self::parse_session_id(session_id) else {
+            return false;
+        };
+        transport
+            .active_sessions()
+            .await
+            .into_iter()
+            .any(|sid| sid == target)
     }
-    
-    async fn send_batch_to_session(&self, _session_id: &SessionId, _messages: &[PushMessageRequest]) -> Result<()> {
-        // TODO: 实现批量发送逻辑
-        Ok(())
-    }
-    
-    async fn is_session_online(&self, _session_id: &SessionId) -> bool {
-        // TODO: 实现会话在线检查
-        // 需要访问 TransportServer 或会话状态缓存
-        true
-    }
-    
+
     async fn get_online_sessions(&self) -> Vec<SessionId> {
-        // TODO: 实现获取在线会话列表的逻辑
-        vec![]
+        let Ok(transport) = self.get_transport().await else {
+            return vec![];
+        };
+        let _ = &self.inner;
+        transport
+            .active_sessions()
+            .await
+            .into_iter()
+            .map(|sid| sid.to_string())
+            .collect()
     }
-} 
+}

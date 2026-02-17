@@ -1,90 +1,85 @@
+use crate::repository::MessageRepository;
 /// Phase 8: 同步相关 RPC 处理器
-/// 
+///
 /// RPC 路由：
 /// - sync/submit - 客户端提交命令
 /// - sync/get_difference - 获取差异
 /// - sync/get_channel_pts - 获取频道 pts
 /// - sync/batch_get_channel_pts - 批量获取频道 pts
-
 use crate::rpc::router::GLOBAL_RPC_ROUTER;
 use crate::rpc::RpcServiceContext;
-use privchat_protocol::rpc::routes;
-use tracing::{info, error, warn};
-use msgtrans::SessionId;
 use chrono::{DateTime, Utc};
-use crate::repository::MessageRepository;
+use msgtrans::SessionId;
+use privchat_protocol::rpc::routes;
+use tracing::{error, warn};
 
 // Phase 8 RPC handlers 在本文件中实现
 
-use serde_json::Value;
 use crate::rpc::error::{RpcError, RpcResult};
+use serde_json::Value;
 
 /// 注册同步系统的所有路由
 pub async fn register_routes(services: RpcServiceContext) {
     // sync/get_channel_pts - 获取频道 pts
     let services_clone = services.clone();
-    GLOBAL_RPC_ROUTER.register(routes::sync::GET_CHANNEL_PTS, move |body, _ctx| {
-        let services = services_clone.clone();
-        async move {
-            handle_get_channel_pts_rpc(body, services).await
-        }
-    }).await;
-    
+    GLOBAL_RPC_ROUTER
+        .register(routes::sync::GET_CHANNEL_PTS, move |body, _ctx| {
+            let services = services_clone.clone();
+            async move { handle_get_channel_pts_rpc(body, services).await }
+        })
+        .await;
+
     // sync/get_difference - 获取差异
     let services_clone = services.clone();
-    GLOBAL_RPC_ROUTER.register(routes::sync::GET_DIFFERENCE, move |body, _ctx| {
-        let services = services_clone.clone();
-        async move {
-            handle_get_difference_rpc(body, services).await
-        }
-    }).await;
-    
+    GLOBAL_RPC_ROUTER
+        .register(routes::sync::GET_DIFFERENCE, move |body, _ctx| {
+            let services = services_clone.clone();
+            async move { handle_get_difference_rpc(body, services).await }
+        })
+        .await;
+
     // sync/submit - 客户端提交命令
     let services_clone = services.clone();
-    GLOBAL_RPC_ROUTER.register(routes::sync::SUBMIT, move |body, ctx| {
-        let services = services_clone.clone();
-        async move {
-            handle_submit_rpc(body, services, ctx).await
-        }
-    }).await;
-    
+    GLOBAL_RPC_ROUTER
+        .register(routes::sync::SUBMIT, move |body, ctx| {
+            let services = services_clone.clone();
+            async move { handle_submit_rpc(body, services, ctx).await }
+        })
+        .await;
+
     // sync/batch_get_channel_pts - 批量获取频道 pts
     let services_clone = services.clone();
-    GLOBAL_RPC_ROUTER.register(routes::sync::BATCH_GET_CHANNEL_PTS, move |body, _ctx| {
-        let services = services_clone.clone();
-        async move {
-            handle_batch_get_channel_pts_rpc(body, services).await
-        }
-    }).await;
+    GLOBAL_RPC_ROUTER
+        .register(routes::sync::BATCH_GET_CHANNEL_PTS, move |body, _ctx| {
+            let services = services_clone.clone();
+            async move { handle_batch_get_channel_pts_rpc(body, services).await }
+        })
+        .await;
 
     // sync/session_ready - 客户端完成 bootstrap，打开补差+实时闸门
     let services_clone = services.clone();
-    GLOBAL_RPC_ROUTER.register(routes::sync::SESSION_READY, move |body, ctx| {
-        let services = services_clone.clone();
-        async move {
-            handle_session_ready_rpc(body, services, ctx).await
-        }
-    }).await;
-    
-    info!("📋 Sync 系统路由注册完成 (get_channel_pts, get_difference, submit, batch_get_channel_pts, session_ready)");
+    GLOBAL_RPC_ROUTER
+        .register(routes::sync::SESSION_READY, move |body, ctx| {
+            let services = services_clone.clone();
+            async move { handle_session_ready_rpc(body, services, ctx).await }
+        })
+        .await;
+
+    tracing::debug!("📋 Sync 系统路由注册完成 (get_channel_pts, get_difference, submit, batch_get_channel_pts, session_ready)");
 }
 
 /// RPC 处理函数：获取频道 pts
 async fn handle_get_channel_pts_rpc(body: Value, services: RpcServiceContext) -> RpcResult<Value> {
     use privchat_protocol::rpc::sync::{GetChannelPtsRequest, GetChannelPtsResponse};
-    
+
     let request: GetChannelPtsRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
-    
+
     // 直接从 pts_generator 获取当前 pts
-    let current_pts = services.pts_generator
-        .current_pts(request.channel_id, request.channel_type)
-        .await;
-    
-    let response = GetChannelPtsResponse {
-        current_pts,
-    };
-    
+    let current_pts = services.pts_generator.current_pts(request.channel_id).await;
+
+    let response = GetChannelPtsResponse { current_pts };
+
     serde_json::to_value(&response)
         .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
@@ -92,86 +87,107 @@ async fn handle_get_channel_pts_rpc(body: Value, services: RpcServiceContext) ->
 /// RPC 处理函数：获取差异
 async fn handle_get_difference_rpc(body: Value, services: RpcServiceContext) -> RpcResult<Value> {
     use privchat_protocol::rpc::sync::GetDifferenceRequest;
-    
+
     let request: GetDifferenceRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
-    
-    info!(
+
+    tracing::debug!(
         "收到差异拉取请求: channel_id={}, channel_type={}, last_pts={}, limit={:?}",
-        request.channel_id, request.channel_type, request.last_pts, request.limit
+        request.channel_id,
+        request.channel_type,
+        request.last_pts,
+        request.limit
     );
-    
+
     // 使用 SyncService 处理差异拉取
-    let response = services.sync_service.handle_get_difference(request).await
+    let response = services
+        .sync_service
+        .handle_get_difference(request)
+        .await
         .map_err(|e| {
             error!("SyncService.handle_get_difference 失败: {}", e);
             RpcError::internal(format!("获取差异失败: {}", e))
         })?;
-    
+
     serde_json::to_value(&response)
         .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
 
 /// RPC 处理函数：客户端提交命令
-async fn handle_submit_rpc(body: Value, services: RpcServiceContext, ctx: crate::rpc::RpcContext) -> RpcResult<Value> {
+async fn handle_submit_rpc(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
     use privchat_protocol::rpc::sync::ClientSubmitRequest;
-    
+
     let request: ClientSubmitRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
     let request_for_projection = request.clone();
-    
+
     // 保存需要的字段（在 request 被移动之前）
     let channel_id = request.channel_id;
-    
+
     // 获取当前用户ID
     let sender_id = crate::rpc::get_current_user_id(&ctx)?;
-    
+
     // 使用 SyncService 处理客户端提交
-    let response = services.sync_service.handle_client_submit(request, sender_id).await
+    let response = services
+        .sync_service
+        .handle_client_submit(request, sender_id)
+        .await
         .map_err(|e| {
             error!("SyncService.handle_client_submit 失败: {}", e);
             RpcError::internal(format!("提交失败: {}", e))
         })?;
 
-    if let Err(e) = project_submit_to_message_views(
-        &services,
-        &request_for_projection,
-        sender_id,
-        &response,
-    )
-    .await
+    if let Err(e) =
+        project_submit_to_message_views(&services, &request_for_projection, sender_id, &response)
+            .await
     {
         warn!(
             "sync/submit 投影到消息视图失败: channel_id={}, local_message_id={}, error={}",
             request_for_projection.channel_id, request_for_projection.local_message_id, e
         );
     }
-    
-    info!(
+
+    tracing::debug!(
         "✅ sync/submit 成功: local_message_id={}, channel_id={}, pts={:?}, has_gap={}",
-        response.local_message_id, channel_id, response.pts, response.has_gap
+        response.local_message_id,
+        channel_id,
+        response.pts,
+        response.has_gap
     );
-    
+
     serde_json::to_value(&response)
         .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
 
 /// RPC 处理函数：批量获取频道 pts
-async fn handle_batch_get_channel_pts_rpc(body: Value, services: RpcServiceContext) -> RpcResult<Value> {
+async fn handle_batch_get_channel_pts_rpc(
+    body: Value,
+    services: RpcServiceContext,
+) -> RpcResult<Value> {
     use privchat_protocol::rpc::sync::BatchGetChannelPtsRequest;
-    
+
     let request: BatchGetChannelPtsRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
-    
+
     // 使用 SyncService 处理批量获取 pts
-    let response = services.sync_service.handle_batch_get_channel_pts(request).await
+    let response = services
+        .sync_service
+        .handle_batch_get_channel_pts(request)
+        .await
         .map_err(|e| {
             error!("SyncService.handle_batch_get_channel_pts 失败: {}", e);
             RpcError::internal(format!("批量获取 pts 失败: {}", e))
         })?;
-    
-    info!("✅ sync/batch_get_channel_pts 成功: 返回 {} 个频道的 pts", response.channel_pts_map.len());
-    
+
+    tracing::debug!(
+        "✅ sync/batch_get_channel_pts 成功: 返回 {} 个频道的 pts",
+        response.channel_pts_map.len()
+    );
+
     serde_json::to_value(&response)
         .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
@@ -191,7 +207,8 @@ async fn handle_session_ready_rpc(
     }
 
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
-    let session_id_str = ctx.session_id
+    let session_id_str = ctx
+        .session_id
         .as_ref()
         .ok_or_else(|| RpcError::validation("缺少 session_id 上下文".to_string()))?;
     let session_id = parse_session_id(session_id_str)?;
@@ -202,15 +219,22 @@ async fn handle_session_ready_rpc(
         .await;
 
     if transitioned {
-        info!("✅ sync/session_ready: session={} user={} 首次 READY，触发补差推送", session_id, user_id);
+        tracing::info!(
+            "✅ sync/session_ready: session={} user={} 首次 READY，触发补差推送",
+            session_id,
+            user_id
+        );
         services.offline_worker.trigger_push(user_id);
     } else {
-        info!("ℹ️ sync/session_ready: session={} user={} 重复 READY（幂等）", session_id, user_id);
+        tracing::info!(
+            "ℹ️ sync/session_ready: session={} user={} 重复 READY（幂等）",
+            session_id,
+            user_id
+        );
     }
 
     let response: SessionReadyResponse = true;
-    serde_json::to_value(response)
-        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+    serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
 
 fn parse_session_id(session_id_str: &str) -> RpcResult<SessionId> {
@@ -229,7 +253,10 @@ async fn project_submit_to_message_views(
     sender_id: u64,
     response: &privchat_protocol::rpc::sync::ClientSubmitResponse,
 ) -> Result<(), String> {
-    if !matches!(response.decision, privchat_protocol::rpc::sync::ServerDecision::Accepted) {
+    if !matches!(
+        response.decision,
+        privchat_protocol::rpc::sync::ServerDecision::Accepted
+    ) {
         return Ok(());
     }
     let Some(server_msg_id) = response.server_msg_id else {
@@ -249,8 +276,8 @@ async fn project_submit_to_message_views(
     }
 
     let (message_type, content, metadata) = normalize_submit_payload(request);
-    let server_ts = DateTime::<Utc>::from_timestamp_millis(response.server_timestamp)
-        .unwrap_or_else(Utc::now);
+    let server_ts =
+        DateTime::<Utc>::from_timestamp_millis(response.server_timestamp).unwrap_or_else(Utc::now);
     let msg = crate::model::message::Message {
         message_id: server_msg_id,
         channel_id: request.channel_id,
@@ -280,26 +307,18 @@ async fn project_submit_to_message_views(
         .channel_service
         .update_last_message(request.channel_id, server_msg_id)
         .await;
-    services
-        .channel_service
-        .update_last_message_preview(
-            request.channel_id,
-            crate::service::channel_service::LastMessagePreview {
-                message_id: server_msg_id,
-                sender_id,
-                content,
-                message_type: message_type.as_str().to_string(),
-                timestamp: server_ts,
-            },
-        )
-        .await;
+    // channel last preview is derived on client from local message table.
 
     Ok(())
 }
 
 fn normalize_submit_payload(
     request: &privchat_protocol::rpc::sync::ClientSubmitRequest,
-) -> (privchat_protocol::ContentMessageType, String, serde_json::Value) {
+) -> (
+    privchat_protocol::ContentMessageType,
+    String,
+    serde_json::Value,
+) {
     let cmd = request.command_type.to_lowercase();
     let msg_type = match cmd.as_str() {
         "image" => privchat_protocol::ContentMessageType::Image,

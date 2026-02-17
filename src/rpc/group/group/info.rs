@@ -1,30 +1,38 @@
-use serde_json::{json, Value};
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use privchat_protocol::rpc::group::group::GroupInfoRequest;
+use serde_json::{json, Value};
 
 /// 处理 群组信息 请求
-pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::RpcContext) -> RpcResult<Value> {
+pub async fn handle(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
     // ✨ 使用协议层类型自动反序列化
     let mut request: GroupInfoRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
-    
+
     // 从 ctx 填充 user_id
     request.user_id = crate::rpc::get_current_user_id(&ctx)?;
-    
+
     let group_id = request.group_id;
-    
-    tracing::info!("🔧 查询群组信息: {}", group_id);
-    
+
+    tracing::debug!("🔧 查询群组信息: {}", group_id);
+
     // 获取群组信息
     match services.channel_service.get_channel(&group_id).await {
         Ok(channel) => {
             // 获取成员列表
-            let members = match services.channel_service.get_channel_members(&group_id).await {
+            let members = match services
+                .channel_service
+                .get_channel_members(&group_id)
+                .await
+            {
                 Ok(members) => members,
                 Err(_) => Vec::new(),
             };
-            
+
             // 创建默认统计信息（get_channel_stats 方法不存在，使用默认值）
             let stats = crate::model::channel::ChannelStats {
                 channel_id: group_id,
@@ -34,7 +42,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
                 active_member_count: 0,
                 stats_time: chrono::Utc::now(),
             };
-            
+
             Ok(json!({
                 "status": "success",
                 "group_info": {

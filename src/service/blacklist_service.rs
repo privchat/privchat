@@ -1,8 +1,8 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::error::Result;
@@ -64,7 +64,10 @@ impl BlacklistService {
         let user_blacklist = store.entry(user_id).or_insert_with(Vec::new);
 
         // 检查是否已经在黑名单中
-        if user_blacklist.iter().any(|entry| entry.blocked_user_id == blocked_user_id) {
+        if user_blacklist
+            .iter()
+            .any(|entry| entry.blocked_user_id == blocked_user_id)
+        {
             info!("用户 {} 已在 {} 的黑名单中", blocked_user_id, user_id);
             // 返回现有条目
             return Ok(user_blacklist
@@ -99,11 +102,7 @@ impl BlacklistService {
     ///
     /// # Returns
     /// 是否成功移除
-    pub async fn remove_from_blacklist(
-        &self,
-        user_id: u64,
-        blocked_user_id: u64,
-    ) -> Result<bool> {
+    pub async fn remove_from_blacklist(&self, user_id: u64, blocked_user_id: u64) -> Result<bool> {
         let mut store = self.blacklist_store.write().await;
 
         if let Some(user_blacklist) = store.get_mut(&user_id) {
@@ -157,7 +156,11 @@ impl BlacklistService {
         let store = self.blacklist_store.read().await;
 
         if let Some(user_blacklist) = store.get(&user_id) {
-            debug!("获取用户 {} 的黑名单，共 {} 个", user_id, user_blacklist.len());
+            debug!(
+                "获取用户 {} 的黑名单，共 {} 个",
+                user_id,
+                user_blacklist.len()
+            );
             return Ok(user_blacklist.clone());
         }
 
@@ -200,11 +203,7 @@ impl BlacklistService {
     ///
     /// # Returns
     /// (A是否拉黑B, B是否拉黑A)
-    pub async fn check_mutual_block(
-        &self,
-        user_a: u64,
-        user_b: u64,
-    ) -> Result<(bool, bool)> {
+    pub async fn check_mutual_block(&self, user_a: u64, user_b: u64) -> Result<(bool, bool)> {
         let a_blocks_b = self.is_blocked(user_a, user_b).await?;
         let b_blocks_a = self.is_blocked(user_b, user_a).await?;
         Ok((a_blocks_b, b_blocks_a))
@@ -257,9 +256,7 @@ mod tests {
         let cache_manager = Arc::new(CacheManager::new_simple());
         let service = BlacklistService::new(cache_manager);
 
-        let result = service
-            .add_to_blacklist(1, 1, None)
-            .await;
+        let result = service.add_to_blacklist(1, 1, None).await;
         assert!(result.is_err());
     }
 
@@ -271,12 +268,8 @@ mod tests {
         service.add_to_blacklist(1, 2, None).await.unwrap();
         service.add_to_blacklist(2, 1, None).await.unwrap();
 
-        let (a_blocks_b, b_blocks_a) = service
-            .check_mutual_block(1, 2)
-            .await
-            .unwrap();
+        let (a_blocks_b, b_blocks_a) = service.check_mutual_block(1, 2).await.unwrap();
         assert!(a_blocks_b);
         assert!(b_blocks_a);
     }
 }
-

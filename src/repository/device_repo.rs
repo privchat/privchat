@@ -6,4 +6,4 @@ impl DeviceRepository {
     pub fn new() -> Self {
         Self
     }
-} 
+}

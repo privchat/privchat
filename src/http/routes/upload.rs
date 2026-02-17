@@ -1,14 +1,9 @@
 //! 文件上传路由
-//! 
+//!
 //! 路由：POST /api/app/files/upload
 //! 认证：需要 X-Upload-Token header
 
-use axum::{
-    extract::State,
-    response::Json,
-    routing::post,
-    Router,
-};
+use axum::{extract::State, response::Json, routing::post, Router};
 use axum_extra::extract::Multipart;
 use serde_json::{json, Value};
 use tracing::info;
@@ -55,17 +50,23 @@ async fn upload_file(
         .get("X-Upload-Token")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ServerError::Validation("缺少 X-Upload-Token header".to_string()))?;
-    
+
     tracing::info!("🔐 验证上传 token: {}", upload_token);
-    
+
     // 验证 token
-    let token_info = state.upload_token_service.validate_token(upload_token).await?;
-    
+    let token_info = state
+        .upload_token_service
+        .validate_token(upload_token)
+        .await?;
+
     // 标记 token 已使用
-    state.upload_token_service.mark_token_used(upload_token).await?;
-    
+    state
+        .upload_token_service
+        .mark_token_used(upload_token)
+        .await?;
+
     tracing::info!("✅ Token 验证通过，用户: {}", token_info.user_id);
-    
+
     let file_service = &state.file_service;
 
     // 上传服务只负责存储：不解析 compress/generate_thumbnail 等处理参数，客户端已在 token 请求时确定类型与限制
@@ -75,15 +76,19 @@ async fn upload_file(
     let mut business_id: Option<String> = None;
 
     // 解析 multipart/form-data：file 必填；business_id 可选（字符串，兼容各类业务）
-    while let Some(field) = multipart.next_field().await
-        .map_err(|e| ServerError::Validation(format!("解析 multipart 失败: {}", e)))? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ServerError::Validation(format!("解析 multipart 失败: {}", e)))?
+    {
         let field_name = field.name().unwrap_or("");
         match field_name {
             "file" => {
                 filename = field.file_name().map(|s| s.to_string());
                 mime_type = field.content_type().map(|s| s.to_string());
-                let data = field.bytes().await
-                    .map_err(|e| crate::error::ServerError::Validation(format!("读取文件数据失败: {}", e)))?;
+                let data = field.bytes().await.map_err(|e| {
+                    crate::error::ServerError::Validation(format!("读取文件数据失败: {}", e))
+                })?;
                 file_data = Some(data.to_vec());
             }
             "business_id" => {
@@ -101,11 +106,12 @@ async fn upload_file(
     // 验证必需字段
     let file_data = file_data.ok_or_else(|| ServerError::Validation("缺少文件数据".to_string()))?;
     let filename = filename.ok_or_else(|| ServerError::Validation("缺少文件名".to_string()))?;
-    let mime_type = mime_type.ok_or_else(|| ServerError::Validation("缺少 MIME 类型".to_string()))?;
-    
+    let mime_type =
+        mime_type.ok_or_else(|| ServerError::Validation("缺少 MIME 类型".to_string()))?;
+
     // 从 token_info 获取 uploader_id
     let uploader_id = token_info.user_id;
-    
+
     // 仅做 token 内约定的校验：文件大小不超过 token 签发时的 max_size
     if file_data.len() as i64 > token_info.max_size {
         return Err(ServerError::Validation(format!(
@@ -118,18 +124,27 @@ async fn upload_file(
     // 从请求头取客户端 IP（兼容反向代理：X-Forwarded-For 取第一个，否则 X-Real-IP）
     let uploader_ip = client_ip_from_headers(&headers);
 
-    info!("📤 上传文件: {} ({} bytes, {}) from 用户 {}, ip: {}", filename, file_data.len(), mime_type, uploader_id, uploader_ip.as_deref().unwrap_or("-"));
-
-    // 只做存储；业务类型来自 token，business_id 可选（表单或后续 update_business 关联）
-    let metadata = file_service.upload_file(
-        file_data,
+    info!(
+        "📤 上传文件: {} ({} bytes, {}) from 用户 {}, ip: {}",
         filename,
+        file_data.len(),
         mime_type,
         uploader_id,
-        uploader_ip,
-        token_info.business_type.clone(),
-        business_id,
-    ).await?;
+        uploader_ip.as_deref().unwrap_or("-")
+    );
+
+    // 只做存储；业务类型来自 token，business_id 可选（表单或后续 update_business 关联）
+    let metadata = file_service
+        .upload_file(
+            file_data,
+            filename,
+            mime_type,
+            uploader_id,
+            uploader_ip,
+            token_info.business_type.clone(),
+            business_id,
+        )
+        .await?;
 
     info!("✅ 文件上传成功: {}", metadata.file_id);
 

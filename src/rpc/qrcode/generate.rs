@@ -1,12 +1,12 @@
-use serde_json::{json, Value};
+use crate::model::{QRKeyOptions, QRType};
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use crate::model::{QRType, QRKeyOptions};
+use serde_json::{json, Value};
 
 /// 处理 生成 QR 码 请求
-/// 
+///
 /// RPC: qrcode/generate
-/// 
+///
 /// 请求参数：
 /// ```json
 /// {
@@ -20,7 +20,7 @@ use crate::model::{QRType, QRKeyOptions};
 ///   "metadata": {}                  // 可选：扩展信息
 /// }
 /// ```
-/// 
+///
 /// 响应：
 /// ```json
 /// {
@@ -32,29 +32,48 @@ use crate::model::{QRType, QRKeyOptions};
 ///   "expire_at": "2026-01-17T12:00:00Z"
 /// }
 /// ```
-pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::RpcContext) -> RpcResult<Value> {
-    tracing::info!("🔧 处理 生成 QR 码 请求: {:?}", body);
-    
+pub async fn handle(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
+    tracing::debug!("🔧 处理 生成 QR 码 请求: {:?}", body);
+
     // 解析参数
-    let qr_type_str = body.get("qr_type").and_then(|v| v.as_str())
+    let qr_type_str = body
+        .get("qr_type")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("qr_type is required".to_string()))?;
-    
+
     let qr_type = QRType::from_str(qr_type_str)
         .ok_or_else(|| RpcError::validation(format!("无效的 qr_type: {}", qr_type_str)))?;
-    
-    let target_id = body.get("target_id").and_then(|v| v.as_str())
+
+    let target_id = body
+        .get("target_id")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("target_id is required".to_string()))?;
-    
-    let creator_id = body.get("creator_id").and_then(|v| v.as_str())
+
+    let creator_id = body
+        .get("creator_id")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("creator_id is required".to_string()))?;
-    
+
     // 可选参数
     let expire_seconds = body.get("expire_seconds").and_then(|v| v.as_i64());
-    let max_usage = body.get("max_usage").and_then(|v| v.as_i64()).map(|v| v as i32);
-    let one_time = body.get("one_time").and_then(|v| v.as_bool()).unwrap_or(false);
-    let revoke_old = body.get("revoke_old").and_then(|v| v.as_bool()).unwrap_or(true);
+    let max_usage = body
+        .get("max_usage")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+    let one_time = body
+        .get("one_time")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let revoke_old = body
+        .get("revoke_old")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let metadata = body.get("metadata").cloned().unwrap_or(json!({}));
-    
+
     // 生成选项
     let options = QRKeyOptions {
         expire_seconds,
@@ -63,18 +82,25 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
         revoke_old,
         metadata,
     };
-    
+
     // 生成 QR Key
-    let record = services.qrcode_service.generate(
-        qr_type,
-        target_id.to_string(),
-        creator_id.to_string(),
-        options,
-    ).await
+    let record = services
+        .qrcode_service
+        .generate(
+            qr_type,
+            target_id.to_string(),
+            creator_id.to_string(),
+            options,
+        )
+        .await
         .map_err(|e| RpcError::internal(format!("生成 QR 码失败: {}", e)))?;
-    
-    tracing::info!("✅ QR 码生成成功: qr_key={}, target={}", record.qr_key, target_id);
-    
+
+    tracing::debug!(
+        "✅ QR 码生成成功: qr_key={}, target={}",
+        record.qr_key,
+        target_id
+    );
+
     Ok(json!({
         "qr_key": record.qr_key,
         "qr_code": record.to_qr_code_string(),
@@ -86,4 +112,3 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: crate::rpc::R
         "used_count": record.used_count,
     }))
 }
-

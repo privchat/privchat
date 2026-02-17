@@ -23,7 +23,7 @@ pub struct RPCMessageResponse {
 
 impl RPCMessageResponse {
     /// 创建成功响应
-    /// 
+    ///
     /// RPC 层不是 HTTP，code == 0 永远表示 success
     pub fn success(data: Value) -> Self {
         Self {
@@ -34,7 +34,7 @@ impl RPCMessageResponse {
     }
 
     /// 创建成功响应（无数据）
-    /// 
+    ///
     /// RPC 层不是 HTTP，code == 0 永远表示 success
     pub fn success_empty() -> Self {
         Self {
@@ -45,7 +45,7 @@ impl RPCMessageResponse {
     }
 
     /// 创建错误响应
-    /// 
+    ///
     /// code != 0 表示错误，常见的错误码：
     /// - 400: ValidationError
     /// - 401: Unauthorized
@@ -61,7 +61,7 @@ impl RPCMessageResponse {
     }
 
     /// 检查响应是否成功
-    /// 
+    ///
     /// # 返回
     /// - `true`: code == 0，表示成功
     /// - `false`: code != 0，表示错误
@@ -71,7 +71,7 @@ impl RPCMessageResponse {
     }
 
     /// 检查响应是否失败
-    /// 
+    ///
     /// # 返回
     /// - `true`: code != 0，表示错误
     /// - `false`: code == 0，表示成功
@@ -79,4 +79,4 @@ impl RPCMessageResponse {
     pub fn is_err(&self) -> bool {
         self.code != 0
     }
-} 
+}

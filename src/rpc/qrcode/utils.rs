@@ -1,8 +1,8 @@
-use url::Url;
 use crate::rpc::error::RpcError;
+use url::Url;
 
 /// 从 QR 码 URL 中提取 qr_key
-/// 
+///
 /// # 示例
 /// ```
 /// let qr_code = "privchat://group/get?qrkey=abc123&token=xyz";
@@ -12,7 +12,7 @@ use crate::rpc::error::RpcError;
 pub fn extract_qr_key_from_url(qr_code: &str) -> Result<String, RpcError> {
     let url = Url::parse(qr_code)
         .map_err(|e| RpcError::validation(format!("无效的 QR 码格式: {}", e)))?;
-    
+
     url.query_pairs()
         .find(|(k, _): &(std::borrow::Cow<str>, std::borrow::Cow<str>)| k == "qrkey")
         .map(|(_, v)| v.to_string())
@@ -20,7 +20,7 @@ pub fn extract_qr_key_from_url(qr_code: &str) -> Result<String, RpcError> {
 }
 
 /// 从 QR 码 URL 中提取 token（可选）
-/// 
+///
 /// # 示例
 /// ```
 /// let qr_code = "privchat://group/get?qrkey=abc123&token=xyz";
@@ -39,7 +39,7 @@ pub fn generate_random_token() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
-    
+
     (0..16)
         .map(|_| {
             let idx = rng.gen_range(0..CHARSET.len());
@@ -71,7 +71,7 @@ mod tests {
         let qr_code = "privchat://user/get?qrkey=def456";
         let qr_key = extract_qr_key_from_url(qr_code).unwrap();
         assert_eq!(qr_key, "def456");
-        
+
         let token = extract_token_from_url(qr_code);
         assert_eq!(token, None);
     }
@@ -80,10 +80,9 @@ mod tests {
     fn test_generate_random_token() {
         let token1 = generate_random_token();
         let token2 = generate_random_token();
-        
+
         assert_eq!(token1.len(), 16);
         assert_eq!(token2.len(), 16);
         assert_ne!(token1, token2);
     }
 }
-

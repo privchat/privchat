@@ -1,17 +1,17 @@
-use std::collections::HashMap;
 use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tracing::{debug, info};
 
-use crate::error::ServerError;
 use super::message::OfflineMessage;
+use crate::error::ServerError;
 
 /// 存储后端 Trait
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// 存储离线消息
     async fn store_message(&self, message: &OfflineMessage) -> Result<(), ServerError>;
-    
+
     /// 批量存储离线消息
     async fn store_messages(&self, messages: &[OfflineMessage]) -> Result<(), ServerError> {
         for message in messages {
@@ -19,28 +19,36 @@ pub trait StorageBackend: Send + Sync {
         }
         Ok(())
     }
-    
+
     /// 获取用户的所有离线消息
     async fn get_messages(&self, user_id: u64) -> Result<Vec<OfflineMessage>, ServerError>;
-    
+
     /// 获取指定数量的用户离线消息
-    async fn get_messages_limit(&self, user_id: u64, limit: usize) -> Result<Vec<OfflineMessage>, ServerError>;
-    
+    async fn get_messages_limit(
+        &self,
+        user_id: u64,
+        limit: usize,
+    ) -> Result<Vec<OfflineMessage>, ServerError>;
+
     /// 删除指定消息
     async fn delete_message(&self, user_id: u64, message_id: u64) -> Result<bool, ServerError>;
-    
+
     /// 批量删除消息
-    async fn delete_messages(&self, user_id: u64, message_ids: &[u64]) -> Result<usize, ServerError>;
-    
+    async fn delete_messages(
+        &self,
+        user_id: u64,
+        message_ids: &[u64],
+    ) -> Result<usize, ServerError>;
+
     /// 删除用户的所有离线消息
     async fn delete_all_messages(&self, user_id: u64) -> Result<usize, ServerError>;
-    
+
     /// 清理过期消息
     async fn cleanup_expired_messages(&self) -> Result<usize, ServerError>;
-    
+
     /// 获取存储统计信息
     async fn get_stats(&self) -> Result<StorageStats, ServerError>;
-    
+
     /// 健康检查
     async fn health_check(&self) -> Result<(), ServerError>;
 }
@@ -83,26 +91,38 @@ impl StorageBackend for MemoryStorage {
     async fn store_message(&self, message: &OfflineMessage) -> Result<(), ServerError> {
         let mut messages = self.messages.write().await;
         let user_id = message.user_id.parse::<u64>().unwrap_or(0);
-        messages.entry(user_id)
+        messages
+            .entry(user_id)
             .or_insert_with(Vec::new)
             .push(message.clone());
-        
-        debug!("Stored message {} for user {}", message.message_id, message.user_id);
+
+        debug!(
+            "Stored message {} for user {}",
+            message.message_id, message.user_id
+        );
         Ok(())
     }
 
     async fn get_messages(&self, user_id: u64) -> Result<Vec<OfflineMessage>, ServerError> {
         let messages = self.messages.read().await;
         let mut user_messages = messages.get(&user_id).cloned().unwrap_or_default();
-        
+
         // 按优先级和时间排序
         user_messages.sort();
-        
-        debug!("Retrieved {} messages for user {}", user_messages.len(), user_id);
+
+        debug!(
+            "Retrieved {} messages for user {}",
+            user_messages.len(),
+            user_id
+        );
         Ok(user_messages)
     }
 
-    async fn get_messages_limit(&self, user_id: u64, limit: usize) -> Result<Vec<OfflineMessage>, ServerError> {
+    async fn get_messages_limit(
+        &self,
+        user_id: u64,
+        limit: usize,
+    ) -> Result<Vec<OfflineMessage>, ServerError> {
         let mut messages = self.get_messages(user_id).await?;
         messages.truncate(limit);
         Ok(messages)
@@ -114,18 +134,22 @@ impl StorageBackend for MemoryStorage {
             let original_len = user_messages.len();
             user_messages.retain(|msg| msg.message_id != message_id);
             let deleted = user_messages.len() < original_len;
-            
+
             if deleted {
                 debug!("Deleted message {} for user {}", message_id, user_id);
             }
-            
+
             Ok(deleted)
         } else {
             Ok(false)
         }
     }
 
-    async fn delete_messages(&self, user_id: u64, message_ids: &[u64]) -> Result<usize, ServerError> {
+    async fn delete_messages(
+        &self,
+        user_id: u64,
+        message_ids: &[u64],
+    ) -> Result<usize, ServerError> {
         let mut deleted_count = 0;
         for &message_id in message_ids {
             if self.delete_message(user_id, message_id).await? {
@@ -155,16 +179,22 @@ impl StorageBackend for MemoryStorage {
             user_messages.retain(|msg| !msg.is_expired());
             let removed = original_len - user_messages.len();
             total_removed += removed;
-            
+
             if removed > 0 {
-                debug!("Cleaned up {} expired messages for user {}", removed, user_id);
+                debug!(
+                    "Cleaned up {} expired messages for user {}",
+                    removed, user_id
+                );
             }
         }
 
         // 移除空的用户条目
         messages.retain(|_, msgs| !msgs.is_empty());
 
-        info!("Cleanup completed: removed {} expired messages", total_removed);
+        info!(
+            "Cleanup completed: removed {} expired messages",
+            total_removed
+        );
         Ok(total_removed)
     }
 
@@ -217,9 +247,9 @@ impl SledStorage {
     pub async fn new(path: &str) -> Result<Self, ServerError> {
         let db = sled::open(path)
             .map_err(|e| ServerError::Internal(format!("Failed to open sled database: {}", e)))?;
-        
+
         info!("Opened Sled database at: {}", path);
-        
+
         Ok(Self {
             db,
             path: path.to_string(),
@@ -255,11 +285,15 @@ impl StorageBackend for SledStorage {
         let user_id = message.user_id.parse::<u64>().unwrap_or(0);
         let key = Self::message_key(user_id, message.message_id);
         let value = Self::serialize_message(message)?;
-        
-        self.db.insert(&key, value)
+
+        self.db
+            .insert(&key, value)
             .map_err(|e| ServerError::Internal(format!("Failed to store message: {}", e)))?;
-        
-        debug!("Stored message {} for user {} in Sled", message.message_id, message.user_id);
+
+        debug!(
+            "Stored message {} for user {} in Sled",
+            message.message_id, message.user_id
+        );
         Ok(())
     }
 
@@ -270,19 +304,27 @@ impl StorageBackend for SledStorage {
         for result in self.db.scan_prefix(&prefix) {
             let (_key, value) = result
                 .map_err(|e| ServerError::Internal(format!("Failed to scan messages: {}", e)))?;
-            
+
             let message = Self::deserialize_message(&value)?;
             messages.push(message);
         }
 
         // 按优先级和时间排序
         messages.sort();
-        
-        debug!("Retrieved {} messages for user {} from Sled", messages.len(), user_id);
+
+        debug!(
+            "Retrieved {} messages for user {} from Sled",
+            messages.len(),
+            user_id
+        );
         Ok(messages)
     }
 
-    async fn get_messages_limit(&self, user_id: u64, limit: usize) -> Result<Vec<OfflineMessage>, ServerError> {
+    async fn get_messages_limit(
+        &self,
+        user_id: u64,
+        limit: usize,
+    ) -> Result<Vec<OfflineMessage>, ServerError> {
         let mut messages = self.get_messages(user_id).await?;
         messages.truncate(limit);
         Ok(messages)
@@ -290,19 +332,28 @@ impl StorageBackend for SledStorage {
 
     async fn delete_message(&self, user_id: u64, message_id: u64) -> Result<bool, ServerError> {
         let key = Self::message_key(user_id, message_id);
-        
-        let removed = self.db.remove(&key)
+
+        let removed = self
+            .db
+            .remove(&key)
             .map_err(|e| ServerError::Internal(format!("Failed to delete message: {}", e)))?
             .is_some();
-        
+
         if removed {
-            debug!("Deleted message {} for user {} from Sled", message_id, user_id);
+            debug!(
+                "Deleted message {} for user {} from Sled",
+                message_id, user_id
+            );
         }
-        
+
         Ok(removed)
     }
 
-    async fn delete_messages(&self, user_id: u64, message_ids: &[u64]) -> Result<usize, ServerError> {
+    async fn delete_messages(
+        &self,
+        user_id: u64,
+        message_ids: &[u64],
+    ) -> Result<usize, ServerError> {
         let mut deleted_count = 0;
         for &message_id in message_ids {
             if self.delete_message(user_id, message_id).await? {
@@ -316,7 +367,9 @@ impl StorageBackend for SledStorage {
         let prefix = Self::user_key_prefix(user_id);
         let mut deleted_count = 0;
 
-        let keys_to_delete: Result<Vec<_>, _> = self.db.scan_prefix(&prefix)
+        let keys_to_delete: Result<Vec<_>, _> = self
+            .db
+            .scan_prefix(&prefix)
             .map(|result| result.map(|(key, _)| key))
             .collect();
 
@@ -324,14 +377,20 @@ impl StorageBackend for SledStorage {
             .map_err(|e| ServerError::Internal(format!("Failed to scan for deletion: {}", e)))?;
 
         for key in keys_to_delete {
-            if self.db.remove(&key)
+            if self
+                .db
+                .remove(&key)
                 .map_err(|e| ServerError::Internal(format!("Failed to delete key: {}", e)))?
-                .is_some() {
+                .is_some()
+            {
                 deleted_count += 1;
             }
         }
 
-        debug!("Deleted all {} messages for user {} from Sled", deleted_count, user_id);
+        debug!(
+            "Deleted all {} messages for user {} from Sled",
+            deleted_count, user_id
+        );
         Ok(deleted_count)
     }
 
@@ -343,7 +402,7 @@ impl StorageBackend for SledStorage {
         for result in self.db.iter() {
             let (key, value) = result
                 .map_err(|e| ServerError::Internal(format!("Failed to iterate messages: {}", e)))?;
-            
+
             // 只处理消息键
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.contains(":msg:") {
@@ -358,14 +417,22 @@ impl StorageBackend for SledStorage {
 
         // 删除过期消息
         for key in keys_to_remove {
-            if self.db.remove(&key)
-                .map_err(|e| ServerError::Internal(format!("Failed to remove expired message: {}", e)))?
-                .is_some() {
+            if self
+                .db
+                .remove(&key)
+                .map_err(|e| {
+                    ServerError::Internal(format!("Failed to remove expired message: {}", e))
+                })?
+                .is_some()
+            {
                 total_removed += 1;
             }
         }
 
-        info!("Cleanup completed: removed {} expired messages from Sled", total_removed);
+        info!(
+            "Cleanup completed: removed {} expired messages from Sled",
+            total_removed
+        );
         Ok(total_removed)
     }
 
@@ -383,9 +450,10 @@ impl StorageBackend for SledStorage {
         let mut users = std::collections::HashSet::new();
 
         for result in self.db.iter() {
-            let (key, value) = result
-                .map_err(|e| ServerError::Internal(format!("Failed to iterate for stats: {}", e)))?;
-            
+            let (key, value) = result.map_err(|e| {
+                ServerError::Internal(format!("Failed to iterate for stats: {}", e))
+            })?;
+
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.contains(":msg:") {
                     if let Ok(message) = Self::deserialize_message(&value) {
@@ -395,8 +463,12 @@ impl StorageBackend for SledStorage {
 
                         match message.status {
                             super::message::DeliveryStatus::Pending => stats.pending_messages += 1,
-                            super::message::DeliveryStatus::Delivering => stats.pending_messages += 1,
-                            super::message::DeliveryStatus::Delivered => stats.delivered_messages += 1,
+                            super::message::DeliveryStatus::Delivering => {
+                                stats.pending_messages += 1
+                            }
+                            super::message::DeliveryStatus::Delivered => {
+                                stats.delivered_messages += 1
+                            }
                             super::message::DeliveryStatus::Failed => stats.failed_messages += 1,
                             super::message::DeliveryStatus::Expired => stats.expired_messages += 1,
                         }
@@ -413,20 +485,26 @@ impl StorageBackend for SledStorage {
         // 尝试写入和读取一个测试键
         let test_key = "health_check";
         let test_value = b"ok";
-        
-        self.db.insert(test_key, test_value)
+
+        self.db
+            .insert(test_key, test_value)
             .map_err(|e| ServerError::Internal(format!("Health check write failed: {}", e)))?;
-        
-        let retrieved = self.db.get(test_key)
+
+        let retrieved = self
+            .db
+            .get(test_key)
             .map_err(|e| ServerError::Internal(format!("Health check read failed: {}", e)))?;
-        
+
         if retrieved.as_deref() != Some(test_value) {
-            return Err(ServerError::Internal("Health check value mismatch".to_string()));
+            return Err(ServerError::Internal(
+                "Health check value mismatch".to_string(),
+            ));
         }
-        
-        self.db.remove(test_key)
+
+        self.db
+            .remove(test_key)
             .map_err(|e| ServerError::Internal(format!("Health check cleanup failed: {}", e)))?;
-        
+
         Ok(())
     }
 }
@@ -472,7 +550,9 @@ mod tests {
     #[tokio::test]
     async fn test_sled_storage() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = SledStorage::new(temp_dir.path().to_str().unwrap()).await.unwrap();
+        let storage = SledStorage::new(temp_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
         let message = create_test_message(1, "user1").await;
 
         // 测试存储
@@ -491,4 +571,4 @@ mod tests {
         assert_eq!(stats.total_messages, 1);
         assert_eq!(stats.user_count, 1);
     }
-} 
+}

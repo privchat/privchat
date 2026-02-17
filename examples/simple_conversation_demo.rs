@@ -3,11 +3,9 @@ use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 
 // 直接使用会话服务和处理器
-use privchat_server::service::channel_service::{ChannelService, ChannelServiceConfig};
 use privchat_server::handler::channel_handler::ChannelHandler;
-use privchat_server::model::channel::{
-    ChannelType, MemberRole, CreateChannelRequest
-};
+use privchat_server::model::channel::{ChannelType, CreateChannelRequest, MemberRole};
+use privchat_server::service::channel_service::{ChannelService, ChannelServiceConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,7 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_members: None,
     };
 
-    match channel_handler.handle_create_channel("bob".to_string(), direct_request).await {
+    match channel_handler
+        .handle_create_channel("bob".to_string(), direct_request)
+        .await
+    {
         Ok(response) => {
             if response.success {
                 info!("✅ 私聊会话创建成功: {}", response.channel.id);
@@ -65,13 +66,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channel_type: ChannelType::Group,
         name: Some("开发团队讨论组".to_string()),
         description: Some("日常开发讨论和技术分享".to_string()),
-        member_ids: vec!["alice".to_string(), "charlie".to_string(), "david".to_string()],
+        member_ids: vec![
+            "alice".to_string(),
+            "charlie".to_string(),
+            "david".to_string(),
+        ],
         is_public: Some(false),
         max_members: Some(20),
     };
 
     let mut group_id = String::new();
-    match channel_handler.handle_create_channel("bob".to_string(), group_request).await {
+    match channel_handler
+        .handle_create_channel("bob".to_string(), group_request)
+        .await
+    {
         Ok(response) => {
             if response.success {
                 group_id = response.channel.id.clone();
@@ -80,7 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("   - 描述: {:?}", response.channel.metadata.description);
                 info!("   - 成员数: {}", response.channel.members.len());
                 info!("   - 创建者: {}", response.channel.creator_id);
-                info!("   - 最大成员数: {:?}", response.channel.metadata.max_members);
+                info!(
+                    "   - 最大成员数: {:?}",
+                    response.channel.metadata.max_members
+                );
             } else {
                 warn!("❌ 群聊会话创建失败: {:?}", response.error);
             }
@@ -95,7 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 演示3: 新成员加入群聊
     if !group_id.is_empty() {
         info!("🔄 演示3: 新成员加入群聊");
-        match channel_handler.handle_join_channel("eve".to_string(), group_id.clone(), None).await {
+        match channel_handler
+            .handle_join_channel("eve".to_string(), group_id.clone(), None)
+            .await
+        {
             Ok(response) => {
                 if response.success {
                     info!("✅ 用户 eve 成功加入群聊");
@@ -113,7 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 演示4: 查找私聊会话
     info!("🔍 演示4: 查找私聊会话");
-    match channel_handler.handle_find_direct_channel("bob".to_string(), "alice".to_string()).await {
+    match channel_handler
+        .handle_find_direct_channel("bob".to_string(), "alice".to_string())
+        .await
+    {
         Ok(response) => {
             if response.found {
                 info!("✅ 找到私聊会话: {:?}", response.channel_id);
@@ -135,8 +152,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("✅ 用户 bob 的会话列表:");
             info!("   - 总数: {}", response.total);
             for (i, conv) in response.channels.iter().enumerate() {
-                info!("   {}. {} (类型: {:?}, 成员数: {})", 
-                      i + 1, conv.id, conv.channel_type, conv.members.len());
+                info!(
+                    "   {}. {} (类型: {:?}, 成员数: {})",
+                    i + 1,
+                    conv.id,
+                    conv.channel_type,
+                    conv.members.len()
+                );
                 if let Some(name) = &conv.metadata.name {
                     info!("      名称: {}", name);
                 }
@@ -162,7 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("   - 群聊会话数: {}", stats.group_channels);
                 info!("   - 系统会话数: {}", stats.system_channels);
                 info!("   - 总成员数: {}", stats.total_members);
-                info!("   - 平均每会话成员数: {:.2}", stats.avg_members_per_channel);
+                info!(
+                    "   - 平均每会话成员数: {:.2}",
+                    stats.avg_members_per_channel
+                );
             }
         }
         Err(e) => {
@@ -175,7 +200,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 演示7: 成员离开群聊
     if !group_id.is_empty() {
         info!("🚪 演示7: 成员离开群聊");
-        match channel_handler.handle_leave_channel("charlie".to_string(), group_id.clone()).await {
+        match channel_handler
+            .handle_leave_channel("charlie".to_string(), group_id.clone())
+            .await
+        {
             Ok(response) => {
                 if response.success {
                     info!("✅ 用户 charlie 成功离开群聊");
@@ -199,7 +227,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("   - 私聊会话数: {}", final_stats.direct_channels);
     info!("   - 群聊会话数: {}", final_stats.group_channels);
     info!("   - 总成员数: {}", final_stats.total_members);
-    info!("   - 平均每会话成员数: {:.2}", final_stats.avg_members_per_channel);
+    info!(
+        "   - 平均每会话成员数: {:.2}",
+        final_stats.avg_members_per_channel
+    );
 
     info!("🎉 Phase 6 会话系统核心演示完成！");
 
@@ -215,4 +246,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("   8. 🧹 自动清理机制 - 无效会话检测和清理");
 
     Ok(())
-} 
+}

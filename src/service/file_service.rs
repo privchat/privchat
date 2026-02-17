@@ -5,11 +5,11 @@
 //!
 //! 上传服务只负责存储，不做压缩/缩略图；类型、大小、业务等以请求上传 token 时的约定为准。
 
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 use opendal::Operator;
 
@@ -75,7 +75,14 @@ impl FileService {
 
     /// 初始化：为每个存储源构建 OpenDAL Operator（Fs 或 S3），本地 FS 预创建子目录
     pub async fn init(&self) -> Result<()> {
-        let subdirs = ["images/", "videos/", "audios/", "files/", "others/", "thumbnails/"];
+        let subdirs = [
+            "images/",
+            "videos/",
+            "audios/",
+            "files/",
+            "others/",
+            "thumbnails/",
+        ];
         for src in self.sources_by_id.values() {
             let op = Self::build_operator(src).await?;
             if src.storage_type == "local" {
@@ -100,19 +107,16 @@ impl FileService {
         if src.storage_type == "local" {
             let root = src.storage_root.trim();
             if root.is_empty() {
-                return Err(ServerError::Internal("local 存储源缺少 storage_root".to_string()));
+                return Err(ServerError::Internal(
+                    "local 存储源缺少 storage_root".to_string(),
+                ));
             }
             let root_path = std::path::Path::new(root);
             // 目录不存在时自动创建，创建失败则返回明确错误
             if !root_path.exists() {
-                tokio::fs::create_dir_all(root_path)
-                    .await
-                    .map_err(|e| {
-                        ServerError::Internal(format!(
-                            "创建文件存储目录失败 \"{}\": {}",
-                            root, e
-                        ))
-                    })?;
+                tokio::fs::create_dir_all(root_path).await.map_err(|e| {
+                    ServerError::Internal(format!("创建文件存储目录失败 \"{}\": {}", root, e))
+                })?;
             }
             let abs_root = if root_path.is_absolute() {
                 root.to_string()
@@ -150,18 +154,26 @@ impl FileService {
             let secret_access_key = src
                 .secret_access_key
                 .as_deref()
-                .ok_or_else(|| ServerError::Internal("S3 存储源缺少 secret_access_key".to_string()))?
+                .ok_or_else(|| {
+                    ServerError::Internal("S3 存储源缺少 secret_access_key".to_string())
+                })?
                 .trim();
-            if endpoint.is_empty() || bucket.is_empty() || access_key_id.is_empty() || secret_access_key.is_empty() {
+            if endpoint.is_empty()
+                || bucket.is_empty()
+                || access_key_id.is_empty()
+                || secret_access_key.is_empty()
+            {
                 return Err(ServerError::Internal(
-                    "S3 存储源 endpoint / bucket / access_key_id / secret_access_key 均不能为空".to_string(),
+                    "S3 存储源 endpoint / bucket / access_key_id / secret_access_key 均不能为空"
+                        .to_string(),
                 ));
             }
-            let endpoint_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-                endpoint.to_string()
-            } else {
-                format!("https://{}", endpoint)
-            };
+            let endpoint_url =
+                if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+                    endpoint.to_string()
+                } else {
+                    format!("https://{}", endpoint)
+                };
             let mut builder = opendal::services::S3::default()
                 .bucket(bucket)
                 .endpoint(&endpoint_url)
@@ -205,7 +217,9 @@ impl FileService {
             .await
             .get(&source.id)
             .cloned()
-            .ok_or_else(|| ServerError::Internal(format!("未找到存储源 id={} 的 Operator", source.id)))?;
+            .ok_or_else(|| {
+                ServerError::Internal(format!("未找到存储源 id={} 的 Operator", source.id))
+            })?;
 
         let file_id = self.file_upload_repo.next_file_id().await?;
         let file_path = self.generate_file_path(file_id, &file_type, &filename);
@@ -243,12 +257,25 @@ impl FileService {
         self.file_upload_repo.get_by_file_id(file_id).await
     }
 
-    pub async fn update_business(&self, file_id: u64, business_type: &str, business_id: &str) -> Result<bool> {
-        self.file_upload_repo.update_business(file_id, business_type, business_id).await
+    pub async fn update_business(
+        &self,
+        file_id: u64,
+        business_type: &str,
+        business_id: &str,
+    ) -> Result<bool> {
+        self.file_upload_repo
+            .update_business(file_id, business_type, business_id)
+            .await
     }
 
-    pub async fn list_file_ids_by_business(&self, business_type: &str, business_id: &str) -> Result<Vec<u64>> {
-        self.file_upload_repo.list_file_ids_by_business(business_type, business_id).await
+    pub async fn list_file_ids_by_business(
+        &self,
+        business_type: &str,
+        business_id: &str,
+    ) -> Result<Vec<u64>> {
+        self.file_upload_repo
+            .list_file_ids_by_business(business_type, business_id)
+            .await
     }
 
     pub async fn verify_file_ownership(&self, file_id: u64, user_id: u64) -> Result<bool> {
@@ -265,7 +292,9 @@ impl FileService {
             return Err(ServerError::Forbidden("无权删除此文件".to_string()));
         }
 
-        let metadata = self.get_file_metadata(file_id).await?
+        let metadata = self
+            .get_file_metadata(file_id)
+            .await?
             .ok_or_else(|| ServerError::NotFound("文件不存在".to_string()))?;
 
         let op = self
@@ -274,7 +303,9 @@ impl FileService {
             .await
             .get(&metadata.storage_source_id)
             .cloned()
-            .ok_or_else(|| ServerError::Internal(format!("未找到存储源 id={}", metadata.storage_source_id)))?;
+            .ok_or_else(|| {
+                ServerError::Internal(format!("未找到存储源 id={}", metadata.storage_source_id))
+            })?;
 
         let _ = op.delete(&metadata.file_path).await;
 
@@ -325,7 +356,9 @@ impl FileService {
     }
 
     pub async fn get_file_url(&self, file_id: u64, user_id: u64) -> Result<FileUrlResponse> {
-        let metadata = self.get_file_metadata(file_id).await?
+        let metadata = self
+            .get_file_metadata(file_id)
+            .await?
             .ok_or_else(|| ServerError::NotFound("文件不存在".to_string()))?;
         if metadata.uploader_id != user_id {
             return Err(ServerError::Forbidden("无权访问此文件".to_string()));
@@ -344,7 +377,9 @@ impl FileService {
 
     /// 读取文件内容（用于下载；统一走 OpenDAL read）
     pub async fn read_file(&self, file_id: u64) -> Result<Vec<u8>> {
-        let metadata = self.get_file_metadata(file_id).await?
+        let metadata = self
+            .get_file_metadata(file_id)
+            .await?
             .ok_or_else(|| ServerError::NotFound("文件不存在".to_string()))?;
         let op = self
             .operators
@@ -352,7 +387,9 @@ impl FileService {
             .await
             .get(&metadata.storage_source_id)
             .cloned()
-            .ok_or_else(|| ServerError::Internal(format!("未找到存储源 id={}", metadata.storage_source_id)))?;
+            .ok_or_else(|| {
+                ServerError::Internal(format!("未找到存储源 id={}", metadata.storage_source_id))
+            })?;
 
         let buf = op
             .read(&metadata.file_path)

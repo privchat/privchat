@@ -10,13 +10,13 @@ impl TokenAuth {
     pub fn new() -> Self {
         Self
     }
-    
+
     /// 验证令牌并返回用户ID
     /// 当前实现：简单的前缀解析，用于演示目的
     /// 令牌格式: "user_<user_id>_token" 例如 "user_123_token"
     pub async fn verify_token(&self, token: &str) -> Result<String, ServerError> {
         debug!("验证令牌: {}", token);
-        
+
         // 简化验证逻辑
         if token.starts_with("user_") && token.ends_with("_token") {
             // 提取用户ID
@@ -29,25 +29,25 @@ impl TokenAuth {
                 }
             }
         }
-        
+
         warn!("令牌验证失败: {}", token);
         Err(ServerError::InvalidToken)
     }
-    
+
     /// 验证设备ID格式
     pub fn validate_device_id(&self, device_id: &str) -> Result<(), ServerError> {
         if device_id.is_empty() {
             return Err(ServerError::InvalidDeviceId);
         }
-        
+
         // 简单的设备ID格式验证
         if device_id.len() < 3 || device_id.len() > 64 {
             return Err(ServerError::InvalidDeviceId);
         }
-        
+
         Ok(())
     }
-    
+
     /// 验证设备类型
     pub fn validate_device_type(&self, device_type: &str) -> Result<(), ServerError> {
         match device_type {
@@ -61,4 +61,4 @@ impl Default for TokenAuth {
     fn default() -> Self {
         Self::new()
     }
-} 
+}

@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// 推送平台（MVP 只支持这两个）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -14,7 +14,7 @@ impl PushVendor {
             PushVendor::Fcm => "fcm",
         }
     }
-    
+
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "apns" => Some(PushVendor::Apns),
@@ -27,7 +27,7 @@ impl PushVendor {
 /// 推送 Payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushPayload {
-    pub r#type: String,  // "new_message"
+    pub r#type: String, // "new_message"
     pub conversation_id: u64,
     pub message_id: u64,
     pub sender_id: u64,
@@ -37,11 +37,11 @@ pub struct PushPayload {
 /// Intent 状态（Phase 3）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntentStatus {
-    Pending,      // 待处理
-    Processing,   // 处理中
-    Sent,         // 已发送
-    Cancelled,    // 已取消（设备上线）
-    Revoked,      // 已撤销（消息撤销）
+    Pending,    // 待处理
+    Processing, // 处理中
+    Sent,       // 已发送
+    Cancelled,  // 已取消（设备上线）
+    Revoked,    // 已撤销（消息撤销）
 }
 
 /// PushIntent（设备级，Phase 3.5）
@@ -51,7 +51,7 @@ pub struct PushIntent {
     pub message_id: u64,
     pub conversation_id: u64,
     pub user_id: u64,
-    pub device_id: String,  // ✨ Phase 3.5: 设备级 Intent
+    pub device_id: String, // ✨ Phase 3.5: 设备级 Intent
     pub sender_id: u64,
     pub payload: PushPayload,
     pub created_at: i64,
@@ -64,7 +64,7 @@ impl PushIntent {
         message_id: u64,
         conversation_id: u64,
         user_id: u64,
-        device_id: String,  // ✨ Phase 3.5: 新增参数
+        device_id: String, // ✨ Phase 3.5: 新增参数
         sender_id: u64,
         payload: PushPayload,
         created_at: i64,
@@ -74,7 +74,7 @@ impl PushIntent {
             message_id,
             conversation_id,
             user_id,
-            device_id,  // ✨ Phase 3.5: 新增字段
+            device_id, // ✨ Phase 3.5: 新增字段
             sender_id,
             payload,
             created_at,

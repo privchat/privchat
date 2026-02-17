@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use sqlx::Type;
@@ -165,13 +165,13 @@ pub struct MemberPermissions {
     pub can_edit_info: bool,
     /// 是否可以管理权限（设置管理员、修改权限）
     pub can_manage_permissions: bool,
-    
+
     // === 消息管理权限（预留，暂不实现） ===
     /// 撤回任意成员的消息
     pub can_revoke_any_message: bool,
     /// 置顶消息
     pub can_pin_message: bool,
-    
+
     // === 特殊权限（预留，暂不实现） ===
     /// @所有人
     pub can_at_all: bool,
@@ -218,11 +218,11 @@ impl MemberPermissions {
             can_invite: true,
             can_remove_member: true,
             can_edit_info: true,
-            can_manage_permissions: false,       // 不能设置管理员
+            can_manage_permissions: false, // 不能设置管理员
             can_revoke_any_message: true,
             can_pin_message: true,
             can_at_all: true,
-            can_edit_settings: false,            // 不能修改群设置
+            can_edit_settings: false, // 不能修改群设置
         }
     }
 
@@ -234,13 +234,13 @@ impl MemberPermissions {
             can_remove_member: false,
             can_edit_info: false,
             can_manage_permissions: false,
-            can_revoke_any_message: false,       // 只能撤回自己的
+            can_revoke_any_message: false, // 只能撤回自己的
             can_pin_message: false,
             can_at_all: false,
             can_edit_settings: false,
         }
     }
-    
+
     /// 根据角色获取权限
     pub fn from_role(role: MemberRole) -> Self {
         match role {
@@ -343,14 +343,14 @@ pub struct ChannelParticipant {
 impl ChannelParticipant {
     /// 从数据库行创建（处理时间戳和类型转换）
     pub fn from_db_row(
-        channel_id: i64,  // PostgreSQL BIGINT
-        user_id: i64,  // PostgreSQL BIGINT
+        channel_id: i64, // PostgreSQL BIGINT
+        user_id: i64,    // PostgreSQL BIGINT
         role: i16,
         nickname: Option<String>,
         permissions: serde_json::Value,
-        mute_until: Option<i64>,  // 毫秒时间戳
-        joined_at: i64,  // 毫秒时间戳
-        left_at: Option<i64>,  // 毫秒时间戳
+        mute_until: Option<i64>, // 毫秒时间戳
+        joined_at: i64,          // 毫秒时间戳
+        left_at: Option<i64>,    // 毫秒时间戳
     ) -> Self {
         Self {
             channel_id: channel_id as u64,
@@ -360,20 +360,31 @@ impl ChannelParticipant {
             permissions: serde_json::from_value(permissions)
                 .unwrap_or_else(|_| MemberPermissions::default()),
             mute_until: mute_until.and_then(|ts| DateTime::from_timestamp_millis(ts)),
-            joined_at: DateTime::from_timestamp_millis(joined_at)
-                .unwrap_or_else(|| Utc::now()),
+            joined_at: DateTime::from_timestamp_millis(joined_at).unwrap_or_else(|| Utc::now()),
             left_at: left_at.and_then(|ts| DateTime::from_timestamp_millis(ts)),
         }
     }
 
     /// 转换为数据库插入值
-    pub fn to_db_values(&self) -> (i64, i64, i16, Option<String>, serde_json::Value, Option<i64>, i64, Option<i64>) {
+    pub fn to_db_values(
+        &self,
+    ) -> (
+        i64,
+        i64,
+        i16,
+        Option<String>,
+        serde_json::Value,
+        Option<i64>,
+        i64,
+        Option<i64>,
+    ) {
         (
             self.channel_id as i64,
             self.user_id as i64,
             self.role as i16,
             self.nickname.clone(),
-            serde_json::to_value(&self.permissions).unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            serde_json::to_value(&self.permissions)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
             self.mute_until.map(|dt| dt.timestamp_millis()),
             self.joined_at.timestamp_millis(),
             self.left_at.map(|dt| dt.timestamp_millis()),
@@ -383,14 +394,14 @@ impl ChannelParticipant {
     /// 转换为业务层的 ChannelMember
     pub fn to_channel_member(&self) -> ChannelMember {
         ChannelMember {
-            user_id: self.user_id,  // u64，不需要转换
+            user_id: self.user_id, // u64，不需要转换
             display_name: self.nickname.clone(),
             role: self.role,
             permissions: self.permissions.clone(),
             joined_at: self.joined_at,
-            last_active_at: self.joined_at,  // 默认使用加入时间
+            last_active_at: self.joined_at, // 默认使用加入时间
             is_muted: self.mute_until.map_or(false, |dt| dt > Utc::now()),
-            last_read_message_id: None,  // 需要从其他表查询
+            last_read_message_id: None, // 需要从其他表查询
             last_read_pts: 0,
         }
     }
@@ -484,7 +495,7 @@ impl Default for ChannelSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     /// 频道ID
-    pub id: u64,  // 数据库中是 BIGINT
+    pub id: u64, // 数据库中是 BIGINT
     /// 频道类型
     pub channel_type: ChannelType,
     /// 会话状态（数据库中没有此字段，从业务逻辑推断）
@@ -506,7 +517,7 @@ pub struct Channel {
     /// 最后一条消息时间（数据库存储为 BIGINT 毫秒时间戳）
     pub last_message_at: Option<DateTime<Utc>>,
     /// 消息总数
-    pub message_count: i64,  // 改为 i64（数据库类型）
+    pub message_count: i64, // 改为 i64（数据库类型）
     /// 创建时间（数据库存储为 BIGINT 毫秒时间戳）
     pub created_at: DateTime<Utc>,
     /// 最后更新时间（数据库存储为 BIGINT 毫秒时间戳）
@@ -543,30 +554,30 @@ impl Channel {
 
     /// 从数据库行创建（处理时间戳和类型转换）
     pub fn from_db_row(
-        channel_id: i64,  // PostgreSQL BIGINT
+        channel_id: i64, // PostgreSQL BIGINT
         channel_type: i16,
-        direct_user1_id: Option<i64>,  // PostgreSQL BIGINT
-        direct_user2_id: Option<i64>,  // PostgreSQL BIGINT
-        group_id: Option<i64>,  // PostgreSQL BIGINT
-        last_message_id: Option<i64>,  // PostgreSQL BIGINT (Snowflake)
-        last_message_at: Option<i64>,  // 毫秒时间戳
+        direct_user1_id: Option<i64>, // PostgreSQL BIGINT
+        direct_user2_id: Option<i64>, // PostgreSQL BIGINT
+        group_id: Option<i64>,        // PostgreSQL BIGINT
+        last_message_id: Option<i64>, // PostgreSQL BIGINT (Snowflake)
+        last_message_at: Option<i64>, // 毫秒时间戳
         message_count: i64,
-        created_at: i64,  // 毫秒时间戳
-        updated_at: i64,  // 毫秒时间戳
+        created_at: i64, // 毫秒时间戳
+        updated_at: i64, // 毫秒时间戳
     ) -> Self {
         let conv_type = ChannelType::from_i16(channel_type);
         let creator_id = match conv_type {
             ChannelType::Direct => direct_user1_id.map(|id| id as u64).unwrap_or(0),
-            ChannelType::Group => 0,  // 需要从 group 表查询 owner_id
+            ChannelType::Group => 0, // 需要从 group 表查询 owner_id
             ChannelType::System => 0,
         };
 
         Self {
             id: channel_id as u64,
             channel_type: conv_type,
-            status: ChannelStatus::Active,  // 默认活跃，需要从业务逻辑推断
-            members: HashMap::new(),  // 需要单独查询
-            metadata: ChannelMetadata::default(),  // 需要从 group 表查询
+            status: ChannelStatus::Active, // 默认活跃，需要从业务逻辑推断
+            members: HashMap::new(),       // 需要单独查询
+            metadata: ChannelMetadata::default(), // 需要从 group 表查询
             creator_id,
             direct_user1_id: direct_user1_id.map(|id| id as u64),
             direct_user2_id: direct_user2_id.map(|id| id as u64),
@@ -574,16 +585,27 @@ impl Channel {
             last_message_id: last_message_id.map(|id| id as u64),
             last_message_at: last_message_at.and_then(|ts| DateTime::from_timestamp_millis(ts)),
             message_count,
-            created_at: DateTime::from_timestamp_millis(created_at)
-                .unwrap_or_else(|| Utc::now()),
-            updated_at: DateTime::from_timestamp_millis(updated_at)
-                .unwrap_or_else(|| Utc::now()),
+            created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
+            updated_at: DateTime::from_timestamp_millis(updated_at).unwrap_or_else(|| Utc::now()),
             settings: None,
         }
     }
 
     /// 转换为数据库插入值
-    pub fn to_db_values(&self) -> (i64, i16, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, i64, i64, i64) {
+    pub fn to_db_values(
+        &self,
+    ) -> (
+        i64,
+        i16,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+    ) {
         (
             self.id as i64,
             self.channel_type.to_i16(),
@@ -601,7 +623,10 @@ impl Channel {
     /// 创建群聊会话
     pub fn new_group(id: u64, creator_id: u64, name: Option<String>) -> Self {
         let mut members = HashMap::new();
-        members.insert(creator_id, ChannelMember::new(creator_id, MemberRole::Owner));
+        members.insert(
+            creator_id,
+            ChannelMember::new(creator_id, MemberRole::Owner),
+        );
 
         let mut metadata = ChannelMetadata::default();
         metadata.name = name;
@@ -615,7 +640,7 @@ impl Channel {
             creator_id,
             direct_user1_id: None,
             direct_user2_id: None,
-            group_id: Some(id),  // ✨ 群聊的 group_id 等于 channel_id
+            group_id: Some(id), // ✨ 群聊的 group_id 等于 channel_id
             last_message_id: None,
             last_message_at: None,
             message_count: 0,
@@ -641,7 +666,7 @@ impl Channel {
 
         // 确定成员角色
         let member_role = role.unwrap_or(MemberRole::Member);
-        
+
         // 对于私聊，只能是普通成员
         if self.channel_type == ChannelType::Direct && member_role != MemberRole::Member {
             return Err("Direct channels only support member role".to_string());
@@ -668,16 +693,24 @@ impl Channel {
             return Err("Cannot remove members from direct channels".to_string());
         }
 
-        let member = self.members.remove(user_id)
+        let member = self
+            .members
+            .remove(user_id)
             .ok_or_else(|| "Member not found".to_string())?;
-        
+
         self.updated_at = Utc::now();
         Ok(member)
     }
 
     /// 更新成员角色
-    pub fn update_member_role(&mut self, user_id: &u64, new_role: MemberRole) -> Result<(), String> {
-        let member = self.members.get_mut(user_id)
+    pub fn update_member_role(
+        &mut self,
+        user_id: &u64,
+        new_role: MemberRole,
+    ) -> Result<(), String> {
+        let member = self
+            .members
+            .get_mut(user_id)
             .ok_or_else(|| "Member not found".to_string())?;
 
         // 私聊不能修改角色
@@ -702,8 +735,13 @@ impl Channel {
     }
 
     /// 检查用户权限
-    pub fn check_permission(&self, user_id: &u64, permission: fn(&MemberPermissions) -> bool) -> bool {
-        self.members.get(user_id)
+    pub fn check_permission(
+        &self,
+        user_id: &u64,
+        permission: fn(&MemberPermissions) -> bool,
+    ) -> bool {
+        self.members
+            .get(user_id)
             .map(|member| permission(&member.permissions))
             .unwrap_or(false)
     }
@@ -723,9 +761,11 @@ impl Channel {
 
     /// 标记成员已读
     pub fn mark_member_read(&mut self, user_id: &u64, message_id: u64) -> Result<(), String> {
-        let member = self.members.get_mut(user_id)
+        let member = self
+            .members
+            .get_mut(user_id)
             .ok_or_else(|| "Member not found".to_string())?;
-        
+
         member.mark_read(message_id);
         Ok(())
     }
@@ -735,7 +775,8 @@ impl Channel {
         if let Some(_last_msg_id) = self.last_message_id {
             // 注意：这里需要比较 u64 message_id，但 ChannelMember 使用 u64
             // 暂时返回所有成员（需要后续优化）
-            self.members.values()
+            self.members
+                .values()
                 .filter(|member| member.last_read_message_id.is_none())
                 .count()
         } else {
@@ -766,12 +807,13 @@ impl Channel {
             Some(name) => name.clone(),
             None => match self.channel_type {
                 ChannelType::Direct => {
-                    let members: Vec<String> = self.members.keys().map(|id| id.to_string()).collect();
+                    let members: Vec<String> =
+                        self.members.keys().map(|id| id.to_string()).collect();
                     format!("私聊 ({})", members.join(", "))
-                },
+                }
                 ChannelType::Group => "群聊".to_string(),
                 ChannelType::System => "系统频道".to_string(),
-            }
+            },
         }
     }
 
@@ -939,24 +981,24 @@ pub struct GroupSettings {
     // === 加群设置 ===
     /// 进群需要审批（简单开关）
     pub join_need_approval: bool,
-    
+
     /// 群成员可以邀请（简单开关）
     pub member_can_invite: bool,
-    
+
     // === 功能设置 ===
     /// 全员禁言
     pub all_muted: bool,
-    
+
     /// 群成员数量上限
     pub max_members: u32,
-    
+
     // === 群信息 ===
     /// 群公告（可选）
     pub announcement: Option<String>,
-    
+
     /// 群描述（可选）
     pub description: Option<String>,
-    
+
     // === 创建时间 ===
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -988,7 +1030,7 @@ impl GroupSettings {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// 更新群组设置
     pub fn update(&mut self) {
         self.updated_at = Utc::now();
@@ -1017,13 +1059,9 @@ pub enum JoinRequestStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JoinMethod {
     /// 群成员邀请
-    Invite {
-        inviter_id: String,
-    },
+    Invite { inviter_id: String },
     /// 群二维码
-    QRCode {
-        qr_code: String,
-    },
+    QRCode { qr_code: String },
 }
 
 /// 加群申请记录
@@ -1089,11 +1127,7 @@ mod tests {
 
     #[test]
     fn test_create_direct_channel() {
-        let conv = Channel::new_direct(
-            123,
-            1,
-            2,
-        );
+        let conv = Channel::new_direct(123, 1, 2);
 
         assert_eq!(conv.channel_type, ChannelType::Direct);
         assert_eq!(conv.members.len(), 2);
@@ -1103,11 +1137,7 @@ mod tests {
 
     #[test]
     fn test_create_group_channel() {
-        let conv = Channel::new_group(
-            123,
-            1,
-            Some("Test Group".to_string()),
-        );
+        let conv = Channel::new_group(123, 1, Some("Test Group".to_string()));
 
         assert_eq!(conv.channel_type, ChannelType::Group);
         assert_eq!(conv.members.len(), 1);
@@ -1117,11 +1147,7 @@ mod tests {
 
     #[test]
     fn test_add_member_to_group() {
-        let mut conv = Channel::new_group(
-            123,
-            1,
-            None,
-        );
+        let mut conv = Channel::new_group(123, 1, None);
 
         assert!(conv.add_member(2, None).is_ok());
         assert_eq!(conv.members.len(), 2);

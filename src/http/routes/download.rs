@@ -1,13 +1,13 @@
 //! 文件下载路由
-//! 
+//!
 //! 路由：GET /api/app/files/{file_id}
 
 use axum::{
-    extract::{State, Path},
+    extract::{Path, State},
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
-    http::{StatusCode, header},
 };
 use tracing::info;
 
@@ -24,12 +24,15 @@ async fn download_file(
     State(state): State<HttpServerState>,
     Path(file_id): Path<String>,
 ) -> Result<impl IntoResponse> {
-    let file_id = file_id.parse::<u64>()
+    let file_id = file_id
+        .parse::<u64>()
         .map_err(|_| ServerError::Validation("file_id 必须为数字".to_string()))?;
     let file_service = &state.file_service;
     info!("📥 下载文件: {}", file_id);
 
-    let metadata = file_service.get_file_metadata(file_id).await?
+    let metadata = file_service
+        .get_file_metadata(file_id)
+        .await?
         .ok_or_else(|| ServerError::NotFound("文件不存在".to_string()))?;
 
     let file_data = file_service.read_file(file_id).await?;
@@ -46,4 +49,3 @@ async fn download_file(
 
     Ok((StatusCode::OK, headers, file_data))
 }
-
