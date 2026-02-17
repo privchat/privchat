@@ -202,7 +202,7 @@ impl MessageHandler for ConnectMessageHandler {
                 token_version,
                 current_version,
             }) => {
-                warn!("❌ ConnectMessageHandler: Token 版本过期: user={}, device={}, token_v={}, current_v={}", 
+                warn!("❌ ConnectMessageHandler: Token 版本过期: user={}, device={}, token_v={}, current_v={}",
                       user_id, device_id, token_version, current_version);
                 return self.create_error_response(
                     "TOKEN_VERSION_MISMATCH",
@@ -356,12 +356,34 @@ impl MessageHandler for ConnectMessageHandler {
         // 仅在 token 首次被认证使用且 token 为“新签发”时发送登录提醒，避免重启/重连反复提示。
         let token_age_secs = Utc::now().timestamp().saturating_sub(claims.iat);
         if first_token_auth && token_age_secs <= 120 {
-            if let Err(e) = self.send_login_notice_message(user_id, &connect_request).await {
-                warn!(
-                    "⚠️ ConnectMessageHandler: 发送登录通知系统消息失败: user_id={}, error={}",
-                    user_id, e
-                );
-            }
+            // spawn 到后台，不阻塞认证响应
+            let channel_service = self.channel_service.clone();
+            let pts_generator = self.pts_generator.clone();
+            let message_repository = self.message_repository.clone();
+            let user_message_index = self.user_message_index.clone();
+            let offline_queue_service = self.offline_queue_service.clone();
+            let connection_manager = self.connection_manager.clone();
+            let system_message_enabled = self.system_message_enabled;
+            let connect_req = connect_request.clone();
+            tokio::spawn(async move {
+                if !system_message_enabled {
+                    return;
+                }
+                if let Err(e) = Self::send_login_notice_message_bg(
+                    user_id,
+                    &connect_req,
+                    channel_service,
+                    pts_generator,
+                    message_repository,
+                    user_message_index,
+                    offline_queue_service,
+                    connection_manager,
+                )
+                .await
+                {
+                    warn!("⚠️ 异步发送登录通知失败: user_id={}, error={}", user_id, e);
+                }
+            });
         } else {
             debug!(
                 "📝 跳过登录提醒: user_id={}, first_token_auth={}, token_age_secs={}",
@@ -502,23 +524,28 @@ impl ConnectMessageHandler {
             metadata: None,
         };
 
-        // 7. 保存登录日志
-        let log = self.login_log_repository.create(log_request).await?;
-
-        info!(
-            "✅ 登录日志已记录: log_id={}, user={}, device={}",
-            log.log_id, user_id, device_id
-        );
-
-        // 8. TODO: 如果是可疑登录，发送通知
-        if log.is_suspicious() {
-            warn!(
-                "🚨 检测到可疑登录: user={}, device={}, risk_score={}",
-                user_id, device_id, risk_score
-            );
-            // TODO: 发送系统通知
-            // self.send_security_notification(user_id, &log).await?;
-        }
+        // 7. 保存登录日志（spawn 到后台，不阻塞认证响应）
+        let log_repo = self.login_log_repository.clone();
+        let device_id_owned = device_id.to_string();
+        tokio::spawn(async move {
+            match log_repo.create(log_request).await {
+                Ok(log) => {
+                    info!(
+                        "✅ 登录日志已记录: log_id={}, user={}, device={}",
+                        log.log_id, user_id, device_id_owned
+                    );
+                    if log.is_suspicious() {
+                        warn!(
+                            "🚨 检测到可疑登录: user={}, device={}, risk_score={}",
+                            user_id, device_id_owned, risk_score
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("⚠️ 异步记录登录日志失败: user={}, error={}", user_id, e);
+                }
+            }
+        });
 
         Ok(true)
     }
@@ -608,7 +635,9 @@ impl ConnectMessageHandler {
             .await
             .map_err(|e| anyhow::anyhow!("persist login notice failed: {}", e))?;
 
-        self.user_message_index.add_message(user_id, pts, message_id).await;
+        self.user_message_index
+            .add_message(user_id, pts, message_id)
+            .await;
 
         let payload = serde_json::to_vec(&json!({ "content": content }))
             .map_err(|e| anyhow::anyhow!("encode login notice payload failed: {}", e))?;
@@ -633,7 +662,11 @@ impl ConnectMessageHandler {
         if let Err(e) = self.offline_queue_service.add(user_id, &push_msg).await {
             warn!("⚠️ 登录通知加入离线队列失败: {:?}", e);
         }
-        match self.connection_manager.send_push_to_user(user_id, &push_msg).await {
+        match self
+            .connection_manager
+            .send_push_to_user(user_id, &push_msg)
+            .await
+        {
             Ok(success) => {
                 debug!(
                     "✅ 登录通知实时推送完成: user_id={}, success_sessions={}",
@@ -645,6 +678,109 @@ impl ConnectMessageHandler {
 
         let _ = self
             .channel_service
+            .update_last_message(channel_id, message_id)
+            .await;
+        Ok(())
+    }
+
+    /// 后台发送登录通知（static 版本，用于 tokio::spawn）
+    async fn send_login_notice_message_bg(
+        user_id: u64,
+        connect_request: &privchat_protocol::protocol::AuthorizationRequest,
+        channel_service: Arc<ChannelService>,
+        pts_generator: Arc<PtsGenerator>,
+        message_repository: Arc<crate::repository::PgMessageRepository>,
+        user_message_index: Arc<UserMessageIndex>,
+        offline_queue_service: Arc<OfflineQueueService>,
+        connection_manager: Arc<crate::infra::ConnectionManager>,
+    ) -> anyhow::Result<()> {
+        let (channel_id, _) = channel_service
+            .get_or_create_direct_channel(
+                user_id,
+                crate::config::SYSTEM_USER_ID,
+                Some("system_login_notice"),
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("get_or_create system channel failed: {}", e))?;
+
+        let now = Utc::now();
+        let message_id = crate::infra::next_message_id();
+        let pts = pts_generator.next_pts(channel_id).await;
+        let device_label = {
+            let name = connect_request.device_info.device_name.trim();
+            if name.is_empty() {
+                format!("{:?}", connect_request.device_info.device_type).to_lowercase()
+            } else {
+                name.to_string()
+            }
+        };
+        let content = format!("您的账号在 {} 设备登录了。", device_label);
+
+        let login_notice_msg = crate::model::message::Message {
+            message_id,
+            channel_id,
+            sender_id: crate::config::SYSTEM_USER_ID,
+            pts: Some(pts as i64),
+            local_message_id: Some(message_id),
+            content: content.clone(),
+            message_type: ContentMessageType::Text,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            reply_to_message_id: None,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+            deleted_at: None,
+            revoked: false,
+            revoked_at: None,
+            revoked_by: None,
+        };
+        message_repository
+            .create(&login_notice_msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("persist login notice failed: {}", e))?;
+
+        user_message_index
+            .add_message(user_id, pts, message_id)
+            .await;
+
+        let payload = serde_json::to_vec(&json!({ "content": content }))
+            .map_err(|e| anyhow::anyhow!("encode login notice payload failed: {}", e))?;
+        let push_msg = privchat_protocol::protocol::PushMessageRequest {
+            setting: privchat_protocol::protocol::MessageSetting::default(),
+            msg_key: format!("msg_{}", message_id),
+            server_message_id: message_id,
+            message_seq: 1,
+            local_message_id: message_id,
+            stream_no: String::new(),
+            stream_seq: 0,
+            stream_flag: 0,
+            timestamp: now.timestamp().max(0) as u32,
+            channel_id,
+            channel_type: 1,
+            message_type: ContentMessageType::Text.as_u32(),
+            expire: 0,
+            topic: String::new(),
+            from_uid: crate::config::SYSTEM_USER_ID,
+            payload,
+        };
+        if let Err(e) = offline_queue_service.add(user_id, &push_msg).await {
+            warn!("⚠️ 登录通知加入离线队列失败: {:?}", e);
+        }
+        match connection_manager
+            .send_push_to_user(user_id, &push_msg)
+            .await
+        {
+            Ok(success) => {
+                debug!(
+                    "✅ 登录通知实时推送完成: user_id={}, success_sessions={}",
+                    user_id, success
+                );
+            }
+            Err(e) => warn!("⚠️ 登录通知实时推送失败: {:?}", e),
+        }
+
+        let _ = channel_service
             .update_last_message(channel_id, message_id)
             .await;
         Ok(())

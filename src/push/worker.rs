@@ -246,10 +246,32 @@ impl PushWorker {
                 Ok(_) => {
                     success_count += 1;
                     debug!("[PUSH WORKER] Task {} sent successfully", task.task_id);
+                    // [TRACE] Node 3: push_sent
+                    {
+                        use crate::infra::delivery_trace::{global_trace_store, stages};
+                        global_trace_store()
+                            .record(
+                                intent.message_id,
+                                stages::PUSH_SENT,
+                                format!("device={}", task.device_id),
+                            )
+                            .await;
+                    }
                 }
                 Err(e) => {
                     failed_count += 1;
                     error!("[PUSH WORKER] Failed to send task {}: {}", task.task_id, e);
+                    // [TRACE] Node 4: push_failed
+                    {
+                        use crate::infra::delivery_trace::{global_trace_store, stages};
+                        global_trace_store()
+                            .record(
+                                intent.message_id,
+                                stages::PUSH_FAILED,
+                                format!("device={} err={}", task.device_id, e),
+                            )
+                            .await;
+                    }
                 }
             }
         }
@@ -296,6 +318,17 @@ impl PushWorker {
                     "[PUSH WORKER] Device-level task {} sent successfully",
                     task.task_id
                 );
+                // [TRACE] Node 3: push_sent (device-level)
+                {
+                    use crate::infra::delivery_trace::{global_trace_store, stages};
+                    global_trace_store()
+                        .record(
+                            task.payload.message_id,
+                            stages::PUSH_SENT,
+                            format!("device={}", task.device_id),
+                        )
+                        .await;
+                }
                 Ok(())
             }
             Err(e) => {
@@ -303,6 +336,17 @@ impl PushWorker {
                     "[PUSH WORKER] Failed to send device-level task {}: {}",
                     task.task_id, e
                 );
+                // [TRACE] Node 4: push_failed (device-level)
+                {
+                    use crate::infra::delivery_trace::{global_trace_store, stages};
+                    global_trace_store()
+                        .record(
+                            task.payload.message_id,
+                            stages::PUSH_FAILED,
+                            format!("device={} err={}", task.device_id, e),
+                        )
+                        .await;
+                }
                 Err(e)
             }
         }

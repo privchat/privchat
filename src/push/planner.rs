@@ -4,8 +4,9 @@ use crate::infra::event_bus::EventBus;
 use crate::infra::redis::RedisClient;
 use crate::push::intent_state::IntentStateManager;
 use crate::push::types::{PushIntent, PushPayload};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -60,6 +61,7 @@ impl PushPlanner {
         sender: tokio::sync::mpsc::Sender<PushIntent>,
     ) -> Result<()> {
         let mut receiver = event_bus.subscribe();
+        let lagged_counter = event_bus.lagged_counter();
 
         info!("[PUSH PLANNER] Started");
 
@@ -81,23 +83,32 @@ impl PushPlanner {
                     }
                 }
                 Ok(event @ DomainEvent::MessageDelivered { .. }) => {
-                    // ✨ Phase 3.5
                     if let Err(e) = self.handle_message_delivered(event).await {
                         error!("[PUSH PLANNER] Failed to handle MessageDelivered: {}", e);
                     }
                 }
                 Ok(event @ DomainEvent::DeviceOnline { .. }) => {
-                    // ✨ Phase 3.5
                     if let Err(e) = self.handle_device_online(event).await {
                         error!("[PUSH PLANNER] Failed to handle DeviceOnline: {}", e);
                     }
                 }
-                Err(e) => {
-                    error!("[PUSH PLANNER] Event bus error: {}", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(RecvError::Lagged(skipped)) => {
+                    lagged_counter.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "⚠️ [PUSH PLANNER] EventBus lagged, skipped {} events (total_lagged={})",
+                        skipped,
+                        lagged_counter.load(Ordering::Relaxed)
+                    );
+                    // 不 sleep，立即继续接收后续事件
+                }
+                Err(RecvError::Closed) => {
+                    error!("[PUSH PLANNER] EventBus closed, stopping");
+                    break;
                 }
             }
         }
+
+        Ok(())
     }
 
     async fn handle_message_committed(

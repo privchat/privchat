@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use super::{ChannelPtsDao, ClientMsgRegistryDao, CommitLogDao, SyncCache};
 use crate::error::Result;
 use crate::model::pts::PtsGenerator;
+use crate::service::{ChannelService, UnreadCountService};
 
 // 重新导出协议类型
 use privchat_protocol::rpc::sync::{
@@ -34,6 +35,12 @@ pub struct SyncService {
 
     /// Redis 缓存
     cache: Arc<SyncCache>,
+
+    /// 频道服务（获取成员列表）
+    channel_service: Arc<ChannelService>,
+
+    /// 未读计数服务
+    unread_count_service: Arc<UnreadCountService>,
 }
 
 impl SyncService {
@@ -44,6 +51,8 @@ impl SyncService {
         pts_dao: Arc<ChannelPtsDao>,
         registry_dao: Arc<ClientMsgRegistryDao>,
         cache: Arc<SyncCache>,
+        channel_service: Arc<ChannelService>,
+        unread_count_service: Arc<UnreadCountService>,
     ) -> Self {
         Self {
             pts_generator,
@@ -51,6 +60,8 @@ impl SyncService {
             pts_dao,
             registry_dao,
             cache,
+            channel_service,
+            unread_count_service,
         }
     }
 
@@ -155,12 +166,64 @@ impl SyncService {
         // 9. 缓存到 Redis ⭐
         self.cache.cache_commit(&commit).await?;
 
+        // [TRACE] Node 1: committed
+        {
+            use crate::infra::delivery_trace::{global_trace_store, stages};
+            let store = global_trace_store();
+            store
+                .begin_trace(server_msg_id, req.channel_id, sender_id)
+                .await;
+            store
+                .record(server_msg_id, stages::COMMITTED, format!("pts={}", new_pts))
+                .await;
+        }
+
         // 10. Fan-out 给在线用户 ⭐
         let online_users = self.cache.get_online_users(req.channel_id).await?;
         if !online_users.is_empty() {
+            // [TRACE] Node 2: fanout
+            {
+                use crate::infra::delivery_trace::{global_trace_store, stages};
+                global_trace_store()
+                    .record(
+                        server_msg_id,
+                        stages::FANOUT,
+                        format!("online_users={}", online_users.len()),
+                    )
+                    .await;
+            }
             self.cache
                 .fanout_to_online_users(&online_users, &commit)
                 .await?;
+        }
+
+        // 10.5 更新其他成员的未读计数 ⭐
+        {
+            match self
+                .channel_service
+                .get_channel_members(&req.channel_id)
+                .await
+            {
+                Ok(members) => {
+                    let receiver_ids: Vec<u64> = members
+                        .iter()
+                        .map(|m| m.user_id)
+                        .filter(|&id| id != sender_id)
+                        .collect();
+                    if !receiver_ids.is_empty() {
+                        if let Err(e) = self
+                            .unread_count_service
+                            .increment_for_channel_members(req.channel_id, &receiver_ids, 1)
+                            .await
+                        {
+                            warn!("⚠️ sync/submit: 更新未读计数失败: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("⚠️ sync/submit: 获取频道成员失败, 跳过未读计数: {}", e);
+                }
+            }
         }
 
         // 11. 注册 local_message_id（防止重复）⭐
@@ -222,9 +285,24 @@ impl SyncService {
             .query_commits_from_cache(req.channel_id, req.last_pts, limit)
             .await?
         {
-            Some(cached_commits) => {
+            Some(cached_commits)
+                if !cached_commits.is_empty() && cached_commits[0].pts == req.last_pts + 1 =>
+            {
+                // 缓存命中且连续：第一条 pts 紧接 last_pts
                 info!("✅ 缓存命中: 返回 {} 条 commits", cached_commits.len());
                 cached_commits
+            }
+            Some(cached_commits) => {
+                // 缓存 partial hit：有数据但不连续（被淘汰了旧条目），回退数据库
+                info!(
+                    "⚠️  缓存 partial hit: 返回 {} 条但首条 pts={} != expected {}，回退数据库",
+                    cached_commits.len(),
+                    cached_commits.first().map(|c| c.pts).unwrap_or(0),
+                    req.last_pts + 1
+                );
+                self.commit_dao
+                    .query_commits(req.channel_id, req.last_pts, limit)
+                    .await?
             }
             None => {
                 // 2. Cache Miss，查数据库 ⭐

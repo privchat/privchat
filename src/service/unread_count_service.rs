@@ -122,6 +122,32 @@ impl UnreadCountService {
         Ok(())
     }
 
+    /// 为一个频道的多个成员批量增加未读计数（并发执行）
+    pub async fn increment_for_channel_members(
+        &self,
+        channel_id: u64,
+        user_ids: &[u64],
+        count: u64,
+    ) -> Result<(), ServerError> {
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+
+        let futures: Vec<_> = user_ids
+            .iter()
+            .map(|&user_id| self.increment(user_id, channel_id, count))
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        for result in results {
+            if let Err(e) = result {
+                tracing::warn!("⚠️ 批量增加未读计数失败: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
     /// 获取所有未读计数
     ///
     /// 返回: HashMap<channel_id, unread_count>

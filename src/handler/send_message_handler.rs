@@ -1,6 +1,7 @@
 use crate::context::RequestContext;
 use crate::error::ServerError;
 use crate::handler::MessageHandler;
+use crate::infra::RouteResult;
 use crate::infra::SessionManager as AuthSessionManager;
 use crate::model::channel::{MessageId, UserId};
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
@@ -10,6 +11,7 @@ use crate::service::{MessageDedupService, OfflineQueueService, UnreadCountServic
 use crate::session::SessionManager;
 use crate::Result;
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 use privchat_protocol::error_code::ErrorCode;
 use serde_json::Value;
 use std::sync::Arc;
@@ -1334,12 +1336,20 @@ impl MessageHandler for SendMessageHandler {
         // 5.5. channel last preview is derived client-side from local message table.
         // Server keeps stable anchor only (last_message_id/timestamp) via update_last_message.
 
-        // 6. 更新其他成员的未读计数
-        if let Err(e) = self
-            .update_member_unread_counts(&channel, &from_uid, &message_record.message_id)
-            .await
+        // 6. 更新其他成员的未读计数（批量并发）
         {
-            warn!("⚠️ SendMessageHandler: 更新未读计数失败: {}", e);
+            let receiver_ids: Vec<u64> = channel
+                .get_member_ids()
+                .into_iter()
+                .filter(|&id| id != from_uid)
+                .collect();
+            if let Err(e) = self
+                .unread_count_service
+                .increment_for_channel_members(channel.id, &receiver_ids, 1)
+                .await
+            {
+                warn!("⚠️ SendMessageHandler: 更新未读计数失败: {}", e);
+            }
         }
 
         // 7. 分发消息到其他在线成员（传递引用消息预览和@提及信息）
@@ -1384,9 +1394,13 @@ impl SendMessageHandler {
         Vec<u64>,
         Option<crate::model::privacy::FriendRequestSource>,
     )> {
-        let json_value: Value = match serde_json::from_slice(payload) {
+        // 复用 privchat-protocol 定义的 MessagePayloadEnvelope，单次 serde 解析
+        use privchat_protocol::message::{MessagePayloadEnvelope, MessageSource};
+
+        let parsed: MessagePayloadEnvelope = match serde_json::from_slice(payload) {
             Ok(v) => v,
             Err(_) => {
+                // fallback: 纯文本模式
                 return Ok((
                     String::from_utf8_lossy(payload).to_string(),
                     None,
@@ -1397,67 +1411,48 @@ impl SendMessageHandler {
             }
         };
 
-        // 提取 content
-        let content = json_value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                // 如果没有 content 字段，尝试使用整个 JSON 作为字符串
-                serde_json::to_string(&json_value)
-                    .unwrap_or_else(|_| String::from_utf8_lossy(payload).to_string())
-            });
+        // content: 如果为空，用整个 payload 作为字符串
+        let content = if parsed.content.is_empty() {
+            String::from_utf8_lossy(payload).to_string()
+        } else {
+            parsed.content
+        };
 
-        // 提取 metadata
-        let metadata = json_value
-            .get("metadata")
-            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string()));
+        // metadata: 序列化回 JSON 字符串
+        let metadata = parsed
+            .metadata
+            .map(|m| serde_json::to_string(&m).unwrap_or_else(|_| "{}".to_string()));
 
-        // ✨ 提取 reply_to_message_id（可选）
-        let reply_to_message_id = json_value
-            .get("reply_to_message_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // ✨ 提取 mentioned_user_ids（可选）- 客户端已选择的用户ID列表
-        let mentioned_user_ids: Vec<u64> = json_value
-            .get("mentioned_user_ids")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
-            .unwrap_or_default();
-
-        // ✨ 提取 message_source（可选）- 非好友消息来源
-        let message_source: Option<crate::model::privacy::FriendRequestSource> =
-            json_value.get("message_source").and_then(|v| {
-                let source_obj = v.as_object()?;
-                let source_type = source_obj.get("type")?.as_str()?;
-                let source_id = source_obj.get("source_id")?.as_str()?;
-
-                match source_type {
-                    "search" => source_id.parse::<u64>().ok().map(|search_session_id| {
-                        crate::model::privacy::FriendRequestSource::Search { search_session_id }
+        // message_source: 从 MessageSource 转为 FriendRequestSource 枚举
+        let message_source =
+            parsed
+                .message_source
+                .and_then(|src: MessageSource| match src.source_type.as_str() {
+                    "search" => src.source_id.parse::<u64>().ok().map(|id| {
+                        crate::model::privacy::FriendRequestSource::Search {
+                            search_session_id: id,
+                        }
                     }),
-                    "group" => source_id.parse::<u64>().ok().map(|group_id| {
-                        crate::model::privacy::FriendRequestSource::Group { group_id }
+                    "group" => src.source_id.parse::<u64>().ok().map(|id| {
+                        crate::model::privacy::FriendRequestSource::Group { group_id: id }
                     }),
-                    "card_share" => source_id.parse::<u64>().ok().map(|share_id| {
-                        crate::model::privacy::FriendRequestSource::CardShare { share_id }
+                    "card_share" => src.source_id.parse::<u64>().ok().map(|id| {
+                        crate::model::privacy::FriendRequestSource::CardShare { share_id: id }
                     }),
                     "qrcode" => Some(crate::model::privacy::FriendRequestSource::Qrcode {
-                        qrcode: source_id.to_string(),
+                        qrcode: src.source_id,
                     }),
                     "phone" => Some(crate::model::privacy::FriendRequestSource::Phone {
-                        phone: source_id.to_string(),
+                        phone: src.source_id,
                     }),
                     _ => None,
-                }
-            });
+                });
 
         Ok((
             content,
             metadata,
-            reply_to_message_id,
-            mentioned_user_ids,
+            parsed.reply_to_message_id,
+            parsed.mentioned_user_ids.unwrap_or_default(),
             message_source,
         ))
     }
@@ -1710,7 +1705,7 @@ impl SendMessageHandler {
         Ok(())
     }
 
-    /// 分发消息到其他在线成员
+    /// 分发消息到其他在线成员（有界并发 fanout）
     async fn distribute_message_to_members(
         &self,
         channel: &crate::model::channel::Channel,
@@ -1718,15 +1713,14 @@ impl SendMessageHandler {
         original_local_message_id: u64,
         message_record: &crate::service::message_history_service::MessageHistoryRecord,
         reply_to_message_preview: Option<&crate::service::ReplyMessagePreview>,
-        mentioned_user_ids: &[u64], // ✨ 添加@提及的用户ID列表
-        is_mention_all: bool,       // ✨ 是否@全体成员
+        mentioned_user_ids: &[u64],
+        is_mention_all: bool,
     ) -> Result<()> {
         info!(
             "📡 SendMessageHandler: 分发消息 {} 到频道 {}",
             message_record.message_id, channel.id
         );
 
-        // 获取频道所有成员（包括发送者，用于消息回显）
         let all_member_ids: Vec<UserId> = channel.get_member_ids();
 
         if all_member_ids.is_empty() {
@@ -1738,12 +1732,11 @@ impl SendMessageHandler {
         }
 
         info!(
-            "📡 SendMessageHandler: 需要分发给 {} 个成员（包括发送者）: {:?}",
-            all_member_ids.len(),
-            all_member_ids
+            "📡 SendMessageHandler: 需要分发给 {} 个成员（包括发送者）",
+            all_member_ids.len()
         );
 
-        // 创建 RecvRequest 消息（包含引用消息预览和@提及信息）
+        // 创建 PushMessageRequest
         let push_message_request = self
             .create_push_message_request(
                 sender_id,
@@ -1751,64 +1744,76 @@ impl SendMessageHandler {
                 original_local_message_id,
                 message_record,
                 reply_to_message_preview,
-                mentioned_user_ids, // ✨ 传递@提及的用户ID列表
-                is_mention_all,     // ✨ 传递是否@全体成员
+                mentioned_user_ids,
+                is_mention_all,
             )
             .await?;
 
-        // 为每个成员发送消息（包括发送者自己），按 user_id -> 所有在线设备 分发
-        let mut success_count = 0;
-        let mut failed_count = 0;
+        let message_id = push_message_request.local_message_id;
 
-        for member_id in all_member_ids {
-            let is_sender = &member_id == sender_id;
+        // 1. 批量分配 PTS + 写 UserMessageIndex（一次 write lock）
+        let receiver_ids: Vec<UserId> = all_member_ids
+            .iter()
+            .filter(|id| *id != sender_id)
+            .cloned()
+            .collect();
 
-            // ✨ 为每个接收者生成 pts（per-channel，Phase 8）
-            // 注意：Phase 8 中 pts 是 per-channel 的，不是 per-user
-            // 所有用户共享同一个 channel 的 pts 序列
-            if !is_sender {
-                let pts = self.pts_generator.next_pts(channel.id).await;
+        if !receiver_ids.is_empty() {
+            let receiver_count = receiver_ids.len() as u64;
+            let base_pts = self
+                .pts_generator
+                .allocate_range(channel.id, receiver_count)
+                .await;
+            for (i, &member_id) in receiver_ids.iter().enumerate() {
+                let pts = base_pts + i as u64;
                 debug!(
                     "✨ 为频道 {} 生成 pts={} (用户: {})",
                     channel.id, pts, member_id
                 );
-                // 将 pts 和 message_id 存储到 UserMessageIndex
-                let message_id = push_message_request.local_message_id;
                 self.user_message_index
                     .add_message(member_id, pts, message_id)
                     .await;
             }
+        }
 
-            match self
-                .message_router
-                .route_message_to_user(&member_id, push_message_request.clone())
-                .await
-            {
+        // 2. 有界并发 fanout（buffer_unordered 限制最大并发数）
+        let results: Vec<(UserId, anyhow::Result<RouteResult>)> = stream::iter(all_member_ids)
+            .map(|member_id| {
+                let router = self.message_router.clone();
+                let msg = push_message_request.clone();
+                async move {
+                    let result = router.route_message_to_user(&member_id, msg).await;
+                    (member_id, result)
+                }
+            })
+            .buffer_unordered(50)
+            .collect()
+            .await;
+
+        // 3. 汇总结果 + 收集离线用户
+        let mut success_count = 0usize;
+        let mut failed_count = 0usize;
+        let mut offline_user_ids: Vec<u64> = Vec::new();
+
+        for (member_id, result) in &results {
+            match result {
                 Ok(route_result) => {
                     success_count += route_result.success_count;
                     failed_count += route_result.failed_count;
-                    // 用户离线时，同步写入 OfflineQueueService (Redis)，
-                    // 供 OfflineMessageWorker 在 session_ready 时补投
                     if route_result.offline_count > 0 {
-                        if let Err(e) = self
-                            .offline_queue_service
-                            .add(member_id, &push_message_request)
-                            .await
-                        {
-                            warn!(
-                                "⚠️ SendMessageHandler: 离线消息写入 Redis 失败 user={} error={}",
-                                member_id, e
-                            );
-                        }
+                        offline_user_ids.push(*member_id);
                     }
                     debug!(
-                        "📡 SendMessageHandler: route_message_to_user user={} success={} failed={} offline={}",
-                        member_id, route_result.success_count, route_result.failed_count, route_result.offline_count
+                        "📡 route user={} success={} failed={} offline={}",
+                        member_id,
+                        route_result.success_count,
+                        route_result.failed_count,
+                        route_result.offline_count
                     );
                 }
                 Err(e) => {
                     warn!(
-                        "❌ SendMessageHandler: route_message_to_user 失败 user={} error={}",
+                        "❌ route_message_to_user 失败 user={} error={}",
                         member_id, e
                     );
                     failed_count += 1;
@@ -1816,9 +1821,22 @@ impl SendMessageHandler {
             }
         }
 
+        // 4. 离线消息批量写入 Redis（Pipeline，单次网络往返）
+        if !offline_user_ids.is_empty() {
+            if let Err(e) = self
+                .offline_queue_service
+                .add_batch_users(&offline_user_ids, &push_message_request)
+                .await
+            {
+                warn!("⚠️ SendMessageHandler: 批量离线消息写入 Redis 失败: {}", e);
+            }
+        }
+
         info!(
-            "📡 SendMessageHandler: 消息分发完成 - 成功: {}, 失败: {}",
-            success_count, failed_count
+            "📡 SendMessageHandler: 消息分发完成 - 成功: {}, 失败: {}, 离线: {}",
+            success_count,
+            failed_count,
+            offline_user_ids.len()
         );
 
         Ok(())

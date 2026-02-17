@@ -42,6 +42,19 @@ impl PtsGenerator {
         counter.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// 批量分配 pts 区间，返回起始值
+    /// pts 范围 = [返回值, 返回值 + count - 1]
+    pub async fn allocate_range(&self, channel_id: u64, count: u64) -> u64 {
+        if count == 0 {
+            return 0;
+        }
+        let mut counters = self.counters.write().await;
+        let counter = counters
+            .entry(channel_id)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        counter.fetch_add(count, Ordering::SeqCst) + 1
+    }
+
     /// 获取当前 pts（不递增）
     pub async fn current_pts(&self, channel_id: u64) -> u64 {
         let counters = self.counters.read().await;

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -15,6 +16,9 @@ use crate::infra::message_router::{
 use crate::infra::SessionManager;
 use crate::model::pts::UserMessageIndex;
 use msgtrans::SessionId;
+
+/// OfflineWorker 队列容量（bounded channel）
+const OFFLINE_QUEUE_CAPACITY: usize = 4096;
 
 /// 离线消息投递Worker配置
 #[derive(Debug, Clone)]
@@ -101,16 +105,22 @@ pub struct OfflineMessageWorker {
     user_states: Arc<RwLock<HashMap<UserId, UserDeliveryState>>>,
     /// 运行状态
     is_running: Arc<RwLock<bool>>,
-    /// 【新增】触发推送的通道（发送端）
-    trigger_tx: mpsc::UnboundedSender<UserId>,
-    /// 【新增】触发推送的通道（接收端）
-    trigger_rx: Arc<Mutex<mpsc::UnboundedReceiver<UserId>>>,
-    /// ✨ 会话管理器（用于获取 local_pts）
+    /// 触发推送的通道（发送端）— bounded channel，防止 OOM
+    trigger_tx: mpsc::Sender<UserId>,
+    /// 触发推送的通道（接收端）
+    trigger_rx: Arc<Mutex<mpsc::Receiver<UserId>>>,
+    /// 会话管理器（用于获取 local_pts）
     session_manager: Arc<SessionManager>,
-    /// ✨ 用户消息索引（用于 pts -> message_id 映射）
+    /// 用户消息索引（用于 pts -> message_id 映射）
     user_message_index: Arc<UserMessageIndex>,
-    /// ✨ 离线队列服务（用于从 Redis 获取消息）
+    /// 离线队列服务（用于从 Redis 获取消息）
     offline_queue_service: Arc<crate::service::OfflineQueueService>,
+    /// 并发投递限制（防止 spawn 爆炸）
+    delivery_semaphore: Arc<Semaphore>,
+    /// try_send 失败计数
+    try_send_fail_count: Arc<AtomicU64>,
+    /// 降级（慢路径）计数
+    fallback_count: Arc<AtomicU64>,
 }
 
 impl OfflineMessageWorker {
@@ -124,7 +134,13 @@ impl OfflineMessageWorker {
         user_message_index: Arc<UserMessageIndex>,
         offline_queue_service: Arc<crate::service::OfflineQueueService>,
     ) -> Self {
-        let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+        let (trigger_tx, trigger_rx) = mpsc::channel(OFFLINE_QUEUE_CAPACITY);
+        let max_concurrent = config.max_concurrent_users;
+
+        info!(
+            "📦 OfflineWorker 队列容量={}, 最大并发投递={}",
+            OFFLINE_QUEUE_CAPACITY, max_concurrent
+        );
 
         Self {
             config,
@@ -139,16 +155,57 @@ impl OfflineMessageWorker {
             session_manager,
             user_message_index,
             offline_queue_service,
+            delivery_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            try_send_fail_count: Arc::new(AtomicU64::new(0)),
+            fallback_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// 【新增】触发推送（ConnectHandler 调用）
-    pub fn trigger_push(&self, user_id: UserId) {
-        if let Err(e) = self.trigger_tx.send(user_id) {
-            error!("触发用户 {} 离线消息推送失败: {}", user_id, e);
-        } else {
-            debug!("✅ 已触发用户 {} 的离线消息推送", user_id);
+    /// 触发推送（ConnectHandler / SyncRPC 调用）
+    ///
+    /// Must-Deliver 语义：try_send 失败时不丢弃，走慢路径（直接 spawn 投递，绕过队列）。
+    /// 调用方应在 spawn 内调用此方法，不要在连接层 read loop 中直接调用。
+    pub async fn trigger_push(&self, user_id: UserId) {
+        match self.trigger_tx.try_send(user_id) {
+            Ok(()) => {
+                debug!("✅ 已触发用户 {} 的离线消息推送", user_id);
+            }
+            Err(mpsc::error::TrySendError::Full(user_id)) => {
+                // Must-Deliver: 队列满时走慢路径（阻塞 send 等待空位）
+                self.try_send_fail_count.fetch_add(1, Ordering::Relaxed);
+                self.fallback_count.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "⚠️ OfflineWorker 队列已满 (capacity={}), 用户 {} 走 fallback (blocking send)",
+                    OFFLINE_QUEUE_CAPACITY, user_id
+                );
+                // 阻塞等待空位：保证 Must-Deliver 不丢，给调用方施加 backpressure
+                if let Err(e) = self.trigger_tx.send(user_id).await {
+                    error!("❌ OfflineWorker fallback 也失败（channel closed）: {}", e);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(user_id)) => {
+                error!(
+                    "❌ OfflineWorker channel 已关闭，无法触发用户 {} 推送",
+                    user_id
+                );
+            }
         }
+    }
+
+    /// 当前队列深度（gauge 指标用）
+    pub fn queue_depth(&self) -> usize {
+        // Sender 的 capacity() 返回剩余容量，depth = 总容量 - 剩余
+        OFFLINE_QUEUE_CAPACITY - self.trigger_tx.capacity()
+    }
+
+    /// try_send 失败累计次数
+    pub fn try_send_fail_total(&self) -> u64 {
+        self.try_send_fail_count.load(Ordering::Relaxed)
+    }
+
+    /// 降级（慢路径）累计次数
+    pub fn fallback_total(&self) -> u64 {
+        self.fallback_count.load(Ordering::Relaxed)
     }
 
     /// 启动Worker主循环（事件驱动模式）
@@ -166,7 +223,7 @@ impl OfflineMessageWorker {
         let stats_interval = Duration::from_secs(self.config.stats_report_interval_secs);
         let cleanup_interval = Duration::from_secs(self.config.cleanup_interval_hours * 3600);
 
-        // 【主任务】事件驱动的推送任务
+        // 【主任务】事件驱动的推送任务（受 delivery_semaphore 并发限制）
         let worker_push = self.clone();
         let push_task = tokio::spawn(async move {
             loop {
@@ -182,15 +239,38 @@ impl OfflineMessageWorker {
                     }
                 };
 
-                info!("📨 收到用户 {} 的离线消息推送触发", user_id);
+                debug!("📨 收到用户 {} 的离线消息推送触发", user_id);
 
-                // 立即推送该用户的所有离线消息（异步执行）
+                // 获取 semaphore permit 限制并发投递数
+                let sem = worker_push.delivery_semaphore.clone();
                 let worker = worker_push.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = worker.deliver_all_user_messages(&user_id).await {
-                        error!("推送用户 {} 的离线消息失败: {}", user_id, e);
+                match sem.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(e) = worker.deliver_all_user_messages(&user_id).await {
+                                error!("推送用户 {} 的离线消息失败: {}", user_id, e);
+                            }
+                        });
                     }
-                });
+                    Err(_) => {
+                        // 并发投递已满，等待 permit（不丢弃，Must-Deliver）
+                        warn!(
+                            "⚠️ OfflineWorker 并发投递已满 (max={}), 用户 {} 等待 permit",
+                            worker_push.config.max_concurrent_users, user_id
+                        );
+                        let permit = sem
+                            .acquire_owned()
+                            .await
+                            .expect("delivery semaphore closed");
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(e) = worker.deliver_all_user_messages(&user_id).await {
+                                error!("推送用户 {} 的离线消息失败: {}", user_id, e);
+                            }
+                        });
+                    }
+                }
 
                 // 检查是否应该停止
                 if !*worker_push.is_running.read().await {
@@ -367,6 +447,21 @@ impl OfflineMessageWorker {
             return Ok(0);
         }
 
+        // [TRACE] Node 5: offline_enqueued (for each message about to be delivered)
+        {
+            use crate::infra::delivery_trace::{global_trace_store, stages};
+            let store = global_trace_store();
+            for msg in &filtered_messages {
+                store
+                    .record(
+                        msg.local_message_id,
+                        stages::OFFLINE_ENQUEUED,
+                        format!("session={} count={}", session_id, filtered_messages.len()),
+                    )
+                    .await;
+            }
+        }
+
         // ✨ 4. 构建消息ID到pts的映射，并按 pts 升序得到有序的 message_id 列表（保证接收方按 1→2→3→4→5 顺序收到）
         let message_pts_map = self
             .user_message_index
@@ -536,6 +631,23 @@ impl OfflineMessageWorker {
                         "✅ 消息 {} 成功推送到 session {}",
                         message.message_id, session_id
                     );
+                    // [TRACE] Node 6: catchup_delivered
+                    {
+                        use crate::infra::delivery_trace::{
+                            global_trace_store, stages, TraceTerminalState,
+                        };
+                        let store = global_trace_store();
+                        store
+                            .record(
+                                message.message_id,
+                                stages::CATCHUP_DELIVERED,
+                                format!("session={}", session_id),
+                            )
+                            .await;
+                        store
+                            .set_terminal(message.message_id, TraceTerminalState::Delivered)
+                            .await;
+                    }
                 }
                 Ok(result) => {
                     warn!(
@@ -863,15 +975,28 @@ impl OfflineMessageWorker {
     /// 报告统计信息
     async fn report_stats(&self) {
         let stats = self.stats.read().await;
+        let queue_depth = self.queue_depth();
+        let try_send_fail = self.try_send_fail_total();
+        let fallback = self.fallback_total();
+        let delivery_inflight =
+            self.config.max_concurrent_users - self.delivery_semaphore.available_permits();
+
+        // 上报 Prometheus 指标
+        metrics::gauge!("privchat_offline_queue_depth").set(queue_depth as f64);
+        metrics::counter!("privchat_offline_try_send_fail_total").absolute(try_send_fail);
+        metrics::counter!("privchat_offline_fallback_total").absolute(fallback);
+        metrics::gauge!("privchat_offline_delivery_inflight").set(delivery_inflight as f64);
+
         info!(
-            "离线投递统计 - 扫描: {}, 用户: {}, 投递: {}, 失败: {}, 过期: {}, 延迟: {:.2}ms, 待处理: {}",
-            stats.total_scans,
+            "📦 离线投递统计 - 用户: {}, 投递: {}, 失败: {}, 过期: {}, queue_depth: {}/{}, try_send_fail: {}, fallback: {}, delivery_inflight: {}/{}",
             stats.users_processed,
             stats.messages_delivered,
             stats.messages_failed,
             stats.messages_expired,
-            stats.avg_delivery_latency_ms,
-            stats.pending_users
+            queue_depth, OFFLINE_QUEUE_CAPACITY,
+            try_send_fail,
+            fallback,
+            delivery_inflight, self.config.max_concurrent_users,
         );
     }
 

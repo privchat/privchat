@@ -94,6 +94,14 @@ pub struct ChatServer {
     message_router: Arc<crate::infra::MessageRouter>,
     /// MessageRouter 的会话发送适配器（绑定 TransportServer 后可真实下发 PushMessageRequest）
     message_router_session_adapter: Arc<crate::infra::message_router::SessionManagerAdapter>,
+    /// 业务 Handler 并发限流器（STABILITY_SPEC 禁令 2）
+    handler_limiter: crate::infra::handler_limiter::HandlerLimiter,
+    /// 事件总线（用于 lagged 指标上报）
+    event_bus: Arc<crate::infra::EventBus>,
+    /// Redis 客户端（用于 pool 指标上报）
+    redis_client: Option<Arc<crate::infra::redis::RedisClient>>,
+    /// 离线消息 Worker（用于队列指标上报）
+    offline_worker: Arc<crate::infra::OfflineMessageWorker>,
 }
 
 impl ChatServer {
@@ -105,6 +113,11 @@ impl ChatServer {
         info!("🤖 初始化系统用户列表...");
         crate::config::init_system_users();
         info!("✅ 系统用户列表初始化完成");
+
+        // 📊 初始化消息投递追踪（DeliveryTrace）
+        info!("📊 初始化 DeliveryTrace 追踪存储...");
+        crate::infra::delivery_trace::init_global_trace_store(10_000);
+        info!("✅ DeliveryTrace 追踪存储初始化完成（容量=10000）");
 
         // 🔌 初始化数据库连接（必须在其他组件之前）
         info!("🔌 初始化数据库连接...");
@@ -541,12 +554,22 @@ impl ChatServer {
 
         // 初始化 SyncService（pts 同步机制）
         info!("🔧 初始化 SyncService...");
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_config = config.cache.redis.clone().unwrap_or_else(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            crate::config::RedisConfig {
+                url,
+                pool_size: 50,
+                min_idle: 10,
+                connection_timeout_secs: 5,
+                command_timeout_ms: 5000,
+                idle_timeout_secs: 300,
+            }
+        });
 
         // 创建 RedisClient
         let redis_client = Arc::new(
-            crate::infra::redis::RedisClient::new(&redis_url)
+            crate::infra::redis::RedisClient::new(&redis_config)
                 .await
                 .map_err(|e| ServerError::Internal(format!("Redis 客户端初始化失败: {}", e)))?,
         );
@@ -555,9 +578,8 @@ impl ChatServer {
         // ✨ 初始化 Push 系统（Phase 2：带 Redis 和设备查询）
         info!("🔧 初始化 Push 系统...");
 
-        // 1. 创建 Event Bus
+        // 1. 创建 EventBus 并设置全局引用
         let event_bus = Arc::new(crate::infra::EventBus::new());
-        // 设置全局 EventBus（MVP 阶段临时方案）
         crate::handler::send_message_handler::set_global_event_bus(event_bus.clone());
         info!("✅ EventBus 创建完成");
 
@@ -618,6 +640,8 @@ impl ChatServer {
             pts_dao,
             registry_dao,
             sync_cache,
+            channel_service.clone(),
+            unread_count_service.clone(),
         ));
         info!("✅ SyncService 创建完成");
 
@@ -658,6 +682,7 @@ impl ChatServer {
             Arc::new(crate::repository::UserSettingsRepository::new(
                 (*pool).clone(),
             )), // user_settings 表为主
+            unread_count_service.clone(),
         );
         crate::rpc::init_rpc_system(rpc_services).await;
         info!("✅ RPC 系统初始化完成");
@@ -689,6 +714,14 @@ impl ChatServer {
         ));
         info!("✅ 安全系统初始化完成");
 
+        // 初始化业务 Handler 限流器
+        let handler_limiter =
+            crate::infra::handler_limiter::HandlerLimiter::new(config.handler_max_inflight);
+        info!(
+            "✅ Handler 限流器初始化完成 (max_inflight={})",
+            config.handler_max_inflight
+        );
+
         info!("✅ 聊天服务器组件初始化完成");
         info!("📋 已注册 6 个消息处理器");
 
@@ -719,6 +752,10 @@ impl ChatServer {
             notification_service,
             message_router,
             message_router_session_adapter,
+            handler_limiter,
+            event_bus,
+            redis_client: Some(redis_client.clone()),
+            offline_worker: offline_worker.clone(),
         })
     }
 
@@ -784,6 +821,7 @@ impl ChatServer {
         );
         info!("  - QUIC 监听地址: {}", self.config.quic_bind_address);
         info!("  - 最大连接数: {}", self.config.max_connections);
+        info!("  - Handler 最大并发: {}", self.config.handler_max_inflight);
         info!("  - 心跳间隔: {}秒", self.config.heartbeat_interval);
         info!("  - L1 缓存内存: {}MB", self.config.cache.l1_max_memory_mb);
         info!("  - L1 缓存 TTL: {}秒", self.config.cache.l1_ttl_secs);
@@ -872,6 +910,7 @@ impl ChatServer {
         let auth_session_manager = self.auth_session_manager.clone();
         let connection_manager = self.connection_manager.clone();
         let message_router = self.message_router.clone();
+        let handler_limiter = self.handler_limiter.clone();
 
         tokio::spawn(async move {
             info!("📡 事件处理器开始监听...");
@@ -972,41 +1011,55 @@ impl ChatServer {
                             stats.messages_received += 1;
                         }
 
-                        // 🎯 使用消息分发器处理消息
+                        // 🎯 使用消息分发器处理消息（受 HandlerLimiter 限流保护）
                         let message_dispatcher = message_dispatcher.clone();
                         let session_id_clone = session_id.clone();
 
-                        // [FIX] Move context into the async task so it can be used for responding
-                        tokio::spawn(async move {
-                            // 直接将 biz_type 转换为 MessageType
-                            let msg_type = MessageType::from(biz_type);
+                        // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop
+                        match handler_limiter.try_acquire() {
+                            Ok(permit) => {
+                                tokio::spawn(async move {
+                                    // permit 绑定在 task 内部，task 结束自动释放
+                                    let _permit = permit;
 
-                            // 创建服务器层的请求上下文
-                            let request_context = crate::context::RequestContext::new(
-                                session_id_clone.clone(),
-                                msg_text.as_bytes().to_vec(),
-                                "127.0.0.1:0".parse().unwrap(), // 临时占位符，后续可以传递真实地址
-                            );
-
-                            // 🚀 使用消息分发器处理消息（包含中间件链）
-                            match message_dispatcher.dispatch(msg_type, request_context).await {
-                                Ok(Some(response)) => {
-                                    // [FIX] context is now moved into this closure, can be used for responding
-                                    context.respond(response);
-                                    debug!("✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})", session_id_clone, biz_type, msg_type);
-                                }
-                                Ok(None) => {
-                                    debug!(
-                                        "消息分发器无响应: {} (biz_type: {}, MessageType: {:?})",
-                                        session_id_clone, biz_type, msg_type
+                                    let msg_type = MessageType::from(biz_type);
+                                    let request_context = crate::context::RequestContext::new(
+                                        session_id_clone.clone(),
+                                        msg_text.as_bytes().to_vec(),
+                                        "127.0.0.1:0".parse().unwrap(),
                                     );
-                                }
-                                Err(e) => {
-                                    error!("❌ 消息分发器处理失败: {:?} - {}", msg_type, e);
-                                    // TODO: 考虑如何处理失败的消息
-                                }
+
+                                    match message_dispatcher
+                                        .dispatch(msg_type, request_context)
+                                        .await
+                                    {
+                                        Ok(Some(response)) => {
+                                            context.respond(response);
+                                            debug!("✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})", session_id_clone, biz_type, msg_type);
+                                        }
+                                        Ok(None) => {
+                                            debug!(
+                                                "消息分发器无响应: {} (biz_type: {}, MessageType: {:?})",
+                                                session_id_clone, biz_type, msg_type
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("❌ 消息分发器处理失败: {:?} - {}", msg_type, e);
+                                        }
+                                    }
+                                });
                             }
-                        });
+                            Err(_) => {
+                                // 限流触发：handler 并发已满
+                                // Best-Effort: 丢弃 + 计数（Ping/Subscribe 等）
+                                // Must-Deliver (SendMessage): 客户端未收到 ACK 会重发
+                                // 不需要服务端慢路径 — 重发由客户端驱动
+                                warn!(
+                                    "🚫 Handler 限流触发，拒绝消息: session={}, biz_type={}",
+                                    session_id, biz_type
+                                );
+                            }
+                        }
                     }
                     ServerEvent::MessageSent {
                         session_id,
@@ -1059,6 +1112,11 @@ impl ChatServer {
     async fn start_stats_updater(&self) {
         let stats = self.stats.clone();
         let auth_session_manager = self.auth_session_manager.clone();
+        let handler_limiter = self.handler_limiter.clone();
+        let event_bus = self.event_bus.clone();
+        let redis_client = self.redis_client.clone();
+        let database = self.database.clone();
+        let offline_worker = self.offline_worker.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -1068,6 +1126,38 @@ impl ChatServer {
                 let mut stats_guard = stats.write().await;
                 stats_guard.active_sessions = auth_session_manager.session_count().await as u64;
                 stats_guard.uptime_seconds += 60;
+
+                // Handler 限流指标上报
+                let inflight = handler_limiter.inflight();
+                let rejected = handler_limiter.rejected_total();
+                crate::infra::metrics::record_handler_inflight(inflight);
+                crate::infra::metrics::record_handler_rejected(rejected);
+
+                // EventBus lagged 指标上报
+                let lagged = event_bus.lagged_total();
+                crate::infra::metrics::record_event_bus_lagged(lagged);
+
+                // Redis 连接池指标上报
+                if let Some(ref redis) = redis_client {
+                    let state = redis.pool_state();
+                    let active = state.connections - state.idle_connections;
+                    crate::infra::metrics::record_redis_pool(active, state.idle_connections);
+                }
+
+                // 数据库连接池指标上报
+                let db_pool = database.pool();
+                let db_size = db_pool.size();
+                let db_idle = db_pool.num_idle() as u32;
+                let db_active = db_size - db_idle;
+                crate::infra::metrics::record_db_pool(db_active, db_idle);
+
+                // 离线队列指标上报
+                let queue_depth = offline_worker.queue_depth();
+                let try_send_fail = offline_worker.try_send_fail_total();
+                let fallback = offline_worker.fallback_total();
+                crate::infra::metrics::record_offline_queue_depth(queue_depth);
+                crate::infra::metrics::record_offline_try_send_fail(try_send_fail);
+                crate::infra::metrics::record_offline_fallback(fallback);
 
                 let secs = stats_guard.uptime_seconds;
                 let days = secs / 86400;
@@ -1085,8 +1175,14 @@ impl ChatServer {
                 };
 
                 info!(
-                    "📊 服务器统计: 在线会话={}, 总连接={}, 运行时间={}",
-                    stats_guard.active_sessions, stats_guard.total_connections, uptime_str
+                    "📊 服务器统计: 在线会话={}, 总连接={}, handler={}/{}, rejected={}, lagged={}, redis_active={}, db_active={}, offline_q={}, 运行={}",
+                    stats_guard.active_sessions, stats_guard.total_connections,
+                    inflight, handler_limiter.max_inflight(), rejected,
+                    lagged,
+                    redis_client.as_ref().map(|r| r.pool_state().connections - r.pool_state().idle_connections).unwrap_or(0),
+                    db_active,
+                    queue_depth,
+                    uptime_str
                 );
             }
         });

@@ -28,7 +28,7 @@ use crate::service::sync::SyncService;
 use crate::service::{
     ApprovalService, BlacklistService, ChannelService, FileService, FriendService,
     MessageHistoryService, OfflineQueueService, PrivacyService, QRCodeService, ReactionService,
-    ReadReceiptService, StickerService, UploadTokenService,
+    ReadReceiptService, StickerService, UnreadCountService, UploadTokenService,
 };
 use router::GLOBAL_RPC_ROUTER;
 use std::sync::Arc;
@@ -126,6 +126,8 @@ pub struct RpcServiceContext {
     pub user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
     /// 用户设置仓库 - ENTITY_SYNC_V1 user_settings，表为主
     pub user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
+    /// 未读计数服务
+    pub unread_count_service: Arc<UnreadCountService>,
 }
 
 impl RpcServiceContext {
@@ -162,6 +164,7 @@ impl RpcServiceContext {
         offline_worker: Arc<crate::infra::OfflineMessageWorker>,
         user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
         user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
+        unread_count_service: Arc<UnreadCountService>,
     ) -> Self {
         Self {
             // channel_service 已合并到 channel_service
@@ -196,6 +199,7 @@ impl RpcServiceContext {
             offline_worker,
             user_device_repo, // ✨ Phase 3.5
             user_settings_repo,
+            unread_count_service,
         }
     }
 }

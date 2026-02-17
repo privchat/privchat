@@ -11,7 +11,9 @@ pub mod cache_manager;
 pub mod cache_manager_simple;
 pub mod connection_manager; // ✨ 新增
 pub mod database;
+pub mod delivery_trace;
 pub mod event_bus;
+pub mod handler_limiter;
 pub mod logger;
 pub mod message_router;
 pub mod metrics;

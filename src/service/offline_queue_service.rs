@@ -48,7 +48,7 @@ impl OfflineQueueService {
         self
     }
 
-    /// 添加离线消息（自动限制 100 条）⭐
+    /// 添加离线消息（自动限制 100 条，Pipeline 单次 RTT）
     pub async fn add(&self, user_id: u64, message: &PushMessageRequest) -> Result<(), ServerError> {
         let key = Self::queue_key(user_id);
         let value = serde_json::to_string(message)
@@ -60,21 +60,19 @@ impl OfflineQueueService {
             .await
             .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
 
-        // 1. 左侧推入新消息（最新消息在左侧）
-        conn.lpush::<_, _, ()>(&key, &value)
-            .await
-            .map_err(|e| ServerError::Internal(format!("LPUSH 失败: {}", e)))?;
-
-        // 2. 保留最新 N 条（自动清理最旧的）⭐
         let max_index = (self.max_queue_size - 1) as isize;
-        conn.ltrim::<_, ()>(&key, 0, max_index)
-            .await
-            .map_err(|e| ServerError::Internal(format!("LTRIM 失败: {}", e)))?;
 
-        // 3. 设置过期时间
-        conn.expire::<_, ()>(&key, self.expire_seconds)
+        // Pipeline: LPUSH + LTRIM + EXPIRE 合并为单次 RTT
+        redis::pipe()
+            .lpush(&key, &value)
+            .ignore()
+            .ltrim(&key, 0, max_index)
+            .ignore()
+            .expire(&key, self.expire_seconds)
+            .ignore()
+            .query_async::<()>(&mut conn)
             .await
-            .map_err(|e| ServerError::Internal(format!("EXPIRE 失败: {}", e)))?;
+            .map_err(|e| ServerError::Internal(format!("Pipeline 执行失败: {}", e)))?;
 
         info!(
             "📥 推送离线消息: user={}, 队列上限={}",
@@ -84,7 +82,7 @@ impl OfflineQueueService {
         Ok(())
     }
 
-    /// 批量推送离线消息
+    /// 批量推送离线消息（Pipeline 单次 RTT）
     pub async fn push_batch(
         &self,
         user_id: u64,
@@ -109,28 +107,66 @@ impl OfflineQueueService {
             .await
             .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
 
-        // 批量推入
-        for value in values {
-            conn.lpush::<_, _, ()>(&key, &value)
-                .await
-                .map_err(|e| ServerError::Internal(format!("LPUSH 失败: {}", e)))?;
-        }
-
-        // 限制长度
         let max_index = (self.max_queue_size - 1) as isize;
-        conn.ltrim::<_, ()>(&key, 0, max_index)
-            .await
-            .map_err(|e| ServerError::Internal(format!("LTRIM 失败: {}", e)))?;
 
-        // 设置过期
-        conn.expire::<_, ()>(&key, self.expire_seconds)
+        // Pipeline: 所有 LPUSH + LTRIM + EXPIRE 合并为单次 RTT
+        let mut pipe = redis::pipe();
+        for value in &values {
+            pipe.lpush(&key, value).ignore();
+        }
+        pipe.ltrim(&key, 0, max_index).ignore();
+        pipe.expire(&key, self.expire_seconds).ignore();
+
+        pipe.query_async::<()>(&mut conn)
             .await
-            .map_err(|e| ServerError::Internal(format!("EXPIRE 失败: {}", e)))?;
+            .map_err(|e| ServerError::Internal(format!("Pipeline 执行失败: {}", e)))?;
 
         info!(
-            "📥 批量推送离线消息: user={}, count={}, 队列上限={}",
+            "📥 批量推送离线消息(pipeline): user={}, count={}, 队列上限={}",
             user_id,
             messages.len(),
+            self.max_queue_size
+        );
+
+        Ok(())
+    }
+
+    /// 批量为多个用户添加同一条离线消息（Redis Pipeline，单次网络往返）
+    pub async fn add_batch_users(
+        &self,
+        user_ids: &[u64],
+        message: &PushMessageRequest,
+    ) -> Result<(), ServerError> {
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+
+        let value = serde_json::to_string(message)
+            .map_err(|e| ServerError::Internal(format!("序列化消息失败: {}", e)))?;
+
+        let mut conn = self
+            .redis_client
+            .get_multiplexed_tokio_connection()
+            .await
+            .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
+
+        let max_index = (self.max_queue_size - 1) as isize;
+
+        let mut pipe = redis::pipe();
+        for &user_id in user_ids {
+            let key = Self::queue_key(user_id);
+            pipe.lpush(key.clone(), value.clone()).ignore();
+            pipe.ltrim(key.clone(), 0, max_index).ignore();
+            pipe.expire(key, self.expire_seconds).ignore();
+        }
+
+        pipe.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| ServerError::Internal(format!("Pipeline 执行失败: {}", e)))?;
+
+        info!(
+            "📥 Pipeline 批量推送离线消息: users={}, 队列上限={}",
+            user_ids.len(),
             self.max_queue_size
         );
 
@@ -284,30 +320,22 @@ impl OfflineQueueService {
         }
 
         if found {
-            // 删除整个列表并重新创建（Redis 没有直接删除指定元素的方法）
-            conn.del::<_, ()>(&key)
-                .await
-                .map_err(|e| ServerError::Internal(format!("DEL 失败: {}", e)))?;
+            // Pipeline: DEL + 重建列表 + LTRIM + EXPIRE 合并为单次 RTT
+            let mut pipe = redis::pipe();
+            pipe.del(&key).ignore();
 
-            // 如果有剩余消息，重新推入
             if !filtered_values.is_empty() {
                 for value in filtered_values.iter().rev() {
-                    conn.lpush::<_, _, ()>(&key, value)
-                        .await
-                        .map_err(|e| ServerError::Internal(format!("LPUSH 失败: {}", e)))?;
+                    pipe.lpush(&key, value).ignore();
                 }
-
-                // 限制长度
                 let max_index = (self.max_queue_size - 1) as isize;
-                conn.ltrim::<_, ()>(&key, 0, max_index)
-                    .await
-                    .map_err(|e| ServerError::Internal(format!("LTRIM 失败: {}", e)))?;
-
-                // 设置过期时间
-                conn.expire::<_, ()>(&key, self.expire_seconds)
-                    .await
-                    .map_err(|e| ServerError::Internal(format!("EXPIRE 失败: {}", e)))?;
+                pipe.ltrim(&key, 0, max_index).ignore();
+                pipe.expire(&key, self.expire_seconds).ignore();
             }
+
+            pipe.query_async::<()>(&mut conn)
+                .await
+                .map_err(|e| ServerError::Internal(format!("Pipeline 执行失败: {}", e)))?;
         }
 
         Ok(found)

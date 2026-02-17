@@ -1,6 +1,6 @@
 use anyhow::Result;
+use dashmap::DashMap;
 use msgtrans::SessionId;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -16,13 +16,14 @@ pub struct DeviceConnection {
 
 /// 连接管理器
 ///
-/// 负责跟踪活跃的 WebSocket/TCP 连接，并提供设备断连功能
+/// 负责跟踪活跃的 WebSocket/TCP 连接，并提供设备断连功能。
+/// 使用 DashMap（分片锁）替代 RwLock<HashMap>，减少锁争用。
 pub struct ConnectionManager {
     /// 连接映射：(user_id, device_id) -> DeviceConnection
-    connections: Arc<RwLock<HashMap<(u64, String), DeviceConnection>>>,
+    connections: DashMap<(u64, String), DeviceConnection>,
 
     /// 反向映射：session_id -> (user_id, device_id)
-    session_index: Arc<RwLock<HashMap<SessionId, (u64, String)>>>,
+    session_index: DashMap<SessionId, (u64, String)>,
 
     /// TransportServer 引用（用于实际断开连接）
     transport_server: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
@@ -32,8 +33,8 @@ impl ConnectionManager {
     /// 创建新的连接管理器
     pub fn new() -> Self {
         Self {
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            session_index: Arc::new(RwLock::new(HashMap::new())),
+            connections: DashMap::new(),
+            session_index: DashMap::new(),
             transport_server: Arc::new(RwLock::new(None)),
         }
     }
@@ -61,17 +62,15 @@ impl ConnectionManager {
             connected_at: now,
         };
 
-        // 更新主映射（完成后释放锁，再取 session_index 避免死锁）
-        let count = {
-            let mut connections = self.connections.write().await;
-            connections.insert((user_id, device_id.clone()), connection);
-            connections.len()
-        };
+        // 插入主映射
+        self.connections
+            .insert((user_id, device_id.clone()), connection);
 
-        // 更新反向映射
-        let mut session_index = self.session_index.write().await;
-        session_index.insert(session_id, (user_id, device_id.clone()));
+        // 插入反向映射
+        self.session_index
+            .insert(session_id, (user_id, device_id.clone()));
 
+        let count = self.connections.len();
         crate::infra::metrics::record_connection_count(count as u64);
 
         debug!(
@@ -83,17 +82,18 @@ impl ConnectionManager {
     }
 
     /// 注销设备连接
-    pub async fn unregister_connection(&self, session_id: SessionId) -> Result<Option<(u64, String)>> {
-        // 从反向映射中获取 user_id 和 device_id，然后释放锁避免与 connections 死锁
-        let removed = {
-            let mut session_index = self.session_index.write().await;
-            session_index.remove(&session_id)
-        };
-        if let Some((user_id, device_id)) = removed.clone() {
-            let mut connections = self.connections.write().await;
-            connections.remove(&(user_id, device_id.clone()));
-            let count = connections.len();
-            drop(connections);
+    pub async fn unregister_connection(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<(u64, String)>> {
+        // 从反向映射中移除并获取 (user_id, device_id)
+        let removed = self.session_index.remove(&session_id).map(|(_, v)| v);
+
+        if let Some((user_id, ref device_id)) = removed {
+            // 从主映射中移除
+            self.connections.remove(&(user_id, device_id.clone()));
+
+            let count = self.connections.len();
             crate::infra::metrics::record_connection_count(count as u64);
 
             debug!(
@@ -110,10 +110,10 @@ impl ConnectionManager {
     /// 用于 "踢设备" 功能：立即断开指定设备的 WebSocket 连接
     pub async fn disconnect_device(&self, user_id: u64, device_id: &str) -> Result<()> {
         // 1. 查找该设备的连接
-        let connections = self.connections.read().await;
-        let connection = connections.get(&(user_id, device_id.to_string())).cloned();
-
-        drop(connections); // 释放读锁
+        let connection = self
+            .connections
+            .get(&(user_id, device_id.to_string()))
+            .map(|entry| entry.clone());
 
         if let Some(conn) = connection {
             info!(
@@ -158,15 +158,16 @@ impl ConnectionManager {
         user_id: u64,
         current_device_id: &str,
     ) -> Result<Vec<String>> {
-        // 1. 查找该用户的所有连接
-        let connections = self.connections.read().await;
-        let devices_to_disconnect: Vec<String> = connections
+        // 1. 收集该用户的其他设备 ID（只持有引用，不持有锁）
+        let devices_to_disconnect: Vec<String> = self
+            .connections
             .iter()
-            .filter(|((uid, device_id), _)| *uid == user_id && device_id != current_device_id)
-            .map(|((_, device_id), _)| device_id.clone())
+            .filter(|entry| {
+                let (uid, device_id) = entry.key();
+                *uid == user_id && device_id != current_device_id
+            })
+            .map(|entry| entry.key().1.clone())
             .collect();
-
-        drop(connections); // 释放读锁
 
         info!(
             "🔌 ConnectionManager: 断开其他设备 user={}, count={}, current_device={}",
@@ -195,24 +196,22 @@ impl ConnectionManager {
 
     /// 获取用户的所有活跃连接
     pub async fn get_user_connections(&self, user_id: u64) -> Vec<DeviceConnection> {
-        let connections = self.connections.read().await;
-        connections
+        self.connections
             .iter()
-            .filter(|((uid, _), _)| *uid == user_id)
-            .map(|(_, conn)| conn.clone())
+            .filter(|entry| entry.key().0 == user_id)
+            .map(|entry| entry.value().clone())
             .collect()
     }
 
     /// 获取活跃连接数
     pub async fn get_connection_count(&self) -> usize {
-        let connections = self.connections.read().await;
-        connections.len()
+        self.connections.len()
     }
 
     /// 检查设备是否在线
     pub async fn is_device_online(&self, user_id: u64, device_id: &str) -> bool {
-        let connections = self.connections.read().await;
-        connections.contains_key(&(user_id, device_id.to_string()))
+        self.connections
+            .contains_key(&(user_id, device_id.to_string()))
     }
 
     /// 实时推送一条 PushMessageRequest 到用户当前所有在线连接
@@ -250,10 +249,7 @@ impl ConnectionManager {
                 Err(e) => {
                     warn!(
                         "⚠️ ConnectionManager: 实时推送失败 user={}, session={}, server_message_id={}, error={}",
-                        user_id,
-                        sid,
-                        message.server_message_id,
-                        e
+                        user_id, sid, message.server_message_id, e
                     );
                 }
             }
@@ -270,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_and_unregister() {
         let manager = ConnectionManager::new();
-        let session_id = SessionId(123);
+        let session_id = SessionId::new(123);
 
         // 注册连接
         manager
@@ -298,15 +294,15 @@ mod tests {
 
         // 注册多个设备
         manager
-            .register_connection(1, "device-001".to_string(), SessionId(101))
+            .register_connection(1, "device-001".to_string(), SessionId::new(101))
             .await
             .unwrap();
         manager
-            .register_connection(1, "device-002".to_string(), SessionId(102))
+            .register_connection(1, "device-002".to_string(), SessionId::new(102))
             .await
             .unwrap();
         manager
-            .register_connection(1, "device-003".to_string(), SessionId(103))
+            .register_connection(1, "device-003".to_string(), SessionId::new(103))
             .await
             .unwrap();
 

@@ -1,7 +1,9 @@
 use anyhow::Result;
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// 登录日志记录
@@ -97,11 +99,20 @@ pub struct LoginLogQuery {
 /// 登录日志仓库
 pub struct LoginLogRepository {
     db_pool: Arc<PgPool>,
+    /// token_jti → true 的本地缓存（L1-only，TTL 30s）
+    token_logged_cache: Cache<String, bool>,
 }
 
 impl LoginLogRepository {
     pub fn new(db_pool: Arc<PgPool>) -> Self {
-        Self { db_pool }
+        let token_logged_cache = Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(Duration::from_secs(30))
+            .build();
+        Self {
+            db_pool,
+            token_logged_cache,
+        }
     }
 
     /// 获取数据库连接池（用于管理 API）
@@ -133,7 +144,7 @@ impl LoginLogRepository {
                 $13, $14,
                 $15, $16, $17, $18, $19, $20
             )
-            RETURNING 
+            RETURNING
                 log_id, user_id, device_id, token_jti, token_created_at, token_first_used_at,
                 device_type, device_name, device_model, os_version,
                 app_id, app_version, ip_address, user_agent,
@@ -166,11 +177,23 @@ impl LoginLogRepository {
         .fetch_one(&*self.db_pool)
         .await?;
 
+        // 写入缓存，后续 is_token_logged 直接命中
+        self.token_logged_cache
+            .insert(record.token_jti.clone(), true)
+            .await;
+
         Ok(record)
     }
 
     /// 检查 token 是否已被记录（防止重复记录）
+    /// 带本地缓存（L1-only, TTL 30s），减少 DB 查询
     pub async fn is_token_logged(&self, token_jti: &str) -> Result<bool> {
+        // L1 缓存命中
+        if self.token_logged_cache.get(token_jti).await.is_some() {
+            return Ok(true);
+        }
+
+        // 缓存 miss，查 DB
         let result = sqlx::query!(
             r#"
             SELECT EXISTS(
@@ -183,6 +206,13 @@ impl LoginLogRepository {
         .fetch_one(&*self.db_pool)
         .await?;
 
+        // DB 命中则回填缓存
+        if result.exists {
+            self.token_logged_cache
+                .insert(token_jti.to_string(), true)
+                .await;
+        }
+
         Ok(result.exists)
     }
 
@@ -190,7 +220,7 @@ impl LoginLogRepository {
     pub async fn get_user_logs(&self, query: LoginLogQuery) -> Result<Vec<LoginLog>> {
         let mut sql = String::from(
             r#"
-            SELECT 
+            SELECT
                 log_id, user_id, device_id, token_jti, token_created_at, token_first_used_at,
                 device_type, device_name, device_model, os_version,
                 app_id, app_version, ip_address, user_agent,
@@ -277,7 +307,7 @@ impl LoginLogRepository {
         let log = sqlx::query_as!(
             LoginLog,
             r#"
-            SELECT 
+            SELECT
                 log_id, user_id, device_id, token_jti, token_created_at, token_first_used_at,
                 device_type, device_name, device_model, os_version,
                 app_id, app_version, ip_address, user_agent,
@@ -348,7 +378,7 @@ impl LoginLogRepository {
         let logs = sqlx::query_as!(
             LoginLog,
             r#"
-            SELECT 
+            SELECT
                 log_id, user_id, device_id, token_jti, token_created_at, token_first_used_at,
                 device_type, device_name, device_model, os_version,
                 app_id, app_version, ip_address, user_agent,

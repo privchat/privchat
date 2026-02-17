@@ -69,6 +69,9 @@ pub struct ServerConfig {
     pub system_message: SystemMessageConfig,
     /// 安全防护配置
     pub security: SecurityProtectionConfig,
+    /// 业务 Handler 最大并发数（Semaphore 限流）
+    /// 仅限制业务处理层，不影响连接层 read/accept
+    pub handler_max_inflight: usize,
 }
 
 impl Default for ServerConfig {
@@ -106,6 +109,7 @@ impl Default for ServerConfig {
             use_internal_auth: true, // 默认启用内置账号系统（方便独立部署和测试）
             system_message: SystemMessageConfig::default(),
             security: SecurityProtectionConfig::default(),
+            handler_max_inflight: 2000,
         }
     }
 }
@@ -152,8 +156,11 @@ impl ServerConfig {
     pub fn with_redis(mut self, redis_url: String) -> Self {
         self.cache.redis = Some(RedisConfig {
             url: redis_url,
-            pool_size: 10,
+            pool_size: 50,
+            min_idle: 10,
             connection_timeout_secs: 5,
+            command_timeout_ms: 5000,
+            idle_timeout_secs: 300,
         });
         self
     }
@@ -187,6 +194,9 @@ impl ServerConfig {
         if let Ok(max_conn) = env::var("PRIVCHAT_MAX_CONNECTIONS") {
             self.max_connections = max_conn.parse().unwrap_or(self.max_connections);
         }
+        if let Ok(max_inflight) = env::var("PRIVCHAT_HANDLER_MAX_INFLIGHT") {
+            self.handler_max_inflight = max_inflight.parse().unwrap_or(self.handler_max_inflight);
+        }
         if let Ok(log_level) = env::var("PRIVCHAT_LOG_LEVEL") {
             self.log_level = log_level;
         }
@@ -196,10 +206,14 @@ impl ServerConfig {
 
         // Redis 配置
         if let Ok(redis_url) = env::var("REDIS_URL") {
+            let existing = self.cache.redis.as_ref();
             self.cache.redis = Some(RedisConfig {
                 url: redis_url,
-                pool_size: 10,
-                connection_timeout_secs: 5,
+                pool_size: existing.map_or(50, |r| r.pool_size),
+                min_idle: existing.map_or(10, |r| r.min_idle),
+                connection_timeout_secs: existing.map_or(5, |r| r.connection_timeout_secs),
+                command_timeout_ms: existing.map_or(5000, |r| r.command_timeout_ms),
+                idle_timeout_secs: existing.map_or(300, |r| r.idle_timeout_secs),
             });
         }
 
@@ -257,10 +271,14 @@ impl ServerConfig {
             self.database_url = db_url.clone();
         }
         if let Some(redis_url) = &cli.redis_url {
+            let existing = self.cache.redis.as_ref();
             self.cache.redis = Some(RedisConfig {
                 url: redis_url.clone(),
-                pool_size: 10,
-                connection_timeout_secs: 5,
+                pool_size: existing.map_or(50, |r| r.pool_size),
+                min_idle: existing.map_or(10, |r| r.min_idle),
+                connection_timeout_secs: existing.map_or(5, |r| r.connection_timeout_secs),
+                command_timeout_ms: existing.map_or(5000, |r| r.command_timeout_ms),
+                idle_timeout_secs: existing.map_or(300, |r| r.idle_timeout_secs),
             });
         }
         if let Some(jwt_secret) = &cli.jwt_secret {
@@ -446,6 +464,7 @@ struct TomlGatewayConfig {
     connection_timeout: Option<u64>,
     heartbeat_interval: Option<u64>,
     use_internal_auth: Option<bool>,
+    handler_max_inflight: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,7 +480,10 @@ struct TomlCacheConfig {
 struct TomlRedisConfig {
     url: Option<String>,
     pool_size: Option<u32>,
+    min_idle: Option<u32>,
     connection_timeout: Option<u64>,
+    command_timeout_ms: Option<u64>,
+    idle_timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,6 +578,9 @@ impl From<TomlConfig> for ServerConfig {
             if let Some(use_internal) = gw.use_internal_auth {
                 config.use_internal_auth = use_internal;
             }
+            if let Some(max_inflight) = gw.handler_max_inflight {
+                config.handler_max_inflight = max_inflight;
+            }
             if let Some(ref list) = gw.listeners {
                 if !list.is_empty() {
                     config.gateway_listeners = list
@@ -609,8 +634,11 @@ impl From<TomlConfig> for ServerConfig {
                 if let Some(url) = redis.url {
                     config.cache.redis = Some(RedisConfig {
                         url,
-                        pool_size: redis.pool_size.unwrap_or(10),
+                        pool_size: redis.pool_size.unwrap_or(50),
+                        min_idle: redis.min_idle.unwrap_or(10),
                         connection_timeout_secs: redis.connection_timeout.unwrap_or(5),
+                        command_timeout_ms: redis.command_timeout_ms.unwrap_or(5000),
+                        idle_timeout_secs: redis.idle_timeout.unwrap_or(300),
                     });
                 }
             }
@@ -718,16 +746,32 @@ impl CacheConfig {
 pub struct RedisConfig {
     /// Redis连接URL
     pub url: String,
-    /// 连接池大小
+    /// 连接池最大连接数
     pub pool_size: u32,
-    /// 连接超时时间（秒）
+    /// 连接池最小空闲连接数
+    pub min_idle: u32,
+    /// 连接超时时间（秒）— 从池获取连接的超时
     pub connection_timeout_secs: u64,
+    /// 命令执行超时时间（毫秒）— 单条 Redis 命令的超时
+    pub command_timeout_ms: u64,
+    /// 空闲连接超时时间（秒）— 超过此时间的空闲连接被回收
+    pub idle_timeout_secs: u64,
 }
 
 impl RedisConfig {
     /// 获取连接超时时间
     pub fn connection_timeout(&self) -> Duration {
         Duration::from_secs(self.connection_timeout_secs)
+    }
+
+    /// 获取命令执行超时时间
+    pub fn command_timeout(&self) -> Duration {
+        Duration::from_millis(self.command_timeout_ms)
+    }
+
+    /// 获取空闲连接超时时间
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs)
     }
 }
 

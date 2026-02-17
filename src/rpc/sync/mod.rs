@@ -224,7 +224,7 @@ async fn handle_session_ready_rpc(
             session_id,
             user_id
         );
-        services.offline_worker.trigger_push(user_id);
+        services.offline_worker.trigger_push(user_id).await;
     } else {
         tracing::info!(
             "ℹ️ sync/session_ready: session={} user={} 重复 READY（幂等）",
