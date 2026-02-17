@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
-use privchat_server::{cli::Cli, config::ServerConfig, logging, ChatServer};
+use privchat_server::{
+    cli::Cli,
+    config::{self, ServerConfig},
+    logging, ChatServer,
+};
 use std::fs;
 use std::process;
 
@@ -14,6 +18,9 @@ async fn main() -> Result<()> {
     // 处理子命令
     if let Some(command) = &cli.command {
         match command {
+            privchat_server::cli::Commands::Migrate => {
+                return run_migrate(&cli).await;
+            }
             privchat_server::cli::Commands::GenerateConfig { path } => {
                 return generate_config(path);
             }
@@ -26,15 +33,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 初始化日志系统（需要在加载配置之前，但可以使用默认值）
-    let log_level = cli.get_log_level().unwrap_or_else(|| "info".to_string());
-    let log_format = cli.get_log_format();
-    logging::init_logging(
-        &log_level,
-        log_format.as_deref(),
-        cli.log_file.as_deref(),
-        cli.quiet,
-    )?;
+    // 快速读取 config.toml 的 [logging] 段（不加载完整配置）
+    let early_log = config::load_early_logging_config(cli.config_file.as_deref());
+
+    // 合并日志配置（优先级：CLI > config.toml > 默认值）
+    let log_level = cli
+        .get_log_level()
+        .or(early_log.level)
+        .unwrap_or_else(|| "info".to_string());
+    let log_format = cli.get_log_format().or(early_log.format);
+    let log_file = cli.log_file.as_deref().or(early_log.file.as_deref());
+
+    logging::init_logging(&log_level, log_format.as_deref(), log_file, cli.quiet)?;
 
     tracing::info!("🚀 PrivChat Server starting...");
 
@@ -58,7 +68,13 @@ async fn main() -> Result<()> {
     tracing::info!("  - L1 Cache TTL: {}s", config.cache.l1_ttl_secs);
     tracing::info!("  - Redis L2 Cache: {}", config.cache.has_redis());
     tracing::info!("  - Log Level: {}", config.log_level);
-    tracing::info!("  - Log Format: {:?}", log_format);
+    tracing::info!(
+        "  - Log Format: {:?}",
+        log_format.as_deref().unwrap_or("compact")
+    );
+    if let Some(f) = log_file {
+        tracing::info!("  - Log File: {}", f);
+    }
     tracing::info!("  - Protocols: {:?}", config.enabled_protocols);
 
     // 创建服务器（如果数据库连接或目录创建等失败，会打印错误并退出）
@@ -131,6 +147,7 @@ base_url = "http://localhost:9083/files"
 [logging]
 level = "info"
 format = "compact"
+# file = "./logs/server.log"
 "#;
 
     fs::write(path, default_config).with_context(|| format!("无法写入配置文件: {}", path))?;
@@ -151,6 +168,78 @@ fn validate_config(path: &str) -> Result<()> {
     println!("  - Max Connections: {}", config.max_connections);
     println!("  - Cache Memory: {}MB", config.cache.l1_max_memory_mb);
 
+    Ok(())
+}
+
+// 编译时自动扫描 migrations/ 目录，按文件名排序嵌入（跳过 000_ 开头的文件）
+include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
+
+/// 执行数据库迁移
+async fn run_migrate(cli: &Cli) -> Result<()> {
+    let _ = dotenvy::dotenv();
+
+    // 获取 DATABASE_URL（从 CLI > 环境变量 > 配置文件）
+    let database_url = cli
+        .database_url
+        .clone()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .context("需要 DATABASE_URL，请在 .env 或环境变量中配置")?;
+
+    println!("🔌 连接数据库...");
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .context("数据库连接失败，请检查 DATABASE_URL")?;
+
+    // 创建迁移记录表（如果不存在）
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS privchat_migrations (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(&pool)
+    .await
+    .context("创建迁移记录表失败")?;
+
+    // 查询已执行的迁移
+    let applied: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM privchat_migrations ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .context("查询迁移记录失败")?;
+
+    let mut count = 0;
+    for (name, sql) in MIGRATIONS {
+        if applied.contains(&name.to_string()) {
+            println!("  ⏭ {} (已执行，跳过)", name);
+            continue;
+        }
+
+        println!("  ▶ 执行 {}...", name);
+        sqlx::raw_sql(sql)
+            .execute(&pool)
+            .await
+            .with_context(|| format!("执行迁移失败: {}", name))?;
+
+        // 记录迁移
+        sqlx::query("INSERT INTO privchat_migrations (name) VALUES ($1)")
+            .bind(*name)
+            .execute(&pool)
+            .await
+            .with_context(|| format!("记录迁移状态失败: {}", name))?;
+
+        println!("  ✅ {} 完成", name);
+        count += 1;
+    }
+
+    if count == 0 {
+        println!("✅ 数据库已是最新，无需迁移");
+    } else {
+        println!("✅ 成功执行 {} 个迁移", count);
+    }
+
+    pool.close().await;
     Ok(())
 }
 

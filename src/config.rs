@@ -43,11 +43,7 @@ pub struct ServerConfig {
     pub quic_bind_address: String,
     /// 网关多监听入口（listeners 数组，生产级可扩展；未来可多实例/多协议多地址）
     pub gateway_listeners: Vec<GatewayListenerConfig>,
-    /// 文件存储根目录（兼容旧配置；若配置了 file.storage_sources 则以此为准）
-    pub file_storage_root: String,
-    /// 文件基础 URL（兼容旧配置；若配置了 file.storage_sources 则以此为准）
-    pub file_base_url: Option<String>,
-    /// 存储源列表（必须至少配置一个 [[file.storage_sources]]；未配置时由 storage_root/base_url 构造 id=0 默认源）
+    /// 存储源列表（必须至少配置一个 [[file.storage_sources]]）
     pub file_storage_sources: Vec<FileStorageSourceConfig>,
     /// 默认存储源 ID（上传时使用，须在 file_storage_sources 中存在）
     pub file_default_storage_source_id: u32,
@@ -72,6 +68,10 @@ pub struct ServerConfig {
     /// 业务 Handler 最大并发数（Semaphore 限流）
     /// 仅限制业务处理层，不影响连接层 read/accept
     pub handler_max_inflight: usize,
+    /// Service Master Key（管理 API 认证）
+    pub service_master_key: String,
+    /// Redis 连接地址
+    pub redis_url: String,
 }
 
 impl Default for ServerConfig {
@@ -79,10 +79,8 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 9001,
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://postgres:postgres@localhost:5432/privchat".to_string()
-            }),
-            jwt_secret: "your_jwt_secret_here".to_string(),
+            database_url: String::new(),
+            jwt_secret: String::new(),
             max_connections: 1000,
             connection_timeout: 300,
             heartbeat_interval: 60,
@@ -100,8 +98,6 @@ impl Default for ServerConfig {
             websocket_bind_address: "0.0.0.0:9080".to_string(),
             quic_bind_address: "0.0.0.0:9001".to_string(),
             gateway_listeners: default_gateway_listeners(),
-            file_storage_root: "./storage/files".to_string(),
-            file_base_url: Some("http://localhost:9083".to_string()),
             file_storage_sources: vec![],
             file_default_storage_source_id: 0,
             http_file_server_port: 9083,
@@ -110,6 +106,8 @@ impl Default for ServerConfig {
             system_message: SystemMessageConfig::default(),
             security: SecurityProtectionConfig::default(),
             handler_max_inflight: 2000,
+            service_master_key: String::new(),
+            redis_url: String::new(),
         }
     }
 }
@@ -204,8 +202,14 @@ impl ServerConfig {
             // 将在日志初始化时使用
         }
 
+        // Service Master Key
+        if let Ok(key) = env::var("SERVICE_MASTER_KEY") {
+            self.service_master_key = key;
+        }
+
         // Redis 配置
         if let Ok(redis_url) = env::var("REDIS_URL") {
+            self.redis_url = redis_url.clone();
             let existing = self.cache.redis.as_ref();
             self.cache.redis = Some(RedisConfig {
                 url: redis_url,
@@ -218,12 +222,6 @@ impl ServerConfig {
         }
 
         // 文件配置
-        if let Ok(storage_root) = env::var("PRIVCHAT_FILE_STORAGE_ROOT") {
-            self.file_storage_root = storage_root;
-        }
-        if let Ok(base_url) = env::var("PRIVCHAT_FILE_BASE_URL") {
-            self.file_base_url = Some(base_url);
-        }
         if let Ok(file_api_url) = env::var("PRIVCHAT_FILE_API_BASE_URL") {
             self.file_api_base_url = Some(file_api_url);
         }
@@ -231,23 +229,9 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// 获取有效的文件存储源列表。必须至少配置一个：若配置了 storage_sources 则用其，否则用单一 storage_root/base_url 构造 id=0 的默认源（兼容旧配置）
+    /// 获取文件存储源列表（必须在 config.toml 中配置 [[file.storage_sources]]）
     pub fn effective_file_storage_sources(&self) -> Vec<FileStorageSourceConfig> {
-        if self.file_storage_sources.is_empty() {
-            vec![FileStorageSourceConfig {
-                id: 0,
-                storage_type: "local".to_string(),
-                storage_root: self.file_storage_root.clone(),
-                base_url: self.file_base_url.clone(),
-                endpoint: None,
-                bucket: None,
-                access_key_id: None,
-                secret_access_key: None,
-                path_prefix: None,
-            }]
-        } else {
-            self.file_storage_sources.clone()
-        }
+        self.file_storage_sources.clone()
     }
 
     /// 从命令行参数合并配置
@@ -346,7 +330,37 @@ impl ServerConfig {
         // 4. 从命令行参数合并（最高优先级）
         config.merge_from_cli(cli);
 
+        // 5. 校验必填项
+        config.validate()?;
+
         Ok(config)
+    }
+
+    /// 校验必填配置项，缺失则报错退出
+    fn validate(&self) -> Result<()> {
+        let mut missing = Vec::new();
+
+        if self.database_url.is_empty() {
+            missing.push("DATABASE_URL");
+        }
+        if self.jwt_secret.is_empty() {
+            missing.push("PRIVCHAT_JWT_SECRET");
+        }
+        if self.service_master_key.is_empty() {
+            missing.push("SERVICE_MASTER_KEY");
+        }
+        if self.redis_url.is_empty() {
+            missing.push("REDIS_URL");
+        }
+
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "缺少必填环境变量: {}\n请在 .env 文件或环境变量中配置后重试",
+                missing.join(", ")
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -525,8 +539,6 @@ fn default_storage_type() -> String {
 
 #[derive(Debug, Deserialize)]
 struct TomlFileConfig {
-    storage_root: Option<String>,
-    base_url: Option<String>,
     /// 存储源列表，必须至少配置一个 [[file.storage_sources]]
     storage_sources: Option<Vec<TomlFileStorageSource>>,
     default_storage_source_id: Option<u32>,
@@ -553,11 +565,50 @@ struct TomlFileStorageSource {
     path_prefix: Option<String>,
 }
 
+/// TOML [logging] 段，用于反序列化
 #[derive(Debug, Deserialize)]
 struct TomlLoggingConfig {
     level: Option<String>,
     format: Option<String>,
     file: Option<String>,
+}
+
+/// 早期日志配置（在完整 ServerConfig 加载之前，快速读取 [logging] 段）
+#[derive(Debug, Default)]
+pub struct EarlyLoggingConfig {
+    pub level: Option<String>,
+    pub format: Option<String>,
+    pub file: Option<String>,
+}
+
+/// 仅用于快速反序列化 config.toml 中的 [logging] 段
+#[derive(Debug, Deserialize)]
+struct TomlLoggingOnly {
+    logging: Option<TomlLoggingConfig>,
+}
+
+/// 从配置文件快速读取 [logging] 段（不加载完整配置）
+///
+/// 用于在 ServerConfig::load() 之前初始化日志系统，
+/// 使日志文件路径可以在 config.toml 中配置。
+pub fn load_early_logging_config(config_file: Option<&str>) -> EarlyLoggingConfig {
+    let path = config_file.unwrap_or("config.toml");
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return EarlyLoggingConfig::default(),
+    };
+    let parsed: TomlLoggingOnly = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(_) => return EarlyLoggingConfig::default(),
+    };
+    match parsed.logging {
+        Some(log) => EarlyLoggingConfig {
+            level: log.level,
+            format: log.format,
+            file: log.file,
+        },
+        None => EarlyLoggingConfig::default(),
+    }
 }
 
 impl From<TomlConfig> for ServerConfig {
@@ -658,12 +709,6 @@ impl From<TomlConfig> for ServerConfig {
             }
             if let Some(api_base_url) = file.server_api_base_url {
                 config.file_api_base_url = Some(api_base_url);
-            }
-            if let Some(storage_root) = file.storage_root {
-                config.file_storage_root = storage_root;
-            }
-            if let Some(base_url) = file.base_url {
-                config.file_base_url = Some(base_url);
             }
             if let Some(sources) = file.storage_sources {
                 config.file_storage_sources = sources

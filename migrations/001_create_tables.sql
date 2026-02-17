@@ -116,9 +116,9 @@ CREATE INDEX idx_privchat_devices_session_version ON privchat_devices (user_id, 
 CREATE INDEX idx_privchat_devices_kicked ON privchat_devices (kicked_at DESC) WHERE session_state = 1;
 
 -- 设备表触发器（自动更新 updated_at）
-CREATE TRIGGER update_privchat_devices_updated_at 
+CREATE TRIGGER update_privchat_devices_updated_at
     BEFORE UPDATE ON privchat_devices
-    FOR EACH ROW 
+    FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
 -- =====================================================
@@ -131,6 +131,7 @@ CREATE TABLE privchat_friendships (
     status SMALLINT DEFAULT 0,  -- 0: Pending, 1: Accepted, 2: Blocked
     source VARCHAR(64),  -- 来源：search, qrcode, share_card, etc.
     source_id VARCHAR(256),  -- 来源ID，与 source 配套，可追溯
+    request_message TEXT,  -- 好友申请消息（status=0 时存申请文案）
     created_at BIGINT NOT NULL DEFAULT now_millis(),
     updated_at BIGINT NOT NULL DEFAULT now_millis(),
     PRIMARY KEY (user_id, friend_id),
@@ -140,7 +141,7 @@ CREATE TABLE privchat_friendships (
 -- 好友关系表索引
 CREATE INDEX idx_privchat_friendships_user ON privchat_friendships (user_id, status);
 CREATE INDEX idx_privchat_friendships_friend ON privchat_friendships (friend_id, status);
-CREATE INDEX idx_privchat_friendships_accepted ON privchat_friendships (user_id, friend_id) 
+CREATE INDEX idx_privchat_friendships_accepted ON privchat_friendships (user_id, friend_id)
     WHERE status = 1;  -- 只索引已接受的好友关系
 
 -- =====================================================
@@ -226,7 +227,7 @@ CREATE TABLE privchat_channels (
 
 -- 频道表索引
 CREATE INDEX idx_privchat_channels_type ON privchat_channels (channel_type);
-CREATE INDEX idx_privchat_channels_direct ON privchat_channels (direct_user1_id, direct_user2_id) 
+CREATE INDEX idx_privchat_channels_direct ON privchat_channels (direct_user1_id, direct_user2_id)
     WHERE channel_type = 0;
 CREATE INDEX idx_privchat_channels_group ON privchat_channels (group_id) WHERE channel_type = 1;
 CREATE INDEX idx_privchat_channels_last_message ON privchat_channels (last_message_at DESC);
@@ -283,14 +284,14 @@ CREATE INDEX idx_privchat_messages_channel_time ON privchat_messages (channel_id
 CREATE INDEX idx_privchat_messages_channel_id ON privchat_messages (channel_id, message_id DESC);  -- 利用Snowflake ID的时间有序性
 CREATE INDEX idx_privchat_messages_sender ON privchat_messages (sender_id, created_at DESC);
 CREATE INDEX idx_privchat_messages_pts ON privchat_messages (sender_id, pts);  -- pts 索引（用于恢复）
-CREATE INDEX idx_privchat_messages_local_message_id ON privchat_messages (channel_id, local_message_id) 
+CREATE INDEX idx_privchat_messages_local_message_id ON privchat_messages (channel_id, local_message_id)
     WHERE local_message_id IS NOT NULL;  -- 用于去重
-CREATE INDEX idx_privchat_messages_reply ON privchat_messages (reply_to_message_id) 
+CREATE INDEX idx_privchat_messages_reply ON privchat_messages (reply_to_message_id)
     WHERE reply_to_message_id IS NOT NULL;
 CREATE INDEX idx_privchat_messages_metadata_gin ON privchat_messages USING GIN (metadata);  -- JSONB GIN 索引
-CREATE INDEX idx_privchat_messages_deleted ON privchat_messages (channel_id, created_at DESC) 
+CREATE INDEX idx_privchat_messages_deleted ON privchat_messages (channel_id, created_at DESC)
     WHERE deleted = false;  -- 只索引未删除的消息
-CREATE INDEX idx_privchat_messages_revoked ON privchat_messages (channel_id, revoked_at) 
+CREATE INDEX idx_privchat_messages_revoked ON privchat_messages (channel_id, revoked_at)
     WHERE revoked = true;  -- 索引已撤回的消息（使用 revoked 布尔字段）
 
 -- 创建初始分区（2026年1月）
@@ -333,6 +334,7 @@ CREATE TABLE privchat_user_channels (
     unread_count INTEGER DEFAULT 0,
     is_pinned BOOLEAN DEFAULT false,
     is_muted BOOLEAN DEFAULT false,
+    is_hidden BOOLEAN DEFAULT false,
     updated_at BIGINT NOT NULL DEFAULT now_millis(),
     PRIMARY KEY (user_id, channel_id)
 );
@@ -340,7 +342,7 @@ CREATE TABLE privchat_user_channels (
 -- 用户频道列表表索引
 CREATE INDEX idx_privchat_user_channels_user_updated ON privchat_user_channels (user_id, updated_at DESC);
 CREATE INDEX idx_privchat_user_channels_user_pinned ON privchat_user_channels (user_id, is_pinned DESC, updated_at DESC);
-CREATE INDEX idx_privchat_user_channels_unread ON privchat_user_channels (user_id, unread_count) 
+CREATE INDEX idx_privchat_user_channels_unread ON privchat_user_channels (user_id, unread_count)
     WHERE unread_count > 0;
 
 -- =====================================================
@@ -403,12 +405,10 @@ COMMENT ON TABLE privchat_user_last_seen IS '用户最后上线时间表：存�
 -- =====================================================
 
 CREATE TABLE privchat_channel_pts (
-    channel_id BIGINT NOT NULL,
-    channel_type SMALLINT NOT NULL,  -- 1=私聊，2=群聊
+    channel_id BIGINT NOT NULL PRIMARY KEY,
     current_pts BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL DEFAULT now_millis(),
-    updated_at BIGINT NOT NULL DEFAULT now_millis(),
-    PRIMARY KEY (channel_id, channel_type)
+    updated_at BIGINT NOT NULL DEFAULT now_millis()
 );
 
 -- 频道 pts 表索引
@@ -435,15 +435,15 @@ CREATE TABLE privchat_commit_log (
     sender_id BIGINT NOT NULL REFERENCES privchat_users(user_id),
     sender_username VARCHAR(100),  -- 发送者用户名（冗余，加速查询）
     created_at BIGINT NOT NULL DEFAULT now_millis(),
-    
+
     -- 唯一索引（防止 pts 重复）
-    UNIQUE (channel_id, channel_type, pts)
+    UNIQUE (channel_id, pts)
 );
 
 -- Commit Log 表索引
-CREATE INDEX idx_privchat_commit_log_channel_pts ON privchat_commit_log (channel_id, channel_type, pts);
+CREATE INDEX idx_privchat_commit_log_channel_pts ON privchat_commit_log (channel_id, pts);
 CREATE INDEX idx_privchat_commit_log_timestamp ON privchat_commit_log (server_timestamp);
-CREATE INDEX idx_privchat_commit_log_local_message_id ON privchat_commit_log (local_message_id) 
+CREATE INDEX idx_privchat_commit_log_local_message_id ON privchat_commit_log (local_message_id)
     WHERE local_message_id IS NOT NULL;
 
 -- 表注释
@@ -520,29 +520,29 @@ CREATE TRIGGER update_privchat_channel_pts_updated_at BEFORE UPDATE ON privchat_
 -- - 用于关联（匹配客户端和服务器消息）
 
 -- 查询示例：
--- 
+--
 -- 1. 获取频道当前 pts
--- SELECT current_pts FROM privchat_channel_pts 
+-- SELECT current_pts FROM privchat_channel_pts
 -- WHERE channel_id = ? AND channel_type = ?;
--- 
+--
 -- 2. 获取差异（pts > last_pts）
--- SELECT * FROM privchat_commit_log 
+-- SELECT * FROM privchat_commit_log
 -- WHERE channel_id = ? AND channel_type = ? AND pts > ?
 -- ORDER BY pts ASC
 -- LIMIT 100;
--- 
+--
 -- 3. 检查 local_message_id 是否重复
--- SELECT server_msg_id, pts FROM privchat_client_msg_registry 
+-- SELECT server_msg_id, pts FROM privchat_client_msg_registry
 -- WHERE local_message_id = ?;
 
 -- =====================================================
 -- 用户 ID 序列设置
 -- =====================================================
--- 
+--
 -- 用户 ID 区间划分：
 -- - 1 ~ 99: 系统功能用户（系统消息、文件助手等，不在数据库中）
 -- - 100,000,000+: 普通用户 + 机器人（用 user_type 字段区分）
--- 
+--
 -- 设置序列起始值为 100000000，保留 1~99 给系统功能用户
 
 DO $$
@@ -551,7 +551,7 @@ DECLARE
 BEGIN
     -- 检查用户表是否为空
     SELECT COUNT(*) INTO user_count FROM privchat_users;
-    
+
     IF user_count = 0 THEN
         -- 表为空，设置序列起始值
         PERFORM setval('privchat_users_user_id_seq', 100000000, false);
@@ -578,16 +578,16 @@ COMMENT ON SEQUENCE privchat_users_user_id_seq IS '用户 ID 序列：从 100000
 
 CREATE TABLE privchat_login_logs (
     log_id BIGSERIAL PRIMARY KEY,
-    
+
     -- 关联信息
     user_id BIGINT NOT NULL REFERENCES privchat_users(user_id) ON DELETE CASCADE,
     device_id UUID NOT NULL,
-    
+
     -- Token 信息
     token_jti VARCHAR(64) NOT NULL,  -- JWT ID（用于关联和撤销检测）
     token_created_at BIGINT NOT NULL,  -- token 创建时间（毫秒时间戳，从 JWT iat 提取）
     token_first_used_at BIGINT NOT NULL DEFAULT now_millis(),  -- token 首次认证时间（真正的登录时间）
-    
+
     -- 设备信息（冗余存储，便于追溯）
     device_type VARCHAR(32) NOT NULL,  -- ios/android/web/desktop/macos/windows
     device_name VARCHAR(128),  -- 设备名称（如 "iPhone 14 Pro"）
@@ -595,15 +595,15 @@ CREATE TABLE privchat_login_logs (
     os_version VARCHAR(64),  -- 操作系统版本
     app_id VARCHAR(64) NOT NULL,  -- 应用ID
     app_version VARCHAR(32),  -- 应用版本
-    
+
     -- 网络信息
     ip_address VARCHAR(45) NOT NULL,  -- IPv4/IPv6
     user_agent TEXT,  -- 浏览器/客户端 User-Agent
-    
+
     -- 登录方式
     login_method VARCHAR(32) NOT NULL,  -- register/login/token_refresh/oauth/sso
     auth_source VARCHAR(64),  -- 认证源（如 "privchat-internal", "oauth-google", "sso-enterprise"）
-    
+
     -- 地理位置信息（可选，通过 IP 解析）
     country VARCHAR(64),
     country_code VARCHAR(3),  -- ISO 3166-1 alpha-2/3
@@ -613,24 +613,24 @@ CREATE TABLE privchat_login_logs (
     longitude DECIMAL(11, 8),
     timezone VARCHAR(64),  -- 时区
     isp VARCHAR(128),  -- ISP/运营商
-    
+
     -- 安全检测
     status SMALLINT NOT NULL DEFAULT 0,  -- 0: Success, 1: Suspicious, 2: Blocked
     risk_score SMALLINT NOT NULL DEFAULT 0,  -- 风险评分 0-100
     risk_factors JSONB DEFAULT '[]',  -- 风险因素数组（如 ["new_location", "unusual_time"]）
     is_new_device BOOLEAN NOT NULL DEFAULT false,  -- 是否为新设备首次登录
     is_new_location BOOLEAN NOT NULL DEFAULT false,  -- 是否为新地理位置
-    
+
     -- 通知状态
     notification_sent BOOLEAN NOT NULL DEFAULT false,  -- 是否已发送登录通知
     notification_sent_at BIGINT,  -- 通知发送时间
     notification_method VARCHAR(32),  -- 通知方式（system_message/email/push）
-    
+
     -- 额外元数据
     metadata JSONB DEFAULT '{}',  -- 额外信息（如检测到的异常、备注等）
-    
+
     created_at BIGINT NOT NULL DEFAULT now_millis(),
-    
+
     -- 组合外键：引用设备表（支持同一设备登录多个账号）
     FOREIGN KEY (user_id, device_id) REFERENCES privchat_devices(user_id, device_id) ON DELETE CASCADE
 );
@@ -690,9 +690,9 @@ CREATE TABLE IF NOT EXISTS privchat_user_devices (
 
 -- 用户设备推送表索引
 CREATE INDEX IF NOT EXISTS idx_privchat_user_devices_user_id ON privchat_user_devices(user_id);
-CREATE INDEX IF NOT EXISTS idx_privchat_user_devices_connected 
+CREATE INDEX IF NOT EXISTS idx_privchat_user_devices_connected
 ON privchat_user_devices(connected) WHERE connected = true;  -- ✨ Phase 3.5
-CREATE INDEX IF NOT EXISTS idx_privchat_user_devices_apns_armed 
+CREATE INDEX IF NOT EXISTS idx_privchat_user_devices_apns_armed
 ON privchat_user_devices(apns_armed) WHERE apns_armed = true;  -- ✨ Phase 3.5
 
 -- 用户设备推送表注释

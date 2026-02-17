@@ -105,6 +105,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// 执行数据库迁移（建表/更新表结构）
+    Migrate,
     /// 生成默认配置文件
     GenerateConfig {
         /// 输出文件路径

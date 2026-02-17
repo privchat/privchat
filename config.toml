@@ -69,6 +69,7 @@ base_url = "http://localhost:8080/files"
 [logging]
 level = "info"
 format = "compact"
+file = "./logs/server.log"
 
 # ==========================================
 # 系统消息配置

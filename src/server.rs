@@ -221,11 +221,8 @@ impl ChatServer {
         info!("✅ JWT 服务初始化完成");
 
         // 2. 创建 Service Key 管理器（使用主密钥模式）
-        let service_master_key = std::env::var("SERVICE_MASTER_KEY").unwrap_or_else(|_| {
-            "default-service-master-key-please-change-in-production".to_string()
-        });
         let service_key_manager = Arc::new(crate::auth::ServiceKeyManager::new_master_key(
-            service_master_key,
+            config.service_master_key.clone(),
         ));
         info!("✅ Service Key 管理器初始化完成");
 
@@ -322,9 +319,8 @@ impl ChatServer {
         info!("✅ UserMessageIndex 创建完成");
 
         // 2. 创建 OfflineQueueService（使用 Redis）
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let offline_queue_service = Arc::new(crate::service::OfflineQueueService::new(&redis_url)?);
+        let offline_queue_service =
+            Arc::new(crate::service::OfflineQueueService::new(&config.redis_url)?);
         info!("✅ OfflineQueueService 创建完成");
 
         // 3. 创建 OfflineMessageWorker
@@ -1436,11 +1432,8 @@ impl ChatServer {
         }
 
         // 创建 Service Key 管理器（用于管理 API 认证）
-        let service_master_key = std::env::var("SERVICE_MASTER_KEY").unwrap_or_else(|_| {
-            "default-service-master-key-please-change-in-production".to_string()
-        });
         let service_key_manager = Arc::new(crate::auth::ServiceKeyManager::new_master_key(
-            service_master_key,
+            self.config.service_master_key.clone(),
         ));
 
         // 获取 ChannelService 和 ChannelService（需要从 server 中获取）
