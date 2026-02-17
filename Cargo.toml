@@ -87,17 +87,17 @@ axum-extra = { version = "0.12.5", features = ["multipart"] }
 multer = "3.1.0"  # multipart/form-data 解析
 
 # HTTP 客户端（Push Provider）
-reqwest = { version = "0.12", features = ["json"] }  # ✨ Phase 2: FCM Provider
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # 数据库
-sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
 
 # 对象存储抽象层（OpenDAL：本地 FS + S3/OSS/COS/MinIO/Garage 等统一 API）
 opendal = { version = "0.55", default-features = false, features = ["services-fs", "services-s3"] }
 
 # Prometheus 监控指标
 metrics = "0.22"
-metrics-exporter-prometheus = "0.13"
+metrics-exporter-prometheus = { version = "0.13", default-features = false, features = ["http-listener"] }
 
 [features]
 default = []
