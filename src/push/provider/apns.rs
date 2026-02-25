@@ -17,6 +17,7 @@ pub struct ApnsProvider {
     team_id: String,
     key_id: String,
     private_key: EncodingKey,
+    use_sandbox: bool,
 }
 
 impl ApnsProvider {
@@ -27,11 +28,13 @@ impl ApnsProvider {
     /// - team_id: Apple Developer Team ID
     /// - key_id: APNs Key ID
     /// - private_key_path: 私钥文件路径（.p8 文件）
+    /// - use_sandbox: 是否使用 APNs Sandbox（开发环境）
     pub fn new(
         bundle_id: String,
         team_id: String,
         key_id: String,
         private_key_path: &str,
+        use_sandbox: bool,
     ) -> Result<Self> {
         // 读取私钥文件
         let private_key_content = std::fs::read_to_string(private_key_path).map_err(|e| {
@@ -49,6 +52,7 @@ impl ApnsProvider {
             team_id,
             key_id,
             private_key,
+            use_sandbox,
         })
     }
 
@@ -105,7 +109,12 @@ impl PushProvider for ApnsProvider {
         // 2. 构建 APNs URL
         // 生产环境: https://api.push.apple.com
         // 开发环境: https://api.sandbox.push.apple.com
-        let url = format!("https://api.push.apple.com/3/device/{}", task.push_token);
+        let endpoint = if self.use_sandbox {
+            "https://api.sandbox.push.apple.com"
+        } else {
+            "https://api.push.apple.com"
+        };
+        let url = format!("{}/3/device/{}", endpoint, task.push_token);
 
         // 3. 构建 payload
         let payload = self.build_apns_payload(task);

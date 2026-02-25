@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::error::{Result, ServerError};
-use crate::http::HttpServerState;
+use crate::http::FileServerState;
 
 /// 从请求头提取客户端 IP（兼容反向代理：X-Forwarded-For 取第一个，否则 X-Real-IP）
 fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -35,13 +35,13 @@ fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
 }
 
 /// 创建上传路由
-pub fn create_route() -> Router<HttpServerState> {
+pub fn create_route() -> Router<FileServerState> {
     Router::new().route("/api/app/files/upload", post(upload_file))
 }
 
 /// 文件上传处理器
 async fn upload_file(
-    State(state): State<HttpServerState>,
+    State(state): State<FileServerState>,
     headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<Value>> {

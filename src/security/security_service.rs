@@ -630,6 +630,81 @@ impl SecurityService {
         }
     }
 
+    // =====================================================
+    // 管理 API 方法
+    // =====================================================
+
+    /// 获取所有处于 ShadowBanned 状态的用户/设备列表（管理 API）
+    pub async fn list_shadow_banned(&self) -> Vec<(u64, String, ClientState, Option<u32>)> {
+        let client_states = self.client_states.read().await;
+        client_states
+            .iter()
+            .filter(|(_, mgr)| mgr.current_state() == ClientState::ShadowBanned)
+            .map(|((user_id, device_id), mgr)| {
+                (
+                    *user_id,
+                    device_id.clone(),
+                    mgr.current_state(),
+                    Some(mgr.trust_score().score),
+                )
+            })
+            .collect()
+    }
+
+    /// 获取用户所有设备的安全状态（管理 API）
+    pub async fn get_user_device_states(
+        &self,
+        user_id: u64,
+        device_ids: &[String],
+    ) -> Vec<(String, Option<ClientState>, Option<u32>)> {
+        let client_states = self.client_states.read().await;
+        device_ids
+            .iter()
+            .map(|device_id| {
+                let key = (user_id, device_id.clone());
+                match client_states.get(&key) {
+                    Some(mgr) => (
+                        device_id.clone(),
+                        Some(mgr.current_state()),
+                        Some(mgr.trust_score().score),
+                    ),
+                    None => (device_id.clone(), None, None),
+                }
+            })
+            .collect()
+    }
+
+    /// 解除用户所有设备的封禁（管理 API）
+    ///
+    /// 返回受影响的设备数
+    pub async fn unban_all_user_devices(
+        &self,
+        user_id: u64,
+        device_ids: &[String],
+    ) -> usize {
+        let mut client_states = self.client_states.write().await;
+        let mut affected = 0;
+        for device_id in device_ids {
+            if let Some(state_manager) =
+                client_states.get_mut(&(user_id, device_id.clone()))
+            {
+                state_manager.transition_to(
+                    ClientState::Normal,
+                    ViolationType::RateLimit, // 占位符
+                    None,
+                );
+                affected += 1;
+            }
+        }
+        if affected > 0 {
+            info!(
+                "管理员批量解封用户 {} ({} 个设备)",
+                user_id, affected
+            );
+        }
+        affected
+    }
+
     /// 定期清理过期数据（后台任务）
     pub async fn cleanup_expired_data(&self) {
         let client_states = self.client_states.write().await;

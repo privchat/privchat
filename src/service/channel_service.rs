@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx;
+use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -380,6 +380,228 @@ impl ChannelService {
         Ok(())
     }
 
+    /// 获取会话列表（管理 API，包括私聊和群聊）
+    pub async fn list_channels_admin(
+        &self,
+        page: u32,
+        page_size: u32,
+        channel_type: Option<i16>,
+        user_id: Option<u64>,
+    ) -> Result<(Vec<serde_json::Value>, u32)> {
+        let offset = (page - 1) * page_size;
+
+        let mut where_clauses = vec![];
+        if let Some(ct) = channel_type {
+            where_clauses.push(format!("c.channel_type = {}", ct));
+        }
+        if user_id.is_some() {
+            where_clauses.push(format!(
+                "c.channel_id IN (SELECT channel_id FROM privchat_channel_members WHERE user_id = {})",
+                user_id.unwrap()
+            ));
+        }
+
+        let where_str = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let sql = format!(
+            r#"
+            SELECT
+                c.channel_id,
+                c.channel_type,
+                c.group_id,
+                COALESCE(g.name, '') as name,
+                g.description,
+                g.member_count as group_member_count,
+                c.last_message_id,
+                c.last_message_at,
+                c.message_count,
+                c.created_at,
+                c.updated_at
+            FROM privchat_channels c
+            LEFT JOIN privchat_groups g ON c.group_id = g.group_id
+            {}
+            ORDER BY c.updated_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+            where_str
+        );
+
+        let channels = sqlx::query(&sql)
+            .bind(page_size as i64)
+            .bind(offset as i64)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| ServerError::Database(format!("查询会话列表失败: {}", e)))?;
+
+        let channel_list: Vec<serde_json::Value> = channels
+            .into_iter()
+            .map(|c| {
+                let channel_id: i64 = c.get("channel_id");
+                let channel_type: i16 = c.get("channel_type");
+                let group_id: Option<i64> = c.get("group_id");
+                let group_member_count: Option<i32> = c.get("group_member_count");
+                let last_message_id: Option<i64> = c.get("last_message_id");
+                let last_message_at: Option<i64> = c.get("last_message_at");
+                let message_count: Option<i64> = c.get("message_count");
+                let created_at: i64 = c.get("created_at");
+                let updated_at: Option<i64> = c.get("updated_at");
+
+                serde_json::json!({
+                    "channel_id": channel_id,
+                    "channel_type": channel_type,
+                    "group_id": group_id,
+                    "name": c.get::<String, _>("name"),
+                    "description": c.get::<Option<String>, _>("description"),
+                    "member_count": group_member_count.unwrap_or(0),
+                    "last_message": last_message_id.map(|mid| {
+                        serde_json::json!({
+                            "message_id": mid,
+                            "timestamp": last_message_at
+                        })
+                    }),
+                    "message_count": message_count.unwrap_or(0),
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                })
+            })
+            .collect();
+
+        // 统计总数
+        let count_sql = if where_str.is_empty() {
+            "SELECT COUNT(*) as count FROM privchat_channels c".to_string()
+        } else {
+            format!(
+                "SELECT COUNT(*) as count FROM privchat_channels c {}",
+                where_str
+            )
+        };
+
+        let count_row = sqlx::query(&count_sql)
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| ServerError::Database(format!("统计会话数失败: {}", e)))?;
+
+        let total: i64 = count_row.get("count");
+
+        Ok((channel_list, total as u32))
+    }
+
+    /// 获取会话详情（管理 API）
+    pub async fn get_channel_admin(
+        &self,
+        channel_id: u64,
+    ) -> Result<Option<serde_json::Value>> {
+        let channel = sqlx::query!(
+            r#"
+            SELECT
+                c.channel_id,
+                c.channel_type,
+                c.group_id,
+                c.last_message_id,
+                c.last_message_at,
+                c.message_count,
+                c.created_at,
+                c.updated_at,
+                COALESCE(g.name, '') as name,
+                g.description,
+                g.member_count as group_member_count
+            FROM privchat_channels c
+            LEFT JOIN privchat_groups g ON c.group_id = g.group_id
+            WHERE c.channel_id = $1
+            "#,
+            channel_id as i64,
+        )
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询会话详情失败: {}", e)))?;
+
+        Ok(channel.map(|c| {
+            let channel_id: i64 = c.channel_id;
+            let channel_type: i16 = c.channel_type;
+            let group_id: Option<i64> = c.group_id;
+            let last_message_id: Option<i64> = c.last_message_id;
+            let last_message_at: Option<i64> = c.last_message_at;
+            let message_count: Option<i64> = c.message_count;
+            let created_at: i64 = c.created_at;
+            let updated_at: i64 = c.updated_at;
+            let group_member_count: Option<i32> = c.group_member_count;
+
+            serde_json::json!({
+                "channel_id": channel_id,
+                "channel_type": channel_type,
+                "group_id": group_id,
+                "name": c.name,
+                "description": c.description,
+                "member_count": group_member_count.unwrap_or(0),
+                "last_message_id": last_message_id,
+                "last_message_at": last_message_at,
+                "message_count": message_count.unwrap_or(0),
+                "created_at": created_at,
+                "updated_at": updated_at,
+            })
+        }))
+    }
+
+    /// 获取会话参与者列表（管理 API）
+    pub async fn list_participants_admin(
+        &self,
+        channel_id: u64,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<serde_json::Value>, u32)> {
+        let offset = (page - 1) * page_size;
+
+        let participants = sqlx::query!(
+            r#"
+            SELECT
+                user_id,
+                role,
+                nickname,
+                joined_at
+            FROM privchat_group_members gm
+            WHERE gm.group_id = $1
+            ORDER BY joined_at ASC
+            LIMIT $2 OFFSET $3
+            "#,
+            channel_id as i64,
+            page_size as i64,
+            offset as i64,
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询参与者列表失败: {}", e)))?;
+
+        let participant_list: Vec<serde_json::Value> = participants
+            .into_iter()
+            .map(|p| {
+                let user_id: i64 = p.user_id;
+                serde_json::json!({
+                    "user_id": user_id,
+                    "role": p.role,
+                    "nickname": p.nickname,
+                    "joined_at": p.joined_at,
+                })
+            })
+            .collect();
+
+        // 统计总数
+        let count_row = sqlx::query(
+            "SELECT COUNT(*) as count FROM privchat_group_members WHERE group_id = $1"
+        )
+        .bind(channel_id as i64)
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("统计参与者数失败: {}", e)))?;
+
+        let total: i64 = count_row.get("count");
+
+        Ok((participant_list, total as u32))
+    }
+
     /// 获取好友关系列表（管理 API，通过私聊会话推断）
     pub async fn list_friendships_admin(
         &self,
@@ -467,6 +689,53 @@ impl ChannelService {
         }
 
         Ok(friend_ids)
+    }
+
+    /// 获取用户加入的群组列表（管理 API）
+    pub async fn get_user_groups_admin(&self, user_id: u64) -> Result<Vec<serde_json::Value>> {
+        let groups = sqlx::query!(
+            r#"
+            SELECT
+                c.channel_id,
+                c.group_id,
+                g.name as group_name,
+                g.description,
+                g.owner_id,
+                g.member_count,
+                gm.role as member_role,
+                gm.nickname as member_nickname,
+                gm.joined_at
+            FROM privchat_channels c
+            INNER JOIN privchat_groups g ON c.group_id = g.group_id
+            INNER JOIN privchat_group_members gm ON g.group_id = gm.group_id
+            WHERE gm.user_id = $1
+            ORDER BY gm.joined_at DESC
+            "#,
+            user_id as i64,
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询用户群组列表失败: {}", e)))?;
+
+        let group_list: Vec<serde_json::Value> = groups
+            .into_iter()
+            .map(|g| {
+                let owner_id: i64 = g.owner_id;
+                serde_json::json!({
+                    "channel_id": g.channel_id as u64,
+                    "group_id": g.group_id.unwrap_or(0) as u64,
+                    "name": g.group_name,
+                    "description": g.description,
+                    "owner_id": owner_id as u64,
+                    "member_count": g.member_count.unwrap_or(0) as u32,
+                    "role": g.member_role,
+                    "nickname": g.member_nickname,
+                    "joined_at": g.joined_at,
+                })
+            })
+            .collect();
+
+        Ok(group_list)
     }
 
     /// 获取群组统计（管理 API）
@@ -578,6 +847,147 @@ impl ChannelService {
 
         info!("✅ 会话创建成功: channel_id={}", channel_id);
         Ok(channel_id)
+    }
+
+    /// 获取群组成员列表（管理 API）
+    pub async fn list_members_admin(
+        &self,
+        group_id: u64,
+    ) -> Result<Vec<(u64, Option<i16>, i64, Option<String>)>> {
+        let members = sqlx::query!(
+            r#"
+            SELECT
+                user_id,
+                role,
+                joined_at,
+                nickname
+            FROM privchat_group_members
+            WHERE group_id = $1
+            ORDER BY joined_at ASC
+            "#,
+            group_id as i64,
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询群组成员失败: {}", e)))?;
+
+        Ok(members
+            .into_iter()
+            .map(|m| (m.user_id as u64, m.role, m.joined_at, m.nickname))
+            .collect())
+    }
+
+    /// 移除群组成员（管理 API）
+    pub async fn remove_member_admin(&self, group_id: u64, user_id: u64) -> Result<()> {
+        let result = sqlx::query!(
+            r#"
+            DELETE FROM privchat_group_members
+            WHERE group_id = $1 AND user_id = $2
+            RETURNING user_id
+            "#,
+            group_id as i64,
+            user_id as i64,
+        )
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("移除群组成员失败: {}", e)))?;
+
+        if result.is_none() {
+            return Err(ServerError::NotFound(format!(
+                "群组 {} 中不存在成员 {}",
+                group_id, user_id
+            )));
+        }
+
+        // 更新群组成员数
+        sqlx::query!(
+            r#"
+            UPDATE privchat_groups
+            SET member_count = GREATEST(COALESCE(member_count, 1) - 1, 0),
+                updated_at = $1
+            WHERE group_id = $2
+            "#,
+            chrono::Utc::now().timestamp_millis(),
+            group_id as i64,
+        )
+        .execute(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("更新群组成员数失败: {}", e)))?;
+
+        info!(
+            "✅ 群组成员已移除: group_id={}, user_id={}",
+            group_id, user_id
+        );
+
+        Ok(())
+    }
+
+    /// 添加群成员（管理 API）
+    ///
+    /// 1. 数据库层面插入成员记录
+    /// 2. 更新群组成员数
+    /// 3. 更新内存状态
+    pub async fn add_member_admin(&self, group_id: u64, user_id: u64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // 1. 检查是否已是成员
+        let existing = sqlx::query!(
+            r#"
+            SELECT user_id FROM privchat_group_members
+            WHERE group_id = $1 AND user_id = $2
+            "#,
+            group_id as i64,
+            user_id as i64,
+        )
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询群组成员失败: {}", e)))?;
+
+        if existing.is_some() {
+            return Err(ServerError::Validation(format!(
+                "用户 {} 已是群组 {} 的成员",
+                user_id, group_id
+            )));
+        }
+
+        // 2. 插入成员记录
+        sqlx::query!(
+            r#"
+            INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, nickname)
+            VALUES ($1, $2, 0, $3, NULL)
+            "#,
+            group_id as i64,
+            user_id as i64,
+            now,
+        )
+        .execute(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("添加群组成员失败: {}", e)))?;
+
+        // 3. 更新群组成员数
+        sqlx::query!(
+            r#"
+            UPDATE privchat_groups
+            SET member_count = COALESCE(member_count, 0) + 1,
+                updated_at = $1
+            WHERE group_id = $2
+            "#,
+            now,
+            group_id as i64,
+        )
+        .execute(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("更新群组成员数失败: {}", e)))?;
+
+        // 4. 更新内存状态（如果 channel 已加载）
+        let _ = self.join_channel(group_id, user_id, None).await;
+
+        info!(
+            "✅ 群组成员已添加: group_id={}, user_id={}",
+            group_id, user_id
+        );
+
+        Ok(())
     }
 
     /// 生成私聊会话的索引键（已排序，确保一致性）

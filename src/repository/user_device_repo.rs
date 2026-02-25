@@ -152,46 +152,89 @@ impl UserDeviceRepository {
         device_id: &str,
         apns_armed: bool,
         push_token: Option<&str>,
+        vendor: Option<&str>,
     ) -> Result<()> {
-        if let Some(token) = push_token {
-            // 同时更新 apns_armed 和 push_token
-            sqlx::query(
-                r#"
-                UPDATE privchat_user_devices
-                SET 
-                    apns_armed = $1,
-                    push_token = $2,
-                    updated_at = NOW()
-                WHERE user_id = $3 AND device_id = $4
-                "#,
-            )
-            .bind(apns_armed)
-            .bind(token)
-            .bind(user_id as i64)
-            .bind(device_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| ServerError::Database(format!("更新设备推送状态失败: {}", e)))?;
-        } else {
-            // 只更新 apns_armed
-            sqlx::query(
-                r#"
-                UPDATE privchat_user_devices
-                SET 
-                    apns_armed = $1,
-                    updated_at = NOW()
-                WHERE user_id = $2 AND device_id = $3
-                "#,
-            )
-            .bind(apns_armed)
-            .bind(user_id as i64)
-            .bind(device_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| ServerError::Database(format!("更新设备推送状态失败: {}", e)))?;
-        }
+        let platform = self
+            .query_platform(user_id, device_id)
+            .await?
+            .unwrap_or_else(|| "unknown".to_string());
+        let inferred_vendor = Self::resolve_vendor(vendor, &platform)?;
+        let token = push_token.map(|it| it.trim()).filter(|it| !it.is_empty());
+
+        // 使用 UPSERT，避免设备首次上报时行不存在导致更新无效。
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_user_devices (user_id, device_id, platform, vendor, push_token, apns_armed, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            ON CONFLICT (user_id, device_id)
+            DO UPDATE SET
+                platform = EXCLUDED.platform,
+                vendor = EXCLUDED.vendor,
+                push_token = COALESCE(EXCLUDED.push_token, privchat_user_devices.push_token),
+                apns_armed = EXCLUDED.apns_armed,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(device_id)
+        .bind(&platform)
+        .bind(inferred_vendor.as_str())
+        .bind(token)
+        .bind(apns_armed)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("更新设备推送状态失败: {}", e)))?;
 
         Ok(())
+    }
+
+    async fn query_platform(&self, user_id: u64, device_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT platform
+            FROM privchat_user_devices
+            WHERE user_id = $1 AND device_id = $2
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询设备平台失败: {}", e)))?;
+
+        if row.is_some() {
+            return Ok(row);
+        }
+
+        let device_type = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT device_type
+            FROM privchat_devices
+            WHERE user_id = $1 AND device_id::text = $2
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询认证设备平台失败: {}", e)))?;
+
+        Ok(device_type)
+    }
+
+    fn resolve_vendor(vendor: Option<&str>, platform: &str) -> Result<PushVendor> {
+        if let Some(raw_vendor) = vendor.map(str::trim).filter(|it| !it.is_empty()) {
+            return PushVendor::from_str(raw_vendor).ok_or_else(|| {
+                ServerError::BadRequest(format!("不支持的推送 vendor: {}", raw_vendor))
+            });
+        }
+
+        let resolved = match platform.to_ascii_lowercase().as_str() {
+            "ios" | "macos" => PushVendor::Apns,
+            "android" => PushVendor::Fcm,
+            _ => PushVendor::Fcm, // 默认按 Android/GMS 处理，后续客户端可显式上报 vendor 覆盖
+        };
+        Ok(resolved)
     }
 
     /// ✨ Phase 3.5: 检查用户是否所有设备都需要推送

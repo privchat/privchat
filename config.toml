@@ -42,6 +42,10 @@ idle_timeout = 300
 timeout_seconds = 300
 cleanup_interval_seconds = 60
 
+[admin]
+port = 9090
+# master_key = "your-secret-key"  # 也可通过环境变量 SERVICE_MASTER_KEY 设置
+
 [file]
 default_storage_source_id = 0
 server_port = 9083
@@ -65,6 +69,70 @@ base_url = "http://localhost:8080/files"
 # storage_type = "local"
 # storage_root = "/data/privchat/files-us"
 # base_url = "https://files-us.example.com/files"
+
+[push]
+enabled = false
+
+[push.apns]
+enabled = false
+bundle_id = "com.netonstream.privchat"
+team_id = ""
+key_id = ""
+private_key_path = ""
+use_sandbox = true
+
+[push.fcm]
+enabled = false
+project_id = ""
+access_token = ""
+
+[push.hms]
+enabled = false
+app_id = ""
+access_token = ""
+endpoint = "https://push-api.cloud.huawei.com"
+
+[push.honor]
+enabled = false
+app_id = ""
+access_token = ""
+endpoint = "https://push-api.hihonor.com"
+
+[push.xiaomi]
+enabled = false
+app_id = ""
+access_token = ""
+endpoint = "https://api.xmpush.xiaomi.com"
+
+[push.oppo]
+enabled = false
+app_id = ""
+access_token = ""
+endpoint = "https://api.push.oppomobile.com"
+
+[push.vivo]
+enabled = false
+app_id = ""
+access_token = ""
+endpoint = "https://api-push.vivo.com.cn"
+
+[push.lenovo]
+enabled = false
+app_id = ""
+access_token = ""
+endpoint = "https://push-api.lenovo.com"
+
+[push.zte]
+enabled = false
+app_id = ""
+access_token = ""
+endpoint = "https://push-api.ztedevice.com"
+
+[push.meizu]
+enabled = false
+app_id = ""
+access_token = ""
+endpoint = "https://server-api-push.meizu.com"
 
 [logging]
 level = "info"

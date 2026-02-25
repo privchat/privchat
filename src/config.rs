@@ -49,6 +49,8 @@ pub struct ServerConfig {
     pub file_default_storage_source_id: u32,
     /// HTTP 文件服务器端口（用于启动服务）
     pub http_file_server_port: u16,
+    /// 管理 API 服务器端口（仅内网访问）
+    pub admin_api_port: u16,
     /// 文件服务 API 基础 URL（用于客户端访问，不包含端口号）
     ///
     /// 文件服务的 HTTP 服务器是独立的，客户端通过此 URL 访问文件相关接口。
@@ -72,6 +74,8 @@ pub struct ServerConfig {
     pub service_master_key: String,
     /// Redis 连接地址
     pub redis_url: String,
+    /// 推送配置
+    pub push: PushConfig,
 }
 
 impl Default for ServerConfig {
@@ -101,6 +105,7 @@ impl Default for ServerConfig {
             file_storage_sources: vec![],
             file_default_storage_source_id: 0,
             http_file_server_port: 9083,
+            admin_api_port: 9090,
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
             use_internal_auth: true, // 默认启用内置账号系统（方便独立部署和测试）
             system_message: SystemMessageConfig::default(),
@@ -108,6 +113,7 @@ impl Default for ServerConfig {
             handler_max_inflight: 2000,
             service_master_key: String::new(),
             redis_url: String::new(),
+            push: PushConfig::default(),
         }
     }
 }
@@ -176,6 +182,14 @@ impl ServerConfig {
 
     /// 从环境变量加载配置（PRIVCHAT_ 前缀）
     pub fn merge_from_env(&mut self) -> Result<()> {
+        fn parse_env_bool(value: &str) -> Option<bool> {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        }
+
         // 服务器配置
         if let Ok(host) = env::var("PRIVCHAT_HOST") {
             self.host = host;
@@ -221,9 +235,186 @@ impl ServerConfig {
             });
         }
 
+        // 管理 API 端口
+        if let Ok(admin_port) = env::var("PRIVCHAT_ADMIN_API_PORT") {
+            self.admin_api_port = admin_port.parse().unwrap_or(self.admin_api_port);
+        }
+
         // 文件配置
         if let Ok(file_api_url) = env::var("PRIVCHAT_FILE_API_BASE_URL") {
             self.file_api_base_url = Some(file_api_url);
+        }
+
+        // Push 总开关
+        if let Ok(v) = env::var("PUSH_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.enabled = parsed;
+            }
+        }
+
+        // APNs
+        if let Ok(v) = env::var("PUSH_APNS_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.apns.enabled = parsed;
+            }
+        }
+        if let Ok(bundle_id) = env::var("PUSH_APNS_BUNDLE_ID") {
+            self.push.apns.bundle_id = Some(bundle_id);
+        }
+        if let Ok(team_id) = env::var("PUSH_APNS_TEAM_ID") {
+            self.push.apns.team_id = Some(team_id);
+        }
+        if let Ok(key_id) = env::var("PUSH_APNS_KEY_ID") {
+            self.push.apns.key_id = Some(key_id);
+        }
+        if let Ok(private_key_path) = env::var("PUSH_APNS_PRIVATE_KEY_PATH") {
+            self.push.apns.private_key_path = Some(private_key_path);
+        }
+        if let Ok(v) = env::var("PUSH_APNS_USE_SANDBOX") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.apns.use_sandbox = parsed;
+            }
+        }
+
+        // FCM
+        if let Ok(v) = env::var("PUSH_FCM_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.fcm.enabled = parsed;
+            }
+        }
+        if let Ok(project_id) = env::var("PUSH_FCM_PROJECT_ID") {
+            self.push.fcm.project_id = Some(project_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_FCM_ACCESS_TOKEN") {
+            self.push.fcm.access_token = Some(access_token);
+        }
+
+        // HMS
+        if let Ok(v) = env::var("PUSH_HMS_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.hms.enabled = parsed;
+            }
+        }
+        if let Ok(app_id) = env::var("PUSH_HMS_APP_ID") {
+            self.push.hms.app_id = Some(app_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_HMS_ACCESS_TOKEN") {
+            self.push.hms.access_token = Some(access_token);
+        }
+        if let Ok(endpoint) = env::var("PUSH_HMS_ENDPOINT") {
+            self.push.hms.endpoint = Some(endpoint);
+        }
+
+        // Honor (HMS 协议，独立凭证)
+        if let Ok(v) = env::var("PUSH_HONOR_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.honor.enabled = parsed;
+            }
+        }
+        if let Ok(app_id) = env::var("PUSH_HONOR_APP_ID") {
+            self.push.honor.app_id = Some(app_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_HONOR_ACCESS_TOKEN") {
+            self.push.honor.access_token = Some(access_token);
+        }
+        if let Ok(endpoint) = env::var("PUSH_HONOR_ENDPOINT") {
+            self.push.honor.endpoint = Some(endpoint);
+        }
+
+        // Xiaomi
+        if let Ok(v) = env::var("PUSH_XIAOMI_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.xiaomi.enabled = parsed;
+            }
+        }
+        if let Ok(app_id) = env::var("PUSH_XIAOMI_APP_ID") {
+            self.push.xiaomi.app_id = Some(app_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_XIAOMI_ACCESS_TOKEN") {
+            self.push.xiaomi.access_token = Some(access_token);
+        }
+        if let Ok(endpoint) = env::var("PUSH_XIAOMI_ENDPOINT") {
+            self.push.xiaomi.endpoint = Some(endpoint);
+        }
+
+        // OPPO
+        if let Ok(v) = env::var("PUSH_OPPO_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.oppo.enabled = parsed;
+            }
+        }
+        if let Ok(app_id) = env::var("PUSH_OPPO_APP_ID") {
+            self.push.oppo.app_id = Some(app_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_OPPO_ACCESS_TOKEN") {
+            self.push.oppo.access_token = Some(access_token);
+        }
+        if let Ok(endpoint) = env::var("PUSH_OPPO_ENDPOINT") {
+            self.push.oppo.endpoint = Some(endpoint);
+        }
+
+        // Vivo
+        if let Ok(v) = env::var("PUSH_VIVO_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.vivo.enabled = parsed;
+            }
+        }
+        if let Ok(app_id) = env::var("PUSH_VIVO_APP_ID") {
+            self.push.vivo.app_id = Some(app_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_VIVO_ACCESS_TOKEN") {
+            self.push.vivo.access_token = Some(access_token);
+        }
+        if let Ok(endpoint) = env::var("PUSH_VIVO_ENDPOINT") {
+            self.push.vivo.endpoint = Some(endpoint);
+        }
+
+        // Lenovo
+        if let Ok(v) = env::var("PUSH_LENOVO_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.lenovo.enabled = parsed;
+            }
+        }
+        if let Ok(app_id) = env::var("PUSH_LENOVO_APP_ID") {
+            self.push.lenovo.app_id = Some(app_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_LENOVO_ACCESS_TOKEN") {
+            self.push.lenovo.access_token = Some(access_token);
+        }
+        if let Ok(endpoint) = env::var("PUSH_LENOVO_ENDPOINT") {
+            self.push.lenovo.endpoint = Some(endpoint);
+        }
+
+        // ZTE
+        if let Ok(v) = env::var("PUSH_ZTE_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.zte.enabled = parsed;
+            }
+        }
+        if let Ok(app_id) = env::var("PUSH_ZTE_APP_ID") {
+            self.push.zte.app_id = Some(app_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_ZTE_ACCESS_TOKEN") {
+            self.push.zte.access_token = Some(access_token);
+        }
+        if let Ok(endpoint) = env::var("PUSH_ZTE_ENDPOINT") {
+            self.push.zte.endpoint = Some(endpoint);
+        }
+
+        // Meizu
+        if let Ok(v) = env::var("PUSH_MEIZU_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.push.meizu.enabled = parsed;
+            }
+        }
+        if let Ok(app_id) = env::var("PUSH_MEIZU_APP_ID") {
+            self.push.meizu.app_id = Some(app_id);
+        }
+        if let Ok(access_token) = env::var("PUSH_MEIZU_ACCESS_TOKEN") {
+            self.push.meizu.access_token = Some(access_token);
+        }
+        if let Ok(endpoint) = env::var("PUSH_MEIZU_ENDPOINT") {
+            self.push.meizu.endpoint = Some(endpoint);
         }
 
         Ok(())
@@ -370,8 +561,115 @@ struct TomlConfig {
     gateway: Option<TomlGatewayConfig>,
     cache: Option<TomlCacheConfig>,
     file: Option<TomlFileConfig>,
+    admin: Option<TomlAdminConfig>,
     logging: Option<TomlLoggingConfig>,
     system_message: Option<TomlSystemMessageConfig>,
+    push: Option<TomlPushConfig>,
+}
+
+/// TOML [admin] 段
+#[derive(Debug, Deserialize)]
+struct TomlAdminConfig {
+    /// 管理 API 监听端口
+    port: Option<u16>,
+    /// Master Key（管理 API 认证）
+    master_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushConfig {
+    enabled: Option<bool>,
+    apns: Option<TomlPushApnsConfig>,
+    fcm: Option<TomlPushFcmConfig>,
+    hms: Option<TomlPushHmsConfig>,
+    honor: Option<TomlPushHonorConfig>,
+    xiaomi: Option<TomlPushXiaomiConfig>,
+    oppo: Option<TomlPushOppoConfig>,
+    vivo: Option<TomlPushVivoConfig>,
+    lenovo: Option<TomlPushLenovoConfig>,
+    zte: Option<TomlPushZteConfig>,
+    meizu: Option<TomlPushMeizuConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushApnsConfig {
+    enabled: Option<bool>,
+    bundle_id: Option<String>,
+    team_id: Option<String>,
+    key_id: Option<String>,
+    private_key_path: Option<String>,
+    use_sandbox: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushFcmConfig {
+    enabled: Option<bool>,
+    project_id: Option<String>,
+    access_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushHmsConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    access_token: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushHonorConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    access_token: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushXiaomiConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    access_token: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushOppoConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    access_token: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushVivoConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    access_token: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushLenovoConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    access_token: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushZteConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    access_token: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlPushMeizuConfig {
+    enabled: Option<bool>,
+    app_id: Option<String>,
+    access_token: Option<String>,
+    endpoint: Option<String>,
 }
 
 /// 单条网关监听配置（listeners 数组元素，生产级可扩展）
@@ -731,6 +1029,15 @@ impl From<TomlConfig> for ServerConfig {
             }
         }
 
+        if let Some(admin) = toml.admin {
+            if let Some(port) = admin.port {
+                config.admin_api_port = port;
+            }
+            if let Some(key) = admin.master_key {
+                config.service_master_key = key;
+            }
+        }
+
         if let Some(system_msg) = toml.system_message {
             if let Some(enabled) = system_msg.enabled {
                 config.system_message.enabled = enabled;
@@ -743,6 +1050,155 @@ impl From<TomlConfig> for ServerConfig {
             }
             if let Some(auto_send) = system_msg.auto_send_welcome {
                 config.system_message.auto_send_welcome = auto_send;
+            }
+        }
+
+        if let Some(push) = toml.push {
+            if let Some(enabled) = push.enabled {
+                config.push.enabled = enabled;
+            }
+            if let Some(apns) = push.apns {
+                if let Some(enabled) = apns.enabled {
+                    config.push.apns.enabled = enabled;
+                }
+                if let Some(bundle_id) = apns.bundle_id {
+                    config.push.apns.bundle_id = Some(bundle_id);
+                }
+                if let Some(team_id) = apns.team_id {
+                    config.push.apns.team_id = Some(team_id);
+                }
+                if let Some(key_id) = apns.key_id {
+                    config.push.apns.key_id = Some(key_id);
+                }
+                if let Some(private_key_path) = apns.private_key_path {
+                    config.push.apns.private_key_path = Some(private_key_path);
+                }
+                if let Some(use_sandbox) = apns.use_sandbox {
+                    config.push.apns.use_sandbox = use_sandbox;
+                }
+            }
+            if let Some(fcm) = push.fcm {
+                if let Some(enabled) = fcm.enabled {
+                    config.push.fcm.enabled = enabled;
+                }
+                if let Some(project_id) = fcm.project_id {
+                    config.push.fcm.project_id = Some(project_id);
+                }
+                if let Some(access_token) = fcm.access_token {
+                    config.push.fcm.access_token = Some(access_token);
+                }
+            }
+            if let Some(hms) = push.hms {
+                if let Some(enabled) = hms.enabled {
+                    config.push.hms.enabled = enabled;
+                }
+                if let Some(app_id) = hms.app_id {
+                    config.push.hms.app_id = Some(app_id);
+                }
+                if let Some(access_token) = hms.access_token {
+                    config.push.hms.access_token = Some(access_token);
+                }
+                if let Some(endpoint) = hms.endpoint {
+                    config.push.hms.endpoint = Some(endpoint);
+                }
+            }
+            if let Some(honor) = push.honor {
+                if let Some(enabled) = honor.enabled {
+                    config.push.honor.enabled = enabled;
+                }
+                if let Some(app_id) = honor.app_id {
+                    config.push.honor.app_id = Some(app_id);
+                }
+                if let Some(access_token) = honor.access_token {
+                    config.push.honor.access_token = Some(access_token);
+                }
+                if let Some(endpoint) = honor.endpoint {
+                    config.push.honor.endpoint = Some(endpoint);
+                }
+            }
+            if let Some(xiaomi) = push.xiaomi {
+                if let Some(enabled) = xiaomi.enabled {
+                    config.push.xiaomi.enabled = enabled;
+                }
+                if let Some(app_id) = xiaomi.app_id {
+                    config.push.xiaomi.app_id = Some(app_id);
+                }
+                if let Some(access_token) = xiaomi.access_token {
+                    config.push.xiaomi.access_token = Some(access_token);
+                }
+                if let Some(endpoint) = xiaomi.endpoint {
+                    config.push.xiaomi.endpoint = Some(endpoint);
+                }
+            }
+            if let Some(oppo) = push.oppo {
+                if let Some(enabled) = oppo.enabled {
+                    config.push.oppo.enabled = enabled;
+                }
+                if let Some(app_id) = oppo.app_id {
+                    config.push.oppo.app_id = Some(app_id);
+                }
+                if let Some(access_token) = oppo.access_token {
+                    config.push.oppo.access_token = Some(access_token);
+                }
+                if let Some(endpoint) = oppo.endpoint {
+                    config.push.oppo.endpoint = Some(endpoint);
+                }
+            }
+            if let Some(vivo) = push.vivo {
+                if let Some(enabled) = vivo.enabled {
+                    config.push.vivo.enabled = enabled;
+                }
+                if let Some(app_id) = vivo.app_id {
+                    config.push.vivo.app_id = Some(app_id);
+                }
+                if let Some(access_token) = vivo.access_token {
+                    config.push.vivo.access_token = Some(access_token);
+                }
+                if let Some(endpoint) = vivo.endpoint {
+                    config.push.vivo.endpoint = Some(endpoint);
+                }
+            }
+            if let Some(lenovo) = push.lenovo {
+                if let Some(enabled) = lenovo.enabled {
+                    config.push.lenovo.enabled = enabled;
+                }
+                if let Some(app_id) = lenovo.app_id {
+                    config.push.lenovo.app_id = Some(app_id);
+                }
+                if let Some(access_token) = lenovo.access_token {
+                    config.push.lenovo.access_token = Some(access_token);
+                }
+                if let Some(endpoint) = lenovo.endpoint {
+                    config.push.lenovo.endpoint = Some(endpoint);
+                }
+            }
+            if let Some(zte) = push.zte {
+                if let Some(enabled) = zte.enabled {
+                    config.push.zte.enabled = enabled;
+                }
+                if let Some(app_id) = zte.app_id {
+                    config.push.zte.app_id = Some(app_id);
+                }
+                if let Some(access_token) = zte.access_token {
+                    config.push.zte.access_token = Some(access_token);
+                }
+                if let Some(endpoint) = zte.endpoint {
+                    config.push.zte.endpoint = Some(endpoint);
+                }
+            }
+            if let Some(meizu) = push.meizu {
+                if let Some(enabled) = meizu.enabled {
+                    config.push.meizu.enabled = enabled;
+                }
+                if let Some(app_id) = meizu.app_id {
+                    config.push.meizu.app_id = Some(app_id);
+                }
+                if let Some(access_token) = meizu.access_token {
+                    config.push.meizu.access_token = Some(access_token);
+                }
+                if let Some(endpoint) = meizu.endpoint {
+                    config.push.meizu.endpoint = Some(endpoint);
+                }
             }
         }
 
@@ -817,6 +1273,247 @@ impl RedisConfig {
     /// 获取空闲连接超时时间
     pub fn idle_timeout(&self) -> Duration {
         Duration::from_secs(self.idle_timeout_secs)
+    }
+}
+
+/// 推送总配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushConfig {
+    /// 推送总开关
+    pub enabled: bool,
+    /// APNs 配置（iOS）
+    pub apns: PushApnsConfig,
+    /// FCM 配置（Android）
+    pub fcm: PushFcmConfig,
+    /// HMS 配置（Huawei / HarmonyOS / Honor）
+    pub hms: PushHmsConfig,
+    /// Honor 配置（协议复用 HMS，但凭证独立）
+    pub honor: PushHonorConfig,
+    /// Xiaomi 配置
+    pub xiaomi: PushXiaomiConfig,
+    /// OPPO 配置
+    pub oppo: PushOppoConfig,
+    /// Vivo 配置
+    pub vivo: PushVivoConfig,
+    /// Lenovo 配置
+    pub lenovo: PushLenovoConfig,
+    /// ZTE 配置
+    pub zte: PushZteConfig,
+    /// Meizu 配置
+    pub meizu: PushMeizuConfig,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            apns: PushApnsConfig::default(),
+            fcm: PushFcmConfig::default(),
+            hms: PushHmsConfig::default(),
+            honor: PushHonorConfig::default(),
+            xiaomi: PushXiaomiConfig::default(),
+            oppo: PushOppoConfig::default(),
+            vivo: PushVivoConfig::default(),
+            lenovo: PushLenovoConfig::default(),
+            zte: PushZteConfig::default(),
+            meizu: PushMeizuConfig::default(),
+        }
+    }
+}
+
+/// APNs 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushApnsConfig {
+    pub enabled: bool,
+    pub bundle_id: Option<String>,
+    pub team_id: Option<String>,
+    pub key_id: Option<String>,
+    pub private_key_path: Option<String>,
+    pub use_sandbox: bool,
+}
+
+impl Default for PushApnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bundle_id: None,
+            team_id: None,
+            key_id: None,
+            private_key_path: None,
+            use_sandbox: false,
+        }
+    }
+}
+
+/// FCM 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushFcmConfig {
+    pub enabled: bool,
+    pub project_id: Option<String>,
+    pub access_token: Option<String>,
+}
+
+impl Default for PushFcmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            project_id: None,
+            access_token: None,
+        }
+    }
+}
+
+/// HMS 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushHmsConfig {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub access_token: Option<String>,
+    /// 可选 API 地址，默认 `https://push-api.cloud.huawei.com`
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushHmsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: None,
+            access_token: None,
+            endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushHonorConfig {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub access_token: Option<String>,
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushHonorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: None,
+            access_token: None,
+            endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushXiaomiConfig {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub access_token: Option<String>,
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushXiaomiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: None,
+            access_token: None,
+            endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushOppoConfig {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub access_token: Option<String>,
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushOppoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: None,
+            access_token: None,
+            endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushVivoConfig {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub access_token: Option<String>,
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushVivoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: None,
+            access_token: None,
+            endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushLenovoConfig {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub access_token: Option<String>,
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushLenovoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: None,
+            access_token: None,
+            endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushZteConfig {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub access_token: Option<String>,
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushZteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: None,
+            access_token: None,
+            endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushMeizuConfig {
+    pub enabled: bool,
+    pub app_id: Option<String>,
+    pub access_token: Option<String>,
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushMeizuConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: None,
+            access_token: None,
+            endpoint: None,
+        }
     }
 }
 

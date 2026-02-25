@@ -2,7 +2,7 @@
 
 use crate::error::DatabaseError;
 use crate::model::message::Message;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -41,6 +41,19 @@ pub trait MessageRepository: Send + Sync {
         message_id: u64,
         revoker_id: u64,
     ) -> Result<Message, DatabaseError>;
+
+    /// 搜索消息（管理 API）
+    async fn search_messages(
+        &self,
+        keyword: &str,
+        channel_id: Option<u64>,
+        user_id: Option<u64>,
+        message_type: Option<i16>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<serde_json::Value>, u32), DatabaseError>;
 }
 
 /// 消息仓库 (PostgreSQL 实现)
@@ -293,6 +306,83 @@ impl PgMessageRepository {
             "this_week": week_result.0 as u64,
             "this_month": month_result.0 as u64,
         }))
+    }
+
+    /// 发送系统消息（管理 API）
+    ///
+    /// 以 SYSTEM_USER_ID 为发送者，向指定频道写入一条消息。
+    /// 返回 (message_id, created_at_millis)。
+    pub async fn send_system_message_admin(
+        &self,
+        channel_id: u64,
+        content: &str,
+        message_type: i16,
+        metadata: &serde_json::Value,
+    ) -> std::result::Result<(u64, i64), DatabaseError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let message_id = crate::infra::snowflake::next_message_id();
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_messages (
+                message_id, channel_id, sender_id, pts, local_message_id,
+                message_type, content, metadata, reply_to_message_id,
+                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by
+            )
+            VALUES ($1, $2, $3, 0, NULL, $4, $5, $6, NULL, $7, $7, false, NULL, false, NULL, NULL)
+            "#,
+        )
+        .bind(message_id as i64)
+        .bind(channel_id as i64)
+        .bind(crate::config::SYSTEM_USER_ID as i64)
+        .bind(message_type)
+        .bind(content)
+        .bind(metadata)
+        .bind(now)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("发送系统消息失败: {}", e)))?;
+
+        Ok((message_id, now))
+    }
+
+    /// 管理端发送消息（可指定发送者）
+    ///
+    /// 与 send_system_message_admin 类似，但允许指定任意 sender_id。
+    /// 返回 (message_id, created_at_millis)。
+    pub async fn send_message_admin(
+        &self,
+        channel_id: u64,
+        sender_id: u64,
+        content: &str,
+        message_type: i16,
+        metadata: &serde_json::Value,
+    ) -> std::result::Result<(u64, i64), DatabaseError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let message_id = crate::infra::snowflake::next_message_id();
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_messages (
+                message_id, channel_id, sender_id, pts, local_message_id,
+                message_type, content, metadata, reply_to_message_id,
+                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by
+            )
+            VALUES ($1, $2, $3, 0, NULL, $4, $5, $6, NULL, $7, $7, false, NULL, false, NULL, NULL)
+            "#,
+        )
+        .bind(message_id as i64)
+        .bind(channel_id as i64)
+        .bind(sender_id as i64)
+        .bind(message_type)
+        .bind(content)
+        .bind(metadata)
+        .bind(now)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("发送消息失败: {}", e)))?;
+
+        Ok((message_id, now))
     }
 }
 
@@ -787,5 +877,163 @@ impl MessageRepository for PgMessageRepository {
         revoked_message.updated_at = chrono::DateTime::from_timestamp_millis(revoked_at).unwrap();
 
         Ok(revoked_message)
+    }
+
+    async fn search_messages(
+        &self,
+        keyword: &str,
+        channel_id: Option<u64>,
+        user_id: Option<u64>,
+        message_type: Option<i16>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<serde_json::Value>, u32), DatabaseError> {
+        let offset = (page - 1) * page_size;
+
+        let mut sql = String::from(
+            r#"
+            SELECT 
+                message_id,
+                channel_id,
+                sender_id,
+                content,
+                message_type,
+                created_at
+            FROM privchat_messages
+            WHERE 1=1
+            AND content ILIKE $1
+            "#,
+        );
+
+        let mut bind_count = 1;
+        let keyword_pattern = format!("%{}%", keyword);
+
+        if channel_id.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND channel_id = ${}", bind_count));
+        }
+        if user_id.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND sender_id = ${}", bind_count));
+        }
+        if message_type.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND message_type = ${}", bind_count));
+        }
+        if start_time.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND created_at >= ${}", bind_count));
+        }
+        if end_time.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND created_at <= ${}", bind_count));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+        bind_count += 1;
+        sql.push_str(&format!(" LIMIT ${}", bind_count));
+        bind_count += 1;
+        sql.push_str(&format!(" OFFSET ${}", bind_count));
+
+        let mut query_builder = sqlx::query(&sql)
+            .bind(&keyword_pattern);
+
+        if let Some(ch_id) = channel_id {
+            query_builder = query_builder.bind(ch_id as i64);
+        }
+        if let Some(uid) = user_id {
+            query_builder = query_builder.bind(uid as i64);
+        }
+        if let Some(mt) = message_type {
+            query_builder = query_builder.bind(mt as i32);
+        }
+        if let Some(st) = start_time {
+            query_builder = query_builder.bind(st);
+        }
+        if let Some(et) = end_time {
+            query_builder = query_builder.bind(et);
+        }
+        query_builder = query_builder.bind(page_size as i64);
+        query_builder = query_builder.bind(offset as i64);
+
+        let rows = query_builder
+            .fetch_all(self.pool.as_ref())
+            .await
+            .map_err(|e| DatabaseError::Database(format!("搜索消息失败: {}", e)))?;
+
+        let messages: Vec<serde_json::Value> = rows.iter().map(|row| {
+            let message_id: i64 = row.get("message_id");
+            let channel_id: i64 = row.get("channel_id");
+            let sender_id: i64 = row.get("sender_id");
+            let content: String = row.get("content");
+            let message_type: i32 = row.get("message_type");
+            let created_at: i64 = row.get("created_at");
+
+            serde_json::json!({
+                "message_id": message_id,
+                "channel_id": channel_id,
+                "sender_id": sender_id,
+                "content": content,
+                "message_type": message_type,
+                "created_at": created_at,
+            })
+        }).collect();
+
+        // 统计总数
+        let mut count_sql = String::from(
+            "SELECT COUNT(*) FROM privchat_messages WHERE 1=1 AND content ILIKE $1"
+        );
+        bind_count = 1;
+
+        if channel_id.is_some() {
+            bind_count += 1;
+            count_sql.push_str(&format!(" AND channel_id = ${}", bind_count));
+        }
+        if user_id.is_some() {
+            bind_count += 1;
+            count_sql.push_str(&format!(" AND sender_id = ${}", bind_count));
+        }
+        if message_type.is_some() {
+            bind_count += 1;
+            count_sql.push_str(&format!(" AND message_type = ${}", bind_count));
+        }
+        if start_time.is_some() {
+            bind_count += 1;
+            count_sql.push_str(&format!(" AND created_at >= ${}", bind_count));
+        }
+        if end_time.is_some() {
+            bind_count += 1;
+            count_sql.push_str(&format!(" AND created_at <= ${}", bind_count));
+        }
+
+        let mut count_query = sqlx::query(&count_sql)
+            .bind(&keyword_pattern);
+
+        if let Some(ch_id) = channel_id {
+            count_query = count_query.bind(ch_id as i64);
+        }
+        if let Some(uid) = user_id {
+            count_query = count_query.bind(uid as i64);
+        }
+        if let Some(mt) = message_type {
+            count_query = count_query.bind(mt as i32);
+        }
+        if let Some(st) = start_time {
+            count_query = count_query.bind(st);
+        }
+        if let Some(et) = end_time {
+            count_query = count_query.bind(et);
+        }
+
+        let count_row = count_query
+            .fetch_one(self.pool.as_ref())
+            .await
+            .map_err(|e| DatabaseError::Database(format!("统计搜索结果失败: {}", e)))?;
+
+        let total: i64 = count_row.get("count");
+
+        Ok((messages, total as u32))
     }
 }

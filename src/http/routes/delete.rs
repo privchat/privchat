@@ -12,16 +12,16 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::error::{Result, ServerError};
-use crate::http::HttpServerState;
+use crate::http::FileServerState;
 
 /// 创建删除路由
-pub fn create_route() -> Router<HttpServerState> {
+pub fn create_route() -> Router<FileServerState> {
     Router::new().route("/api/app/files/{file_id}", delete(delete_file))
 }
 
 /// 删除文件处理器
 async fn delete_file(
-    State(state): State<HttpServerState>,
+    State(state): State<FileServerState>,
     Path(file_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>> {

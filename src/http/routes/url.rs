@@ -12,16 +12,16 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::error::{Result, ServerError};
-use crate::http::HttpServerState;
+use crate::http::FileServerState;
 
 /// 创建 URL 路由
-pub fn create_route() -> Router<HttpServerState> {
+pub fn create_route() -> Router<FileServerState> {
     Router::new().route("/api/app/files/{file_id}/url", get(get_file_url))
 }
 
 /// 获取文件 URL 处理器
 async fn get_file_url(
-    State(state): State<HttpServerState>,
+    State(state): State<FileServerState>,
     Path(file_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>> {

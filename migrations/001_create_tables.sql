@@ -678,7 +678,7 @@ CREATE TABLE IF NOT EXISTS privchat_user_devices (
     user_id BIGINT NOT NULL,
     device_id VARCHAR(128) NOT NULL,
     platform VARCHAR(32) NOT NULL,  -- ios / android / desktop
-    vendor VARCHAR(32) NOT NULL,     -- apns / fcm（MVP 只支持这两个）
+    vendor VARCHAR(32) NOT NULL,     -- apns / fcm / hms / xiaomi / oppo / vivo / honor / lenovo / zte / meizu
     push_token TEXT,                 -- 推送令牌
     apns_armed BOOLEAN DEFAULT false,  -- ✨ Phase 3.5: 是否需要推送（客户端声明能力）
     connected BOOLEAN DEFAULT false,  -- ✨ Phase 3.5: 是否存在可用长连接（QUIC/WebSocket/TCP，事实状态）
@@ -700,7 +700,7 @@ COMMENT ON TABLE privchat_user_devices IS '用户设备推送信息表（Phase 3
 COMMENT ON COLUMN privchat_user_devices.user_id IS '用户ID';
 COMMENT ON COLUMN privchat_user_devices.device_id IS '设备ID';
 COMMENT ON COLUMN privchat_user_devices.platform IS '平台：ios / android / desktop';
-COMMENT ON COLUMN privchat_user_devices.vendor IS '推送平台：apns / fcm';
+COMMENT ON COLUMN privchat_user_devices.vendor IS '推送平台：apns / fcm / hms / xiaomi / oppo / vivo / honor / lenovo / zte / meizu';
 COMMENT ON COLUMN privchat_user_devices.push_token IS '推送令牌';
 COMMENT ON COLUMN privchat_user_devices.apns_armed IS '是否需要推送（客户端声明能力）';  -- ✨ Phase 3.5
 COMMENT ON COLUMN privchat_user_devices.connected IS '是否存在可用长连接（QUIC/WebSocket/TCP，事实状态）';  -- ✨ Phase 3.5

@@ -1,4 +1,4 @@
-//! HTTP 服务器 - 使用 Axum 提供文件服务
+//! HTTP 服务器 - 文件服务 + 管理 API 分离部署
 
 use axum::Router;
 use std::sync::Arc;
@@ -8,78 +8,126 @@ use tracing::info;
 use crate::auth::DeviceManagerDb;
 use crate::auth::{ServiceKeyManager, TokenIssueService};
 use crate::http::routes;
+use crate::infra::ConnectionManager;
 use crate::repository::{LoginLogRepository, PgMessageRepository, UserRepository};
-use crate::service::{ChannelService, FileService, UploadTokenService};
+use crate::security::SecurityService;
+use crate::service::{AdminService, ChannelService, FileService, UploadTokenService};
 
-/// HTTP 文件服务器共享状态
+/// 文件服务器共享状态
 #[derive(Clone)]
-pub struct HttpServerState {
+pub struct FileServerState {
     pub file_service: Arc<FileService>,
     pub upload_token_service: Arc<UploadTokenService>,
-    pub token_issue_service: Arc<TokenIssueService>,
-    // 管理 API 所需的服务
+}
+
+/// 管理 API 服务器共享状态
+#[derive(Clone)]
+pub struct AdminServerState {
     pub service_key_manager: Arc<ServiceKeyManager>,
+    pub token_issue_service: Arc<TokenIssueService>,
     pub user_repository: Arc<UserRepository>,
     pub login_log_repository: Arc<LoginLogRepository>,
     pub device_manager_db: Arc<DeviceManagerDb>,
     pub message_repository: Arc<PgMessageRepository>,
     pub channel_service: Arc<ChannelService>,
+    pub connection_manager: Arc<ConnectionManager>,
+    pub security_service: Arc<SecurityService>,
+    pub admin_service: Arc<AdminService>,
 }
 
-/// HTTP 文件服务器
+/// HTTP 文件服务器（对外，0.0.0.0）
 pub struct FileHttpServer {
-    state: HttpServerState,
+    state: FileServerState,
     port: u16,
 }
 
 impl FileHttpServer {
-    /// 创建新的 HTTP 文件服务器
     pub fn new(
         file_service: Arc<FileService>,
         upload_token_service: Arc<UploadTokenService>,
-        token_issue_service: Arc<TokenIssueService>,
-        service_key_manager: Arc<ServiceKeyManager>,
-        user_repository: Arc<UserRepository>,
-        login_log_repository: Arc<LoginLogRepository>,
-        device_manager_db: Arc<DeviceManagerDb>,
-        message_repository: Arc<PgMessageRepository>,
-        channel_service: Arc<ChannelService>,
         port: u16,
     ) -> Self {
         Self {
-            state: HttpServerState {
+            state: FileServerState {
                 file_service,
                 upload_token_service,
-                token_issue_service,
-                service_key_manager,
-                user_repository,
-                login_log_repository,
-                device_manager_db,
-                message_repository,
-                channel_service,
             },
             port,
         }
     }
 
-    /// 启动 HTTP 服务器（在单独的 tokio task 中运行）
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 构建路由
         let app = Router::new()
-            .merge(routes::create_routes())
+            .merge(routes::create_file_routes())
             .layer(CorsLayer::permissive())
             .with_state(self.state.clone());
 
-        // 绑定地址
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-        info!("🌐 HTTP 文件服务器启动在端口 {}", self.port);
+        info!("🌐 HTTP 文件服务器启动在 {}", addr);
 
-        // 启动服务器
-        let server = axum::serve(listener, app);
-        server.await?;
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+}
 
+/// 管理 API 服务器（仅内网，127.0.0.1）
+pub struct AdminHttpServer {
+    state: AdminServerState,
+    port: u16,
+}
+
+impl AdminHttpServer {
+    pub fn new(
+        service_key_manager: Arc<ServiceKeyManager>,
+        token_issue_service: Arc<TokenIssueService>,
+        user_repository: Arc<UserRepository>,
+        login_log_repository: Arc<LoginLogRepository>,
+        device_manager_db: Arc<DeviceManagerDb>,
+        message_repository: Arc<PgMessageRepository>,
+        channel_service: Arc<ChannelService>,
+        connection_manager: Arc<ConnectionManager>,
+        security_service: Arc<SecurityService>,
+        port: u16,
+    ) -> Self {
+        let admin_service = Arc::new(AdminService::new(
+            user_repository.clone(),
+            device_manager_db.clone(),
+            connection_manager.clone(),
+            channel_service.clone(),
+            message_repository.clone(),
+        ));
+
+        Self {
+            state: AdminServerState {
+                service_key_manager,
+                token_issue_service,
+                user_repository,
+                login_log_repository,
+                device_manager_db,
+                message_repository,
+                channel_service,
+                connection_manager,
+                security_service,
+                admin_service,
+            },
+            port,
+        }
+    }
+
+    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let app = Router::new()
+            .merge(routes::create_admin_routes())
+            .layer(CorsLayer::permissive())
+            .with_state(self.state.clone());
+
+        let addr = format!("0.0.0.0:{}", self.port);
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+        info!("🔒 管理 API 服务器启动在端口 {}", self.port);
+
+        axum::serve(listener, app).await?;
         Ok(())
     }
 }

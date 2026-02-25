@@ -1,4 +1,5 @@
 // 业务服务层模块
+pub mod admin_service;
 pub mod auth_service;
 pub mod channel_service; // ChannelService 在这里
 pub mod friend_service;
@@ -42,6 +43,7 @@ pub mod reaction_service;
 // 新增 @提及服务
 pub mod mention_service;
 
+pub use admin_service::AdminService;
 pub use approval_service::{ApprovalService, JoinMethod, JoinRequest, JoinRequestStatus};
 pub use auth_service::AuthService;
 pub use blacklist_service::{BlacklistEntry, BlacklistService};

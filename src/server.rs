@@ -601,13 +601,483 @@ impl ChatServer {
         });
         info!("✅ PushPlanner 后台任务已启动（带 Redis 在线检查 + 撤销/取消支持）");
 
-        // 6. 创建 Push Worker（带设备 Repository 和状态管理器）
+        // 6. 根据配置初始化 Push Provider
+        let fcm_provider = if config.push.enabled && config.push.fcm.enabled {
+            let project_id = config
+                .push
+                .fcm
+                .project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .fcm
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (project_id, access_token) {
+                (Some(project_id), Some(access_token)) => {
+                    info!("✅ FCM Provider 已启用");
+                    Some(Arc::new(crate::push::provider::FcmProvider::new(
+                        project_id,
+                        access_token,
+                    )))
+                }
+                _ => {
+                    warn!("⚠️ FCM Provider 已配置启用但缺少 project_id/access_token，已降级为禁用");
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ FCM Provider 未启用");
+            None
+        };
+
+        let apns_provider = if config.push.enabled && config.push.apns.enabled {
+            let bundle_id = config
+                .push
+                .apns
+                .bundle_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let team_id = config
+                .push
+                .apns
+                .team_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let key_id = config
+                .push
+                .apns
+                .key_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let private_key_path = config
+                .push
+                .apns
+                .private_key_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+
+            match (bundle_id, team_id, key_id, private_key_path) {
+                (Some(bundle_id), Some(team_id), Some(key_id), Some(private_key_path)) => {
+                    match crate::push::provider::ApnsProvider::new(
+                        bundle_id,
+                        team_id,
+                        key_id,
+                        &private_key_path,
+                        config.push.apns.use_sandbox,
+                    ) {
+                        Ok(provider) => {
+                            info!(
+                                "✅ APNs Provider 已启用（sandbox={}）",
+                                config.push.apns.use_sandbox
+                            );
+                            Some(Arc::new(provider))
+                        }
+                        Err(e) => {
+                            warn!("⚠️ APNs Provider 初始化失败，已降级为禁用: {}", e);
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    warn!("⚠️ APNs Provider 已配置启用但缺少 bundle_id/team_id/key_id/private_key_path，已降级为禁用");
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ APNs Provider 未启用");
+            None
+        };
+
+        let hms_provider = if config.push.enabled && config.push.hms.enabled {
+            let app_id = config
+                .push
+                .hms
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .hms
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let endpoint = config
+                .push
+                .hms
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (app_id, access_token) {
+                (Some(app_id), Some(access_token)) => {
+                    info!("✅ HMS Provider 已启用");
+                    Some(Arc::new(crate::push::provider::HmsProvider::new(
+                        app_id,
+                        access_token,
+                        endpoint,
+                    )))
+                }
+                _ => {
+                    warn!("⚠️ HMS Provider 已配置启用但缺少 app_id/access_token，已降级为禁用");
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ HMS Provider 未启用");
+            None
+        };
+
+        let honor_provider = if config.push.enabled && config.push.honor.enabled {
+            let app_id = config
+                .push
+                .honor
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .honor
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let endpoint = config
+                .push
+                .honor
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (app_id, access_token) {
+                (Some(app_id), Some(access_token)) => {
+                    info!("✅ Honor Provider 已启用（HMS 协议）");
+                    Some(Arc::new(crate::push::provider::HmsProvider::new(
+                        app_id,
+                        access_token,
+                        endpoint,
+                    )))
+                }
+                _ => {
+                    warn!(
+                        "⚠️ Honor Provider 已配置启用但缺少 app_id/access_token，已降级为禁用"
+                    );
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ Honor Provider 未启用");
+            None
+        };
+
+        let xiaomi_provider = if config.push.enabled && config.push.xiaomi.enabled {
+            let app_id = config
+                .push
+                .xiaomi
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .xiaomi
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let endpoint = config
+                .push
+                .xiaomi
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (app_id, access_token) {
+                (Some(app_id), Some(access_token)) => {
+                    info!("✅ Xiaomi Provider 已启用");
+                    Some(Arc::new(crate::push::provider::XiaomiProvider::new(
+                        app_id,
+                        access_token,
+                        endpoint,
+                    )))
+                }
+                _ => {
+                    warn!(
+                        "⚠️ Xiaomi Provider 已配置启用但缺少 app_id/access_token，已降级为禁用"
+                    );
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ Xiaomi Provider 未启用");
+            None
+        };
+
+        let oppo_provider = if config.push.enabled && config.push.oppo.enabled {
+            let app_id = config
+                .push
+                .oppo
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .oppo
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let endpoint = config
+                .push
+                .oppo
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (app_id, access_token) {
+                (Some(app_id), Some(access_token)) => {
+                    info!("✅ OPPO Provider 已启用");
+                    Some(Arc::new(crate::push::provider::OppoProvider::new(
+                        app_id,
+                        access_token,
+                        endpoint,
+                    )))
+                }
+                _ => {
+                    warn!("⚠️ OPPO Provider 已配置启用但缺少 app_id/access_token，已降级为禁用");
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ OPPO Provider 未启用");
+            None
+        };
+
+        let vivo_provider = if config.push.enabled && config.push.vivo.enabled {
+            let app_id = config
+                .push
+                .vivo
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .vivo
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let endpoint = config
+                .push
+                .vivo
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (app_id, access_token) {
+                (Some(app_id), Some(access_token)) => {
+                    info!("✅ Vivo Provider 已启用");
+                    Some(Arc::new(crate::push::provider::VivoProvider::new(
+                        app_id,
+                        access_token,
+                        endpoint,
+                    )))
+                }
+                _ => {
+                    warn!("⚠️ Vivo Provider 已配置启用但缺少 app_id/access_token，已降级为禁用");
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ Vivo Provider 未启用");
+            None
+        };
+
+        let lenovo_provider = if config.push.enabled && config.push.lenovo.enabled {
+            let app_id = config
+                .push
+                .lenovo
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .lenovo
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let endpoint = config
+                .push
+                .lenovo
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (app_id, access_token) {
+                (Some(app_id), Some(access_token)) => {
+                    info!("✅ Lenovo Provider 已启用");
+                    Some(Arc::new(crate::push::provider::LenovoProvider::new(
+                        app_id,
+                        access_token,
+                        endpoint,
+                    )))
+                }
+                _ => {
+                    warn!(
+                        "⚠️ Lenovo Provider 已配置启用但缺少 app_id/access_token，已降级为禁用"
+                    );
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ Lenovo Provider 未启用");
+            None
+        };
+
+        let zte_provider = if config.push.enabled && config.push.zte.enabled {
+            let app_id = config
+                .push
+                .zte
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .zte
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let endpoint = config
+                .push
+                .zte
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (app_id, access_token) {
+                (Some(app_id), Some(access_token)) => {
+                    info!("✅ ZTE Provider 已启用");
+                    Some(Arc::new(crate::push::provider::ZteProvider::new(
+                        app_id,
+                        access_token,
+                        endpoint,
+                    )))
+                }
+                _ => {
+                    warn!("⚠️ ZTE Provider 已配置启用但缺少 app_id/access_token，已降级为禁用");
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ ZTE Provider 未启用");
+            None
+        };
+
+        let meizu_provider = if config.push.enabled && config.push.meizu.enabled {
+            let app_id = config
+                .push
+                .meizu
+                .app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let access_token = config
+                .push
+                .meizu
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let endpoint = config
+                .push
+                .meizu
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            match (app_id, access_token) {
+                (Some(app_id), Some(access_token)) => {
+                    info!("✅ Meizu Provider 已启用");
+                    Some(Arc::new(crate::push::provider::MeizuProvider::new(
+                        app_id,
+                        access_token,
+                        endpoint,
+                    )))
+                }
+                _ => {
+                    warn!(
+                        "⚠️ Meizu Provider 已配置启用但缺少 app_id/access_token，已降级为禁用"
+                    );
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ Meizu Provider 未启用");
+            None
+        };
+
+        // 7. 创建 Push Worker（带设备 Repository 和状态管理器）
         let mut push_worker = crate::push::PushWorker::with_providers(
             push_rx,
             user_device_repo.clone(), // Clone 一份给 Worker
             intent_state,
-            None, // FCM Provider（可选，需要配置）
-            None, // APNs Provider（可选，需要配置）
+            fcm_provider,
+            apns_provider,
+            hms_provider,
+            honor_provider,
+            xiaomi_provider,
+            oppo_provider,
+            vivo_provider,
+            lenovo_provider,
+            zte_provider,
+            meizu_provider,
         );
         tokio::spawn(async move {
             if let Err(e) = push_worker.start().await {
@@ -1422,7 +1892,7 @@ impl ChatServer {
         Ok(())
     }
 
-    /// 启动 HTTP 文件服务器（在单独的 tokio task 中运行）
+    /// 启动 HTTP 服务（文件服务 + 管理 API 分端口）
     async fn start_http_server(&self) -> Result<(), ServerError> {
         // 初始化 Prometheus 指标（供 GET /metrics 暴露）
         if crate::infra::metrics::init().is_err() {
@@ -1431,36 +1901,15 @@ impl ChatServer {
             info!("📊 Prometheus 指标已启用，GET /metrics 可用");
         }
 
-        // 创建 Service Key 管理器（用于管理 API 认证）
-        let service_key_manager = Arc::new(crate::auth::ServiceKeyManager::new_master_key(
-            self.config.service_master_key.clone(),
-        ));
-
-        // 获取 ChannelService 和 ChannelService（需要从 server 中获取）
-        // 注意：这里需要访问 server 中的这些服务，但目前它们不在 Server 结构体中
-        // 需要从 RPC 服务上下文中获取，或者添加到 Server 结构体中
-        // 暂时使用临时方案：从全局服务中获取
-
-        // TODO: 需要将 channel_service 和 channel_service 添加到 Server 结构体中
-        // 或者从 RPC 服务上下文中获取
-
-        // 创建 HTTP 服务器
-        let http_server = crate::http::FileHttpServer::new(
+        // ---- 文件服务（对外） ----
+        let file_server = crate::http::FileHttpServer::new(
             self.file_service.clone(),
             self.upload_token_service.clone(),
-            self.token_issue_service.clone(),
-            service_key_manager,
-            self.user_repository.clone(),
-            self.login_log_repository.clone(),
-            self.device_manager_db.clone(),
-            self.message_repository.clone(),
-            self.channel_service.clone(),
             self.config.http_file_server_port,
         );
 
-        // 在单独的 tokio task 中启动 HTTP 服务器
         tokio::spawn(async move {
-            if let Err(e) = http_server.start().await {
+            if let Err(e) = file_server.start().await {
                 error!("❌ HTTP 文件服务器启动失败: {}", e);
             }
         });
@@ -1469,6 +1918,36 @@ impl ChatServer {
             "✅ HTTP 文件服务器已在后台启动（端口 {}）",
             self.config.http_file_server_port
         );
+
+        // ---- 管理 API（仅内网） ----
+        let service_key_manager = Arc::new(crate::auth::ServiceKeyManager::new_master_key(
+            self.config.service_master_key.clone(),
+        ));
+
+        let admin_server = crate::http::AdminHttpServer::new(
+            service_key_manager,
+            self.token_issue_service.clone(),
+            self.user_repository.clone(),
+            self.login_log_repository.clone(),
+            self.device_manager_db.clone(),
+            self.message_repository.clone(),
+            self.channel_service.clone(),
+            self.connection_manager.clone(),
+            self.security_service.clone(),
+            self.config.admin_api_port,
+        );
+
+        tokio::spawn(async move {
+            if let Err(e) = admin_server.start().await {
+                error!("❌ 管理 API 服务器启动失败: {}", e);
+            }
+        });
+
+        info!(
+            "✅ 管理 API 服务器已在后台启动（端口 {}）",
+            self.config.admin_api_port
+        );
+
         Ok(())
     }
 }

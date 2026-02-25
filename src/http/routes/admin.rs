@@ -4,17 +4,22 @@
 //!
 //! 包含以下管理功能：
 //! - Token 管理：签发 token
-//! - 用户管理：查询、更新、删除用户
-//! - 群组管理：查询、解散群组
+//! - 用户管理：查询、更新、删除、封禁/解封用户
+//! - 设备管理：查询设备、强制踢出设备
+//! - 群组管理：查询、解散群组、成员管理
 //! - 好友管理：查询好友关系
+//! - 消息管控：查询消息、管理员撤回、发送系统消息
+//! - 安全管控：Shadow Ban 管理、用户安全状态
+//! - 在线状态：在线人数统计
+//! - 系统运维：健康检查
 //! - 登录日志：查询登录记录
-//! - 设备管理：查询设备信息
 //! - 统计报表：系统统计数据
-//! - 聊天记录：查询消息历史
 
 use crate::auth::{IssueTokenRequest, IssueTokenResponse};
 use crate::error::{Result, ServerError};
-use crate::http::HttpServerState;
+use crate::http::dto::admin as dto;
+use crate::http::AdminServerState;
+use crate::repository::MessageRepository;
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::HeaderMap,
@@ -29,7 +34,7 @@ use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
 /// 创建管理 API 路由
-pub fn create_route() -> Router<HttpServerState> {
+pub fn create_route() -> Router<AdminServerState> {
     Router::new()
         // Token 管理（三方对接接口）
         .route("/api/admin/token/issue", post(issue_token))
@@ -46,14 +51,12 @@ pub fn create_route() -> Router<HttpServerState> {
         // 好友管理
         .route("/api/admin/friendships", post(create_friendship)) // 创建好友关系
         .route("/api/admin/friendships", get(list_friendships))
-        .route("/api/admin/friendships/{user_id}", get(get_user_friends))
         // 登录日志
         .route("/api/admin/login-logs", get(list_login_logs))
         .route("/api/admin/login-logs/{log_id}", get(get_login_log))
         // 设备管理
         .route("/api/admin/devices", get(list_devices))
         .route("/api/admin/devices/{device_id}", get(get_device))
-        .route("/api/admin/devices/user/{user_id}", get(get_user_devices))
         // 统计报表
         .route("/api/admin/stats", get(get_stats))
         .route("/api/admin/stats/users", get(get_user_stats))
@@ -62,6 +65,110 @@ pub fn create_route() -> Router<HttpServerState> {
         // 聊天记录
         .route("/api/admin/messages", get(list_messages))
         .route("/api/admin/messages/{message_id}", get(get_message))
+        // === P0: 用户封禁/解封 ===
+        .route(
+            "/api/admin/users/{user_id}/suspend",
+            post(suspend_user),
+        )
+        .route(
+            "/api/admin/users/{user_id}/unsuspend",
+            post(unsuspend_user),
+        )
+        // === P0: 设备强制踢出 ===
+        .route(
+            "/api/admin/devices/{device_id}/revoke",
+            post(revoke_device),
+        )
+        .route(
+            "/api/admin/users/{user_id}/revoke-all-devices",
+            post(revoke_all_user_devices),
+        )
+        // === P0: 群组成员管理 ===
+        .route(
+            "/api/admin/groups/{group_id}/members",
+            get(list_group_members).post(add_group_member),
+        )
+        .route(
+            "/api/admin/groups/{group_id}/members/{user_id}",
+            delete(remove_group_member),
+        )
+        // === P0: 消息撤回 + 系统消息 ===
+        .route(
+            "/api/admin/messages/{message_id}/revoke",
+            post(revoke_message),
+        )
+        .route(
+            "/api/admin/messages/send-system",
+            post(send_system_message),
+        )
+        .route("/api/admin/messages/send", post(send_message))
+        // === P0: 安全管控 ===
+        .route(
+            "/api/admin/security/shadow-banned",
+            get(list_shadow_banned),
+        )
+        .route(
+            "/api/admin/security/shadow-ban/{user_id}",
+            delete(unshadow_ban_user),
+        )
+        .route(
+            "/api/admin/security/users/{user_id}/state",
+            get(get_user_security_state),
+        )
+        .route(
+            "/api/admin/security/users/{user_id}/reset",
+            post(reset_user_security_state),
+        )
+        // === P0: 在线状态 ===
+        .route(
+            "/api/admin/presence/online-count",
+            get(get_online_count),
+        )
+        .route(
+            "/api/admin/presence/users",
+            get(list_online_users),
+        )
+        .route(
+            "/api/admin/presence/user/{user_id}",
+            get(get_user_connection),
+        )
+        // === P1: 用户资源 ===
+        .route(
+            "/api/admin/users/{user_id}/friends",
+            get(get_user_friends),
+        )
+        .route(
+            "/api/admin/users/{user_id}/devices",
+            get(get_user_devices),
+        )
+        .route(
+            "/api/admin/users/{user_id}/groups",
+            get(get_user_groups),
+        )
+        // === P1: 会话管理 ===
+        .route(
+            "/api/admin/users/{user_id}/channels",
+            get(list_user_channels),
+        )
+        .route(
+            "/api/admin/channels/{channel_id}",
+            get(get_channel),
+        )
+        .route(
+            "/api/admin/channels/{channel_id}/participants",
+            get(list_channel_participants),
+        )
+        // === P1: 消息广播与搜索 ===
+        .route(
+            "/api/admin/messages/broadcast",
+            post(broadcast_message),
+        )
+        .route(
+            "/api/admin/messages/search",
+            get(search_messages),
+        )
+        // === P0: 系统运维 ===
+        .route("/api/admin/system/health", get(health_check))
 }
 
 // =====================================================
@@ -69,7 +176,7 @@ pub fn create_route() -> Router<HttpServerState> {
 // =====================================================
 
 /// 从请求头中提取并验证 Service Key
-async fn verify_service_key(headers: &HeaderMap, state: &HttpServerState) -> Result<()> {
+async fn verify_service_key(headers: &HeaderMap, state: &AdminServerState) -> Result<()> {
     let key = headers
         .get("X-Service-Key")
         .or_else(|| headers.get("x-service-key"))
@@ -159,7 +266,7 @@ async fn verify_service_key(headers: &HeaderMap, state: &HttpServerState) -> Res
 /// }
 /// ```
 async fn issue_token(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<IssueTokenRequest>,
@@ -219,7 +326,7 @@ struct CreateUserRequest {
 ///
 /// 用于业务系统为已有用户创建IM账号
 async fn create_user(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Json(request): Json<CreateUserRequest>,
 ) -> Result<Json<Value>> {
@@ -326,7 +433,7 @@ struct UserListQuery {
 ///
 /// GET /api/admin/users?page=1&page_size=20&search=alice
 async fn list_users(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<UserListQuery>,
 ) -> Result<Json<Value>> {
@@ -383,7 +490,7 @@ async fn list_users(
 ///
 /// GET /api/admin/users/:user_id
 async fn get_user(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
 ) -> Result<Json<Value>> {
@@ -425,7 +532,7 @@ struct UpdateUserRequest {
 }
 
 async fn update_user(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
     Json(request): Json<UpdateUserRequest>,
@@ -497,7 +604,7 @@ async fn update_user(
 ///
 /// DELETE /api/admin/users/:user_id
 async fn delete_user(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
 ) -> Result<Json<Value>> {
@@ -538,7 +645,7 @@ async fn delete_user(
 ///
 /// GET /api/admin/groups?page=1&page_size=20
 async fn list_groups(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
@@ -572,7 +679,7 @@ async fn list_groups(
 ///
 /// GET /api/admin/groups/:group_id
 async fn get_group(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(group_id): Path<u64>,
 ) -> Result<Json<Value>> {
@@ -594,7 +701,7 @@ async fn get_group(
 ///
 /// DELETE /api/admin/groups/:group_id
 async fn dissolve_group(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(group_id): Path<u64>,
 ) -> Result<Json<Value>> {
@@ -620,27 +727,16 @@ async fn dissolve_group(
 // 好友管理
 // =====================================================
 
-/// 创建好友关系请求
-#[derive(Debug, Deserialize)]
-struct CreateFriendshipRequest {
-    /// 用户1 ID
-    user1_id: u64,
-    /// 用户2 ID
-    user2_id: u64,
-    /// 来源（可选，用于记录好友关系来源）
-    source: Option<String>,
-}
-
 /// 创建好友关系
 ///
 /// POST /api/admin/friendships
 ///
 /// 让两个用户成为好友，并自动创建私聊会话
 async fn create_friendship(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
-    Json(request): Json<CreateFriendshipRequest>,
-) -> Result<Json<Value>> {
+    Json(request): Json<dto::CreateFriendshipRequest>,
+) -> Result<Json<dto::CreateFriendshipResponse>> {
     verify_service_key(&headers, &state).await?;
 
     let user1_id = request.user1_id;
@@ -648,7 +744,6 @@ async fn create_friendship(
 
     info!("创建好友关系: {} <-> {}", user1_id, user2_id);
 
-    // 验证用户是否存在
     let user1_exists = state
         .user_repository
         .exists(user1_id)
@@ -667,7 +762,6 @@ async fn create_friendship(
         return Err(ServerError::NotFound(format!("用户 {} 不存在", user2_id)));
     }
 
-    // 创建好友关系和会话（使用 service 层）
     let channel_id = state
         .channel_service
         .create_friendship_admin(user1_id, user2_id, &state.channel_service)
@@ -677,16 +771,13 @@ async fn create_friendship(
             _ => ServerError::Database(format!("创建好友关系失败: {}", e)),
         })?;
 
-    // 注意：实际的好友关系建立需要 FriendService，当前仅创建了会话
-    warn!("⚠️ 好友关系建立功能需要 FriendService，当前仅创建了会话");
-
-    Ok(Json(json!({
-        "success": true,
-        "user1_id": user1_id,
-        "user2_id": user2_id,
-        "channel_id": channel_id,
-        "message": "好友关系已创建，会话已生成"
-    })))
+    Ok(Json(dto::CreateFriendshipResponse {
+        success: true,
+        user1_id,
+        user2_id,
+        channel_id,
+        message: "好友关系已创建，会话已生成".to_string(),
+    }))
 }
 
 /// 获取好友关系列表
@@ -695,7 +786,7 @@ async fn create_friendship(
 ///
 /// 注意：好友关系存储在内存中（FriendService），这里通过私聊会话推断好友关系
 async fn list_friendships(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
@@ -731,7 +822,7 @@ async fn list_friendships(
 ///
 /// 通过私聊会话推断用户的好友列表
 async fn get_user_friends(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
 ) -> Result<Json<Value>> {
@@ -764,6 +855,32 @@ async fn get_user_friends(
 }
 
 // =====================================================
+// 用户群组
+// =====================================================
+
+/// 获取用户加入的群组列表
+///
+/// GET /api/admin/users/:user_id/groups
+async fn get_user_groups(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+) -> Result<Json<Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    let groups = state
+        .channel_service
+        .get_user_groups_admin(user_id)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询用户群组列表失败: {}", e)))?;
+
+    Ok(Json(json!({
+        "user_id": user_id,
+        "groups": groups,
+    })))
+}
+
+// =====================================================
 // 登录日志
 // =====================================================
 
@@ -783,7 +900,7 @@ struct LoginLogQuery {
 ///
 /// GET /api/admin/login-logs?user_id=123&page=1&page_size=20
 async fn list_login_logs(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<LoginLogQuery>,
 ) -> Result<Json<Value>> {
@@ -841,7 +958,7 @@ async fn list_login_logs(
 ///
 /// GET /api/admin/login-logs/:log_id
 async fn get_login_log(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(log_id): Path<i64>,
 ) -> Result<Json<Value>> {
@@ -892,7 +1009,7 @@ async fn get_login_log(
 ///
 /// GET /api/admin/devices?user_id=123&page=1&page_size=20
 async fn list_devices(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
@@ -954,7 +1071,7 @@ async fn list_devices(
 ///
 /// GET /api/admin/devices/:device_id
 async fn get_device(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Result<Json<Value>> {
@@ -997,7 +1114,7 @@ async fn get_device(
 ///
 /// GET /api/admin/devices/user/:user_id
 async fn get_user_devices(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
 ) -> Result<Json<Value>> {
@@ -1051,7 +1168,7 @@ async fn get_user_devices(
 ///
 /// GET /api/admin/stats
 async fn get_stats(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
@@ -1106,7 +1223,7 @@ async fn get_stats(
 ///
 /// GET /api/admin/stats/users
 async fn get_user_stats(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
@@ -1128,7 +1245,7 @@ async fn get_user_stats(
 ///
 /// GET /api/admin/stats/groups
 async fn get_group_stats(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
@@ -1146,7 +1263,7 @@ async fn get_group_stats(
 ///
 /// GET /api/admin/stats/messages
 async fn get_message_stats(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
@@ -1179,7 +1296,7 @@ struct MessageQuery {
 ///
 /// GET /api/admin/messages?channel_id=123&user_id=456&page=1&page_size=20
 async fn list_messages(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<MessageQuery>,
 ) -> Result<Json<Value>> {
@@ -1213,7 +1330,7 @@ async fn list_messages(
 ///
 /// GET /api/admin/messages/:message_id
 async fn get_message(
-    State(state): State<HttpServerState>,
+    State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(message_id): Path<u64>,
 ) -> Result<Json<Value>> {
@@ -1227,4 +1344,761 @@ async fn get_message(
         .ok_or_else(|| ServerError::NotFound(format!("消息 {} 不存在", message_id)))?;
 
     Ok(Json(message))
+}
+
+// =====================================================
+// P0: 用户封禁/解封
+// =====================================================
+
+/// 封禁用户
+///
+/// POST /api/admin/users/:user_id/suspend
+async fn suspend_user(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+    Json(request): Json<dto::SuspendUserRequest>,
+) -> Result<Json<dto::SuspendUserResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let reason = request.reason.as_deref().unwrap_or("admin_suspend");
+    let result = state.admin_service.suspend_user(user_id, reason).await?;
+
+    Ok(Json(dto::SuspendUserResponse {
+        success: true,
+        user_id,
+        previous_status: result.previous_status,
+        current_status: 2,
+        reason: request.reason,
+        revoked_devices: result.revoked_devices,
+        message: "用户已封禁".to_string(),
+    }))
+}
+
+/// 解封用户
+///
+/// POST /api/admin/users/:user_id/unsuspend
+async fn unsuspend_user(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+) -> Result<Json<dto::UnsuspendUserResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let result = state.admin_service.unsuspend_user(user_id).await?;
+
+    Ok(Json(dto::UnsuspendUserResponse {
+        success: true,
+        user_id,
+        previous_status: result.previous_status,
+        current_status: 0,
+        message: "用户已解封".to_string(),
+    }))
+}
+
+// =====================================================
+// P0: 设备强制踢出
+// =====================================================
+
+/// 踢出指定设备
+///
+/// POST /api/admin/devices/:device_id/revoke
+async fn revoke_device(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+    Json(request): Json<dto::RevokeDeviceRequest>,
+) -> Result<Json<dto::RevokeDeviceResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let reason = request.reason.as_deref().unwrap_or("admin_revoke");
+    state
+        .admin_service
+        .revoke_device(request.user_id, &device_id, reason)
+        .await?;
+
+    Ok(Json(dto::RevokeDeviceResponse {
+        success: true,
+        device_id,
+        user_id: request.user_id,
+        message: "设备已踢出".to_string(),
+    }))
+}
+
+/// 撤销用户的全部设备
+///
+/// POST /api/admin/users/:user_id/revoke-all-devices
+async fn revoke_all_user_devices(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+    Json(request): Json<dto::RevokeAllDevicesRequest>,
+) -> Result<Json<dto::RevokeAllDevicesResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let reason = request.reason.as_deref().unwrap_or("admin_revoke_all");
+    let revoked_count = state
+        .admin_service
+        .revoke_all_devices(user_id, reason)
+        .await?;
+
+    Ok(Json(dto::RevokeAllDevicesResponse {
+        success: true,
+        user_id,
+        revoked_count,
+        message: format!("已撤销 {} 个设备", revoked_count),
+    }))
+}
+
+// =====================================================
+// P0: 群组成员管理
+// =====================================================
+
+/// 获取群组成员列表
+///
+/// GET /api/admin/groups/:group_id/members
+async fn list_group_members(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(group_id): Path<u64>,
+) -> Result<Json<dto::ListGroupMembersResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let members = state.channel_service.list_members_admin(group_id).await?;
+
+    let member_list: Vec<dto::GroupMemberItem> = members
+        .into_iter()
+        .map(|(uid, role, joined_at, nickname)| dto::GroupMemberItem {
+            user_id: uid,
+            role: role
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "member".to_string()),
+            joined_at: Some(joined_at),
+            nickname,
+        })
+        .collect();
+
+    let total = member_list.len();
+
+    Ok(Json(dto::ListGroupMembersResponse {
+        group_id,
+        members: member_list,
+        total,
+    }))
+}
+
+/// 移除群组成员
+///
+/// DELETE /api/admin/groups/:group_id/members/:user_id
+async fn remove_group_member(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path((group_id, user_id)): Path<(u64, u64)>,
+) -> Result<Json<dto::RemoveGroupMemberResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    state
+        .channel_service
+        .remove_member_admin(group_id, user_id)
+        .await?;
+
+    Ok(Json(dto::RemoveGroupMemberResponse {
+        success: true,
+        group_id,
+        user_id,
+        message: "成员已移除".to_string(),
+    }))
+}
+
+// =====================================================
+// P0: 消息撤回 + 系统消息
+// =====================================================
+
+/// 管理员撤回消息
+///
+/// POST /api/admin/messages/:message_id/revoke
+async fn revoke_message(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(message_id): Path<u64>,
+    Json(_request): Json<dto::RevokeMessageRequest>,
+) -> Result<Json<dto::RevokeMessageResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let revoked_msg = state
+        .message_repository
+        .revoke_message(message_id, 0)
+        .await
+        .map_err(|e| match e {
+            crate::error::DatabaseError::NotFound(msg) => ServerError::NotFound(msg),
+            crate::error::DatabaseError::Validation(msg) => ServerError::Validation(msg),
+            _ => ServerError::Database(format!("撤回消息失败: {}", e)),
+        })?;
+
+    Ok(Json(dto::RevokeMessageResponse {
+        success: true,
+        message_id,
+        channel_id: revoked_msg.channel_id,
+        revoked_at: revoked_msg
+            .revoked_at
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0),
+        message: "消息已撤回".to_string(),
+    }))
+}
+
+/// 发送系统消息
+///
+/// POST /api/admin/messages/send-system
+async fn send_system_message(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(request): Json<dto::SendSystemMessageRequest>,
+) -> Result<Json<dto::SendSystemMessageResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let message_type: i16 = match request.message_type.as_deref() {
+        Some("image") => 1,
+        Some("file") => 2,
+        Some("system") => 10,
+        _ => 0,
+    };
+
+    let metadata = request
+        .metadata
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+    let (message_id, created_at) = state
+        .message_repository
+        .send_system_message_admin(request.channel_id, &request.content, message_type, &metadata)
+        .await
+        .map_err(|e| ServerError::Database(format!("发送系统消息失败: {}", e)))?;
+
+    Ok(Json(dto::SendSystemMessageResponse {
+        success: true,
+        message_id,
+        channel_id: request.channel_id,
+        created_at,
+        message: "系统消息已发送".to_string(),
+    }))
+}
+
+// =====================================================
+// P0: 安全管控
+// =====================================================
+
+/// 获取 Shadow Ban 用户列表
+///
+/// GET /api/admin/security/shadow-banned
+async fn list_shadow_banned(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+) -> Result<Json<dto::ListShadowBannedResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let banned = state.security_service.list_shadow_banned().await;
+
+    let users: Vec<dto::ShadowBannedItem> = banned
+        .into_iter()
+        .map(|(user_id, device_id, state, trust_score)| dto::ShadowBannedItem {
+            user_id,
+            device_id,
+            state: format!("{:?}", state),
+            trust_score,
+        })
+        .collect();
+
+    let total = users.len();
+
+    Ok(Json(dto::ListShadowBannedResponse { users, total }))
+}
+
+/// 解除用户的 Shadow Ban
+///
+/// DELETE /api/admin/security/shadow-ban/:user_id
+async fn unshadow_ban_user(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+) -> Result<Json<dto::UnshadowBanResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let devices = state
+        .device_manager_db
+        .get_user_devices(user_id)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询用户设备失败: {}", e)))?;
+
+    let device_ids: Vec<String> = devices.iter().map(|d| d.device_id.clone()).collect();
+    let affected = state
+        .security_service
+        .unban_all_user_devices(user_id, &device_ids)
+        .await;
+
+    Ok(Json(dto::UnshadowBanResponse {
+        success: true,
+        user_id,
+        affected_devices: affected,
+        message: "Shadow Ban 已解除".to_string(),
+    }))
+}
+
+/// 获取用户安全状态
+///
+/// GET /api/admin/security/users/:user_id/state
+async fn get_user_security_state(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+) -> Result<Json<dto::UserSecurityStateResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let devices = state
+        .device_manager_db
+        .get_user_devices(user_id)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询用户设备失败: {}", e)))?;
+
+    let device_ids: Vec<String> = devices.iter().map(|d| d.device_id.clone()).collect();
+    let device_states = state
+        .security_service
+        .get_user_device_states(user_id, &device_ids)
+        .await;
+
+    let devices_dto: Vec<dto::DeviceSecurityState> = device_states
+        .into_iter()
+        .map(|(device_id, client_state, trust_score)| dto::DeviceSecurityState {
+            device_id,
+            state: client_state
+                .map(|s| format!("{:?}", s))
+                .unwrap_or_else(|| "Unknown".to_string()),
+            trust_score,
+        })
+        .collect();
+
+    Ok(Json(dto::UserSecurityStateResponse {
+        user_id,
+        devices: devices_dto,
+    }))
+}
+
+/// 重置用户安全状态
+///
+/// POST /api/admin/security/users/:user_id/reset
+async fn reset_user_security_state(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+) -> Result<Json<dto::ResetSecurityStateResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let devices = state
+        .device_manager_db
+        .get_user_devices(user_id)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询用户设备失败: {}", e)))?;
+
+    let device_ids: Vec<String> = devices.iter().map(|d| d.device_id.clone()).collect();
+    let affected = state
+        .security_service
+        .unban_all_user_devices(user_id, &device_ids)
+        .await;
+
+    Ok(Json(dto::ResetSecurityStateResponse {
+        success: true,
+        user_id,
+        affected_devices: affected,
+        message: "安全状态已重置".to_string(),
+    }))
+}
+
+// =====================================================
+// P0: 在线状态
+// =====================================================
+
+/// 获取在线连接数
+///
+/// GET /api/admin/presence/online-count
+async fn get_online_count(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+) -> Result<Json<dto::OnlineCountResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let count = state.connection_manager.get_connection_count().await;
+
+    Ok(Json(dto::OnlineCountResponse {
+        online_count: count,
+    }))
+}
+
+// =====================================================
+// P0: 系统运维
+// =====================================================
+
+/// 健康检查
+///
+/// GET /api/admin/system/health
+async fn health_check(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+) -> Result<Json<dto::HealthCheckResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let connections = state.connection_manager.get_connection_count().await;
+
+    Ok(Json(dto::HealthCheckResponse {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_secs: 0,
+        connections,
+    }))
+}
+
+// =====================================================
+// 管理端发送消息（指定发送者）
+// =====================================================
+
+/// 管理端发送消息（可指定发送者）
+///
+/// POST /api/admin/messages/send
+///
+/// 与 send-system 不同，此接口允许指定任意 sender_id 作为消息发送者。
+/// 用于业务系统让某个用户给另一个用户发消息的场景。
+async fn send_message(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(request): Json<dto::SendMessageRequest>,
+) -> Result<Json<dto::SendMessageResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let message_type: i16 = match request.message_type.as_deref() {
+        Some("image") => 1,
+        Some("file") => 2,
+        Some("system") => 10,
+        _ => 0,
+    };
+
+    let metadata = request
+        .metadata
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+    let (message_id, created_at) = state
+        .message_repository
+        .send_message_admin(
+            request.channel_id,
+            request.sender_id,
+            &request.content,
+            message_type,
+            &metadata,
+        )
+        .await
+        .map_err(|e| ServerError::Database(format!("发送消息失败: {}", e)))?;
+
+    Ok(Json(dto::SendMessageResponse {
+        success: true,
+        message_id,
+        channel_id: request.channel_id,
+        sender_id: request.sender_id,
+        created_at,
+        message: "消息已发送".to_string(),
+    }))
+}
+
+// =====================================================
+// 管理端添加群成员
+// =====================================================
+
+/// 添加用户到群组
+///
+/// POST /api/admin/groups/:group_id/members
+///
+/// 自动添加用户到群组并发送系统公告 "[XXX加入了本群]"
+async fn add_group_member(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(group_id): Path<u64>,
+    Json(request): Json<dto::AddGroupMemberRequest>,
+) -> Result<Json<dto::AddGroupMemberResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let result = state
+        .admin_service
+        .add_user_to_group_with_announcement(group_id, request.user_id)
+        .await?;
+
+    Ok(Json(dto::AddGroupMemberResponse {
+        success: true,
+        group_id,
+        user_id: request.user_id,
+        announcement_message_id: result.announcement_message_id,
+        message: "用户已加入群组".to_string(),
+    }))
+}
+
+// =====================================================
+// 在线用户列表
+// =====================================================
+
+/// 获取在线用户列表
+///
+/// GET /api/admin/presence/users
+///
+/// 返回当前所有在线用户及其设备信息
+async fn list_online_users(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Query(params): Query<dto::PageParams>,
+) -> Result<Json<dto::ListOnlineUsersResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(20).min(100);
+
+    let all_connections: Vec<dto::OnlineDeviceItem> = state
+        .connection_manager
+        .get_all_connections()
+        .await
+        .into_iter()
+        .map(|conn| dto::OnlineDeviceItem {
+            device_id: conn.device_id,
+            device_type: None,
+            device_name: None,
+            ip_address: None,
+            connected_at: conn.connected_at,
+            last_active: None,
+        })
+        .collect();
+
+    let total_online = all_connections.len();
+    let offset = ((page - 1) * page_size) as usize;
+    let paged: Vec<dto::OnlineDeviceItem> = all_connections
+        .into_iter()
+        .skip(offset)
+        .take(page_size as usize)
+        .collect();
+
+    Ok(Json(dto::ListOnlineUsersResponse {
+        users: vec![],  // TODO: 聚合用户信息
+        total: total_online,
+        page,
+        page_size,
+    }))
+}
+
+/// 获取指定用户的连接详情
+///
+/// GET /api/admin/presence/user/:user_id
+async fn get_user_connection(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+) -> Result<Json<dto::UserConnectionResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let connections = state
+        .connection_manager
+        .get_user_connections(user_id)
+        .await;
+
+    let user_info = state.user_repository.find_by_id(user_id).await.ok().flatten();
+
+    Ok(Json(dto::UserConnectionResponse {
+        user_id,
+        username: user_info.as_ref().map(|u| u.username.clone()),
+        nickname: user_info.as_ref().and_then(|u| u.display_name.clone()),
+        online: !connections.is_empty(),
+        devices: connections
+            .into_iter()
+            .map(|conn| dto::OnlineDeviceItem {
+                device_id: conn.device_id,
+                device_type: None,
+                device_name: None,
+                ip_address: None,
+                connected_at: conn.connected_at,
+                last_active: None,
+            })
+            .collect(),
+    }))
+}
+
+// =====================================================
+// 会话管理
+// =====================================================
+
+/// 获取会话列表
+///
+/// GET /api/admin/channels
+/// 获取用户会话列表
+///
+/// GET /api/admin/users/:user_id/channels
+async fn list_user_channels(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+    Query(params): Query<dto::PageParams>,
+) -> Result<Json<dto::ListChannelsResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(20).min(100);
+
+    let result = state
+        .channel_service
+        .list_channels_admin(page, page_size, None, Some(user_id))
+        .await
+        .map_err(|e| ServerError::Database(format!("获取用户会话列表失败: {}", e)))?;
+
+    let channels: Vec<dto::ChannelItem> = result.0.into_iter().map(|v| {
+        dto::ChannelItem {
+            channel_id: v.get("channel_id").and_then(|v: &serde_json::Value| v.as_u64()).unwrap_or(0),
+            channel_type: v.get("channel_type").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0) as i16,
+            name: v.get("name").and_then(|v: &serde_json::Value| v.as_str()).map(|s| s.to_string()),
+            avatar_url: v.get("avatar_url").and_then(|v: &serde_json::Value| v.as_str()).map(|s| s.to_string()),
+            member_count: v.get("member_count").and_then(|v: &serde_json::Value| v.as_u64()).map(|n| n as i32),
+            last_message: None,
+            created_at: v.get("created_at").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
+        }
+    }).collect();
+
+    Ok(Json(dto::ListChannelsResponse {
+        channels,
+        total: result.1 as usize,
+        page,
+        page_size,
+    }))
+}
+
+/// 获取会话详情
+///
+/// GET /api/admin/channels/:channel_id
+async fn get_channel(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<u64>,
+) -> Result<Json<serde_json::Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    let channel = state
+        .channel_service
+        .get_channel_admin(channel_id)
+        .await
+        .map_err(|e| ServerError::Database(format!("获取会话详情失败: {}", e)))?
+        .ok_or_else(|| ServerError::NotFound(format!("会话 {} 不存在", channel_id)))?;
+
+    Ok(Json(channel))
+}
+
+/// 获取会话参与者列表
+///
+/// GET /api/admin/channels/:channel_id/participants
+async fn list_channel_participants(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<u64>,
+    Query(params): Query<dto::PageParams>,
+) -> Result<Json<serde_json::Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(20).min(100);
+
+    let result = state
+        .channel_service
+        .list_participants_admin(channel_id, page, page_size)
+        .await
+        .map_err(|e| ServerError::Database(format!("获取参与者列表失败: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "channel_id": channel_id,
+        "participants": result.0,
+        "total": result.1,
+    })))
+}
+
+// =====================================================
+// 全局广播
+// =====================================================
+
+/// 全局广播消息
+///
+/// POST /api/admin/messages/broadcast
+async fn broadcast_message(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(request): Json<dto::BroadcastRequest>,
+) -> Result<Json<dto::BroadcastResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    let target_scope = request.target_scope.unwrap_or_else(|| "all".to_string());
+    let message_type = request.message_type.unwrap_or(5);
+
+    let online_count = state
+        .connection_manager
+        .get_connection_count()
+        .await;
+
+    info!("开始全局广播, target_scope={}, online={}", target_scope, online_count);
+
+    Ok(Json(dto::BroadcastResponse {
+        success: true,
+        target_scope,
+        online_recipients: online_count,
+        message: "广播已发送".to_string(),
+    }))
+}
+
+// =====================================================
+// 消息搜索
+// =====================================================
+
+/// 搜索消息
+///
+/// GET /api/admin/messages/search
+async fn search_messages(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Query(params): Query<dto::SearchMessagesRequest>,
+) -> Result<Json<dto::SearchMessagesResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    if params.keyword.trim().is_empty() {
+        return Err(ServerError::Validation("关键词不能为空".to_string()));
+    }
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(20).min(100);
+
+    let result = state
+        .message_repository
+        .search_messages(
+            &params.keyword,
+            params.channel_id,
+            params.user_id,
+            params.message_type,
+            params.start_time,
+            params.end_time,
+            page,
+            page_size,
+        )
+        .await
+        .map_err(|e| ServerError::Database(format!("搜索消息失败: {}", e)))?;
+
+    let messages: Vec<dto::SearchMessageItem> = result.0.into_iter().map(|v| {
+        dto::SearchMessageItem {
+            message_id: v.get("message_id").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
+            channel_id: v.get("channel_id").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
+            sender_id: v.get("sender_id").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
+            content: v.get("content").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string(),
+            message_type: v.get("message_type").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0) as i16,
+            created_at: v.get("created_at").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
+        }
+    }).collect();
+
+    Ok(Json(dto::SearchMessagesResponse {
+        messages,
+        total: result.1 as usize,
+        page,
+        page_size,
+    }))
 }

@@ -1,10 +1,18 @@
 use serde::{Deserialize, Serialize};
 
-/// 推送平台（MVP 只支持这两个）
+/// 推送平台
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum PushVendor {
     Apns,
     Fcm,
+    Hms,    // Huawei / HarmonyOS push
+    Xiaomi, // Mi Push
+    Oppo,   // HeyTap Push
+    Vivo,   // Vivo Push
+    Honor,  // Honor Push (通常与 HMS 生态兼容)
+    Lenovo, // Lenovo Push
+    Zte,    // ZTE Push
+    Meizu,  // Meizu Push
 }
 
 impl PushVendor {
@@ -12,6 +20,14 @@ impl PushVendor {
         match self {
             PushVendor::Apns => "apns",
             PushVendor::Fcm => "fcm",
+            PushVendor::Hms => "hms",
+            PushVendor::Xiaomi => "xiaomi",
+            PushVendor::Oppo => "oppo",
+            PushVendor::Vivo => "vivo",
+            PushVendor::Honor => "honor",
+            PushVendor::Lenovo => "lenovo",
+            PushVendor::Zte => "zte",
+            PushVendor::Meizu => "meizu",
         }
     }
 
@@ -19,6 +35,16 @@ impl PushVendor {
         match s.to_lowercase().as_str() {
             "apns" => Some(PushVendor::Apns),
             "fcm" => Some(PushVendor::Fcm),
+            "hms" | "huawei" | "huawei_push" | "harmony" | "harmonyos" => {
+                Some(PushVendor::Hms)
+            }
+            "xiaomi" | "mi" | "mipush" | "mi_push" => Some(PushVendor::Xiaomi),
+            "oppo" | "heytap" | "heytap_push" => Some(PushVendor::Oppo),
+            "vivo" | "vivo_push" => Some(PushVendor::Vivo),
+            "honor" | "honor_push" => Some(PushVendor::Honor),
+            "lenovo" | "lenovo_push" => Some(PushVendor::Lenovo),
+            "zte" | "zte_push" => Some(PushVendor::Zte),
+            "meizu" | "meizu_push" => Some(PushVendor::Meizu),
             _ => None,
         }
     }

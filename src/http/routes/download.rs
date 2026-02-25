@@ -12,16 +12,16 @@ use axum::{
 use tracing::info;
 
 use crate::error::{Result, ServerError};
-use crate::http::HttpServerState;
+use crate::http::FileServerState;
 
 /// 创建下载路由
-pub fn create_route() -> Router<HttpServerState> {
+pub fn create_route() -> Router<FileServerState> {
     Router::new().route("/api/app/files/{file_id}", get(download_file))
 }
 
 /// 文件下载处理器
 async fn download_file(
-    State(state): State<HttpServerState>,
+    State(state): State<FileServerState>,
     Path(file_id): Path<String>,
 ) -> Result<impl IntoResponse> {
     let file_id = file_id
