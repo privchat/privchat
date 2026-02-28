@@ -56,8 +56,8 @@ ip_connections_per_second = 10.0
 ### 步骤 2: 在 server.rs 中初始化
 
 ```rust
-use privchat_server::security::{SecurityService, SecurityConfig};
-use privchat_server::middleware::SecurityMiddleware;
+use privchat::security::{SecurityService, SecurityConfig};
+use privchat::middleware::SecurityMiddleware;
 
 // 从配置创建安全服务
 let security_config = config.security.clone().into();

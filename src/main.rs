@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use anyhow::{Context, Result};
-use privchat_server::{
+use privchat::{
     cli::Cli,
     config::{self, ServerConfig},
     logging, ChatServer,
@@ -35,16 +35,16 @@ async fn main() -> Result<()> {
     // 处理子命令
     if let Some(command) = &cli.command {
         match command {
-            privchat_server::cli::Commands::Migrate => {
+            privchat::cli::Commands::Migrate => {
                 return run_migrate(&cli).await;
             }
-            privchat_server::cli::Commands::GenerateConfig { path } => {
+            privchat::cli::Commands::GenerateConfig { path } => {
                 return generate_config(path);
             }
-            privchat_server::cli::Commands::ValidateConfig { path } => {
+            privchat::cli::Commands::ValidateConfig { path } => {
                 return validate_config(path);
             }
-            privchat_server::cli::Commands::ShowConfig => {
+            privchat::cli::Commands::ShowConfig => {
                 return show_config(&cli);
             }
         }

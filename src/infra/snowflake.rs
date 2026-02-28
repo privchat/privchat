@@ -81,7 +81,7 @@ fn init_generator() -> &'static Mutex<Snowflake> {
 /// # 示例
 ///
 /// ```rust
-/// use privchat_server::infra::snowflake::next_message_id;
+/// use privchat::infra::snowflake::next_message_id;
 ///
 /// let message_id = next_message_id();
 /// println!("Generated message ID: {}", message_id);
