@@ -1,5 +1,5 @@
 [package]
-name = "privchat-server"
+name = "privchat"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance instant messaging server built on msgtrans"
