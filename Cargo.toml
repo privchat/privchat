@@ -3,24 +3,22 @@ name = "privchat-server"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance instant messaging server built on msgtrans"
-authors = ["Your Name <your.email@example.com>"]
-license = "MIT"
-repository = "https://github.com/yourusername/privchat-server"
+authors = ["zoujiaqing <zoujiaqing@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/privchat/privchat"
 keywords = ["chat", "messaging", "server", "websocket", "quic"]
 categories = ["network-programming", "web-programming"]
 
 [[bin]]
-name = "privchat-server"
+name = "privchat"
 path = "src/main.rs"
-
-
 
 [dependencies]
 # 传输层
 msgtrans = { path = "../msgtrans", version = "1.0" }
 
 # 协议
-privchat-protocol = { path = "../privchat-protocol", version = "0.1.0" }
+privchat-protocol = { path = "../privchat-protocol", version = "0.1" }
 
 # 异步运行时
 tokio = { version = "1.0", features = ["full"] }
