@@ -618,17 +618,17 @@ impl MessageHandler for SendMessageHandler {
                                 channel
                             }
                         }
-                        crate::model::channel::ChannelType::System => {
-                            // 系统会话：不支持消息发送
+                        crate::model::channel::ChannelType::Room => {
+                            // Room 频道不支持 SendMessage，消息通过 Admin API 广播
                             warn!(
-                                "❌ SendMessageHandler: 系统会话不支持消息发送: {}",
+                                "❌ SendMessageHandler: Room 频道不支持 SendMessage: {}",
                                 send_message_request.channel_id
                             );
                             return self
                                 .create_error_response(
                                     &send_message_request,
                                     ErrorCode::OperationNotAllowed,
-                                    "系统会话不支持消息发送",
+                                    "Room channels do not accept SendMessage",
                                 )
                                 .await;
                         }
@@ -1923,7 +1923,7 @@ impl SendMessageHandler {
             channel_type: match channel.channel_type {
                 crate::model::channel::ChannelType::Direct => 1u8,
                 crate::model::channel::ChannelType::Group => 2u8,
-                crate::model::channel::ChannelType::System => 3u8,
+                crate::model::channel::ChannelType::Room => 2u8,
             },
             message_type: message_record.message_type,
             expire: 0,
@@ -2077,7 +2077,7 @@ impl SendMessageHandler {
         let channel_type = match channel.channel_type {
             crate::model::channel::ChannelType::Direct => ChannelType::Direct,
             crate::model::channel::ChannelType::Group => ChannelType::Group,
-            crate::model::channel::ChannelType::System => ChannelType::System,
+            crate::model::channel::ChannelType::Room => ChannelType::Group,
         };
 
         // 使用第一个成员作为创建者（通常是频道的owner）

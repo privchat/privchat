@@ -8,7 +8,7 @@ use tracing::info;
 use crate::auth::DeviceManagerDb;
 use crate::auth::{ServiceKeyManager, TokenIssueService};
 use crate::http::routes;
-use crate::infra::ConnectionManager;
+use crate::infra::{ConnectionManager, SubscribeManager};
 use crate::repository::{LoginLogRepository, PgMessageRepository, UserRepository};
 use crate::security::SecurityService;
 use crate::service::{AdminService, ChannelService, FileService, UploadTokenService};
@@ -33,6 +33,7 @@ pub struct AdminServerState {
     pub connection_manager: Arc<ConnectionManager>,
     pub security_service: Arc<SecurityService>,
     pub admin_service: Arc<AdminService>,
+    pub subscribe_manager: Arc<SubscribeManager>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -89,6 +90,7 @@ impl AdminHttpServer {
         channel_service: Arc<ChannelService>,
         connection_manager: Arc<ConnectionManager>,
         security_service: Arc<SecurityService>,
+        subscribe_manager: Arc<SubscribeManager>,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -111,6 +113,7 @@ impl AdminHttpServer {
                 connection_manager,
                 security_service,
                 admin_service,
+                subscribe_manager,
             },
             port,
         }

@@ -503,3 +503,20 @@ pub struct HealthCheckResponse {
     pub uptime_secs: u64,
     pub connections: usize,
 }
+
+// =====================================================
+// Room 频道管理
+// =====================================================
+
+/// 创建 Room 频道请求
+#[derive(Debug, Deserialize)]
+pub struct CreateRoomChannelRequest {
+    pub name: Option<String>,
+}
+
+/// Room 频道广播请求
+#[derive(Debug, Deserialize)]
+pub struct RoomBroadcastRequest {
+    pub content: String,
+    pub sender_id: Option<u64>,
+}

@@ -75,6 +75,13 @@ pub fn next_message_id() -> u64 {
     guard.next_id().expect("Failed to generate Snowflake ID")
 }
 
+/// 生成下一个频道ID
+///
+/// 频道ID与消息ID使用相同的雪花算法，确保全局唯一性
+pub fn next_channel_id() -> u64 {
+    next_message_id()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

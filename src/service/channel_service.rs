@@ -89,8 +89,6 @@ pub struct ChannelServiceStats {
     pub direct_channels: usize,
     /// 群聊会话数
     pub group_channels: usize,
-    /// 系统会话数
-    pub system_channels: usize,
     /// 总成员数
     pub total_members: usize,
     /// 平均每个会话的成员数
@@ -1119,11 +1117,11 @@ impl ChannelService {
 
                 conv
             }
-            ChannelType::System => {
+            ChannelType::Room => {
                 return Ok(ChannelResponse {
                     channel: Channel::new_direct(0, 0, 0),
                     success: false,
-                    error: Some("System channels cannot be created by users".to_string()),
+                    error: Some("Room channels are created via Admin API".to_string()),
                 });
             }
         };
@@ -1367,11 +1365,12 @@ impl ChannelService {
 
                 conv
             }
-            ChannelType::System => {
-                // 系统会话通常是只读的，用于系统通知
-                let mut conv = Channel::new_group(channel_id, creator_id, request.name.clone());
-                conv.metadata.description = request.description;
-                conv
+            ChannelType::Room => {
+                return Ok(ChannelResponse {
+                    channel: Channel::new_direct(0, 0, 0),
+                    success: false,
+                    error: Some("Room channels are created via Admin API".to_string()),
+                });
             }
         };
 
@@ -1697,7 +1696,7 @@ impl ChannelService {
                 let channel_type = match ch.channel_type {
                     ChannelType::Direct => 1i64,
                     ChannelType::Group => 2i64,
-                    ChannelType::System => 3i64,
+                    ChannelType::Room => 2i64,
                 };
                 let payload = serde_json::to_value(ChannelSyncPayload {
                     channel_id: Some(ch.id),
@@ -2048,7 +2047,6 @@ impl ChannelService {
         let mut active_channels = 0;
         let mut direct_channels = 0;
         let mut group_channels = 0;
-        let mut system_channels = 0;
         let mut total_members = 0;
 
         for conv in channels.values() {
@@ -2059,7 +2057,7 @@ impl ChannelService {
             match conv.channel_type {
                 ChannelType::Direct => direct_channels += 1,
                 ChannelType::Group => group_channels += 1,
-                ChannelType::System => system_channels += 1,
+                ChannelType::Room => {},
             }
 
             total_members += conv.members.len();
@@ -2076,7 +2074,6 @@ impl ChannelService {
             active_channels,
             direct_channels,
             group_channels,
-            system_channels,
             total_members,
             avg_members_per_channel,
         }

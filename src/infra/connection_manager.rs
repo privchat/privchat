@@ -26,7 +26,7 @@ pub struct ConnectionManager {
     session_index: DashMap<SessionId, (u64, String)>,
 
     /// TransportServer 引用（用于实际断开连接）
-    transport_server: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
+    pub transport_server: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
 }
 
 impl ConnectionManager {

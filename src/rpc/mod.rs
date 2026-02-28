@@ -21,7 +21,7 @@ pub mod user;
 
 use crate::auth::{DeviceManager, DeviceManagerDb, TokenRevocationService};
 use crate::config::ServerConfig;
-use crate::infra::{CacheManager, ConnectionManager, MessageRouter, PresenceManager}; // ✨ 新增 ConnectionManager
+use crate::infra::{CacheManager, ConnectionManager, MessageRouter, PresenceManager, SubscribeManager, TypingRateLimiter};
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::UserRepository;
 use crate::service::sync::SyncService;
@@ -116,6 +116,8 @@ pub struct RpcServiceContext {
     pub message_repository: Arc<crate::repository::PgMessageRepository>,
     /// 连接管理器 - 用于管理活跃连接和设备断连
     pub connection_manager: Arc<ConnectionManager>, // ✨ 新增
+    /// Room 管理器 - 用于管理发布订阅频道
+    pub subscribe_manager: Arc<SubscribeManager>,
     /// 同步服务 - 用于 pts 同步机制
     pub sync_service: Arc<SyncService>, // ✨ 新增
     /// 认证会话管理器 - 用于 READY 闸门
@@ -128,6 +130,8 @@ pub struct RpcServiceContext {
     pub user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
     /// 未读计数服务
     pub unread_count_service: Arc<UnreadCountService>,
+    /// Typing 限频器 - (user_id, channel_id) 500ms/次
+    pub typing_rate_limiter: Arc<TypingRateLimiter>,
 }
 
 impl RpcServiceContext {
@@ -159,12 +163,14 @@ impl RpcServiceContext {
         user_repository: Arc<UserRepository>,
         message_repository: Arc<crate::repository::PgMessageRepository>,
         connection_manager: Arc<ConnectionManager>, // ✨ 新增参数
+        subscribe_manager: Arc<SubscribeManager>,
         sync_service: Arc<SyncService>,             // ✨ 新增参数
         auth_session_manager: Arc<crate::infra::SessionManager>,
         offline_worker: Arc<crate::infra::OfflineMessageWorker>,
         user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
         user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
         unread_count_service: Arc<UnreadCountService>,
+        typing_rate_limiter: Arc<TypingRateLimiter>,
     ) -> Self {
         Self {
             // channel_service 已合并到 channel_service
@@ -194,12 +200,14 @@ impl RpcServiceContext {
             user_repository,
             message_repository,
             connection_manager, // ✨ 新增
+            subscribe_manager,
             sync_service,       // ✨ 新增
             auth_session_manager,
             offline_worker,
             user_device_repo, // ✨ Phase 3.5
             user_settings_repo,
             unread_count_service,
+            typing_rate_limiter,
         }
     }
 }

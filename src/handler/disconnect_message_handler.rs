@@ -1,18 +1,25 @@
 use crate::context::RequestContext;
 use crate::handler::MessageHandler;
+use crate::infra::SubscribeManager;
 use crate::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// 断开连接消息处理器
 pub struct DisconnectMessageHandler {
     connection_manager: Arc<crate::infra::ConnectionManager>,
+    subscribe_manager: Arc<SubscribeManager>,
 }
 
 impl DisconnectMessageHandler {
-    pub fn new(connection_manager: Arc<crate::infra::ConnectionManager>) -> Self {
-        Self { connection_manager }
+    pub fn new(
+        connection_manager: Arc<crate::infra::ConnectionManager>,
+        subscribe_manager: Arc<SubscribeManager>,
+    ) -> Self {
+        Self {
+            connection_manager,
+            subscribe_manager,
+        }
     }
 }
 
@@ -38,12 +45,21 @@ impl MessageHandler for DisconnectMessageHandler {
         // 注销连接
         if let Err(e) = self
             .connection_manager
-            .unregister_connection(context.session_id)
+            .unregister_connection(context.session_id.clone())
             .await
         {
             warn!("⚠️ DisconnectMessageHandler: 注销连接失败: {}", e);
         } else {
             info!("✅ DisconnectMessageHandler: 连接已注销");
+        }
+
+        // 清理频道订阅
+        let left_channels = self.subscribe_manager.on_session_disconnect(&context.session_id);
+        if !left_channels.is_empty() {
+            info!(
+                "🔌 DisconnectMessageHandler: Session {} 离开频道 {:?}",
+                context.session_id, left_channels
+            );
         }
 
         // 创建断开连接响应

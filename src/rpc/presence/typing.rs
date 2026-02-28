@@ -3,11 +3,10 @@ use tracing::warn;
 
 use crate::rpc::{get_current_user_id, RpcContext, RpcError, RpcResult, RpcServiceContext};
 use privchat_protocol::presence::*;
-use privchat_protocol::PushMessageRequest;
 
 /// RPC Handler: presence/typing
 ///
-/// 发送输入状态通知
+/// 发送输入状态通知（通过 Subscribe/Publish 机制广播给频道订阅者）
 pub async fn handle(
     params: Value,
     services: RpcServiceContext,
@@ -28,10 +27,27 @@ pub async fn handle(
         req.action_type
     );
 
+    // 2.5 限频检查：(user_id, channel_id) 500ms 内只允许 1 次广播
+    if !services.typing_rate_limiter.check_and_update(user_id, req.channel_id) {
+        tracing::debug!(
+            "⏱️ presence/typing: rate limited user {} in channel {} (dropped_total={})",
+            user_id,
+            req.channel_id,
+            services.typing_rate_limiter.dropped_total(),
+        );
+        // 被限频时仍返回成功（客户端无需感知）
+        let response = TypingIndicatorResponse {
+            code: 0,
+            message: "OK".to_string(),
+        };
+        return serde_json::to_value(response)
+            .map_err(|e| RpcError::internal(format!("Serialize response failed: {}", e)));
+    }
+
     // 3. 构造通知消息
     let notification = TypingStatusNotification {
         user_id,
-        username: None, // 可选：从缓存或数据库获取用户名
+        username: None,
         channel_id: req.channel_id,
         channel_type: req.channel_type,
         is_typing: req.is_typing,
@@ -39,72 +55,63 @@ pub async fn handle(
         timestamp: chrono::Utc::now().timestamp(),
     };
 
-    // 4. 广播给会话中的其他成员
     let notification_payload = serde_json::to_vec(&notification)
         .map_err(|e| RpcError::internal(format!("Serialize notification failed: {}", e)))?;
 
-    // 根据会话类型决定广播方式
-    match req.channel_type {
-        1 => {
-            // 私聊：channel_id 就是对方的 user_id
-            // 推送给对方（如果对方在线）
-            let target_user_id = req.channel_id;
+    // 4. 构造 PublishRequest (topic="typing")
+    let publish_request = privchat_protocol::protocol::PublishRequest {
+        channel_id: req.channel_id,
+        topic: Some("typing".to_string()),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        payload: notification_payload,
+        publisher: Some(user_id.to_string()),
+        server_message_id: None, // typing 事件不需要消息ID
+    };
 
-            // 构造 PushMessageRequest
-            let push_msg = PushMessageRequest {
-                setting: Default::default(),
-                msg_key: String::new(),
-                server_message_id: 0, // 输入状态不需要消息ID
-                message_seq: 0,
-                local_message_id: 0,
-                stream_no: String::new(),
-                stream_seq: 0,
-                stream_flag: 0,
-                timestamp: chrono::Utc::now().timestamp() as u32,
-                channel_id: req.channel_id,
-                channel_type: 1, // 私聊
-                message_type: privchat_protocol::ContentMessageType::System.as_u32(),
-                expire: 0,
-                topic: String::new(),
-                from_uid: user_id,
-                payload: notification_payload,
-            };
+    let payload_bytes = privchat_protocol::encode_message(&publish_request)
+        .map_err(|e| RpcError::internal(format!("Encode PublishRequest failed: {}", e)))?;
 
-            // 使用 MessageRouter 推送
-            if let Err(e) = services
-                .message_router
-                .route_message_to_user(&target_user_id, push_msg)
-                .await
-            {
-                warn!(
-                    "Failed to broadcast typing to user {}: {}",
-                    target_user_id, e
-                );
-            } else {
-                tracing::debug!("✅ Broadcasted typing status to user {}", target_user_id);
+    // 5. 获取该频道的所有订阅者并广播
+    let sessions = services.subscribe_manager.get_channel_sessions(req.channel_id);
+    let sender_session_id = ctx.session_id.clone();
+
+    let transport = services.connection_manager.transport_server.read().await;
+    if let Some(server) = transport.as_ref() {
+        let mut delivered = 0usize;
+        for sid in &sessions {
+            // 跳过发送者自己
+            if sender_session_id.as_deref() == Some(&sid.to_string()) {
+                continue;
+            }
+
+            let mut packet = msgtrans::packet::Packet::one_way(0u32, payload_bytes.clone());
+            packet.set_biz_type(
+                privchat_protocol::protocol::MessageType::PublishRequest as u8,
+            );
+
+            // best-effort：发送失败仅记录日志
+            match server.send_to_session(sid.clone(), packet).await {
+                Ok(_) => {
+                    delivered += 1;
+                }
+                Err(e) => {
+                    warn!("Failed to send typing to session {}: {}", sid, e);
+                }
             }
         }
-        2 => {
-            // 群聊：需要查询群成员并广播给其他在线成员
-            // TODO: 实现群聊广播逻辑
-            // 1. 查询群成员列表
-            // 2. 过滤掉当前用户
-            // 3. 推送给所有在线成员
 
-            tracing::debug!("TODO: Broadcast typing status to group {}", req.channel_id);
-        }
-        _ => {
-            warn!("Unknown channel_type: {}", req.channel_type);
-        }
+        tracing::debug!(
+            "📢 Broadcast typing to {}/{} subscribers for channel {}",
+            delivered,
+            sessions.len().saturating_sub(1),
+            req.channel_id,
+        );
     }
 
-    tracing::debug!(
-        "📢 Broadcasting typing status to channel {} (type={})",
-        req.channel_id,
-        req.channel_type
-    );
-
-    // 5. 返回响应
+    // 6. 返回响应
     let response = TypingIndicatorResponse {
         code: 0,
         message: "OK".to_string(),

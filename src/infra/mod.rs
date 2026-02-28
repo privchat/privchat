@@ -22,7 +22,9 @@ pub mod online_status_manager;
 pub mod presence_manager;
 pub mod presence_manager_with_db;
 pub mod redis;
+pub mod subscribe_manager; // 频道事件订阅管理
 pub mod session_manager;
+pub mod typing_rate_limiter; // typing 限频器
 pub mod snowflake; // ✨ 新增：事件总线
                    // pub mod redis_cache;
                    // pub mod service_protocol;
@@ -57,12 +59,14 @@ pub use presence_manager_with_db::{
     PresenceConfig, PresenceManagerWithDb as PresenceManager, PresenceStats,
 };
 pub use session_manager::{SessionInfo, SessionManager}; // ✨ 新增
+pub use subscribe_manager::{SubscribeManager, MAX_CHANNEL_SUBSCRIBERS_ONLINE, MAX_SUBSCRIPTIONS_PER_SESSION};
+pub use typing_rate_limiter::TypingRateLimiter;
 
 // 数据库连接管理
 pub use database::Database;
 
 // Snowflake ID生成器
-pub use snowflake::next_message_id;
+pub use snowflake::{next_message_id, next_channel_id};
 // pub use logger::setup_logger;
 // pub use metrics::Metrics;
 // pub use redis::RedisManager;

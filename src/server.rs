@@ -102,6 +102,8 @@ pub struct ChatServer {
     redis_client: Option<Arc<crate::infra::redis::RedisClient>>,
     /// 离线消息 Worker（用于队列指标上报）
     offline_worker: Arc<crate::infra::OfflineMessageWorker>,
+    /// Room 管理器（用于发布订阅频道管理）
+    subscribe_manager: Arc<crate::infra::SubscribeManager>,
 }
 
 impl ChatServer {
@@ -242,6 +244,10 @@ impl ChatServer {
         // 3.3 创建连接管理器（✨ 新增，用于管理活跃连接和设备断连）
         let connection_manager = Arc::new(crate::infra::ConnectionManager::new());
         info!("✅ 连接管理器初始化完成");
+
+        // 3.4 创建 Room 管理器（用于发布订阅频道管理）
+        let subscribe_manager = Arc::new(crate::infra::SubscribeManager::new());
+        info!("✅ Room 管理器初始化完成");
 
         // 4. 创建 Token 撤销服务
         let token_revocation_service = Arc::new(crate::auth::TokenRevocationService::new(
@@ -513,12 +519,12 @@ impl ChatServer {
 
         message_dispatcher.register_handler(
             MessageType::SubscribeRequest,
-            Box::new(SubscribeMessageHandler::new()),
+            Box::new(SubscribeMessageHandler::new(subscribe_manager.clone(), channel_service.clone())),
         );
         message_dispatcher.register_handler(
             MessageType::DisconnectRequest,
-            Box::new(DisconnectMessageHandler::new(connection_manager.clone())),
-        ); // ✨ 新增参数
+            Box::new(DisconnectMessageHandler::new(connection_manager.clone(), subscribe_manager.clone())),
+        );
         message_dispatcher.register_handler(
             MessageType::RpcRequest,
             Box::new(RPCMessageHandler::new(auth_middleware.clone())),
@@ -1111,6 +1117,9 @@ impl ChatServer {
         ));
         info!("✅ SyncService 创建完成");
 
+        // Typing 限频器
+        let typing_rate_limiter = Arc::new(crate::infra::TypingRateLimiter::new());
+
         // 初始化 RPC 系统
         info!("🔧 初始化 RPC 系统...");
         let rpc_services = crate::rpc::RpcServiceContext::new(
@@ -1141,6 +1150,7 @@ impl ChatServer {
             user_repository.clone(),
             message_repository.clone(),
             connection_manager.clone(), // ✨ 新增
+            subscribe_manager.clone(),
             sync_service.clone(),       // ✨ 新增
             auth_session_manager.clone(),
             offline_worker.clone(),
@@ -1149,6 +1159,7 @@ impl ChatServer {
                 (*pool).clone(),
             )), // user_settings 表为主
             unread_count_service.clone(),
+            typing_rate_limiter.clone(),
         );
         crate::rpc::init_rpc_system(rpc_services).await;
         info!("✅ RPC 系统初始化完成");
@@ -1222,6 +1233,7 @@ impl ChatServer {
             event_bus,
             redis_client: Some(redis_client.clone()),
             offline_worker: offline_worker.clone(),
+            subscribe_manager,
         })
     }
 
@@ -1377,6 +1389,7 @@ impl ChatServer {
         let connection_manager = self.connection_manager.clone();
         let message_router = self.message_router.clone();
         let handler_limiter = self.handler_limiter.clone();
+        let subscribe_manager = self.subscribe_manager.clone();
 
         tokio::spawn(async move {
             info!("📡 事件处理器开始监听...");
@@ -1414,6 +1427,12 @@ impl ChatServer {
 
                         // 清理认证会话
                         auth_session_manager.unbind_session(&session_id).await;
+
+                        // 清理频道订阅（防止幽灵 session 堆积）
+                        let left_channels = subscribe_manager.on_session_disconnect(&session_id);
+                        if !left_channels.is_empty() {
+                            info!("📡 连接关闭: session {} 离开频道 {:?}", session_id, left_channels);
+                        }
 
                         // 清理连接管理 + 消息路由在线状态
                         match connection_manager.unregister_connection(session_id).await {
@@ -1934,6 +1953,7 @@ impl ChatServer {
             self.channel_service.clone(),
             self.connection_manager.clone(),
             self.security_service.clone(),
+            self.subscribe_manager.clone(),
             self.config.admin_api_port,
         );
 

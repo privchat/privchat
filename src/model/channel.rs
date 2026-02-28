@@ -30,10 +30,10 @@ pub enum ChannelType {
     /// 私聊（1v1）
     #[default]
     Direct = 0,
-    /// 群聊
+    /// 群聊（强语义 IM）
     Group = 1,
-    /// 系统频道（通知等）
-    System = 2,
+    /// Room 频道（session-scoped 发布/订阅广播通道）
+    Room = 2,
 }
 
 impl ChannelType {
@@ -42,7 +42,7 @@ impl ChannelType {
         match value {
             0 => ChannelType::Direct,
             1 => ChannelType::Group,
-            2 => ChannelType::System,
+            2 => ChannelType::Room,
             _ => ChannelType::Direct,
         }
     }
@@ -69,7 +69,7 @@ impl From<ChannelType> for ChannelKind {
         match ty {
             ChannelType::Direct => ChannelKind::PrivateChat,
             ChannelType::Group => ChannelKind::GroupChat,
-            ChannelType::System => ChannelKind::Broadcast,
+            ChannelType::Room => ChannelKind::Broadcast,
         }
     }
 }
@@ -79,7 +79,7 @@ impl From<ChannelKind> for ChannelType {
         match kind {
             ChannelKind::PrivateChat => ChannelType::Direct,
             ChannelKind::GroupChat => ChannelType::Group,
-            ChannelKind::Broadcast => ChannelType::System,
+            ChannelKind::Broadcast => ChannelType::Room,
         }
     }
 }
@@ -569,7 +569,7 @@ impl Channel {
         let creator_id = match conv_type {
             ChannelType::Direct => direct_user1_id.map(|id| id as u64).unwrap_or(0),
             ChannelType::Group => 0, // 需要从 group 表查询 owner_id
-            ChannelType::System => 0,
+            ChannelType::Room => 0, // Room 频道没有 creator_id
         };
 
         Self {
@@ -812,7 +812,7 @@ impl Channel {
                     format!("私聊 ({})", members.join(", "))
                 }
                 ChannelType::Group => "群聊".to_string(),
-                ChannelType::System => "系统频道".to_string(),
+                ChannelType::Room => format!("Room 频道 {}", self.id),
             },
         }
     }

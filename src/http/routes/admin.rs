@@ -48,6 +48,11 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/api/admin/groups", get(list_groups))
         .route("/api/admin/groups/{group_id}", get(get_group))
         .route("/api/admin/groups/{group_id}", delete(dissolve_group))
+        // Room 频道管理
+        .route("/api/admin/room", post(create_room_channel))
+        .route("/api/admin/room", get(list_room_channels))
+        .route("/api/admin/room/{channel_id}", get(get_room_channel))
+        .route("/api/admin/room/{channel_id}/broadcast", post(room_broadcast))
         // 好友管理
         .route("/api/admin/friendships", post(create_friendship)) // 创建好友关系
         .route("/api/admin/friendships", get(list_friendships))
@@ -720,6 +725,204 @@ async fn dissolve_group(
         "success": true,
         "group_id": group_id,
         "message": "群组已解散"
+    })))
+}
+
+// =====================================================
+// Room 频道管理
+// =====================================================
+
+use crate::infra::next_channel_id;
+
+/// 创建 Room 频道
+///
+/// POST /api/admin/room
+async fn create_room_channel(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(payload): Json<dto::CreateRoomChannelRequest>,
+) -> Result<Json<Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    let channel_id = next_channel_id();
+    let name = payload.name.unwrap_or_else(|| format!("Room-{}", channel_id));
+
+    info!("📡 Admin: 创建 Room 频道 channel_id={}, name={}", channel_id, name);
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "name": name,
+        "message": "频道创建成功"
+    })))
+}
+
+/// 获取 Room 频道列表
+///
+/// GET /api/admin/room?page=1&page_size=20
+async fn list_room_channels(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    let page = params
+        .get("page")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = params
+        .get("page_size")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(20)
+        .min(100);
+
+    let all_channels = state.subscribe_manager.get_all_channels();
+    let total_channels = all_channels.len();
+    let total_sessions = state.subscribe_manager.get_total_session_count();
+
+    // 分页
+    let start = ((page - 1) * page_size) as usize;
+    let channels: Vec<Value> = all_channels
+        .into_iter()
+        .skip(start)
+        .take(page_size as usize)
+        .map(|(channel_id, session_count)| {
+            json!({
+                "channel_id": channel_id,
+                "online_count": session_count,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "channels": channels,
+        "total": total_channels,
+        "total_sessions": total_sessions,
+        "page": page,
+        "page_size": page_size,
+    })))
+}
+
+/// 获取 Room 频道详情
+///
+/// GET /api/admin/room/:channel_id
+async fn get_room_channel(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<u64>,
+) -> Result<Json<Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    let online_count = state.subscribe_manager.get_channel_online_count(channel_id);
+
+    Ok(Json(json!({
+        "channel_id": channel_id,
+        "online_count": online_count,
+    })))
+}
+
+/// Room 频道广播
+///
+/// POST /api/admin/room/:channel_id/broadcast
+async fn room_broadcast(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<u64>,
+    Json(payload): Json<dto::RoomBroadcastRequest>,
+) -> Result<Json<Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    let sessions = state.subscribe_manager.get_channel_sessions(channel_id);
+    let online_count = sessions.len();
+
+    if sessions.is_empty() {
+        return Ok(Json(json!({
+            "success": true,
+            "channel_id": channel_id,
+            "online_count": 0,
+            "delivered": 0,
+            "message": "频道内无在线订阅者"
+        })));
+    }
+
+    let transport = state.connection_manager.transport_server.read().await;
+    let Some(server) = transport.as_ref() else {
+        return Err(ServerError::Internal("TransportServer 未就绪".to_string()));
+    };
+
+    let message_content = payload.content.clone();
+    let publisher = payload.sender_id.map(|id| id.to_string());
+    let server_msg_id = crate::infra::next_message_id();
+
+    // Room 广播使用 PublishRequest（发布订阅协议）
+    let publish_request = privchat_protocol::protocol::PublishRequest {
+        channel_id,
+        topic: None,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        payload: message_content.into_bytes(),
+        publisher,
+        server_message_id: Some(server_msg_id),
+    };
+
+    let payload_bytes = privchat_protocol::encode_message(&publish_request)
+        .map_err(|e| ServerError::Protocol(format!("编码消息失败: {}", e)))?;
+
+    // 并行广播：使用 tokio::spawn 并发发送，不逐个 await（非阻塞 fanout）
+    let payload_bytes = std::sync::Arc::new(payload_bytes);
+    let mut handles = Vec::with_capacity(sessions.len());
+
+    for sid in sessions {
+        let server_clone = server.clone();
+        let bytes = payload_bytes.clone();
+        handles.push(tokio::spawn(async move {
+            let mut packet = msgtrans::packet::Packet::one_way(0u32, (*bytes).clone());
+            packet.set_biz_type(
+                privchat_protocol::protocol::MessageType::PublishRequest as u8,
+            );
+            // 每个 session 发送超时 500ms，避免慢连接阻塞整个广播
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                server_clone.send_to_session(sid.clone(), packet),
+            )
+            .await
+            {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
+                    warn!("广播到 session {} 失败: {}", sid, e);
+                    false
+                }
+                Err(_) => {
+                    warn!("广播到 session {} 超时", sid);
+                    false
+                }
+            }
+        }));
+    }
+
+    // 等待所有发送完成
+    let mut delivered = 0usize;
+    for handle in handles {
+        if let Ok(true) = handle.await {
+            delivered += 1;
+        }
+    }
+
+    info!(
+        "📡 Admin: Room 广播 channel_id={}, 在线={}, 投递={}",
+        channel_id, online_count, delivered
+    );
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "online_count": online_count,
+        "delivered": delivered,
+        "server_message_id": server_msg_id,
     })))
 }
 
