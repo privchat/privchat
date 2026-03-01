@@ -214,7 +214,7 @@ async fn verify_service_key(headers: &HeaderMap, state: &AdminServerState) -> Re
 
     // 验证 service key
     if !state.service_key_manager.verify(&service_key).await {
-        warn!("❌ 无效的 service key");
+        warn!("❌ 无效的 service key: {}, 期望: {}", service_key, state.service_key_manager.display_expected().await);
         return Err(ServerError::Unauthorized("无效的 service key".to_string()));
     }
 
@@ -854,7 +854,13 @@ async fn room_broadcast(
     let sessions = state.subscribe_manager.get_channel_sessions(channel_id);
     let online_count = sessions.len();
 
+    info!(
+        "📡 Room broadcast 开始: channel_id={}, 在线订阅者={}",
+        channel_id, online_count
+    );
+
     if sessions.is_empty() {
+        info!("📡 Room broadcast 跳过: channel_id={}, 无在线订阅者", channel_id);
         return Ok(Json(json!({
             "success": true,
             "channel_id": channel_id,
@@ -908,13 +914,16 @@ async fn room_broadcast(
             )
             .await
             {
-                Ok(Ok(_)) => true,
+                Ok(Ok(_)) => {
+                    debug!("📡 Room publish -> session {} 成功", sid);
+                    true
+                }
                 Ok(Err(e)) => {
-                    warn!("广播到 session {} 失败: {}", sid, e);
+                    warn!("📡 Room publish -> session {} 失败: {}", sid, e);
                     false
                 }
                 Err(_) => {
-                    warn!("广播到 session {} 超时", sid);
+                    warn!("📡 Room publish -> session {} 超时", sid);
                     false
                 }
             }

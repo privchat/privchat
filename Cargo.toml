@@ -2,7 +2,7 @@
 name = "privchat"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance instant messaging server built on msgtrans"
+description = "A high-performance, secure instant messaging server built with Rust"
 authors = ["zoujiaqing <zoujiaqing@gmail.com>"]
 license = "Apache-2.0"
 homepage = "https://privchat.dev"

@@ -117,13 +117,23 @@ async fn main() -> Result<()> {
 /// 生成默认配置文件
 fn generate_config(path: &str) -> Result<()> {
     let default_config = r#"# PrivChat Server 配置文件
-# 此文件由 privchat-server generate-config 生成
+# 此文件由 privchat generate-config 生成
+
+# 数据库配置（必填）
+# database_url = "postgres://user:password@localhost:5432/privchat"
+
+# JWT 密钥（必填）
+# jwt_secret = "your-jwt-secret-key"
+
+# Redis 配置（必填）
+# redis_url = "redis://127.0.0.1:6379"
 
 [gateway]
 max_connections = 100000
 connection_timeout = 300
 heartbeat_interval = 60
 use_internal_auth = true
+handler_max_inflight = 2000
 
 [[gateway.listeners]]
 protocol = "tcp"
@@ -142,9 +152,21 @@ port = 9080
 path = "/gate"
 compression = true
 
+[admin]
+port = 9090
+master_key = "your-service-master-key"
+
 [cache]
 l1_max_memory_mb = 256
 l1_ttl_secs = 3600
+
+# [cache.redis]
+# url = "redis://127.0.0.1:6379"
+# pool_size = 50
+# min_idle = 10
+# connection_timeout_secs = 5
+# command_timeout_ms = 5000
+# idle_timeout_secs = 300
 
 [cache.online_status]
 timeout_seconds = 300
@@ -161,10 +183,60 @@ storage_type = "local"
 storage_root = "./storage/files"
 base_url = "http://localhost:9083/files"
 
+# [[file.storage_sources]]
+# id = 1
+# storage_type = "s3"
+# endpoint = "s3.amazonaws.com"
+# bucket = "privchat-files"
+# access_key_id = "your-access-key"
+# secret_access_key = "your-secret-key"
+# path_prefix = "uploads/"
+# base_url = "https://your-cdn.example.com/uploads"
+
+[security]
+mode = "observe"
+enable_shadow_ban = false
+enable_ip_ban = true
+
+[security.rate_limit]
+user_tokens_per_second = 50.0
+user_burst_capacity = 100.0
+channel_messages_per_second = 3.0
+channel_burst_capacity = 10.0
+ip_connections_per_second = 5.0
+ip_burst_capacity = 10.0
+
+[system_message]
+enabled = true
+welcome_message = "👋 欢迎使用 PrivChat！\n\n这是一个端到端加密的即时通讯系统。"
+auto_create_channel = true
+auto_send_welcome = true
+
 [logging]
 level = "info"
 format = "compact"
 # file = "./logs/server.log"
+
+[push]
+enabled = false
+
+# [push.apns]
+# enabled = false
+# bundle_id = "com.example.privchat"
+# team_id = "YOUR_TEAM_ID"
+# key_id = "YOUR_KEY_ID"
+# private_key_path = "./certs/apns.p8"
+# use_sandbox = false
+
+# [push.fcm]
+# enabled = false
+# project_id = "your-firebase-project-id"
+# access_token = "your-access-token"
+
+# [push.hms]
+# enabled = false
+# app_id = "your-huawei-app-id"
+# access_token = "your-access-token"
 "#;
 
     fs::write(path, default_config).with_context(|| format!("无法写入配置文件: {}", path))?;

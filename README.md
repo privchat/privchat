@@ -1,6 +1,6 @@
-# PrivChat Server
+# PrivChat
 
-High-performance chat server built on the msgtrans framework.
+A high-performance, secure instant messaging server built with Rust.
 
 ## 🎯 Vision
 

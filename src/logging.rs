@@ -31,7 +31,10 @@ pub fn init_logging(
     quiet: bool,
 ) -> Result<()> {
     let level = if quiet { "error" } else { log_level };
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    // 默认将 msgtrans 传输层日志设为 info，避免大量底层 debug 日志刷屏
+    let default_filter = format!("{},msgtrans=info", level);
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&default_filter));
 
     if let Some(path) = log_file {
         let path = std::path::Path::new(path);

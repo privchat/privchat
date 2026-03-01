@@ -18,6 +18,7 @@
 //! HTTP 服务器 - 文件服务 + 管理 API 分离部署
 
 use axum::Router;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tracing::info;
@@ -147,7 +148,11 @@ impl AdminHttpServer {
 
         info!("🔒 管理 API 服务器启动在端口 {}", self.port);
 
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok(())
     }
 }

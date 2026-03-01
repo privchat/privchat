@@ -77,6 +77,18 @@ impl ServiceKeyManager {
         }
     }
 
+    /// 获取期望的 key 信息（用于调试日志）
+    pub async fn display_expected(&self) -> String {
+        match &self.strategy {
+            ServiceKeyStrategy::MasterKey(master) => master.clone(),
+            ServiceKeyStrategy::AllowAny => "[allow-any]".to_string(),
+            ServiceKeyStrategy::Whitelist(whitelist) => {
+                let keys = whitelist.read().await;
+                keys.iter().cloned().collect::<Vec<_>>().join(", ")
+            }
+        }
+    }
+
     /// 添加新的 service key（仅白名单模式支持）
     pub async fn add_key(&self, key: String) -> Result<()> {
         match &self.strategy {

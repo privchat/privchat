@@ -1,6 +1,6 @@
-# PrivChat Server
+# PrivChat
 
-基于 msgtrans 框架的高性能聊天服务器
+基于 Rust 构建的高性能、安全的即时通讯服务器
 
 ## 🎯 愿景
 
@@ -1325,4 +1325,4 @@ privchat-server/
 
 [快速开始](#-快速开始) • [功能列表](#-功能列表) • [开发文档](docs/) • [贡献指南](../CONTRIBUTING.md)
 
-</div> 
+</div>

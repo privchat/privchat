@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use msgtrans::{
     event::ServerEvent,
@@ -287,6 +287,7 @@ impl ChatServer {
             jwt_service.clone(),
             service_key_manager.clone(), // 使用 clone，因为后面还需要用到
             device_manager.clone(),
+            Some(device_manager_db.clone()),
         ));
         info!("✅ Token 签发服务初始化完成");
         info!("✅ 认证系统初始化完成");
@@ -1485,12 +1486,12 @@ impl ChatServer {
                         let msg_type = MessageType::from(biz_type);
                         if matches!(msg_type, MessageType::PingRequest) {
                             if let Some(user_id) = user_id {
-                                debug!(
+                                trace!(
                                     "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
                                     session_id, user_id, biz_type, msg_type, msg_text
                                 );
                             } else {
-                                debug!(
+                                trace!(
                                     "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
                                     session_id, biz_type, msg_type, msg_text
                                 );
@@ -1516,6 +1517,8 @@ impl ChatServer {
                         // 🎯 使用消息分发器处理消息（受 HandlerLimiter 限流保护）
                         let message_dispatcher = message_dispatcher.clone();
                         let session_id_clone = session_id.clone();
+                        // 保存 user_id 供 handler 使用
+                        let dispatch_user_id = auth_session_manager.get_user_id(&session_id).await;
 
                         // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop
                         match handler_limiter.try_acquire() {
@@ -1525,11 +1528,14 @@ impl ChatServer {
                                     let _permit = permit;
 
                                     let msg_type = MessageType::from(biz_type);
-                                    let request_context = crate::context::RequestContext::new(
+                                    let mut request_context = crate::context::RequestContext::new(
                                         session_id_clone.clone(),
                                         msg_text.as_bytes().to_vec(),
                                         "127.0.0.1:0".parse().unwrap(),
                                     );
+                                    if let Some(uid) = dispatch_user_id {
+                                        request_context = request_context.with_user_id(uid);
+                                    }
 
                                     match message_dispatcher
                                         .dispatch(msg_type, request_context)
@@ -1537,7 +1543,11 @@ impl ChatServer {
                                     {
                                         Ok(Some(response)) => {
                                             context.respond(response);
-                                            debug!("✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})", session_id_clone, biz_type, msg_type);
+                                            if matches!(msg_type, MessageType::PingRequest) {
+                                                trace!("✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})", session_id_clone, biz_type, msg_type);
+                                            } else {
+                                                debug!("✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})", session_id_clone, biz_type, msg_type);
+                                            }
                                         }
                                         Ok(None) => {
                                             debug!(
@@ -1567,7 +1577,7 @@ impl ChatServer {
                         session_id,
                         message_id,
                     } => {
-                        debug!("📤 消息已发送: {} -> {}", session_id, message_id);
+                        trace!("📤 消息已发送: {} -> {}", session_id, message_id);
 
                         // 更新统计信息
                         {

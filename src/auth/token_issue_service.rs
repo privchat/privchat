@@ -16,6 +16,7 @@
 // limitations under the License.
 
 use crate::auth::device_manager::DeviceManager;
+use crate::auth::device_manager_db::DeviceManagerDb;
 use crate::auth::jwt_service::JwtService;
 use crate::auth::models::{Device, DeviceType, IssueTokenRequest, IssueTokenResponse};
 use crate::auth::service_key_manager::ServiceKeyManager;
@@ -30,6 +31,7 @@ pub struct TokenIssueService {
     jwt_service: Arc<JwtService>,
     service_key_manager: Arc<ServiceKeyManager>,
     device_manager: Arc<DeviceManager>,
+    device_manager_db: Option<Arc<DeviceManagerDb>>,
 }
 
 impl TokenIssueService {
@@ -38,11 +40,13 @@ impl TokenIssueService {
         jwt_service: Arc<JwtService>,
         service_key_manager: Arc<ServiceKeyManager>,
         device_manager: Arc<DeviceManager>,
+        device_manager_db: Option<Arc<DeviceManagerDb>>,
     ) -> Self {
         Self {
             jwt_service,
             service_key_manager,
             device_manager,
+            device_manager_db,
         }
     }
 
@@ -61,8 +65,8 @@ impl TokenIssueService {
         // 1. 验证 service key
         if !self.service_key_manager.verify(service_key).await {
             warn!(
-                "❌ 无效的 service key，拒绝签发 token (business_system_id: {})",
-                request.business_system_id
+                "❌ 无效的 service key: {}，拒绝签发 token (business_system_id: {})",
+                service_key, request.business_system_id
             );
             return Err(ServerError::Unauthorized("无效的 service key".to_string()));
         }
@@ -111,7 +115,13 @@ impl TokenIssueService {
             ip_address: ip_address.clone(),
         };
 
-        self.device_manager.register_device(device).await?;
+        // 同时注册到内存和数据库
+        self.device_manager.register_device(device.clone()).await?;
+        if let Some(ref db) = self.device_manager_db {
+            if let Err(e) = db.register_or_update_device(&device).await {
+                warn!("⚠️ 设备写入数据库失败（内存已注册）: {}", e);
+            }
+        }
 
         let ttl = request.ttl.unwrap_or(self.jwt_service.default_ttl());
         let expires_at = Utc::now() + chrono::Duration::seconds(ttl);
@@ -194,7 +204,7 @@ mod tests {
         let device_manager = Arc::new(DeviceManager::new());
 
         let service =
-            TokenIssueService::new(jwt_service, service_key_manager, device_manager.clone());
+            TokenIssueService::new(jwt_service, service_key_manager, device_manager.clone(), None);
 
         let request = IssueTokenRequest {
             user_id: 12345,
@@ -236,7 +246,7 @@ mod tests {
 
         let device_manager = Arc::new(DeviceManager::new());
 
-        let service = TokenIssueService::new(jwt_service, service_key_manager, device_manager);
+        let service = TokenIssueService::new(jwt_service, service_key_manager, device_manager, None);
 
         let request = IssueTokenRequest {
             user_id: 12345,
