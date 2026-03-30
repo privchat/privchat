@@ -6,8 +6,11 @@ on:
       - "src/service/**"
       - "src/rpc/**"
       - "src/repository/**"
+      - "src/infra/**"
+      - "src/context.rs"
       - "migrations/**"
       - "tests/channel_read_cursor_gate_test.rs"
+      - "tests/protocol_non_db_gate_test.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
@@ -19,8 +22,11 @@ on:
       - "src/service/**"
       - "src/rpc/**"
       - "src/repository/**"
+      - "src/infra/**"
+      - "src/context.rs"
       - "migrations/**"
       - "tests/channel_read_cursor_gate_test.rs"
+      - "tests/protocol_non_db_gate_test.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
@@ -70,3 +76,6 @@ jobs:
 
       - name: Channel read cursor gate tests
         run: RUSTC_WRAPPER= cargo test --test channel_read_cursor_gate_test -- --nocapture
+
+      - name: Protocol non-db gate tests
+        run: RUSTC_WRAPPER= cargo test --test protocol_non_db_gate_test -- --nocapture
