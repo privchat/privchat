@@ -1,0 +1,72 @@
+name: channel-read-cursor-gate
+
+on:
+  pull_request:
+    paths:
+      - "src/service/**"
+      - "src/rpc/**"
+      - "src/repository/**"
+      - "migrations/**"
+      - "tests/channel_read_cursor_gate_test.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - ".github/workflows/channel-read-cursor-gate.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/service/**"
+      - "src/rpc/**"
+      - "src/repository/**"
+      - "migrations/**"
+      - "tests/channel_read_cursor_gate_test.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - ".github/workflows/channel-read-cursor-gate.yml"
+
+jobs:
+  read-cursor-gate:
+    name: channel-read-cursor-gate
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: privchat_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d privchat_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/privchat_test
+      PRIVCHAT_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/privchat_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Apply schema migrations
+        run: |
+          for f in migrations/001_create_tables.sql migrations/002_add_message_partitions_2026_03_2026_04_and_default.sql migrations/003_channel_read_cursor.sql; do
+            echo "apply $f"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Server compile check (sqlx online)
+        run: RUSTC_WRAPPER= cargo check
+
+      - name: Channel read cursor gate tests
+        run: RUSTC_WRAPPER= cargo test --test channel_read_cursor_gate_test -- --nocapture

@@ -854,13 +854,8 @@ async fn room_broadcast(
     let sessions = state.subscribe_manager.get_channel_sessions(channel_id);
     let online_count = sessions.len();
 
-    info!(
-        "📡 Room broadcast 开始: channel_id={}, 在线订阅者={}",
-        channel_id, online_count
-    );
-
     if sessions.is_empty() {
-        info!("📡 Room broadcast 跳过: channel_id={}, 无在线订阅者", channel_id);
+        debug!("📡 Room broadcast 跳过: channel_id={}, 无在线订阅者", channel_id);
         return Ok(Json(json!({
             "success": true,
             "channel_id": channel_id,

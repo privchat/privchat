@@ -468,7 +468,7 @@ privchat-server/
 - Create, info, list; member add/remove/list/leave; roles (Owner/Admin/Member), transfer_owner, set admin, permissions, mute/unmute, mute_all, settings get/update, QR generate/join, approval list/handle
 
 #### Message status (100%)
-- `message/status/read`, `count`, `read_list`, `read_stats`
+- `message/status/read_pts`, `count`, `read_list`, `read_stats`
 
 #### Presence (100%)
 - subscribe, query, batch_query, unsubscribe, stats

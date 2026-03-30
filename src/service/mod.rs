@@ -37,6 +37,8 @@ pub mod message_history_service;
 pub mod privacy_service;
 // 新增已读回执服务
 pub mod read_receipt_service;
+// read_pts 单一路径服务
+pub mod read_state_service;
 // 新增文件服务
 pub mod file_service;
 // 新增上传 token 服务
@@ -86,6 +88,7 @@ pub use push_service::PushService;
 pub use qrcode_service::QRCodeService;
 pub use reaction_service::{Reaction, ReactionService, ReactionStats};
 pub use read_receipt_service::{GroupReadStats, ReadReceipt, ReadReceiptService};
+pub use read_state_service::{ChannelReadCursorRow, ReadPtsUpdateResult, ReadStateService};
 pub use sticker_service::{Sticker, StickerPackage, StickerService};
 pub use unread_count_service::UnreadCountService;
 pub use upload_token_service::{UploadToken, UploadTokenService};

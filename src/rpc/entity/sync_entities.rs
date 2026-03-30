@@ -23,7 +23,7 @@ use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcContext;
 use crate::rpc::{get_current_user_id, RpcServiceContext};
 use privchat_protocol::rpc::sync::{
-    MessageStatusSyncPayload, SyncEntitiesRequest, SyncEntitiesResponse, SyncEntityItem,
+    ChannelReadCursorSyncPayload, SyncEntitiesRequest, SyncEntitiesResponse, SyncEntityItem,
     UserSettingsSyncPayload,
 };
 use serde_json::{json, Value};
@@ -35,8 +35,7 @@ const SUPPORTED_ENTITY_TYPES: &[&str] = &[
     "group",
     "group_member",
     "channel",
-    "message_status",
-    "message_read_status",
+    "channel_read_cursor",
     "user_settings",
 ];
 
@@ -171,33 +170,28 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
             .sync_entities_page_for_group_members(user_id, since_version, scope, limit)
             .await
             .map_err(|e| RpcError::internal(format!("群成员同步失败: {}", e)))?,
-        "message_status" | "message_read_status" => {
+        "channel_read_cursor" => {
             let since_v = since_version.unwrap_or(0);
             let (rows, next_version, has_more) = services
-                .read_receipt_service
-                .sync_message_status_page(user_id, since_v, parse_scope_channel_id(scope), limit)
+                .read_state_service
+                .sync_channel_read_cursor_page(user_id, since_v, parse_scope_channel_id(scope), limit)
                 .await
-                .map_err(|e| RpcError::internal(format!("消息状态同步失败: {}", e)))?;
+                .map_err(|e| RpcError::internal(format!("已读游标同步失败: {}", e)))?;
             let items: Vec<SyncEntityItem> = rows
                 .into_iter()
                 .map(|row| {
-                    let payload = serde_json::to_value(MessageStatusSyncPayload {
-                        message_id: Some(row.message_id),
-                        server_message_id: Some(row.message_id),
-                        id: Some(row.message_id),
+                    let payload = serde_json::to_value(ChannelReadCursorSyncPayload {
                         channel_id: Some(row.channel_id),
-                        channel_type: None,
-                        type_field: None,
-                        conversation_type: None,
-                        status: None,
-                        readed: Some(true),
-                        is_read: Some(true),
-                        read: Some(true),
+                        channel_type: Some(row.channel_type),
+                        type_field: Some(row.channel_type),
+                        reader_id: Some(row.reader_id),
+                        last_read_pts: Some(row.last_read_pts),
+                        updated_at: Some(row.version as i64),
                     })
                     .unwrap_or_else(|_| json!({}));
                     SyncEntityItem {
-                        entity_id: format!("{}:{}", row.message_id, row.user_id),
-                        version: row.read_at.timestamp_millis().max(1) as u64,
+                        entity_id: format!("{}:{}", row.channel_id, row.reader_id),
+                        version: row.version,
                         deleted: false,
                         payload: Some(payload),
                     }

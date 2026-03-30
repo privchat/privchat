@@ -451,6 +451,11 @@ impl ChatServer {
 
         // 创建已读回执服务
         let read_receipt_service = Arc::new(crate::service::ReadReceiptService::new());
+        let read_state_service = Arc::new(crate::service::ReadStateService::new(
+            channel_service.clone(),
+            message_router.clone(),
+            pool.clone(),
+        ));
 
         // 创建文件服务（多数据中心：按 current_region 或 default_storage_source_id 选择存储源）
         info!("🔧 初始化文件服务...");
@@ -1148,6 +1153,7 @@ impl ChatServer {
             friend_service.clone(),
             privacy_service.clone(),
             read_receipt_service.clone(),
+            read_state_service.clone(),
             upload_token_service.clone(),
             file_service.clone(),
             sticker_service.clone(),

@@ -45,7 +45,7 @@ use crate::service::sync::SyncService;
 use crate::service::{
     ApprovalService, BlacklistService, ChannelService, FileService, FriendService,
     MessageHistoryService, OfflineQueueService, PrivacyService, QRCodeService, ReactionService,
-    ReadReceiptService, StickerService, UnreadCountService, UploadTokenService,
+    ReadReceiptService, ReadStateService, StickerService, UnreadCountService, UploadTokenService,
 };
 use router::GLOBAL_RPC_ROUTER;
 use std::sync::Arc;
@@ -109,6 +109,7 @@ pub struct RpcServiceContext {
     pub friend_service: Arc<FriendService>,
     pub privacy_service: Arc<PrivacyService>,
     pub read_receipt_service: Arc<ReadReceiptService>,
+    pub read_state_service: Arc<ReadStateService>,
     pub upload_token_service: Arc<UploadTokenService>,
     pub file_service: Arc<FileService>,
     pub sticker_service: Arc<StickerService>,
@@ -160,6 +161,7 @@ impl RpcServiceContext {
         friend_service: Arc<FriendService>,
         privacy_service: Arc<PrivacyService>,
         read_receipt_service: Arc<ReadReceiptService>,
+        read_state_service: Arc<ReadStateService>,
         upload_token_service: Arc<UploadTokenService>,
         file_service: Arc<FileService>,
         sticker_service: Arc<StickerService>,
@@ -197,6 +199,7 @@ impl RpcServiceContext {
             friend_service,
             privacy_service,
             read_receipt_service,
+            read_state_service,
             upload_token_service,
             file_service,
             sticker_service,

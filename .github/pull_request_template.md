@@ -40,6 +40,16 @@
 - [ ] 集成测试通过（如适用）
 - [ ] 压测验证通过（如涉及性能路径）
 
+## Channel Read Cursor Gate（必填）
+
+- [ ] 是否影响 `channel_read_cursor` 写路径（`read_pts` / upsert max / 单调性）？
+- [ ] 是否影响 `read_list/read_stats` 的 cursor 投影逻辑？
+- [ ] 是否影响 read receipt policy（`disabled | count_only | full_list`）？
+- [ ] 本次改动是否命中 `channel-read-cursor-gate` 的 paths 覆盖？
+- [ ] 本地是否跑过 `cargo test --test channel_read_cursor_gate_test -- --nocapture`？
+- [ ] 是否修改了 workflow 或 job 名称（`channel-read-cursor-gate / channel-read-cursor-gate`）？
+- [ ] 若修改了检查名，是否已同步更新分支保护（Branch Protection Required Status Checks）？
+
 ## 压测相关（如涉及）
 
 - [ ] 已运行 `scripts/pre-loadtest-check.sh` 且全部通过

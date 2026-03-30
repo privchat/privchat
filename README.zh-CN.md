@@ -690,7 +690,7 @@ privchat-server/
 - ✅ 加群审批：`group/approval/list`, `handle`
 
 #### 消息状态 (100%)
-- ✅ 已读标记：`message/status/read`（单条，兼容，Phase 8 测试通过）
+- ✅ 已读标记：`message/status/read_pts`（read_pts 单一路径）
 - ✅ **按 pts 推进已读**：`message/status/read_pts`（推荐，O(1)，见 [READ_RECEIPT_PTS_MODEL](../privchat-docs/design/READ_RECEIPT_PTS_MODEL.md)）
 - ✅ 未读计数：`message/status/count`
 - ✅ 已读列表：`message/status/read_list`
@@ -857,7 +857,7 @@ privchat-server/
   - ✅ 统一 Channel 模型：合并会话列表和频道信息字段
 
 - ✅ **读状态（read_pts）模型**（协议层正确模型）
-  - ✅ 单条消息已读 `message/status/read`（兼容，Phase 8 测试通过）
+  - ✅ 已读推进 `message/status/read_pts`（read_pts 单一路径）
   - ✅ **按 pts 推进已读** `message/status/read_pts`（O(1) 存储/广播，天然幂等、单调）
   - ✅ 服务端 per-user per-channel `last_read_pts`，广播 `UserReadEvent`
   - ❌ 不提供「批量 message_id」RPC（避免 O(n) 负载；本地 UI 可保留批量写本地存储）

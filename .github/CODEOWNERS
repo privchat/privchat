@@ -1,0 +1,19 @@
+# Default owner
+* @zoujiaqing
+
+# Channel read cursor gate workflow
+/.github/workflows/channel-read-cursor-gate.yml @zoujiaqing
+
+# Gate integration tests
+/tests/channel_read_cursor_gate_test.rs @zoujiaqing
+
+# Message status RPC (read_pts / read_list / read_stats / policy)
+/src/rpc/message/status/** @zoujiaqing
+
+# Cursor authority service + entity sync bridge
+/src/service/read_state_service.rs @zoujiaqing
+/src/rpc/entity/sync_entities.rs @zoujiaqing
+
+# Read cursor migration(s)
+/migrations/003_channel_read_cursor.sql @zoujiaqing
+/migrations/*channel_read_cursor*.sql @zoujiaqing
