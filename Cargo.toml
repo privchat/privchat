@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 # 传输层
-msgtrans = { path = "../msgtrans", version = "1.0" }
+msgtrans = "~1.0.6"
 
 # 协议
 privchat-protocol = { path = "../privchat-protocol", version = "0.1" }
