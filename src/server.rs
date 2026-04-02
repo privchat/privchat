@@ -453,6 +453,7 @@ impl ChatServer {
         let read_receipt_service = Arc::new(crate::service::ReadReceiptService::new());
         let read_state_service = Arc::new(crate::service::ReadStateService::new(
             channel_service.clone(),
+            unread_count_service.clone(),
             message_router.clone(),
             pool.clone(),
         ));

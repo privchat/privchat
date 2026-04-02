@@ -18,7 +18,7 @@
 use crate::error::{Result, ServerError};
 use crate::infra::MessageRouter;
 use crate::model::channel::{ChannelId, ChannelKind, UserId};
-use crate::service::ChannelService;
+use crate::service::{ChannelService, UnreadCountService};
 use privchat_protocol::protocol::PushMessageRequest;
 use std::sync::Arc;
 use sqlx::{PgPool, Row};
@@ -110,6 +110,7 @@ async fn upsert_channel_read_cursor_row(
 /// 已读状态服务（read_pts 单一路径）
 pub struct ReadStateService {
     channel_service: Arc<ChannelService>,
+    unread_count_service: Arc<UnreadCountService>,
     message_router: Arc<MessageRouter>,
     pool: Arc<PgPool>,
 }
@@ -117,11 +118,13 @@ pub struct ReadStateService {
 impl ReadStateService {
     pub fn new(
         channel_service: Arc<ChannelService>,
+        unread_count_service: Arc<UnreadCountService>,
         message_router: Arc<MessageRouter>,
         pool: Arc<PgPool>,
     ) -> Self {
         Self {
             channel_service,
+            unread_count_service,
             message_router,
             pool,
         }
@@ -160,6 +163,14 @@ impl ReadStateService {
         )
         .await
         .map_err(|e| ServerError::Database(format!("更新 privchat_channel_read_cursor 失败: {}", e)))?;
+
+        self.channel_service
+            .clear_user_channel_unread(reader_id, channel_id)
+            .await?;
+        self.unread_count_service
+            .clear_channel(reader_id, channel_id)
+            .await
+            .map_err(|e| ServerError::Internal(format!("清理 unread_count cache 失败: {}", e)))?;
 
         let advanced = upserted.advanced;
         if advanced {

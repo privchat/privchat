@@ -268,6 +268,16 @@ impl SyncService {
                         .collect();
                     if !receiver_ids.is_empty() {
                         if let Err(e) = self
+                            .channel_service
+                            .increment_user_channel_unread(req.channel_id, &receiver_ids, 1)
+                            .await
+                        {
+                            warn!(
+                                "⚠️ sync/submit: 持久化 privchat_user_channels 未读计数失败: {}",
+                                e
+                            );
+                        }
+                        if let Err(e) = self
                             .unread_count_service
                             .increment_for_channel_members(req.channel_id, &receiver_ids, 1)
                             .await

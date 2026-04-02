@@ -254,6 +254,71 @@ impl ChannelService {
         Ok(())
     }
 
+    pub async fn increment_user_channel_unread(
+        &self,
+        channel_id: u64,
+        user_ids: &[u64],
+        count: i32,
+    ) -> Result<()> {
+        if user_ids.is_empty() || count <= 0 {
+            return Ok(());
+        }
+
+        self.ensure_user_channel_rows(channel_id, user_ids).await?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        for user_id in user_ids {
+            sqlx::query(
+                r#"
+                UPDATE privchat_user_channels
+                SET unread_count = GREATEST(0, unread_count + $3),
+                    updated_at = $4
+                WHERE user_id = $1 AND channel_id = $2
+                "#,
+            )
+            .bind(*user_id as i64)
+            .bind(channel_id as i64)
+            .bind(count)
+            .bind(now)
+            .execute(self.pool())
+            .await
+            .map_err(|e| {
+                ServerError::Database(format!(
+                    "increment privchat_user_channels unread failed for user={} channel={}: {}",
+                    user_id, channel_id, e
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn clear_user_channel_unread(&self, user_id: u64, channel_id: u64) -> Result<()> {
+        self.ensure_user_channel_rows(channel_id, &[user_id]).await?;
+
+        sqlx::query(
+            r#"
+            UPDATE privchat_user_channels
+            SET unread_count = 0,
+                updated_at = $3
+            WHERE user_id = $1 AND channel_id = $2
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(channel_id as i64)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(self.pool())
+        .await
+        .map_err(|e| {
+            ServerError::Database(format!(
+                "clear privchat_user_channels unread failed for user={} channel={}: {}",
+                user_id, channel_id, e
+            ))
+        })?;
+
+        Ok(())
+    }
+
     // =====================================================
     // 管理 API 方法
     // =====================================================
@@ -3182,6 +3247,7 @@ mod tests {
     use crate::model::channel::ChannelType;
     use crate::repository::PgChannelRepository;
     use sqlx::postgres::PgPoolOptions;
+    use sqlx::Row;
     use std::sync::Arc;
 
     #[test]
@@ -3231,6 +3297,55 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
             .bind(channel_id as i64)
+            .execute(service.pool())
+            .await;
+    }
+
+    async fn ensure_user(service: &ChannelService, user_id: u64, username: &str) {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO privchat_users (user_id, username, display_name)
+            VALUES ($1, $2, $2)
+            ON CONFLICT (user_id) DO UPDATE
+            SET username = EXCLUDED.username,
+                display_name = EXCLUDED.display_name
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(username)
+        .execute(service.pool())
+        .await
+        .expect("ensure user");
+    }
+
+    async fn ensure_group(service: &ChannelService, group_id: u64, owner_id: u64, name: &str) {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO privchat_groups (group_id, owner_id, name, description)
+            VALUES ($1, $2, $3, 'channel-service-test')
+            ON CONFLICT (group_id) DO UPDATE
+            SET owner_id = EXCLUDED.owner_id,
+                name = EXCLUDED.name
+            "#,
+        )
+        .bind(group_id as i64)
+        .bind(owner_id as i64)
+        .bind(name)
+        .execute(service.pool())
+        .await
+        .expect("ensure group");
+    }
+
+    async fn cleanup_user(service: &ChannelService, user_id: u64) {
+        let _ = sqlx::query("DELETE FROM privchat_users WHERE user_id = $1")
+            .bind(user_id as i64)
+            .execute(service.pool())
+            .await;
+    }
+
+    async fn cleanup_group(service: &ChannelService, group_id: u64) {
+        let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
+            .bind(group_id as i64)
             .execute(service.pool())
             .await;
     }
@@ -3366,5 +3481,115 @@ mod tests {
         let conv = service.get_channel(&conv_id).await.unwrap();
         assert_eq!(conv.members.len(), 1);
         cleanup_channel(&service, conv_id).await;
+    }
+
+    #[tokio::test]
+    async fn channel_sync_reads_persisted_unread_count_after_increment_and_clear() {
+        let Some(service) = open_test_service().await else {
+            eprintln!(
+                "skip channel_sync_reads_persisted_unread_count_after_increment_and_clear: DATABASE_URL not configured"
+            );
+            return;
+        };
+        let owner_id = 9_170_001_u64;
+        let group_id = 9_170_101_u64;
+        let channel_id = 9_170_201_u64;
+
+        cleanup_channel(&service, channel_id).await;
+        cleanup_group(&service, group_id).await;
+        cleanup_user(&service, owner_id).await;
+
+        ensure_user(&service, owner_id, "channel_sync_unread_owner").await;
+        ensure_group(&service, group_id, owner_id, "channel-sync-unread-group").await;
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_channels (channel_id, channel_type, group_id)
+            VALUES ($1, 2, $2)
+            ON CONFLICT (channel_id) DO UPDATE
+            SET group_id = EXCLUDED.group_id
+            "#,
+        )
+        .bind(channel_id as i64)
+        .bind(group_id as i64)
+        .execute(service.pool())
+        .await
+        .expect("ensure channel");
+        service
+            .ensure_user_channel_rows(channel_id, &[owner_id])
+            .await
+            .expect("ensure user channel row");
+
+        let before = sqlx::query(
+            "SELECT unread_count, sync_version FROM privchat_user_channels WHERE user_id = $1 AND channel_id = $2",
+        )
+        .bind(owner_id as i64)
+        .bind(channel_id as i64)
+        .fetch_one(service.pool())
+        .await
+        .expect("fetch before row");
+        assert_eq!(before.get::<i32, _>("unread_count"), 0);
+        let before_sync_version = before.get::<i64, _>("sync_version");
+
+        service
+            .increment_user_channel_unread(channel_id, &[owner_id], 1)
+            .await
+            .expect("increment unread");
+
+        let response = service
+            .sync_entities_page_for_channels(owner_id, None, None, 20)
+            .await
+            .expect("sync entities after increment");
+        let item = response
+            .items
+            .iter()
+            .find(|item| item.entity_id == channel_id.to_string())
+            .expect("channel sync item after increment");
+        let unread_after_increment = item
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("unread_count"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        assert_eq!(unread_after_increment, 1);
+
+        service
+            .clear_user_channel_unread(owner_id, channel_id)
+            .await
+            .expect("clear unread");
+
+        let after = sqlx::query(
+            "SELECT unread_count, sync_version FROM privchat_user_channels WHERE user_id = $1 AND channel_id = $2",
+        )
+        .bind(owner_id as i64)
+        .bind(channel_id as i64)
+        .fetch_one(service.pool())
+        .await
+        .expect("fetch after row");
+        assert_eq!(after.get::<i32, _>("unread_count"), 0);
+        assert!(
+            after.get::<i64, _>("sync_version") > before_sync_version,
+            "user_channel sync_version should advance after unread persistence changes"
+        );
+
+        let response = service
+            .sync_entities_page_for_channels(owner_id, None, None, 20)
+            .await
+            .expect("sync entities after clear");
+        let item = response
+            .items
+            .iter()
+            .find(|item| item.entity_id == channel_id.to_string())
+            .expect("channel sync item after clear");
+        let unread_after_clear = item
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("unread_count"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        assert_eq!(unread_after_clear, 0);
+
+        cleanup_channel(&service, channel_id).await;
+        cleanup_group(&service, group_id).await;
+        cleanup_user(&service, owner_id).await;
     }
 }
