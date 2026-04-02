@@ -81,13 +81,6 @@ pub struct CachedUserProfile {
     pub email: Option<String>,
 }
 
-/// 单条用户设置存储项（ENTITY_SYNC_V1 user_settings，存 Redis）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserSettingEntry {
-    pub v: u64,
-    pub value: serde_json::Value,
-}
-
 /// 会话信息缓存数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedChannel {
@@ -179,11 +172,6 @@ impl CacheManager {
     /// 构建二维码索引缓存 key
     fn qrcode_index_cache_key(qrcode: &str) -> String {
         format!("qrcode:{}", qrcode)
-    }
-
-    /// 构建用户设置缓存 key（ENTITY_SYNC_V1 user_settings，scope=None）
-    fn user_settings_cache_key(user_id: u64) -> String {
-        format!("user_settings:{}", user_id)
     }
 
     // ========== 构造方法 ==========
@@ -857,92 +845,6 @@ impl CacheManager {
 
         debug!("Updated privacy settings: {}", user_id);
         Ok(())
-    }
-
-    // ========== 用户设置管理（ENTITY_SYNC_V1 user_settings） ==========
-
-    /// 设置单条用户设置，返回新 version
-    pub async fn set_user_setting(
-        &self,
-        user_id: u64,
-        setting_key: &str,
-        value: serde_json::Value,
-    ) -> Result<u64, ServerError> {
-        let redis_key = Self::user_settings_cache_key(user_id);
-        let mut map: std::collections::HashMap<String, UserSettingEntry> =
-            self.get_from_redis(&redis_key).await?.unwrap_or_default();
-        let next_v = map
-            .values()
-            .map(|e| e.v)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        map.insert(
-            setting_key.to_string(),
-            UserSettingEntry { v: next_v, value },
-        );
-        self.set_to_redis(&redis_key, &map).await?;
-        Ok(next_v)
-    }
-
-    /// 批量设置用户设置，返回新 version（每次写入递增一个 version）
-    pub async fn set_user_settings_batch(
-        &self,
-        user_id: u64,
-        settings: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Result<u64, ServerError> {
-        if settings.is_empty() {
-            let redis_key = Self::user_settings_cache_key(user_id);
-            let map: std::collections::HashMap<String, UserSettingEntry> =
-                self.get_from_redis(&redis_key).await?.unwrap_or_default();
-            return Ok(map.values().map(|e| e.v).max().unwrap_or(0));
-        }
-        let redis_key = Self::user_settings_cache_key(user_id);
-        let mut map: std::collections::HashMap<String, UserSettingEntry> =
-            self.get_from_redis(&redis_key).await?.unwrap_or_default();
-        let next_v = map
-            .values()
-            .map(|e| e.v)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        for (k, value) in settings {
-            map.insert(
-                k.clone(),
-                UserSettingEntry {
-                    v: next_v,
-                    value: value.clone(),
-                },
-            );
-        }
-        self.set_to_redis(&redis_key, &map).await?;
-        Ok(next_v)
-    }
-
-    /// 获取 user_settings 自 since_version 之后的项，用于 entity/sync_entities
-    /// 返回 (items: (setting_key, payload_value, version), next_version, has_more)
-    pub async fn get_user_settings_since(
-        &self,
-        user_id: u64,
-        since_version: u64,
-        limit: u32,
-    ) -> Result<(Vec<(String, serde_json::Value, u64)>, u64, bool), ServerError> {
-        let redis_key = Self::user_settings_cache_key(user_id);
-        let map: std::collections::HashMap<String, UserSettingEntry> =
-            self.get_from_redis(&redis_key).await?.unwrap_or_default();
-        let mut list: Vec<(String, serde_json::Value, u64)> = map
-            .into_iter()
-            .filter(|(_, e)| e.v > since_version)
-            .map(|(k, e)| (k, e.value, e.v))
-            .collect();
-        list.sort_by_key(|(_, _, v)| *v);
-        let limit = limit as usize;
-        let has_more = list.len() > limit;
-        if has_more {
-            list.truncate(limit);
-        }
-        let next_version = list.last().map(|(_, _, v)| *v).unwrap_or(since_version);
-        Ok((list, next_version, has_more))
     }
 
     // ========== 搜索记录管理 ==========

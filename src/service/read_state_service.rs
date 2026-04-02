@@ -187,12 +187,12 @@ impl ReadStateService {
                 channel_id,
                 user_id,
                 last_read_pts,
-                (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS version_ms
+                sync_version
             FROM privchat_channel_read_cursor
             WHERE user_id = $1
-              AND (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT > $2
+              AND sync_version > $2
               AND ($3::BIGINT IS NULL OR channel_id = $3)
-            ORDER BY updated_at ASC, channel_id ASC
+            ORDER BY sync_version ASC, channel_id ASC
             LIMIT $4
             "#,
         )
@@ -223,7 +223,7 @@ impl ReadStateService {
                 channel_type,
                 reader_id: row.get::<i64, _>("user_id") as u64,
                 last_read_pts: row.get::<i64, _>("last_read_pts") as u64,
-                version: row.get::<i64, _>("version_ms") as u64,
+                version: row.get::<i64, _>("sync_version") as u64,
             });
         }
         let next_version = rows.last().map(|r| r.version).unwrap_or(since_version);

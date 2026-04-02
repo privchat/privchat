@@ -20,6 +20,7 @@ use crate::model::user::User;
 use crate::repository::MessageRepository;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::service::sync::get_global_sync_service;
 use privchat_protocol::rpc::auth::UserRegisterRequest;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -234,6 +235,30 @@ pub async fn handle(
 
                     match services.message_repository.create(&welcome_msg).await {
                         Ok(_) => {
+                            if let Some(sync_service) = get_global_sync_service() {
+                                let commit = privchat_protocol::rpc::sync::ServerCommit {
+                                    pts,
+                                    server_msg_id: message_id,
+                                    local_message_id: Some(message_id),
+                                    channel_id,
+                                    channel_type: 1,
+                                    message_type: privchat_protocol::ContentMessageType::Text
+                                        .as_str()
+                                        .to_string(),
+                                    content: json!({ "text": content.clone() }),
+                                    server_timestamp: now.timestamp_millis(),
+                                    sender_id: crate::config::SYSTEM_USER_ID,
+                                    sender_info: None,
+                                };
+                                if let Err(e) = sync_service.record_existing_commit(&commit).await {
+                                    tracing::warn!(
+                                        "⚠️ 欢迎消息 commit 记录失败: channel_id={}, message_id={}, error={}",
+                                        channel_id,
+                                        message_id,
+                                        e
+                                    );
+                                }
+                            }
                             // ✨ 加入 UserMessageIndex，否则离线推送时 get_message_ids_above 查不到
                             services
                                 .user_message_index

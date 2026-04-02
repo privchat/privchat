@@ -254,7 +254,7 @@ mod tests {
 
     fn create_test_claims(user_id: u64, device_id: &str) -> ImTokenClaims {
         ImTokenClaims {
-            sub: user_id,
+            sub: user_id.to_string(),
             device_id: device_id.to_string(),
             exp: (Utc::now() + Duration::hours(24)).timestamp(),
             iat: Utc::now().timestamp(),
@@ -270,14 +270,14 @@ mod tests {
     #[tokio::test]
     async fn test_bind_and_get_session() {
         let manager = SessionManager::new(24);
-        let session_id = SessionId::new("test-session".to_string());
-        let claims = create_test_claims("alice", "device-1");
+        let session_id = SessionId::new(1);
+        let claims = create_test_claims(1001, "device-1");
 
         // 绑定会话
         manager
             .bind_session(
                 session_id.clone(),
-                "alice".to_string(),
+                "1001".to_string(),
                 "device-1".to_string(),
                 claims,
             )
@@ -285,19 +285,19 @@ mod tests {
 
         // 获取用户 ID
         let user_id = manager.get_user_id(&session_id).await;
-        assert_eq!(user_id, Some("alice".to_string()));
+        assert_eq!(user_id, Some("1001".to_string()));
     }
 
     #[tokio::test]
     async fn test_unbind_session() {
         let manager = SessionManager::new(24);
-        let session_id = SessionId::new("test-session".to_string());
-        let claims = create_test_claims("alice", "device-1");
+        let session_id = SessionId::new(1);
+        let claims = create_test_claims(1001, "device-1");
 
         manager
             .bind_session(
                 session_id.clone(),
-                "alice".to_string(),
+                "1001".to_string(),
                 "device-1".to_string(),
                 claims,
             )
@@ -314,13 +314,13 @@ mod tests {
     #[tokio::test]
     async fn test_list_user_sessions() {
         let manager = SessionManager::new(24);
-        let claims = create_test_claims("alice", "device-1");
+        let claims = create_test_claims(1001, "device-1");
 
         // 同一用户的多个会话
         manager
             .bind_session(
-                SessionId::new("session-1".to_string()),
-                "alice".to_string(),
+                SessionId::new(1),
+                "1001".to_string(),
                 "device-1".to_string(),
                 claims.clone(),
             )
@@ -328,15 +328,15 @@ mod tests {
 
         manager
             .bind_session(
-                SessionId::new("session-2".to_string()),
-                "alice".to_string(),
+                SessionId::new(2),
+                "1001".to_string(),
                 "device-2".to_string(),
                 claims.clone(),
             )
             .await;
 
         // 列出用户的所有会话
-        let sessions = manager.list_user_sessions("alice").await;
+        let sessions = manager.list_user_sessions(1001).await;
         assert_eq!(sessions.len(), 2);
     }
 }

@@ -19,44 +19,46 @@ use crate::error::{Result, ServerError};
 use crate::model::channel::{MessageId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// 消息 Reaction（点赞/表情）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reaction {
-    /// 消息ID
     pub message_id: MessageId,
-    /// 用户ID
     pub user_id: UserId,
-    /// Emoji 表情（如 👍, ❤️, 😂, 😮, 😢）
     pub emoji: String,
-    /// 创建时间
     pub created_at: DateTime<Utc>,
 }
 
 /// Reaction 统计信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactionStats {
-    /// Emoji -> 用户ID列表
     pub reactions: HashMap<String, Vec<UserId>>,
-    /// 总 Reaction 数量
     pub total_count: usize,
+}
+
+#[derive(Debug, FromRow)]
+struct ReactionRow {
+    emoji: String,
+    created_at: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct ReactionStatsRow {
+    user_id: i64,
+    emoji: String,
 }
 
 /// Reaction 服务
 pub struct ReactionService {
-    /// message_id -> { user_id -> Reaction }
-    reactions: Arc<RwLock<HashMap<MessageId, HashMap<UserId, Reaction>>>>,
+    pool: Arc<PgPool>,
 }
 
 impl ReactionService {
-    /// 创建新的 Reaction 服务
-    pub fn new() -> Self {
-        Self {
-            reactions: Arc::new(RwLock::new(HashMap::new())),
-        }
+    pub fn new(pool: Arc<PgPool>) -> Self {
+        Self { pool }
     }
 
     /// 添加 Reaction
@@ -66,87 +68,113 @@ impl ReactionService {
         user_id: u64,
         emoji: &str,
     ) -> Result<Reaction> {
-        // 验证 emoji 格式（简单验证，实际应该更严格）
         if emoji.is_empty() || emoji.len() > 10 {
             return Err(ServerError::Validation("无效的 emoji".to_string()));
         }
 
-        let reaction = Reaction {
+        let created_at_ms = Utc::now().timestamp_millis();
+        let row = sqlx::query_as::<_, ReactionRow>(
+            r#"
+            INSERT INTO privchat_message_reactions
+                (message_id, user_id, emoji, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $4)
+            ON CONFLICT (message_id, user_id)
+            DO UPDATE SET
+                emoji = EXCLUDED.emoji,
+                updated_at = EXCLUDED.updated_at
+            RETURNING emoji, created_at
+            "#,
+        )
+        .bind(message_id as i64)
+        .bind(user_id as i64)
+        .bind(emoji)
+        .bind(created_at_ms)
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("添加 Reaction 失败: {}", e)))?;
+
+        Ok(Reaction {
             message_id,
             user_id,
             emoji: emoji.to_string(),
-            created_at: Utc::now(),
-        };
-
-        let mut reactions = self.reactions.write().await;
-        let message_reactions = reactions.entry(message_id).or_insert_with(HashMap::new);
-
-        // 如果用户已经对该消息有 Reaction，则替换（一个用户只能有一个 Reaction）
-        message_reactions.insert(user_id, reaction.clone());
-
-        Ok(reaction)
+            created_at: DateTime::from_timestamp_millis(row.created_at).unwrap_or_else(Utc::now),
+        })
     }
 
     /// 移除 Reaction
-    pub async fn remove_reaction(&self, message_id: u64, user_id: u64) -> Result<()> {
-        let mut reactions = self.reactions.write().await;
+    pub async fn remove_reaction(&self, message_id: u64, user_id: u64) -> Result<Option<Reaction>> {
+        let removed = self.get_user_reaction(message_id, user_id).await;
+        sqlx::query(
+            r#"
+            DELETE FROM privchat_message_reactions
+            WHERE message_id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(message_id as i64)
+        .bind(user_id as i64)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("移除 Reaction 失败: {}", e)))?;
 
-        if let Some(message_reactions) = reactions.get_mut(&message_id) {
-            message_reactions.remove(&user_id);
-
-            // 如果该消息没有 Reaction 了，删除整个条目
-            if message_reactions.is_empty() {
-                reactions.remove(&message_id);
-            }
-        }
-
-        Ok(())
+        Ok(removed)
     }
 
     /// 获取消息的所有 Reaction
     pub async fn get_message_reactions(&self, message_id: u64) -> Result<ReactionStats> {
-        let reactions = self.reactions.read().await;
+        let rows = sqlx::query_as::<_, ReactionStatsRow>(
+            r#"
+            SELECT user_id, emoji
+            FROM privchat_message_reactions
+            WHERE message_id = $1
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(message_id as i64)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询 Reaction 失败: {}", e)))?;
 
-        if let Some(message_reactions) = reactions.get(&message_id) {
-            // 按 emoji 分组
-            let mut emoji_to_users: HashMap<String, Vec<UserId>> = HashMap::new();
-
-            for (user_id, reaction) in message_reactions.iter() {
-                emoji_to_users
-                    .entry(reaction.emoji.clone())
-                    .or_insert_with(Vec::new)
-                    .push(user_id.clone());
-            }
-
-            let total_count = message_reactions.len();
-
-            Ok(ReactionStats {
-                reactions: emoji_to_users,
-                total_count,
-            })
-        } else {
-            Ok(ReactionStats {
-                reactions: HashMap::new(),
-                total_count: 0,
-            })
+        let mut reactions: HashMap<String, Vec<UserId>> = HashMap::new();
+        for row in rows {
+            reactions
+                .entry(row.emoji)
+                .or_default()
+                .push(row.user_id as u64);
         }
+        let total_count = reactions.values().map(Vec::len).sum();
+
+        Ok(ReactionStats {
+            reactions,
+            total_count,
+        })
     }
 
     /// 检查用户是否对消息有 Reaction
     pub async fn has_reaction(&self, message_id: u64, user_id: u64) -> Option<Reaction> {
-        let reactions = self.reactions.read().await;
-
-        reactions.get(&message_id)?.get(&user_id).cloned()
+        self.get_user_reaction(message_id, user_id).await
     }
 
     /// 获取用户对消息的 Reaction（如果存在）
     pub async fn get_user_reaction(&self, message_id: u64, user_id: u64) -> Option<Reaction> {
-        self.has_reaction(message_id, user_id).await
-    }
-}
+        let row = sqlx::query_as::<_, ReactionRow>(
+            r#"
+            SELECT emoji, created_at
+            FROM privchat_message_reactions
+            WHERE message_id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(message_id as i64)
+        .bind(user_id as i64)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .ok()
+        .flatten()?;
 
-impl Default for ReactionService {
-    fn default() -> Self {
-        Self::new()
+        Some(Reaction {
+            message_id,
+            user_id,
+            emoji: row.emoji,
+            created_at: DateTime::from_timestamp_millis(row.created_at).unwrap_or_else(Utc::now),
+        })
     }
 }

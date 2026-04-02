@@ -152,7 +152,7 @@ mod tests {
 
         // 签发 token
         let token = jwt_service
-            .issue_token("alice", "device-123", "ecommerce", "ios", None)
+            .issue_token(1001, "device-123", "ecommerce", "ios", None)
             .unwrap();
 
         assert!(!token.is_empty());
@@ -160,7 +160,7 @@ mod tests {
         // 验证 token
         let claims = jwt_service.verify_token(&token).unwrap();
 
-        assert_eq!(claims.sub, "alice");
+        assert_eq!(claims.sub, "1001");
         assert_eq!(claims.device_id, "device-123");
         assert_eq!(claims.business_system_id, "ecommerce");
         assert_eq!(claims.app_id, "ios");
@@ -181,7 +181,7 @@ mod tests {
 
         // 签发 token
         let token = jwt_service
-            .issue_token("alice", "device-123", "ecommerce", "ios", None)
+            .issue_token(1001, "device-123", "ecommerce", "ios", None)
             .unwrap();
 
         // 验证 token（device_id 匹配）
@@ -189,7 +189,7 @@ mod tests {
             .verify_token_with_device(&token, "device-123")
             .unwrap();
 
-        assert_eq!(claims.sub, "alice");
+        assert_eq!(claims.sub, "1001");
         assert_eq!(claims.device_id, "device-123");
 
         // 验证 token（device_id 不匹配）

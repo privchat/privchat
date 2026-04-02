@@ -90,6 +90,12 @@ pub enum ServerError {
     InvalidDeviceType,
     /// 重复条目
     DuplicateEntry(String),
+    /// 需要按 channel 做 scoped resync
+    ChannelResyncRequired(String),
+    /// 需要按 entity family 做 scoped resync
+    EntityResyncRequired(String),
+    /// 需要 full rebuild
+    FullRebuildRequired(String),
 }
 
 impl fmt::Display for ServerError {
@@ -127,6 +133,13 @@ impl fmt::Display for ServerError {
             ServerError::InvalidDeviceId => write!(f, "Invalid device ID"),
             ServerError::InvalidDeviceType => write!(f, "Invalid device type"),
             ServerError::DuplicateEntry(msg) => write!(f, "Duplicate entry: {}", msg),
+            ServerError::ChannelResyncRequired(msg) => {
+                write!(f, "Channel resync required: {}", msg)
+            }
+            ServerError::EntityResyncRequired(msg) => {
+                write!(f, "Entity resync required: {}", msg)
+            }
+            ServerError::FullRebuildRequired(msg) => write!(f, "Full rebuild required: {}", msg),
         }
     }
 }
@@ -149,7 +162,11 @@ impl IntoResponse for ServerError {
             | ServerError::ChannelNotFound(_)
             | ServerError::MessageNotFound(_)
             | ServerError::NotFound(_) => StatusCode::NOT_FOUND,
-            ServerError::Duplicate(_) | ServerError::DuplicateEntry(_) => StatusCode::CONFLICT,
+            ServerError::Duplicate(_)
+            | ServerError::DuplicateEntry(_)
+            | ServerError::ChannelResyncRequired(_)
+            | ServerError::EntityResyncRequired(_)
+            | ServerError::FullRebuildRequired(_) => StatusCode::CONFLICT,
             ServerError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ServerError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -291,6 +308,9 @@ impl From<&ServerError> for ErrorCode {
             ServerError::InvalidDeviceId => ErrorCode::InvalidDeviceId,
             ServerError::InvalidDeviceType => ErrorCode::InvalidDeviceType,
             ServerError::DuplicateEntry(_) => ErrorCode::DuplicateEntry,
+            ServerError::ChannelResyncRequired(_) => ErrorCode::Duplicate,
+            ServerError::EntityResyncRequired(_) => ErrorCode::Duplicate,
+            ServerError::FullRebuildRequired(_) => ErrorCode::Duplicate,
         }
     }
 }

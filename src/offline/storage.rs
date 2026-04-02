@@ -535,7 +535,7 @@ mod tests {
     async fn create_test_message(id: u64, user_id: u64) -> OfflineMessage {
         OfflineMessage::new(
             id,
-            user_id,
+            user_id.to_string(),
             "sender".to_string(),
             "conv".to_string(),
             Bytes::from("test message"),
@@ -546,21 +546,21 @@ mod tests {
     #[tokio::test]
     async fn test_memory_storage() {
         let storage = MemoryStorage::new();
-        let message = create_test_message(1, "user1").await;
+        let message = create_test_message(1, 1001).await;
 
         // 测试存储
         storage.store_message(&message).await.unwrap();
 
         // 测试获取
-        let messages = storage.get_messages("user1").await.unwrap();
+        let messages = storage.get_messages(1001).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, 1);
 
         // 测试删除
-        let deleted = storage.delete_message("user1", 1).await.unwrap();
+        let deleted = storage.delete_message(1001, 1).await.unwrap();
         assert!(deleted);
 
-        let messages = storage.get_messages("user1").await.unwrap();
+        let messages = storage.get_messages(1001).await.unwrap();
         assert_eq!(messages.len(), 0);
     }
 
@@ -570,13 +570,13 @@ mod tests {
         let storage = SledStorage::new(temp_dir.path().to_str().unwrap())
             .await
             .unwrap();
-        let message = create_test_message(1, "user1").await;
+        let message = create_test_message(1, 1001).await;
 
         // 测试存储
         storage.store_message(&message).await.unwrap();
 
         // 测试获取
-        let messages = storage.get_messages("user1").await.unwrap();
+        let messages = storage.get_messages(1001).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, 1);
 

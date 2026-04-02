@@ -21,10 +21,10 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcContext;
-use crate::rpc::{get_current_user_id, RpcServiceContext};
+use crate::rpc::RpcServiceContext;
+use privchat_protocol::ErrorCode;
 use privchat_protocol::rpc::sync::{
     ChannelReadCursorSyncPayload, SyncEntitiesRequest, SyncEntitiesResponse, SyncEntityItem,
-    UserSettingsSyncPayload,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -36,7 +36,6 @@ const SUPPORTED_ENTITY_TYPES: &[&str] = &[
     "group_member",
     "channel",
     "channel_read_cursor",
-    "user_settings",
 ];
 
 fn parse_scope_channel_id(scope: Option<&str>) -> Option<u64> {
@@ -59,6 +58,35 @@ fn parse_scope_user_id(scope: Option<&str>) -> Option<u64> {
         .next_back()
 }
 
+fn sync_authenticated_user_id(ctx: &RpcContext) -> RpcResult<u64> {
+    let user_id_str = ctx.user_id.as_ref().ok_or_else(|| {
+        RpcError::from_code(
+            privchat_protocol::ErrorCode::SyncFullRebuildRequired,
+            "session user missing for entity/sync_entities".to_string(),
+        )
+    })?;
+
+    user_id_str.parse::<u64>().map_err(|_| {
+        RpcError::from_code(
+            privchat_protocol::ErrorCode::SyncFullRebuildRequired,
+            "invalid session user_id for entity/sync_entities".to_string(),
+        )
+    })
+}
+
+fn entity_resync_required<S: Into<String>>(msg: S) -> RpcError {
+    RpcError::from_code(ErrorCode::SyncEntityResyncRequired, msg.into())
+}
+
+fn validate_group_member_scope(scope: Option<&str>) -> RpcResult<()> {
+    if parse_scope_channel_id(scope).is_none() {
+        return Err(entity_resync_required(
+            "group_member sync requires scope=group_id",
+        ));
+    }
+    Ok(())
+}
+
 /// 处理 entity/sync_entities 请求
 pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -> RpcResult<Value> {
     tracing::debug!("🔧 处理 entity/sync_entities 请求: {:?}", body);
@@ -66,7 +94,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
     let request: SyncEntitiesRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
-    let user_id = get_current_user_id(&ctx)?;
+    let user_id = sync_authenticated_user_id(&ctx)?;
 
     let since_version = request.since_version;
     let scope = request.scope.as_deref();
@@ -111,46 +139,41 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
                 }
             }
 
-            let sorted_user_ids: Vec<u64> = related_user_ids.into_iter().collect();
-            let start_idx = since_version.unwrap_or(0) as usize;
-            let page_ids: Vec<u64> = sorted_user_ids
-                .iter()
-                .skip(start_idx)
-                .take(limit as usize)
-                .copied()
-                .collect();
-            let total_consumed = start_idx + page_ids.len();
-            let has_more = total_consumed < sorted_user_ids.len();
-
-            let mut items: Vec<SyncEntityItem> = Vec::with_capacity(page_ids.len());
-            for peer_user_id in page_ids {
-                if let Ok(Some(profile)) = crate::rpc::helpers::get_user_profile_with_fallback(
-                    peer_user_id,
-                    &services.user_repository,
-                    &services.cache_manager,
-                )
+            let related_user_ids: Vec<u64> = related_user_ids.into_iter().collect();
+            let since_v = since_version.unwrap_or(0);
+            let users = services
+                .user_repository
+                .find_related_since(&related_user_ids, since_v, limit)
                 .await
-                {
-                    items.push(SyncEntityItem {
-                        entity_id: peer_user_id.to_string(),
-                        version: 1,
-                        deleted: false,
-                        payload: Some(json!({
-                            "user_id": peer_user_id,
-                            "uid": peer_user_id,
-                            "username": profile.username,
-                            "nickname": profile.nickname,
-                            "avatar": profile.avatar_url.unwrap_or_default(),
-                            "user_type": profile.user_type,
-                            "updated_at": 1
-                        })),
-                    });
-                }
+                .map_err(|e| RpcError::internal(format!("用户资料同步失败: {}", e)))?;
+            let has_more = users.len() >= limit as usize;
+            let mut next_version = since_v;
+
+            let mut items: Vec<SyncEntityItem> = Vec::with_capacity(users.len());
+            for entry in users {
+                let user = entry.user;
+                let updated_at = user.updated_at.timestamp_millis();
+                next_version = next_version.max(entry.sync_version);
+                items.push(SyncEntityItem {
+                    entity_id: user.id.to_string(),
+                    version: entry.sync_version,
+                    deleted: false,
+                    payload: Some(json!({
+                        "user_id": user.id,
+                        "uid": user.id,
+                        "username": user.username,
+                        "nickname": user.display_name.clone().unwrap_or_else(|| user.username.clone()),
+                        "avatar": user.avatar_url.clone().unwrap_or_default(),
+                        "user_type": user.user_type,
+                        "status": user.status,
+                        "updated_at": updated_at
+                    })),
+                });
             }
 
             SyncEntitiesResponse {
                 items,
-                next_version: total_consumed as u64,
+                next_version,
                 has_more,
                 min_version: None,
             }
@@ -165,11 +188,21 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
             .sync_entities_page_for_channels(user_id, since_version, scope, limit)
             .await
             .map_err(|e| RpcError::internal(format!("会话列表同步失败: {}", e)))?,
-        "group_member" => services
-            .channel_service
-            .sync_entities_page_for_group_members(user_id, since_version, scope, limit)
-            .await
-            .map_err(|e| RpcError::internal(format!("群成员同步失败: {}", e)))?,
+        "group_member" => {
+            validate_group_member_scope(scope)?;
+            services
+                .channel_service
+                .sync_entities_page_for_group_members(user_id, since_version, scope, limit)
+                .await
+                .map_err(|e| match e {
+                    crate::error::ServerError::Validation(msg)
+                        if msg.contains("group_member sync requires scope") =>
+                    {
+                        entity_resync_required(msg)
+                    }
+                    other => RpcError::internal(format!("群成员同步失败: {}", other)),
+                })?
+        }
         "channel_read_cursor" => {
             let since_v = since_version.unwrap_or(0);
             let (rows, next_version, has_more) = services
@@ -204,36 +237,6 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
                 min_version: None,
             }
         }
-        "user_settings" => {
-            let since_v = since_version.unwrap_or(0);
-            let (list, next_version, has_more) = services
-                .user_settings_repo
-                .get_since(user_id, since_v, limit)
-                .await
-                .map_err(|e| RpcError::internal(format!("用户设置同步失败: {}", e)))?;
-            let items: Vec<SyncEntityItem> = list
-                .into_iter()
-                .map(|(setting_key, value, version)| {
-                    let payload = serde_json::to_value(UserSettingsSyncPayload {
-                        setting_key: Some(setting_key.clone()),
-                        value: Some(value),
-                    })
-                    .unwrap_or_else(|_| json!({}));
-                    SyncEntityItem {
-                        entity_id: setting_key,
-                        version,
-                        deleted: false,
-                        payload: Some(payload),
-                    }
-                })
-                .collect();
-            SyncEntitiesResponse {
-                items,
-                next_version,
-                has_more,
-                min_version: None,
-            }
-        }
         other => {
             let supported = SUPPORTED_ENTITY_TYPES.join(", ");
             return Err(RpcError::validation(format!(
@@ -244,4 +247,64 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
     };
 
     serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::RpcContext;
+
+    #[test]
+    fn supported_entity_types_match_current_entity_sync_surface() {
+        assert_eq!(
+            SUPPORTED_ENTITY_TYPES,
+            &[
+                "friend",
+                "user",
+                "group",
+                "group_member",
+                "channel",
+                "channel_read_cursor",
+            ]
+        );
+        assert!(!SUPPORTED_ENTITY_TYPES.contains(&"message"));
+    }
+
+    #[test]
+    fn scope_parsers_extract_current_supported_formats() {
+        assert_eq!(parse_scope_channel_id(Some("30001")), Some(30001));
+        assert_eq!(parse_scope_channel_id(Some("group:30001")), Some(30001));
+        assert_eq!(
+            parse_scope_channel_id(Some("channel:2|30001")),
+            Some(30001)
+        );
+
+        assert_eq!(parse_scope_user_id(Some("20001")), Some(20001));
+        assert_eq!(parse_scope_user_id(Some("user:20001")), Some(20001));
+        assert_eq!(parse_scope_user_id(Some("friend/20001")), Some(20001));
+    }
+
+    #[test]
+    fn missing_sync_entities_user_requires_full_rebuild() {
+        let err = sync_authenticated_user_id(&RpcContext::new()).expect_err("missing user");
+        assert_eq!(err.code, ErrorCode::SyncFullRebuildRequired);
+    }
+
+    #[test]
+    fn invalid_sync_entities_user_requires_full_rebuild() {
+        let ctx = RpcContext::new().with_user_id("bad-user".to_string());
+        let err = sync_authenticated_user_id(&ctx).expect_err("invalid user");
+        assert_eq!(err.code, ErrorCode::SyncFullRebuildRequired);
+    }
+
+    #[test]
+    fn missing_group_member_scope_requires_entity_resync() {
+        let err = validate_group_member_scope(None).expect_err("expected scope failure");
+        assert_eq!(err.code, ErrorCode::SyncEntityResyncRequired);
+    }
+
+    #[test]
+    fn valid_group_member_scope_is_accepted() {
+        validate_group_member_scope(Some("group:30001")).expect("group_id scope");
+    }
 }

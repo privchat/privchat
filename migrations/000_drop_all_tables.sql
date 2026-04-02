@@ -11,6 +11,7 @@ DROP TABLE IF EXISTS privchat_client_msg_registry CASCADE;
 DROP TABLE IF EXISTS privchat_commit_log CASCADE;
 DROP TABLE IF EXISTS privchat_channel_pts CASCADE;
 DROP TABLE IF EXISTS privchat_channel_read_cursor CASCADE;
+DROP TABLE IF EXISTS privchat_channel_user_state CASCADE;
 DROP TABLE IF EXISTS privchat_user_last_seen CASCADE;
 DROP TABLE IF EXISTS privchat_device_sync_state CASCADE;
 DROP TABLE IF EXISTS privchat_user_channels CASCADE;

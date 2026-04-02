@@ -564,7 +564,8 @@ impl ChatServer {
 
         // 创建 Reaction 服务
         info!("🔧 初始化 Reaction 服务...");
-        let reaction_service = Arc::new(crate::service::ReactionService::new());
+        let reaction_service =
+            Arc::new(crate::service::ReactionService::new(pool.clone()));
         info!("✅ Reaction 服务初始化完成");
 
         // 创建在线状态管理器
@@ -1138,6 +1139,7 @@ impl ChatServer {
             channel_service.clone(),
             unread_count_service.clone(),
         ));
+        crate::service::sync::set_global_sync_service(sync_service.clone());
         info!("✅ SyncService 创建完成");
 
         // Typing 限频器
@@ -1179,9 +1181,6 @@ impl ChatServer {
             auth_session_manager.clone(),
             offline_worker.clone(),
             user_device_repo.clone(), // ✨ Phase 3.5
-            Arc::new(crate::repository::UserSettingsRepository::new(
-                (*pool).clone(),
-            )), // user_settings 表为主
             unread_count_service.clone(),
             typing_rate_limiter.clone(),
         );

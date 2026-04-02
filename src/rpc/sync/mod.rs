@@ -35,6 +35,22 @@ use tracing::{error, warn};
 use crate::rpc::error::{RpcError, RpcResult};
 use serde_json::Value;
 
+fn sync_authenticated_user_id(ctx: &crate::rpc::RpcContext) -> RpcResult<u64> {
+    let user_id_str = ctx.user_id.as_ref().ok_or_else(|| {
+        RpcError::from_code(
+            privchat_protocol::ErrorCode::SyncFullRebuildRequired,
+            "session user missing for sync/session_ready".to_string(),
+        )
+    })?;
+
+    user_id_str.parse::<u64>().map_err(|_| {
+        RpcError::from_code(
+            privchat_protocol::ErrorCode::SyncFullRebuildRequired,
+            "invalid session user_id for sync/session_ready".to_string(),
+        )
+    })
+}
+
 /// 注册同步系统的所有路由
 pub async fn register_routes(services: RpcServiceContext) {
     // sync/get_channel_pts - 获取频道 pts
@@ -87,15 +103,19 @@ pub async fn register_routes(services: RpcServiceContext) {
 
 /// RPC 处理函数：获取频道 pts
 async fn handle_get_channel_pts_rpc(body: Value, services: RpcServiceContext) -> RpcResult<Value> {
-    use privchat_protocol::rpc::sync::{GetChannelPtsRequest, GetChannelPtsResponse};
+    use privchat_protocol::rpc::sync::GetChannelPtsRequest;
 
     let request: GetChannelPtsRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
 
-    // 直接从 pts_generator 获取当前 pts
-    let current_pts = services.pts_generator.current_pts(request.channel_id).await;
-
-    let response = GetChannelPtsResponse { current_pts };
+    let response = services
+        .sync_service
+        .handle_get_channel_pts(request)
+        .await
+        .map_err(|e| {
+            error!("SyncService.handle_get_channel_pts 失败: {}", e);
+            RpcError::from(e)
+        })?;
 
     serde_json::to_value(&response)
         .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
@@ -123,7 +143,7 @@ async fn handle_get_difference_rpc(body: Value, services: RpcServiceContext) -> 
         .await
         .map_err(|e| {
             error!("SyncService.handle_get_difference 失败: {}", e);
-            RpcError::internal(format!("获取差异失败: {}", e))
+            RpcError::from(e)
         })?;
 
     serde_json::to_value(&response)
@@ -223,11 +243,16 @@ async fn handle_session_ready_rpc(
             .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
     }
 
-    let user_id = crate::rpc::get_current_user_id(&ctx)?;
+    let user_id = sync_authenticated_user_id(&ctx)?;
     let session_id_str = ctx
         .session_id
         .as_ref()
-        .ok_or_else(|| RpcError::validation("缺少 session_id 上下文".to_string()))?;
+        .ok_or_else(|| {
+            RpcError::from_code(
+                privchat_protocol::ErrorCode::SyncFullRebuildRequired,
+                "missing session_id for sync/session_ready".to_string(),
+            )
+        })?;
     let session_id = parse_session_id(session_id_str)?;
 
     let transitioned = services
@@ -262,6 +287,24 @@ fn parse_session_id(session_id_str: &str) -> RpcResult<SessionId> {
         .parse::<u64>()
         .map_err(|_| RpcError::validation(format!("无效 session_id: {}", session_id_str)))?;
     Ok(SessionId::from(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_session_ready_user_requires_full_rebuild() {
+        let err = sync_authenticated_user_id(&crate::rpc::RpcContext::new()).expect_err("missing");
+        assert_eq!(err.code, privchat_protocol::ErrorCode::SyncFullRebuildRequired);
+    }
+
+    #[test]
+    fn invalid_session_ready_user_requires_full_rebuild() {
+        let ctx = crate::rpc::RpcContext::new().with_user_id("not-a-u64".to_string());
+        let err = sync_authenticated_user_id(&ctx).expect_err("invalid");
+        assert_eq!(err.code, privchat_protocol::ErrorCode::SyncFullRebuildRequired);
+    }
 }
 
 async fn project_submit_to_message_views(

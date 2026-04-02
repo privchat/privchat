@@ -242,10 +242,11 @@ impl BlacklistService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CacheConfig;
 
     #[tokio::test]
     async fn test_blacklist_basic_operations() {
-        let cache_manager = Arc::new(CacheManager::new_simple());
+        let cache_manager = Arc::new(CacheManager::new(CacheConfig::default()).await.unwrap());
         let service = BlacklistService::new(cache_manager);
 
         // 添加黑名单
@@ -270,7 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_block_self() {
-        let cache_manager = Arc::new(CacheManager::new_simple());
+        let cache_manager = Arc::new(CacheManager::new(CacheConfig::default()).await.unwrap());
         let service = BlacklistService::new(cache_manager);
 
         let result = service.add_to_blacklist(1, 1, None).await;
@@ -279,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mutual_block_check() {
-        let cache_manager = Arc::new(CacheManager::new_simple());
+        let cache_manager = Arc::new(CacheManager::new(CacheConfig::default()).await.unwrap());
         let service = BlacklistService::new(cache_manager);
 
         service.add_to_blacklist(1, 2, None).await.unwrap();

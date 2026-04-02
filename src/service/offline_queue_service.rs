@@ -367,6 +367,33 @@ impl OfflineQueueService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use privchat_protocol::message::ContentMessageType;
+    use privchat_protocol::protocol::MessageSetting;
+
+    fn build_push_message(
+        server_message_id: u64,
+        user_id: u64,
+        local_message_id: u64,
+    ) -> PushMessageRequest {
+        PushMessageRequest {
+            setting: MessageSetting::default(),
+            msg_key: format!("msg-key-{server_message_id}"),
+            server_message_id,
+            message_seq: server_message_id as u32,
+            local_message_id,
+            stream_no: format!("stream-{server_message_id}"),
+            stream_seq: 1,
+            stream_flag: 0,
+            timestamp: 1_704_624_000 + server_message_id as u32,
+            channel_id: 3001,
+            channel_type: 1,
+            message_type: ContentMessageType::Text.as_u32(),
+            expire: 0,
+            topic: String::new(),
+            from_uid: 1001,
+            payload: format!("hello-{server_message_id}").into_bytes(),
+        }
+    }
 
     // 注意：这些测试需要 Redis 运行在 localhost:6379
     // 如果没有 Redis，测试会失败
@@ -376,32 +403,22 @@ mod tests {
     async fn test_push_and_get() {
         let service = OfflineQueueService::new("redis://127.0.0.1:6379").expect("连接 Redis 失败");
 
-        let user_id = "test_user_001";
+        let user_id = 900001_u64;
 
         // 清空队列
         service.clear(user_id).await.expect("清空失败");
 
         // 推送消息
-        let msg = PushMessageRequest {
-            pts: 1,
-            message_id: "msg_001".to_string(),
-            from_user_id: "alice".to_string(),
-            to_user_id: user_id,
-            channel_id: "channel_001".to_string(),
-            local_message_id: "client_001".to_string(),
-            message_type: "text".to_string(),
-            content: "Hello".to_string(),
-            metadata: None,
-            created_at: 1704624000,
-            is_revoked: false,
-        };
+        let msg = build_push_message(1, user_id, 101);
 
-        service.push(user_id, &msg).await.expect("推送失败");
+        service.add(user_id, &msg).await.expect("推送失败");
 
         // 获取消息
         let messages = service.get_all(user_id).await.expect("获取失败");
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].pts, 1);
+        assert_eq!(messages[0].server_message_id, 1);
+        assert_eq!(messages[0].local_message_id, 101);
+        assert_eq!(messages[0].from_uid, 1001);
 
         // 清空
         service.clear(user_id).await.expect("清空失败");
@@ -414,32 +431,20 @@ mod tests {
             .expect("连接 Redis 失败")
             .with_max_size(10); // 设置上限为 10
 
-        let user_id = "test_user_002";
+        let user_id = 900002_u64;
         service.clear(user_id).await.expect("清空失败");
 
         // 推送 15 条消息
         for i in 1..=15 {
-            let msg = PushMessageRequest {
-                pts: i,
-                message_id: format!("msg_{:03}", i),
-                from_user_id: "alice".to_string(),
-                to_user_id: user_id,
-                channel_id: "channel_001".to_string(),
-                local_message_id: format!("client_{:03}", i),
-                message_type: "text".to_string(),
-                content: format!("Message {}", i),
-                metadata: None,
-                created_at: 1704624000 + i as i64,
-                is_revoked: false,
-            };
-            service.push(user_id, &msg).await.expect("推送失败");
+            let msg = build_push_message(i, user_id, 100 + i);
+            service.add(user_id, &msg).await.expect("推送失败");
         }
 
-        // 队列应该只保留最新 10 条（pts 6-15）
+        // 队列应该只保留最新 10 条（server_message_id 6-15）
         let messages = service.get_all(user_id).await.expect("获取失败");
         assert_eq!(messages.len(), 10);
-        assert_eq!(messages[0].pts, 15); // 最新的
-        assert_eq!(messages[9].pts, 6); // 最旧的
+        assert_eq!(messages[0].server_message_id, 15); // 最新的
+        assert_eq!(messages[9].server_message_id, 6); // 最旧的
 
         // 清空
         service.clear(user_id).await.expect("清空失败");

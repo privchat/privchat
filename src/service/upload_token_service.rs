@@ -232,7 +232,7 @@ mod tests {
         // 生成 token
         let token = service
             .generate_token(
-                "user1".to_string(),
+                1001,
                 FileType::Image,
                 10485760, // 10MB
                 "message".to_string(),
@@ -243,7 +243,7 @@ mod tests {
 
         // 验证 token
         let validated = service.validate_token(&token.token).await.unwrap();
-        assert_eq!(validated.user_id, "user1");
+        assert_eq!(validated.user_id, 1001);
         assert_eq!(validated.file_type, FileType::Image);
         assert_eq!(validated.business_type, "message");
         assert!(validated.is_valid());
@@ -255,7 +255,7 @@ mod tests {
 
         let token = service
             .generate_token(
-                "user1".to_string(),
+                1001,
                 FileType::Image,
                 10485760,
                 "message".to_string(),

@@ -100,6 +100,7 @@ impl ChannelRepository for PgChannelRepository {
             message_count: i64,
             created_at: i64,
             updated_at: i64,
+            sync_version: i64,
         }
 
         let row = sqlx::query_as::<_, ChannelRow>(
@@ -114,7 +115,8 @@ impl ChannelRepository for PgChannelRepository {
                 last_message_at,
                 message_count,
                 created_at,
-                updated_at
+                updated_at,
+                sync_version
             FROM privchat_channels
             WHERE channel_id = $1
             "#,
@@ -136,6 +138,7 @@ impl ChannelRepository for PgChannelRepository {
                 r.message_count,
                 r.created_at,
                 r.updated_at,
+                r.sync_version,
             ))),
             None => Ok(None),
         }

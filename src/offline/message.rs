@@ -243,10 +243,10 @@ impl PartialOrd for OfflineMessage {
 impl Ord for OfflineMessage {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // 首先按优先级排序（高优先级在前）
-        match other.priority.cmp(&self.priority) {
+        match self.priority.cmp(&other.priority) {
             std::cmp::Ordering::Equal => {
                 // 优先级相同时，按创建时间排序（早创建的在前）
-                self.created_at.cmp(&other.created_at)
+                other.created_at.cmp(&self.created_at)
             }
             other_order => other_order,
         }
@@ -297,7 +297,7 @@ mod tests {
         msg1.priority = MessagePriority::Low;
         msg2.priority = MessagePriority::High;
 
-        assert!(msg2 < msg1); // 高优先级应该排在前面
+        assert!(msg2 > msg1); // 高优先级应该排在前面
     }
 
     #[test]

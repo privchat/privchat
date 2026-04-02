@@ -39,7 +39,11 @@ pub async fn handle(
     let friend_id = request.friend_id;
 
     // 检查是否是好友
-    let is_friend = services.friend_service.is_friend(user_id, friend_id).await;
+    let is_friend = services
+        .friend_service
+        .try_is_friend(user_id, friend_id)
+        .await
+        .map_err(|e| RpcError::internal(format!("Check friend failed: {}", e)))?;
 
     tracing::debug!(
         "✅ 检查好友关系: {} 和 {} 是好友: {}",

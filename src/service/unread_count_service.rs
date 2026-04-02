@@ -340,25 +340,25 @@ mod tests {
         let cache_manager = Arc::new(CacheManager::new());
         let service = UnreadCountService::new(cache_manager);
 
-        let user_id = Uuid::new_v4().to_string();
-        let channel_id = Uuid::new_v4().to_string();
+        let user_id = 1001_u64;
+        let channel_id = 3001_u64;
 
         // 增加计数
         service
-            .increment(&user_id, &channel_id, 1)
+            .increment(user_id, channel_id, 1)
             .await
             .expect("增加失败");
         service
-            .increment(&user_id, &channel_id, 2)
+            .increment(user_id, channel_id, 2)
             .await
             .expect("增加失败");
 
         // 获取计数
-        let count = service.get(&user_id, &channel_id).await.expect("获取失败");
+        let count = service.get(user_id, channel_id).await.expect("获取失败");
         assert_eq!(count, 3);
 
         // 获取所有
-        let all_counts = service.get_all(&user_id).await.expect("获取失败");
+        let all_counts = service.get_all(user_id).await.expect("获取失败");
         assert_eq!(all_counts.len(), 1);
         assert_eq!(all_counts.get(&channel_id), Some(&3));
     }
@@ -368,29 +368,29 @@ mod tests {
         let cache_manager = Arc::new(CacheManager::new());
         let service = UnreadCountService::new(cache_manager);
 
-        let user_id = Uuid::new_v4().to_string();
-        let channel1 = Uuid::new_v4().to_string();
-        let channel2 = Uuid::new_v4().to_string();
+        let user_id = 1001_u64;
+        let channel1 = 3001_u64;
+        let channel2 = 3002_u64;
 
         // 增加计数
         service
-            .increment(&user_id, &channel1, 5)
+            .increment(user_id, channel1, 5)
             .await
             .expect("增加失败");
         service
-            .increment(&user_id, &channel2, 10)
+            .increment(user_id, channel2, 10)
             .await
             .expect("增加失败");
 
         // 清空一个会话
         service
-            .clear_channel(&user_id, &channel1)
+            .clear_channel(user_id, channel1)
             .await
             .expect("清空失败");
 
         // 验证
-        let count1 = service.get(&user_id, &channel1).await.expect("获取失败");
-        let count2 = service.get(&user_id, &channel2).await.expect("获取失败");
+        let count1 = service.get(user_id, channel1).await.expect("获取失败");
+        let count2 = service.get(user_id, channel2).await.expect("获取失败");
         assert_eq!(count1, 0);
         assert_eq!(count2, 10);
     }
@@ -400,25 +400,25 @@ mod tests {
         let cache_manager = Arc::new(CacheManager::new());
         let service = UnreadCountService::new(cache_manager);
 
-        let user_id = Uuid::new_v4().to_string();
-        let channel1 = Uuid::new_v4().to_string();
-        let channel2 = Uuid::new_v4().to_string();
+        let user_id = 1001_u64;
+        let channel1 = 3001_u64;
+        let channel2 = 3002_u64;
 
         // 增加计数
         service
-            .increment(&user_id, &channel1, 5)
+            .increment(user_id, channel1, 5)
             .await
             .expect("增加失败");
         service
-            .increment(&user_id, &channel2, 10)
+            .increment(user_id, channel2, 10)
             .await
             .expect("增加失败");
 
         // 清空所有
-        service.clear_all(&user_id).await.expect("清空失败");
+        service.clear_all(user_id).await.expect("清空失败");
 
         // 验证
-        let all_counts = service.get_all(&user_id).await.expect("获取失败");
+        let all_counts = service.get_all(user_id).await.expect("获取失败");
         assert_eq!(all_counts.len(), 0);
     }
 }

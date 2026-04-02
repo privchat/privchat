@@ -35,3 +35,15 @@ pub use pts_dao::ChannelPtsDao;
 pub use registry_dao::ClientMsgRegistryDao;
 pub use sync_cache::SyncCache;
 pub use sync_service::SyncService;
+
+use std::sync::{Arc, OnceLock};
+
+static GLOBAL_SYNC_SERVICE: OnceLock<Arc<SyncService>> = OnceLock::new();
+
+pub fn set_global_sync_service(sync_service: Arc<SyncService>) {
+    let _ = GLOBAL_SYNC_SERVICE.set(sync_service);
+}
+
+pub fn get_global_sync_service() -> Option<Arc<SyncService>> {
+    GLOBAL_SYNC_SERVICE.get().cloned()
+}

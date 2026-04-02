@@ -158,7 +158,7 @@ mod tests {
         let device_manager = Arc::new(DeviceManager::new());
         let service = TokenRevocationService::new(device_manager.clone());
 
-        let device = create_test_device("alice", "device-1", "jti-123");
+        let device = create_test_device(1001, "device-1", "jti-123");
         device_manager.register_device(device).await.unwrap();
 
         // 撤销设备
@@ -177,16 +177,16 @@ mod tests {
         let service = TokenRevocationService::new(device_manager.clone());
 
         device_manager
-            .register_device(create_test_device("alice", "device-1", "jti-1"))
+            .register_device(create_test_device(1001, "device-1", "jti-1"))
             .await
             .unwrap();
         device_manager
-            .register_device(create_test_device("alice", "device-2", "jti-2"))
+            .register_device(create_test_device(1001, "device-2", "jti-2"))
             .await
             .unwrap();
 
         // 撤销所有设备
-        let count = service.revoke_all_devices("alice").await.unwrap();
+        let count = service.revoke_all_devices(1001).await.unwrap();
         assert_eq!(count, 2);
 
         // 检查所有 jti 是否在黑名单中
@@ -194,7 +194,7 @@ mod tests {
         assert!(service.is_revoked("jti-2").await);
 
         // 检查所有设备是否被删除
-        assert_eq!(device_manager.get_user_devices("alice").await.len(), 0);
+        assert_eq!(device_manager.get_user_devices(1001).await.len(), 0);
     }
 
     #[tokio::test]

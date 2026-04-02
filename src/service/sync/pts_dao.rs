@@ -138,6 +138,36 @@ impl ChannelPtsDao {
         Ok(())
     }
 
+    /// 将 pts 提升到至少指定值，绝不回退当前 pts
+    pub async fn bump_pts_to_at_least(&self, channel_id: u64, pts: u64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_channel_pts
+            (channel_id, current_pts, created_at, updated_at)
+            VALUES ($1, $2, $3, $3)
+            ON CONFLICT (channel_id) DO UPDATE
+            SET current_pts = GREATEST(privchat_channel_pts.current_pts, EXCLUDED.current_pts),
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(channel_id as i64)
+        .bind(pts as i64)
+        .bind(now)
+        .execute(self.db.pool())
+        .await
+        .map_err(|e| {
+            error!(
+                "提升 pts 失败: channel_id={}, pts={}, error={}",
+                channel_id, pts, e
+            );
+            crate::error::ServerError::Database(format!("Failed to bump pts: {}", e))
+        })?;
+
+        Ok(())
+    }
+
     /// 批量初始化 pts（从其他表恢复）
     pub async fn batch_init_pts(&self, channel_pts_list: Vec<(u64, u64)>) -> Result<()> {
         // TODO: 实现批量插入
@@ -151,8 +181,6 @@ impl ChannelPtsDao {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_allocate_pts() {
         // 测试 pts 原子递增

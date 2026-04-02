@@ -214,8 +214,6 @@ impl ClientMsgRegistryDao {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_register_and_check_duplicate() {
         // 测试注册和幂等性检查

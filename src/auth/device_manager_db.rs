@@ -698,7 +698,5 @@ impl DeviceType {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // TODO: 添加集成测试（需要测试数据库）
 }

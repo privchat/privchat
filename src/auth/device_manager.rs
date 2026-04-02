@@ -276,12 +276,12 @@ mod tests {
     async fn test_register_and_get_device() {
         let manager = DeviceManager::new();
 
-        let device = create_test_device("alice", "device-1");
+        let device = create_test_device(1001, "device-1");
         manager.register_device(device.clone()).await.unwrap();
 
         let retrieved = manager.get_device("device-1").await;
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().user_id, "alice");
+        assert_eq!(retrieved.unwrap().user_id, 1001);
     }
 
     #[tokio::test]
@@ -289,15 +289,15 @@ mod tests {
         let manager = DeviceManager::new();
 
         manager
-            .register_device(create_test_device("alice", "device-1"))
+            .register_device(create_test_device(1001, "device-1"))
             .await
             .unwrap();
         manager
-            .register_device(create_test_device("alice", "device-2"))
+            .register_device(create_test_device(1001, "device-2"))
             .await
             .unwrap();
 
-        let devices = manager.get_user_devices("alice").await;
+        let devices = manager.get_user_devices(1001).await;
         assert_eq!(devices.len(), 2);
     }
 
@@ -306,7 +306,7 @@ mod tests {
         let manager = DeviceManager::new();
 
         manager
-            .register_device(create_test_device("alice", "device-1"))
+            .register_device(create_test_device(1001, "device-1"))
             .await
             .unwrap();
 
@@ -322,7 +322,7 @@ mod tests {
         let manager = DeviceManager::new();
 
         manager
-            .register_device(create_test_device("alice", "device-1"))
+            .register_device(create_test_device(1001, "device-1"))
             .await
             .unwrap();
 

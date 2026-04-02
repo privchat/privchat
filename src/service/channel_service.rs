@@ -169,6 +169,91 @@ impl ChannelService {
         self.channel_repository.pool()
     }
 
+    fn sync_channel_type(channel_type: ChannelType) -> i32 {
+        match channel_type {
+            ChannelType::Direct => 1,
+            ChannelType::Group => 2,
+            ChannelType::Room => 3,
+        }
+    }
+
+    async fn persist_user_channel_flags(
+        &self,
+        user_id: u64,
+        channel_id: u64,
+        pinned: Option<bool>,
+        muted: Option<bool>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_user_channels (
+                user_id,
+                channel_id,
+                is_pinned,
+                is_muted,
+                updated_at
+            )
+            VALUES (
+                $1,
+                $2,
+                COALESCE($3, false),
+                COALESCE($4, false),
+                $5
+            )
+            ON CONFLICT (user_id, channel_id) DO UPDATE SET
+                is_pinned = COALESCE($3, privchat_user_channels.is_pinned),
+                is_muted = COALESCE($4, privchat_user_channels.is_muted),
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(channel_id as i64)
+        .bind(pinned)
+        .bind(muted)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("persist user_channel flags failed: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn ensure_user_channel_rows(&self, channel_id: u64, user_ids: &[u64]) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+
+        for user_id in user_ids {
+            sqlx::query(
+                r#"
+                INSERT INTO privchat_user_channels (
+                    user_id,
+                    channel_id,
+                    unread_count,
+                    is_pinned,
+                    is_muted,
+                    updated_at
+                )
+                VALUES ($1, $2, 0, false, false, $3)
+                ON CONFLICT (user_id, channel_id) DO NOTHING
+                "#,
+            )
+            .bind(*user_id as i64)
+            .bind(channel_id as i64)
+            .bind(now)
+            .execute(self.pool())
+            .await
+            .map_err(|e| {
+                ServerError::Database(format!(
+                    "ensure privchat_user_channels failed for user={} channel={}: {}",
+                    user_id, channel_id, e
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
     // =====================================================
     // 管理 API 方法
     // =====================================================
@@ -894,15 +979,19 @@ impl ChannelService {
 
     /// 移除群组成员（管理 API）
     pub async fn remove_member_admin(&self, group_id: u64, user_id: u64) -> Result<()> {
-        let result = sqlx::query!(
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = sqlx::query(
             r#"
-            DELETE FROM privchat_group_members
-            WHERE group_id = $1 AND user_id = $2
+            UPDATE privchat_group_members
+            SET left_at = $3,
+                updated_at = $3
+            WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
             RETURNING user_id
             "#,
-            group_id as i64,
-            user_id as i64,
         )
+        .bind(group_id as i64)
+        .bind(user_id as i64)
+        .bind(now)
         .fetch_optional(self.pool())
         .await
         .map_err(|e| ServerError::Database(format!("移除群组成员失败: {}", e)))?;
@@ -946,19 +1035,24 @@ impl ChannelService {
         let now = chrono::Utc::now().timestamp_millis();
 
         // 1. 检查是否已是成员
-        let existing = sqlx::query!(
+        let existing = sqlx::query(
             r#"
-            SELECT user_id FROM privchat_group_members
+            SELECT user_id, left_at FROM privchat_group_members
             WHERE group_id = $1 AND user_id = $2
             "#,
-            group_id as i64,
-            user_id as i64,
         )
+        .bind(group_id as i64)
+        .bind(user_id as i64)
         .fetch_optional(self.pool())
         .await
         .map_err(|e| ServerError::Database(format!("查询群组成员失败: {}", e)))?;
 
-        if existing.is_some() {
+        if existing
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("left_at").ok().flatten())
+            .is_none()
+            && existing.is_some()
+        {
             return Err(ServerError::Validation(format!(
                 "用户 {} 已是群组 {} 的成员",
                 user_id, group_id
@@ -966,15 +1060,21 @@ impl ChannelService {
         }
 
         // 2. 插入成员记录
-        sqlx::query!(
+        sqlx::query(
             r#"
-            INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, nickname)
-            VALUES ($1, $2, 0, $3, NULL)
+            INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, nickname, left_at, updated_at)
+            VALUES ($1, $2, 0, $3, NULL, NULL, $3)
+            ON CONFLICT (group_id, user_id) DO UPDATE SET
+                role = EXCLUDED.role,
+                joined_at = EXCLUDED.joined_at,
+                nickname = EXCLUDED.nickname,
+                left_at = NULL,
+                updated_at = EXCLUDED.updated_at
             "#,
-            group_id as i64,
-            user_id as i64,
-            now,
         )
+        .bind(group_id as i64)
+        .bind(user_id as i64)
+        .bind(now)
         .execute(self.pool())
         .await
         .map_err(|e| ServerError::Database(format!("添加群组成员失败: {}", e)))?;
@@ -1219,12 +1319,15 @@ impl ChannelService {
         channels.insert(actual_conv_id, channel.clone());
         drop(channels);
 
+        let member_ids = channel.get_member_ids();
+        self.ensure_user_channel_rows(actual_conv_id, &member_ids)
+            .await?;
+
         // 更新用户会话索引（使用包含成员的原始 channel 对象）
         self.update_user_channel_index(&channel).await;
 
         // 如果是私聊，更新私聊索引（使用包含成员的原始 channel 对象）
         if channel.channel_type == ChannelType::Direct {
-            let member_ids = channel.get_member_ids();
             if member_ids.len() == 2 {
                 let key = Self::make_direct_key(member_ids[0], member_ids[1]);
                 let mut direct_index = self.direct_channel_index.write().await;
@@ -1415,9 +1518,12 @@ impl ChannelService {
         channels.insert(channel_id, channel.clone());
         drop(channels);
 
+        let member_ids: Vec<u64> = channel.members.keys().cloned().collect();
+        self.ensure_user_channel_rows(channel_id, &member_ids).await?;
+
         // 更新用户会话索引
         let mut user_channels = self.user_channels.write().await;
-        for member_id in channel.members.keys() {
+        for member_id in &member_ids {
             user_channels
                 .entry(*member_id)
                 .or_insert_with(Vec::new)
@@ -1427,7 +1533,6 @@ impl ChannelService {
 
         // 如果是私聊，更新私聊索引
         if channel.channel_type == ChannelType::Direct {
-            let member_ids: Vec<u64> = channel.members.keys().cloned().collect();
             if member_ids.len() == 2 {
                 let key = Self::make_direct_key(member_ids[0], member_ids[1]);
                 let mut index = self.direct_channel_index.write().await;
@@ -1570,62 +1675,79 @@ impl ChannelService {
     pub async fn sync_entities_page_for_groups(
         &self,
         user_id: u64,
-        _since_version: Option<u64>,
-        scope: Option<&str>,
+        since_version: Option<u64>,
+        _scope: Option<&str>,
         limit: u32,
     ) -> Result<privchat_protocol::rpc::sync::SyncEntitiesResponse> {
         use privchat_protocol::rpc::sync::{
             GroupSyncPayload, SyncEntitiesResponse, SyncEntityItem,
         };
+        let since_v = since_version.unwrap_or(0);
 
-        let response = self.get_user_channels(user_id).await;
-        let channels: Vec<Channel> = response
-            .channels
-            .into_iter()
-            .filter(|ch| ch.channel_type == ChannelType::Group)
-            .collect();
+        #[derive(sqlx::FromRow)]
+        struct GroupSyncRow {
+            group_id: i64,
+            name: String,
+            description: Option<String>,
+            avatar_url: Option<String>,
+            owner_id: i64,
+            member_count: i32,
+            created_at: i64,
+            updated_at: i64,
+            sync_version: i64,
+        }
 
-        let limit = limit.min(200).max(1);
-        let after_id: Option<u64> = scope
-            .and_then(|s| s.strip_prefix("cursor:"))
-            .and_then(|s| s.parse::<u64>().ok());
+        let limit = limit.min(200).max(1) as i64;
+        let rows = sqlx::query_as::<_, GroupSyncRow>(
+            r#"
+            SELECT
+                g.group_id,
+                g.name,
+                g.description,
+                g.avatar_url,
+                g.owner_id,
+                g.member_count,
+                g.created_at,
+                g.updated_at,
+                g.sync_version
+            FROM privchat_groups g
+            INNER JOIN privchat_group_members gm
+                ON gm.group_id = g.group_id
+            WHERE gm.user_id = $1
+              AND gm.left_at IS NULL
+              AND g.status = 0
+              AND g.sync_version > $2
+            ORDER BY g.sync_version ASC, g.group_id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(since_v as i64)
+        .bind(limit + 1)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询群组同步分页失败: {}", e)))?;
 
-        let start_idx = if let Some(aid) = after_id {
-            channels
-                .iter()
-                .position(|ch| ch.id == aid)
-                .map(|i| i + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let page: Vec<&Channel> = channels
-            .iter()
-            .skip(start_idx)
-            .take(limit as usize)
-            .collect();
-        let total_consumed = start_idx + page.len();
-        let has_more = total_consumed < channels.len();
-        let last_message_cache = self.last_message_cache.read().await;
+        let (page, has_more) = take_sync_page(rows, limit as usize);
 
         let items: Vec<SyncEntityItem> = page
             .iter()
-            .map(|ch| {
+            .map(|row| {
                 let payload = serde_json::to_value(GroupSyncPayload {
-                    group_id: Some(ch.id),
-                    name: ch.metadata.name.clone(),
-                    description: ch.metadata.description.clone(),
-                    avatar: ch.metadata.avatar_url.clone(),
-                    avatar_url: ch.metadata.avatar_url.clone(),
-                    owner_id: Some(ch.creator_id),
-                    member_count: Some(ch.members.len() as u32),
-                    created_at: Some(ch.created_at.timestamp_millis()),
-                    updated_at: Some(ch.updated_at.timestamp_millis()),
+                    group_id: Some(row.group_id as u64),
+                    name: Some(row.name.clone()),
+                    description: row.description.clone(),
+                    avatar: row.avatar_url.clone(),
+                    avatar_url: row.avatar_url.clone(),
+                    owner_id: Some(row.owner_id as u64),
+                    member_count: Some(row.member_count.max(0) as u32),
+                    created_at: Some(row.created_at),
+                    updated_at: Some(row.updated_at),
                 })
                 .unwrap_or_else(|_| serde_json::json!({}));
                 SyncEntityItem {
-                    entity_id: ch.id.to_string(),
-                    version: 1,
+                    entity_id: row.group_id.to_string(),
+                    version: row.sync_version as u64,
                     deleted: false,
                     payload: Some(payload),
                 }
@@ -1634,7 +1756,7 @@ impl ChannelService {
 
         Ok(SyncEntitiesResponse {
             items,
-            next_version: 1,
+            next_version: next_version_from_page(&page, since_v, |row| row.sync_version as u64),
             has_more,
             min_version: None,
         })
@@ -1644,7 +1766,7 @@ impl ChannelService {
     pub async fn sync_entities_page_for_channels(
         &self,
         user_id: u64,
-        _since_version: Option<u64>,
+        since_version: Option<u64>,
         scope: Option<&str>,
         limit: u32,
     ) -> Result<privchat_protocol::rpc::sync::SyncEntitiesResponse> {
@@ -1652,31 +1774,92 @@ impl ChannelService {
             ChannelSyncPayload, SyncEntitiesResponse, SyncEntityItem,
         };
 
-        let response = self.get_user_channels(user_id).await;
-        // 过滤掉用户已隐藏的频道
+        #[derive(sqlx::FromRow)]
+        struct ChannelSyncRow {
+            channel_id: i64,
+            channel_type: i16,
+            direct_user1_id: Option<i64>,
+            direct_user2_id: Option<i64>,
+            group_id: Option<i64>,
+            last_message_id: Option<i64>,
+            last_message_at: Option<i64>,
+            last_message_content: Option<String>,
+            message_count: i64,
+            created_at: i64,
+            updated_at: i64,
+            channel_sync_version: i64,
+            group_name: Option<String>,
+            group_avatar_url: Option<String>,
+            unread_count: i32,
+            is_pinned: bool,
+            is_muted: bool,
+            sync_version: i64,
+        }
+
+        let rows = sqlx::query_as::<_, ChannelSyncRow>(
+            r#"
+            SELECT
+                c.channel_id,
+                c.channel_type,
+                c.direct_user1_id,
+                c.direct_user2_id,
+                c.group_id,
+                c.last_message_id,
+                c.last_message_at,
+                lm.content AS last_message_content,
+                c.message_count,
+                c.created_at,
+                c.updated_at,
+                c.sync_version AS channel_sync_version,
+                g.name AS group_name,
+                g.avatar_url AS group_avatar_url,
+                uc.unread_count,
+                uc.is_pinned,
+                uc.is_muted,
+                GREATEST(c.sync_version, uc.sync_version) AS sync_version
+            FROM privchat_user_channels uc
+            INNER JOIN privchat_channels c
+                ON c.channel_id = uc.channel_id
+            LEFT JOIN privchat_groups g
+                ON g.group_id = c.group_id
+            LEFT JOIN privchat_messages lm
+                ON lm.message_id = c.last_message_id
+            WHERE uc.user_id = $1
+            "#,
+        )
+        .bind(user_id as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询频道同步分页失败: {}", e)))?;
         let hidden_lock = self.hidden_channels.read().await;
-        let channels: Vec<Channel> = response
-            .channels
+        let mut channels: Vec<ChannelSyncRow> = rows
             .into_iter()
-            .filter(|ch| !hidden_lock.contains(&(user_id, ch.id)))
+            .filter(|row| !hidden_lock.contains(&(user_id, row.channel_id as u64)))
             .collect();
         drop(hidden_lock);
+
+        if let Some(since) = since_version {
+            channels.retain(|row| (row.sync_version as u64) > since);
+        }
+        channels.sort_by(|a, b| {
+            a.sync_version
+                .cmp(&b.sync_version)
+                .then_with(|| a.channel_id.cmp(&b.channel_id))
+        });
 
         let limit = limit.min(200).max(1);
         let after_id: Option<u64> = scope
             .and_then(|s| s.strip_prefix("cursor:"))
             .and_then(|s| s.parse::<u64>().ok());
 
-        let start_idx = if let Some(aid) = after_id {
-            channels
+        let start_idx = channel_cursor_start_index(
+            &channels
                 .iter()
-                .position(|ch| ch.id == aid)
-                .map(|i| i + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let page: Vec<&Channel> = channels
+                .map(|row| row.channel_id as u64)
+                .collect::<Vec<_>>(),
+            after_id,
+        );
+        let page: Vec<&ChannelSyncRow> = channels
             .iter()
             .skip(start_idx)
             .take(limit as usize)
@@ -1687,51 +1870,60 @@ impl ChannelService {
 
         let items: Vec<SyncEntityItem> = page
             .iter()
-            .map(|ch| {
-                let channel_name = if ch.channel_type == ChannelType::Direct {
-                    ch.get_member_ids()
-                        .into_iter()
-                        .find(|uid| *uid != user_id)
+            .map(|row| {
+                let channel_id = row.channel_id as u64;
+                let channel_type_enum = ChannelType::from_i16(row.channel_type);
+                let channel_name = if channel_type_enum == ChannelType::Direct {
+                    let peer_id = match (
+                        row.direct_user1_id.map(|v| v as u64),
+                        row.direct_user2_id.map(|v| v as u64),
+                    ) {
+                        (Some(left), Some(right)) if left == user_id => Some(right),
+                        (Some(left), Some(right)) if right == user_id => Some(left),
+                        _ => None,
+                    };
+                    peer_id
                         .map(|uid| uid.to_string())
-                        .unwrap_or_else(|| ch.metadata.name.clone().unwrap_or_default())
+                        .unwrap_or_default()
                 } else {
-                    ch.metadata.name.clone().unwrap_or_default()
+                    row.group_name.clone().unwrap_or_default()
                 };
 
-                let preview = last_message_cache.get(&ch.id).cloned();
+                let preview = last_message_cache.get(&channel_id).cloned();
 
                 let last_msg_content = preview
                     .as_ref()
                     .map(|p| p.content.clone())
+                    .or_else(|| row.last_message_content.clone())
                     .unwrap_or_default();
                 let last_msg_timestamp = preview
                     .as_ref()
                     .map(|p| p.timestamp.timestamp_millis())
-                    .or(ch.last_message_at.map(|ts| ts.timestamp_millis()))
+                    .or(row.last_message_at)
                     .unwrap_or(0);
 
-                let channel_type = match ch.channel_type {
+                let channel_type = match channel_type_enum {
                     ChannelType::Direct => 1i64,
                     ChannelType::Group => 2i64,
                     ChannelType::Room => 2i64,
                 };
                 let payload = serde_json::to_value(ChannelSyncPayload {
-                    channel_id: Some(ch.id),
+                    channel_id: Some(channel_id),
                     channel_type: Some(channel_type),
                     type_field: Some(channel_type),
                     channel_name: Some(channel_name.clone()),
                     name: Some(channel_name),
-                    avatar: Some(ch.metadata.avatar_url.as_deref().unwrap_or("").to_string()),
-                    unread_count: Some(0),
+                    avatar: Some(row.group_avatar_url.clone().unwrap_or_default()),
+                    unread_count: Some(row.unread_count),
                     last_msg_content: Some(last_msg_content),
                     last_msg_timestamp: Some(last_msg_timestamp),
-                    top: Some(0),
-                    mute: Some(0),
+                    top: Some(if row.is_pinned { 1 } else { 0 }),
+                    mute: Some(if row.is_muted { 1 } else { 0 }),
                 })
                 .unwrap_or_else(|_| serde_json::json!({}));
                 SyncEntityItem {
-                    entity_id: ch.id.to_string(),
-                    version: 1,
+                    entity_id: channel_id.to_string(),
+                    version: row.sync_version as u64,
                     deleted: false,
                     payload: Some(payload),
                 }
@@ -1740,7 +1932,9 @@ impl ChannelService {
 
         Ok(SyncEntitiesResponse {
             items,
-            next_version: 1,
+            next_version: next_version_from_page(&page, since_version.unwrap_or(0), |row| {
+                row.sync_version as u64
+            }),
             has_more,
             min_version: None,
         })
@@ -1798,46 +1992,78 @@ impl ChannelService {
             });
         }
 
+        #[derive(sqlx::FromRow)]
+        struct GroupMemberSyncRow {
+            group_id: i64,
+            user_id: i64,
+            role: i16,
+            nickname: Option<String>,
+            mute_until: Option<i64>,
+            joined_at: i64,
+            left_at: Option<i64>,
+            updated_at: i64,
+            sync_version: i64,
+        }
+
         let since_v = since_version.unwrap_or(0);
-        let page_limit = limit.min(200).max(1) as usize;
+        let page_limit = limit.min(200).max(1) as i64;
+        let rows = sqlx::query_as::<_, GroupMemberSyncRow>(
+            r#"
+            SELECT
+                group_id,
+                user_id,
+                role,
+                nickname,
+                mute_until,
+                joined_at,
+                left_at,
+                updated_at,
+                sync_version
+            FROM privchat_group_members
+            WHERE group_id = $1
+              AND sync_version > $2
+            ORDER BY sync_version ASC, user_id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(group_id as i64)
+        .bind(since_v as i64)
+        .bind(page_limit + 1)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询群成员同步分页失败: {}", e)))?;
 
-        let mut members: Vec<_> = channel.members.values().cloned().collect();
-        members.sort_by_key(|m| (m.joined_at.timestamp_millis().max(1) as u64, m.user_id));
+        let (page_rows, has_more) = take_sync_page(rows, page_limit as usize);
+        let next_version = next_version_from_page(&page_rows, since_v, |row| row.sync_version as u64);
 
-        let filtered: Vec<_> = members
+        let items: Vec<SyncEntityItem> = page_rows
             .into_iter()
-            .filter(|m| (m.joined_at.timestamp_millis().max(1) as u64) > since_v)
-            .collect();
-
-        let has_more = filtered.len() > page_limit;
-        let page: Vec<_> = filtered.into_iter().take(page_limit).collect();
-        let next_version = page
-            .last()
-            .map(|m| m.joined_at.timestamp_millis().max(1) as u64)
-            .unwrap_or(since_v);
-
-        let items: Vec<SyncEntityItem> = page
-            .into_iter()
-            .map(|m| {
-                let version = m.joined_at.timestamp_millis().max(1) as u64;
-                let payload = serde_json::to_value(GroupMemberSyncPayload {
-                    group_id: Some(group_id),
-                    user_id: Some(m.user_id),
-                    uid: Some(m.user_id),
-                    role: Some(i32::from(m.role.to_i16())),
-                    status: Some(0),
-                    alias: m.display_name.clone(),
-                    is_muted: Some(m.is_muted),
-                    joined_at: Some(m.joined_at.timestamp_millis()),
-                    updated_at: Some(m.last_active_at.timestamp_millis()),
-                    version: Some(version as i64),
-                })
-                .unwrap_or_else(|_| serde_json::json!({}));
+            .map(|row| {
+                let deleted = row.left_at.is_some();
+                let payload = if deleted {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_value(GroupMemberSyncPayload {
+                            group_id: Some(row.group_id as u64),
+                            user_id: Some(row.user_id as u64),
+                            uid: Some(row.user_id as u64),
+                            role: Some(i32::from(row.role)),
+                            status: Some(0),
+                            alias: row.nickname,
+                            is_muted: Some(row.mute_until.unwrap_or(0) > chrono::Utc::now().timestamp_millis()),
+                            joined_at: Some(row.joined_at),
+                            updated_at: Some(row.updated_at),
+                            version: Some(row.sync_version),
+                        })
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    )
+                };
                 SyncEntityItem {
-                    entity_id: format!("{}:{}", group_id, m.user_id),
-                    version,
-                    deleted: false,
-                    payload: Some(payload),
+                    entity_id: format!("{}:{}", row.group_id, row.user_id),
+                    version: row.sync_version as u64,
+                    deleted,
+                    payload,
                 }
             })
             .collect();
@@ -1874,6 +2100,8 @@ impl ChannelService {
             match channel.add_member(user_id, role) {
                 Ok(_) => {
                     drop(channels);
+
+                    self.ensure_user_channel_rows(channel_id, &[user_id]).await?;
 
                     // 更新用户会话索引
                     let mut user_channels = self.user_channels.write().await;
@@ -2039,10 +2267,37 @@ impl ChannelService {
 
     /// 更新最后消息
     pub async fn update_last_message(&self, channel_id: u64, message_id: u64) -> Result<bool> {
-        let mut channels = self.channels.write().await;
+        let mut updated_channel = {
+            let mut channels = self.channels.write().await;
 
-        if let Some(channel) = channels.get_mut(&channel_id) {
-            channel.update_last_message(message_id);
+            if let Some(channel) = channels.get_mut(&channel_id) {
+                channel.update_last_message(message_id);
+                Some(channel.clone())
+            } else {
+                None
+            }
+        };
+
+        if updated_channel.is_none() {
+            if let Some(mut channel) = self
+                .channel_repository
+                .find_by_id(channel_id)
+                .await
+                .map_err(|e| ServerError::Database(format!("查询会话失败: {}", e)))?
+            {
+                channel.update_last_message(message_id);
+                updated_channel = Some(channel.clone());
+
+                let mut channels = self.channels.write().await;
+                channels.insert(channel_id, channel);
+            }
+        }
+
+        if let Some(channel) = updated_channel {
+            self.channel_repository
+                .update(&channel)
+                .await
+                .map_err(|e| ServerError::Database(format!("更新会话最后消息失败: {}", e)))?;
             Ok(true)
         } else {
             Ok(false)
@@ -2183,17 +2438,35 @@ impl ChannelService {
             }
         }
 
-        // 从 privchat_user_channels 加载隐藏状态到内存缓存
-        if let Ok(rows) = sqlx::query_as::<_, (i64,)>(
-            "SELECT channel_id FROM privchat_user_channels WHERE user_id = $1 AND is_hidden = true",
+        // 从 privchat_user_channels 加载隐藏/置顶/静音状态到内存缓存
+        #[derive(sqlx::FromRow)]
+        struct UserChannelFlagRow {
+            channel_id: i64,
+            is_hidden: bool,
+            is_pinned: bool,
+            is_muted: bool,
+        }
+        if let Ok(rows) = sqlx::query_as::<_, UserChannelFlagRow>(
+            "SELECT channel_id, is_hidden, is_pinned, is_muted FROM privchat_user_channels WHERE user_id = $1",
         )
         .bind(user_id as i64)
         .fetch_all(self.channel_repository.pool())
         .await
         {
             let mut hidden_channels = self.hidden_channels.write().await;
-            for (cid,) in rows {
-                hidden_channels.insert((user_id, cid as u64));
+            let mut pinned_channels = self.pinned_channels.write().await;
+            let mut muted_channels = self.muted_channels.write().await;
+            for row in rows {
+                let cid = row.channel_id as u64;
+                if row.is_hidden {
+                    hidden_channels.insert((user_id, cid));
+                }
+                if row.is_pinned {
+                    pinned_channels.insert((user_id, cid));
+                }
+                if row.is_muted {
+                    muted_channels.insert((user_id, cid));
+                }
             }
         }
     }
@@ -2257,6 +2530,9 @@ impl ChannelService {
             info!("User {} unpinned channel {}", user_id, channel_id);
         }
 
+        self.persist_user_channel_flags(user_id, channel_id, Some(pinned), None)
+            .await?;
+
         Ok(true)
     }
 
@@ -2279,6 +2555,9 @@ impl ChannelService {
             muted_channels.remove(&key);
             info!("User {} unmuted channel {}", user_id, channel_id);
         }
+
+        self.persist_user_channel_flags(user_id, channel_id, None, Some(muted))
+            .await?;
 
         Ok(())
     }
@@ -2449,6 +2728,8 @@ impl ChannelService {
             .map_err(|e| ServerError::Database(format!("get_or_create_direct_channel: {}", e)))?;
         let channel_id = channel.id;
         if created {
+            self.ensure_user_channel_rows(channel_id, &[user_id, target_user_id])
+                .await?;
             if let Err(e) = self
                 .create_private_chat_with_id(user_id, target_user_id, channel_id)
                 .await
@@ -2460,6 +2741,8 @@ impl ChannelService {
                 );
             }
         } else if self.get_channel_opt(channel_id).await.is_none() {
+            self.ensure_user_channel_rows(channel_id, &[user_id, target_user_id])
+                .await?;
             // 已存在但缓存没有，从 DB 加载到缓存
             if let Err(e) = self
                 .create_private_chat_with_id(user_id, target_user_id, channel_id)
@@ -2471,6 +2754,9 @@ impl ChannelService {
                     channel_id
                 );
             }
+        } else {
+            self.ensure_user_channel_rows(channel_id, &[user_id, target_user_id])
+                .await?;
         }
 
         // 如果该频道之前被用户隐藏过，自动取消隐藏
@@ -2597,13 +2883,33 @@ impl ChannelService {
         channel_id: &u64,
         user_id: &u64,
         muted: bool,
-        _mute_until: Option<chrono::DateTime<chrono::Utc>>,
+        mute_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<()> {
+        let mute_until_ms = if muted {
+            mute_until.map(|ts| ts.timestamp_millis())
+        } else {
+            None
+        };
+        sqlx::query(
+            r#"
+            UPDATE privchat_group_members
+            SET mute_until = $3,
+                updated_at = $4
+            WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
+            "#,
+        )
+        .bind(*channel_id as i64)
+        .bind(*user_id as i64)
+        .bind(mute_until_ms)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("更新群成员禁言状态失败: {}", e)))?;
+
         let mut channels = self.channels.write().await;
         if let Some(channel) = channels.get_mut(channel_id) {
             if let Some(member) = channel.members.get_mut(user_id) {
                 member.is_muted = muted;
-                // TODO: 如果需要，可以添加 mute_until 字段到 ChannelMember
                 Ok(())
             } else {
                 Err(ServerError::NotFound(format!(
@@ -2851,85 +3157,180 @@ impl ChannelService {
     }
 }
 
+fn take_sync_page<T>(rows: Vec<T>, limit: usize) -> (Vec<T>, bool) {
+    let has_more = rows.len() > limit;
+    let page = rows.into_iter().take(limit).collect();
+    (page, has_more)
+}
+
+fn next_version_from_page<T, F>(page: &[T], since_version: u64, version_of: F) -> u64
+where
+    F: Fn(&T) -> u64,
+{
+    page.last().map(version_of).unwrap_or(since_version)
+}
+
+fn channel_cursor_start_index(channel_ids: &[u64], after_id: Option<u64>) -> usize {
+    after_id
+        .and_then(|aid| channel_ids.iter().position(|id| *id == aid).map(|i| i + 1))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::channel::ChannelType;
+    use crate::repository::PgChannelRepository;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    #[test]
+    fn take_sync_page_reports_has_more_only_when_over_limit() {
+        let (page, has_more) = take_sync_page(vec![1, 2, 3], 2);
+        assert_eq!(page, vec![1, 2]);
+        assert!(has_more);
+
+        let (page, has_more) = take_sync_page(vec![1, 2], 2);
+        assert_eq!(page, vec![1, 2]);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn next_version_from_page_uses_last_row_or_since_version() {
+        let page = vec![3_u64, 7_u64, 9_u64];
+        assert_eq!(next_version_from_page(&page, 2, |v| *v), 9);
+        assert_eq!(next_version_from_page::<u64, _>(&[], 12, |v| *v), 12);
+    }
+
+    #[test]
+    fn channel_cursor_start_index_advances_after_matching_channel() {
+        let ids = vec![100, 200, 300];
+        assert_eq!(channel_cursor_start_index(&ids, None), 0);
+        assert_eq!(channel_cursor_start_index(&ids, Some(100)), 1);
+        assert_eq!(channel_cursor_start_index(&ids, Some(200)), 2);
+        assert_eq!(channel_cursor_start_index(&ids, Some(999)), 0);
+    }
+
+    async fn open_test_service() -> Option<ChannelService> {
+        let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .ok()?;
+        let repo = Arc::new(PgChannelRepository::new(Arc::new(pool)));
+        Some(ChannelService::new_with_repository(repo))
+    }
+
+    async fn cleanup_channel(service: &ChannelService, channel_id: u64) {
+        let _ = sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = $1")
+            .bind(channel_id as i64)
+            .execute(service.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(channel_id as i64)
+            .execute(service.pool())
+            .await;
+    }
 
     #[tokio::test]
     async fn test_create_direct_channel() {
-        let service = ChannelService::new_default();
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip test_create_direct_channel: DATABASE_URL not configured");
+            return;
+        };
+        let creator_id = 910001_u64;
+        let peer_id = 910002_u64;
 
         let request = CreateChannelRequest {
             channel_type: ChannelType::Direct,
             name: None,
             description: None,
-            member_ids: vec!["user2".to_string()],
+            member_ids: vec![peer_id],
             is_public: None,
             max_members: None,
         };
 
         let response = service
-            .create_channel("user1".to_string(), request)
+            .create_channel(creator_id, request)
             .await
             .unwrap();
         assert!(response.success);
         assert_eq!(response.channel.channel_type, ChannelType::Direct);
         assert_eq!(response.channel.members.len(), 2);
+        cleanup_channel(&service, response.channel.id).await;
     }
 
     #[tokio::test]
     async fn test_create_group_channel() {
-        let service = ChannelService::new_default();
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip test_create_group_channel: DATABASE_URL not configured");
+            return;
+        };
+        let creator_id = 920001_u64;
 
         let request = CreateChannelRequest {
             channel_type: ChannelType::Group,
             name: Some("Test Group".to_string()),
             description: Some("A test group".to_string()),
-            member_ids: vec!["user2".to_string(), "user3".to_string()],
+            member_ids: vec![920002, 920003],
             is_public: Some(false),
             max_members: Some(10),
         };
 
         let response = service
-            .create_channel("user1".to_string(), request)
+            .create_channel(creator_id, request)
             .await
             .unwrap();
         assert!(response.success);
         assert_eq!(response.channel.channel_type, ChannelType::Group);
         assert_eq!(response.channel.members.len(), 3); // creator + 2 members
+        cleanup_channel(&service, response.channel.id).await;
     }
 
     #[tokio::test]
     async fn test_find_direct_channel() {
-        let service = ChannelService::new_default();
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip test_find_direct_channel: DATABASE_URL not configured");
+            return;
+        };
+        let creator_id = 930001_u64;
+        let peer_id = 930002_u64;
 
         let request = CreateChannelRequest {
             channel_type: ChannelType::Direct,
             name: None,
             description: None,
-            member_ids: vec!["user2".to_string()],
+            member_ids: vec![peer_id],
             is_public: None,
             max_members: None,
         };
 
         let response = service
-            .create_channel("user1".to_string(), request)
+            .create_channel(creator_id, request)
             .await
             .unwrap();
         assert!(response.success);
 
         let conv_id = response.channel.id.clone();
-        let found_id = service.find_direct_channel("user1", "user2").await;
+        let found_id = service.find_direct_channel(creator_id, peer_id).await;
         assert_eq!(found_id, Some(conv_id.clone()));
 
-        let found_id2 = service.find_direct_channel("user2", "user1").await;
+        let found_id2 = service.find_direct_channel(peer_id, creator_id).await;
         assert_eq!(found_id2, Some(conv_id));
+        cleanup_channel(&service, response.channel.id).await;
     }
 
     #[tokio::test]
     async fn test_join_and_leave_channel() {
-        let service = ChannelService::new_default();
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip test_join_and_leave_channel: DATABASE_URL not configured");
+            return;
+        };
+        let creator_id = 940001_u64;
+        let joiner_id = 940002_u64;
 
         let request = CreateChannelRequest {
             channel_type: ChannelType::Group,
@@ -2941,14 +3342,14 @@ mod tests {
         };
 
         let response = service
-            .create_channel("user1".to_string(), request)
+            .create_channel(creator_id, request)
             .await
             .unwrap();
         let conv_id = response.channel.id;
 
         // 加入会话
         let joined = service
-            .join_channel(&conv_id, "user2".to_string(), None)
+            .join_channel(conv_id, joiner_id, None)
             .await
             .unwrap();
         assert!(joined);
@@ -2958,11 +3359,12 @@ mod tests {
         assert_eq!(conv.members.len(), 2);
 
         // 离开会话
-        let left = service.leave_channel(&conv_id, "user2").await.unwrap();
+        let left = service.leave_channel(conv_id, joiner_id).await.unwrap();
         assert!(left);
 
         // 检查成员
         let conv = service.get_channel(&conv_id).await.unwrap();
         assert_eq!(conv.members.len(), 1);
+        cleanup_channel(&service, conv_id).await;
     }
 }

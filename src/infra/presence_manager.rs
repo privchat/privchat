@@ -458,7 +458,6 @@ impl PresenceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_subscribe_and_get_status() {

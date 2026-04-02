@@ -26,8 +26,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     // TODO: 导入必要的模块
     // use privchat_server::service::sync::*;
     // use privchat_protocol::rpc::sync::*;

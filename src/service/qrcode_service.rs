@@ -255,8 +255,10 @@ impl QRCodeService {
         // 从反向索引中查找
         if let Some(qr_key_entry) = self.target_index.get(target_id) {
             let qr_key = qr_key_entry.value().clone();
+            drop(qr_key_entry);
             if let Some(mut record) = self.storage.get_mut(&qr_key) {
                 record.revoked = true;
+                drop(record);
                 self.target_index.remove(target_id);
 
                 tracing::info!(
@@ -399,7 +401,7 @@ mod tests {
         assert_eq!(record.qr_key.len(), 12);
 
         // 解析二维码
-        let resolved = service.resolve(&record.qr_key, "bob", None).await.unwrap();
+        let resolved = service.resolve(&record.qr_key, 1002, None).await.unwrap();
         assert_eq!(resolved.target_id, "alice");
         assert_eq!(resolved.used_count, 1);
     }
@@ -424,14 +426,14 @@ mod tests {
 
         // 使用正确的 token 解析
         let resolved = service
-            .resolve(&record.qr_key, "bob", Some("abc123"))
+            .resolve(&record.qr_key, 1002, Some("abc123"))
             .await
             .unwrap();
         assert_eq!(resolved.target_id, "group_123");
 
         // 使用错误的 token 应该失败
         let result = service
-            .resolve(&record.qr_key, "charlie", Some("wrong"))
+            .resolve(&record.qr_key, 1003, Some("wrong"))
             .await;
         assert!(result.is_err());
     }
@@ -491,12 +493,12 @@ mod tests {
 
         // 第一次解析成功
         let _ = service
-            .resolve(&record.qr_key, "alice", None)
+            .resolve(&record.qr_key, 1001, None)
             .await
             .unwrap();
 
         // 第二次解析应该失败（已达使用上限）
-        let result = service.resolve(&record.qr_key, "alice", None).await;
+        let result = service.resolve(&record.qr_key, 1001, None).await;
         assert!(result.is_err());
     }
 }

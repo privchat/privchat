@@ -118,6 +118,15 @@ impl From<crate::error::ServerError> for RpcError {
             crate::error::ServerError::ChannelNotFound(msg) => {
                 RpcError::from_code(ErrorCode::ChannelNotFound, msg)
             }
+            crate::error::ServerError::ChannelResyncRequired(msg) => {
+                RpcError::from_code(ErrorCode::SyncChannelResyncRequired, msg)
+            }
+            crate::error::ServerError::EntityResyncRequired(msg) => {
+                RpcError::from_code(ErrorCode::SyncEntityResyncRequired, msg)
+            }
+            crate::error::ServerError::FullRebuildRequired(msg) => {
+                RpcError::from_code(ErrorCode::SyncFullRebuildRequired, msg)
+            }
             _ => RpcError::internal(err.to_string()),
         }
     }

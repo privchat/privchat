@@ -313,8 +313,8 @@ mod tests {
 
         let request = service
             .create_join_request(
-                "group_123".to_string(),
-                "alice".to_string(),
+                3001,
+                1001,
                 JoinMethod::QRCode {
                     qr_code_id: "qr_456".to_string(),
                 },
@@ -328,7 +328,7 @@ mod tests {
 
         let fetched = service.get_request(&request.request_id).await.unwrap();
         assert!(fetched.is_some());
-        assert_eq!(fetched.unwrap().user_id, "alice");
+        assert_eq!(fetched.unwrap().user_id, 1001);
     }
 
     #[tokio::test]
@@ -337,8 +337,8 @@ mod tests {
 
         let request = service
             .create_join_request(
-                "group_123".to_string(),
-                "alice".to_string(),
+                3001,
+                1001,
                 JoinMethod::QRCode {
                     qr_code_id: "qr_456".to_string(),
                 },
@@ -349,12 +349,12 @@ mod tests {
             .unwrap();
 
         let approved = service
-            .approve_request(&request.request_id, "admin1".to_string())
+            .approve_request(&request.request_id, 9001)
             .await
             .unwrap();
 
         assert_eq!(approved.status, JoinRequestStatus::Approved);
-        assert_eq!(approved.handler_id, Some("admin1".to_string()));
+        assert_eq!(approved.handler_id, Some(9001));
     }
 
     #[tokio::test]
@@ -363,8 +363,8 @@ mod tests {
 
         let request = service
             .create_join_request(
-                "group_123".to_string(),
-                "alice".to_string(),
+                3001,
+                1001,
                 JoinMethod::MemberInvite {
                     inviter_id: "bob".to_string(),
                 },
@@ -377,7 +377,7 @@ mod tests {
         let rejected = service
             .reject_request(
                 &request.request_id,
-                "admin1".to_string(),
+                9001,
                 Some("不符合要求".to_string()),
             )
             .await
@@ -394,8 +394,8 @@ mod tests {
         // 创建3个请求
         service
             .create_join_request(
-                "group_123".to_string(),
-                "alice".to_string(),
+                3001,
+                1001,
                 JoinMethod::QRCode {
                     qr_code_id: "qr_1".to_string(),
                 },
@@ -407,8 +407,8 @@ mod tests {
 
         service
             .create_join_request(
-                "group_123".to_string(),
-                "bob".to_string(),
+                3001,
+                1002,
                 JoinMethod::QRCode {
                     qr_code_id: "qr_2".to_string(),
                 },
@@ -419,7 +419,7 @@ mod tests {
             .unwrap();
 
         let requests = service
-            .get_pending_requests_by_group("group_123")
+            .get_pending_requests_by_group(3001)
             .await
             .unwrap();
         assert_eq!(requests.len(), 2);

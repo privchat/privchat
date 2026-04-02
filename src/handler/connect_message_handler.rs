@@ -26,6 +26,7 @@ use crate::repository::MessageRepository;
 use crate::service::{
     ChannelService, NotificationService, OfflineQueueService, UnreadCountService,
 };
+use crate::service::sync::get_global_sync_service;
 use crate::session::SessionManager;
 use crate::Result;
 use async_trait::async_trait;
@@ -652,6 +653,25 @@ impl ConnectMessageHandler {
             .await
             .map_err(|e| anyhow::anyhow!("persist login notice failed: {}", e))?;
 
+        if let Some(sync_service) = get_global_sync_service() {
+            let commit = privchat_protocol::rpc::sync::ServerCommit {
+                pts,
+                server_msg_id: message_id,
+                local_message_id: Some(message_id),
+                channel_id,
+                channel_type: 1,
+                message_type: ContentMessageType::Text.as_str().to_string(),
+                content: serde_json::json!({ "text": content.clone() }),
+                server_timestamp: now.timestamp_millis(),
+                sender_id: crate::config::SYSTEM_USER_ID,
+                sender_info: None,
+            };
+            sync_service
+                .record_existing_commit(&commit)
+                .await
+                .map_err(|e| anyhow::anyhow!("record login notice commit failed: {}", e))?;
+        }
+
         self.user_message_index
             .add_message(user_id, pts, message_id)
             .await;
@@ -756,6 +776,25 @@ impl ConnectMessageHandler {
             .create(&login_notice_msg)
             .await
             .map_err(|e| anyhow::anyhow!("persist login notice failed: {}", e))?;
+
+        if let Some(sync_service) = get_global_sync_service() {
+            let commit = privchat_protocol::rpc::sync::ServerCommit {
+                pts,
+                server_msg_id: message_id,
+                local_message_id: Some(message_id),
+                channel_id,
+                channel_type: 1,
+                message_type: ContentMessageType::Text.as_str().to_string(),
+                content: serde_json::json!({ "text": content.clone() }),
+                server_timestamp: now.timestamp_millis(),
+                sender_id: crate::config::SYSTEM_USER_ID,
+                sender_info: None,
+            };
+            sync_service
+                .record_existing_commit(&commit)
+                .await
+                .map_err(|e| anyhow::anyhow!("record login notice commit failed: {}", e))?;
+        }
 
         user_message_index
             .add_message(user_id, pts, message_id)

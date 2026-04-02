@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use chrono::Utc;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;

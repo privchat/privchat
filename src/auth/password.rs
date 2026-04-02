@@ -42,8 +42,14 @@ pub const PASSWORD_COST: u32 = DEFAULT_COST; // 12
 ///
 /// # 示例
 /// ```
+/// use privchat::auth::hash_password;
+/// use privchat::error::DatabaseError;
+///
+/// fn main() -> Result<(), DatabaseError> {
 /// let hash = hash_password("secret123")?;
 /// // 输出类似: $2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYKwqHhKbCS
+/// # Ok(())
+/// # }
 /// ```
 pub fn hash_password(password: &str) -> Result<String, DatabaseError> {
     hash(password, PASSWORD_COST)
@@ -65,9 +71,16 @@ pub fn hash_password(password: &str) -> Result<String, DatabaseError> {
 ///
 /// # 示例
 /// ```
+/// use privchat::auth::verify_password;
+/// use privchat::error::DatabaseError;
+///
+/// fn main() -> Result<(), DatabaseError> {
 /// let hash = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYKwqHhKbCS";
 /// let valid = verify_password("secret123", hash)?;  // true
 /// let invalid = verify_password("wrong", hash)?;    // false
+/// # let _ = (valid, invalid);
+/// # Ok(())
+/// # }
 /// ```
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, DatabaseError> {
     verify(password, hash).map_err(|e| DatabaseError::Internal(format!("密码验证失败: {}", e)))

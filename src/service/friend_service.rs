@@ -332,7 +332,12 @@ impl FriendService {
 
     /// 检查是否是好友
     pub async fn is_friend(&self, user_id: u64, friend_id: u64) -> bool {
-        sqlx::query_scalar::<_, i64>(
+        self.try_is_friend(user_id, friend_id).await.unwrap_or(false)
+    }
+
+    /// 检查是否是好友（保留数据库错误）
+    pub async fn try_is_friend(&self, user_id: u64, friend_id: u64) -> Result<bool> {
+        sqlx::query_scalar::<_, i32>(
             r#"
             SELECT 1
             FROM privchat_friendships
@@ -349,7 +354,7 @@ impl FriendService {
         .fetch_optional(self.pool.as_ref())
         .await
         .map(|v| v.is_some())
-        .unwrap_or(false)
+        .map_err(|e| ServerError::Database(format!("Failed to check friendship: {}", e)))
     }
 
     /// 获取与某用户的好友关系（用于列表返回 source_type/source_id）
@@ -479,8 +484,8 @@ impl FriendService {
     pub async fn sync_entities_page(
         &self,
         user_id: u64,
-        _since_version: Option<u64>,
-        scope: Option<&str>,
+        since_version: Option<u64>,
+        _scope: Option<&str>,
         limit: u32,
         user_repository: &Arc<UserRepository>,
         cache_manager: &Arc<CacheManager>,
@@ -491,34 +496,47 @@ impl FriendService {
             SyncEntitiesResponse, SyncEntityItem,
         };
 
-        let friend_ids = self.get_friends(user_id).await?;
         let limit = limit.min(200).max(1);
-        let after_id: Option<u64> = scope
-            .and_then(|s| s.strip_prefix("cursor:"))
-            .and_then(|s| s.parse::<u64>().ok());
+        let since_v = since_version.unwrap_or(0);
 
-        let start_idx = if let Some(aid) = after_id {
-            friend_ids
-                .iter()
-                .position(|&id| id == aid)
-                .map(|i| i + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let friend_ids_page: Vec<u64> = friend_ids
-            .iter()
-            .skip(start_idx)
-            .take(limit as usize)
-            .cloned()
-            .collect();
-        let total_consumed = start_idx + friend_ids_page.len();
-        let has_more = total_consumed < friend_ids.len();
+        #[derive(sqlx::FromRow)]
+        struct FriendSyncRow {
+            friend_id: i64,
+            created_at: i64,
+            updated_at: i64,
+            sync_version: i64,
+        }
 
-        let mut items = Vec::with_capacity(friend_ids_page.len());
-        for friend_id in &friend_ids_page {
+        let rows = sqlx::query_as::<_, FriendSyncRow>(
+            r#"
+            SELECT friend_id, created_at, updated_at, sync_version
+            FROM privchat_friendships
+            WHERE user_id = $1
+              AND status = 1
+              AND sync_version > $2
+            ORDER BY sync_version ASC, friend_id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(since_v as i64)
+        .bind(limit as i64 + 1)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("Failed to query friend sync page: {}", e)))?;
+
+        let has_more = rows.len() > limit as usize;
+        let page: Vec<_> = rows.into_iter().take(limit as usize).collect();
+        let next_version = page
+            .last()
+            .map(|row| row.sync_version as u64)
+            .unwrap_or(since_v);
+
+        let mut items = Vec::with_capacity(page.len());
+        for row in &page {
+            let friend_id = row.friend_id as u64;
             let profile_opt =
-                get_user_profile_with_fallback(*friend_id, user_repository, cache_manager)
+                get_user_profile_with_fallback(friend_id, user_repository, cache_manager)
                     .await
                     .ok()
                     .flatten();
@@ -526,25 +544,20 @@ impl FriendService {
                 Some(p) => p,
                 None => continue,
             };
-            let friendship = self.get_friendship(user_id, *friend_id).await;
-            let created_at = friendship
-                .as_ref()
-                .map(|f| f.created_at.timestamp_millis())
-                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
             let payload_typed = FriendSyncPayload {
-                user_id: Some(*friend_id),
-                uid: Some(*friend_id),
+                user_id: Some(friend_id),
+                uid: Some(friend_id),
                 tags: None,
                 is_pinned: Some(false),
                 pinned: Some(false),
-                created_at: Some(created_at),
-                updated_at: None,
-                version: Some(1),
+                created_at: Some(row.created_at),
+                updated_at: Some(row.updated_at),
+                version: Some(row.sync_version),
                 friend: Some(FriendSyncFriendPayload {
-                    created_at: Some(created_at),
-                    updated_at: None,
-                    version: Some(1),
+                    created_at: Some(row.created_at),
+                    updated_at: Some(row.updated_at),
+                    version: Some(row.sync_version),
                 }),
                 user: Some(FriendSyncUserPayload {
                     username: Some(profile.username.clone()),
@@ -555,7 +568,7 @@ impl FriendService {
                     user_type: Some(i32::from(profile.user_type)),
                     type_field: Some(i32::from(profile.user_type)),
                     updated_at: None,
-                    version: Some(1),
+                    version: None,
                 }),
             };
             let payload = serde_json::to_value(payload_typed).map_err(|e| {
@@ -564,7 +577,7 @@ impl FriendService {
 
             items.push(SyncEntityItem {
                 entity_id: friend_id.to_string(),
-                version: 1,
+                version: row.sync_version as u64,
                 deleted: false,
                 payload: Some(payload),
             });
@@ -572,7 +585,7 @@ impl FriendService {
 
         Ok(SyncEntitiesResponse {
             items,
-            next_version: 1,
+            next_version,
             has_more,
             min_version: None,
         })

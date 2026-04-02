@@ -539,6 +539,8 @@ pub struct Channel {
     pub created_at: DateTime<Utc>,
     /// 最后更新时间（数据库存储为 BIGINT 毫秒时间戳）
     pub updated_at: DateTime<Utc>,
+    /// 实体同步版本（ENTITY_SYNC_V1 会话增量游标）
+    pub sync_version: i64,
     /// 频道权限设置（可选，用于扩展功能）
     pub settings: Option<ChannelSettings>,
 }
@@ -565,6 +567,7 @@ impl Channel {
             message_count: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            sync_version: Utc::now().timestamp_millis(),
             settings: None,
         }
     }
@@ -581,6 +584,7 @@ impl Channel {
         message_count: i64,
         created_at: i64, // 毫秒时间戳
         updated_at: i64, // 毫秒时间戳
+        sync_version: i64,
     ) -> Self {
         let conv_type = ChannelType::from_i16(channel_type);
         let creator_id = match conv_type {
@@ -604,6 +608,7 @@ impl Channel {
             message_count,
             created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
             updated_at: DateTime::from_timestamp_millis(updated_at).unwrap_or_else(|| Utc::now()),
+            sync_version,
             settings: None,
         }
     }
@@ -663,6 +668,7 @@ impl Channel {
             message_count: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            sync_version: Utc::now().timestamp_millis(),
             settings: None,
         }
     }

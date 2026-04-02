@@ -17,6 +17,7 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::repository::MessageRepository;
 use privchat_protocol::rpc::message::reaction::MessageReactionAddRequest;
 use serde_json::{json, Value};
 
@@ -45,7 +46,38 @@ pub async fn handle(
         .add_reaction(message_id, user_id, &emoji)
         .await
     {
-        Ok(_reaction) => {
+        Ok(reaction) => {
+            if let Ok(Some(message)) = services.message_repository.as_ref().find_by_id(message_id).await {
+                let channel_id = message.channel_id;
+                let channel_type = services
+                    .channel_service
+                    .get_channel(&channel_id)
+                    .await
+                    .map(|channel| channel.channel_type.to_i16() as u8)
+                    .unwrap_or(1);
+                let payload = json!({
+                    "message_id": message_id,
+                    "channel_id": channel_id,
+                    "channel_type": channel_type,
+                    "uid": user_id,
+                    "emoji": emoji,
+                    "created_at": reaction.created_at.timestamp_millis(),
+                    "deleted": false,
+                });
+                if let Err(e) = services
+                    .sync_service
+                    .append_server_event_commit(
+                        channel_id,
+                        channel_type,
+                        "message_reaction",
+                        payload,
+                        user_id,
+                    )
+                    .await
+                {
+                    tracing::warn!("⚠️ 写入 reaction pts commit 失败: {}", e);
+                }
+            }
             tracing::debug!(
                 "✅ 成功添加 Reaction: user={}, message={}, emoji={}",
                 user_id,

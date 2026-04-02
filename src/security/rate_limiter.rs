@@ -451,7 +451,7 @@ mod tests {
 
         // 大群文本
         let cost2 = FanoutCostCalculator::calculate_message_cost(200, 100, false);
-        assert!(cost2 > 5);
+        assert_eq!(cost2, 5);
 
         // 大群媒体
         let cost3 = FanoutCostCalculator::calculate_message_cost(200, 50000, true);

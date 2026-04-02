@@ -100,7 +100,6 @@ pub mod message_repo;
 pub mod presence_repository;
 pub mod user_device_repo; // ✨ 新增：用户设备 Repository
 pub mod user_repo;
-pub mod user_settings_repo; // ENTITY_SYNC_V1 user_settings，表为主 // 文件上传记录（持久化，有据可查）
 
 // 重新导出 PostgreSQL Repository 实现
 pub use channel_repo::{ChannelRepository, PgChannelRepository};
@@ -111,4 +110,3 @@ pub use message_repo::{MessageRepository, PgMessageRepository};
 pub use presence_repository::PresenceRepository;
 pub use user_device_repo::{UserDevice, UserDeviceRepository}; // ✨ 新增
 pub use user_repo::UserRepository;
-pub use user_settings_repo::UserSettingsRepository;

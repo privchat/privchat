@@ -22,8 +22,11 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(not(test))]
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+#[cfg(not(test))]
+use tracing::error;
 
 /// 调度器配置
 #[derive(Debug, Clone)]
@@ -313,6 +316,8 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
 
     /// 启动主投递循环
     async fn start_delivery_loop(&self) {
+        #[cfg(not(test))]
+        {
         let queue_manager = self.queue_manager.clone();
         let message_deliverer = self.message_deliverer.clone();
         let config = self.config.clone();
@@ -414,10 +419,13 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                 deliveries.retain(|_user_id, handle| !handle.is_finished());
             }
         });
+        }
     }
 
     /// 启动统计报告任务
     async fn start_stats_reporter(&self) {
+        #[cfg(not(test))]
+        {
         let _queue_manager = self.queue_manager.clone();
         let stats = self.stats.clone();
         let running = self.running.clone();
@@ -446,10 +454,13 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                 );
             }
         });
+        }
     }
 
     /// 启动重试循环
     async fn start_retry_loop(&self) {
+        #[cfg(not(test))]
+        {
         let _queue_manager = self.queue_manager.clone();
         let _message_deliverer = self.message_deliverer.clone();
         let running = self.running.clone();
@@ -479,29 +490,65 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
                 // }
             }
         });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OnlineStatusConfig;
     use crate::infra::OnlineStatusManager;
     use crate::offline::queue::create_memory_queue_manager;
     use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct DeterministicFlakyDeliverer {
+        calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct DeterministicSuccessDeliverer;
+
+    #[async_trait::async_trait]
+    impl MessageDeliverer for DeterministicSuccessDeliverer {
+        async fn deliver_message(
+            &self,
+            _user_id: u64,
+            _message: &crate::offline::message::OfflineMessage,
+        ) -> Result<(), ServerError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessageDeliverer for DeterministicFlakyDeliverer {
+        async fn deliver_message(
+            &self,
+            _user_id: u64,
+            _message: &crate::offline::message::OfflineMessage,
+        ) -> Result<(), ServerError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call % 2 == 0 {
+                Ok(())
+            } else {
+                Err(ServerError::Internal(
+                    "Deterministic delivery failure".to_string(),
+                ))
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_scheduler_basic_operations() {
         let queue_manager = Arc::new(create_memory_queue_manager(None).await.unwrap());
-        let online_status_manager = Arc::new(OnlineStatusManager::new());
-        let message_deliverer = Arc::new(LogMessageDeliverer);
+        let online_status_manager = Arc::new(OnlineStatusManager::new(OnlineStatusConfig::default()));
+        let message_deliverer = Arc::new(DeterministicSuccessDeliverer);
         let config = SchedulerConfig::default();
+        let user_id = 1001_u64;
 
-        let scheduler = OfflineScheduler::new(
-            queue_manager.clone(),
-            online_status_manager.clone(),
-            message_deliverer,
-            config,
-        );
+        let scheduler = OfflineScheduler::new(queue_manager.clone(), message_deliverer, config);
 
         // 启动队列管理器和调度器
         queue_manager.start().await.unwrap();
@@ -510,7 +557,7 @@ mod tests {
         // 模拟用户上线
         online_status_manager.simple_user_online(
             "session1".to_string(),
-            "user1".to_string(),
+            user_id.to_string(),
             "device1".to_string(),
             privchat_protocol::DeviceType::iOS,
             "127.0.0.1".to_string(),
@@ -519,7 +566,7 @@ mod tests {
         // 添加离线消息
         let message_id = queue_manager
             .add_message(
-                "user1".to_string(),
+                user_id,
                 "sender1".to_string(),
                 "conv1".to_string(),
                 Bytes::from("Hello"),
@@ -530,7 +577,7 @@ mod tests {
             .unwrap();
 
         // 手动触发投递
-        let delivered = scheduler.trigger_delivery_for_user("user1").await.unwrap();
+        let delivered = scheduler.trigger_delivery_for_user(user_id).await.unwrap();
         assert_eq!(delivered, 1);
 
         // 检查统计信息
@@ -545,16 +592,12 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_with_failures() {
         let queue_manager = Arc::new(create_memory_queue_manager(None).await.unwrap());
-        let online_status_manager = Arc::new(OnlineStatusManager::new());
-        let message_deliverer = Arc::new(LogMessageDeliverer);
+        let online_status_manager = Arc::new(OnlineStatusManager::new(OnlineStatusConfig::default()));
+        let message_deliverer = Arc::new(DeterministicFlakyDeliverer::default());
         let config = SchedulerConfig::default();
+        let user_id = 1001_u64;
 
-        let scheduler = OfflineScheduler::new(
-            queue_manager.clone(),
-            online_status_manager.clone(),
-            message_deliverer,
-            config,
-        );
+        let scheduler = OfflineScheduler::new(queue_manager.clone(), message_deliverer, config);
 
         queue_manager.start().await.unwrap();
         scheduler.start().await.unwrap();
@@ -562,7 +605,7 @@ mod tests {
         // 模拟用户上线
         online_status_manager.simple_user_online(
             "session1".to_string(),
-            "user1".to_string(),
+            user_id.to_string(),
             "device1".to_string(),
             privchat_protocol::DeviceType::iOS,
             "127.0.0.1".to_string(),
@@ -572,7 +615,7 @@ mod tests {
         for i in 1..=10 {
             queue_manager
                 .add_message(
-                    "user1".to_string(),
+                    user_id,
                     "sender1".to_string(),
                     "conv1".to_string(),
                     Bytes::from(format!("Message {}", i)),
@@ -584,7 +627,7 @@ mod tests {
         }
 
         // 手动触发投递
-        let delivered = scheduler.trigger_delivery_for_user("user1").await.unwrap();
+        let delivered = scheduler.trigger_delivery_for_user(user_id).await.unwrap();
 
         // 检查统计信息
         let stats = scheduler.get_stats().await;

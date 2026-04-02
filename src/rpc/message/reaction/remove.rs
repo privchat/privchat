@@ -17,6 +17,7 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::repository::MessageRepository;
 use privchat_protocol::rpc::message::reaction::MessageReactionRemoveRequest;
 use serde_json::{json, Value};
 
@@ -37,7 +38,7 @@ pub async fn handle(
 
     let user_id = request.user_id;
     let message_id = request.server_message_id;
-    let emoji = &request.emoji;
+    let requested_emoji = &request.emoji;
 
     // Handler 只返回 data 负载，外层 code/message 由 RPC 层封装；协议约定 data 为裸 bool
     match services
@@ -45,12 +46,48 @@ pub async fn handle(
         .remove_reaction(message_id, user_id)
         .await
     {
-        Ok(()) => {
+        Ok(removed) => {
+            if let Ok(Some(message)) = services.message_repository.as_ref().find_by_id(message_id).await {
+                let channel_id = message.channel_id;
+                let channel_type = services
+                    .channel_service
+                    .get_channel(&channel_id)
+                    .await
+                    .map(|channel| channel.channel_type.to_i16() as u8)
+                    .unwrap_or(1);
+                let payload = json!({
+                    "message_id": message_id,
+                    "channel_id": channel_id,
+                    "channel_type": channel_type,
+                    "uid": user_id,
+                    "emoji": removed
+                        .as_ref()
+                        .map(|reaction| reaction.emoji.clone())
+                        .unwrap_or_else(|| requested_emoji.clone()),
+                    "deleted": true,
+                });
+                if let Err(e) = services
+                    .sync_service
+                    .append_server_event_commit(
+                        channel_id,
+                        channel_type,
+                        "message_reaction",
+                        payload,
+                        user_id,
+                    )
+                    .await
+                {
+                    tracing::warn!("⚠️ 写入 reaction remove pts commit 失败: {}", e);
+                }
+            }
             tracing::debug!(
                 "✅ 成功移除 Reaction: user={}, message={}, emoji={}",
                 user_id,
                 message_id,
-                emoji
+                removed
+                    .as_ref()
+                    .map(|reaction| reaction.emoji.as_str())
+                    .unwrap_or(requested_emoji)
             );
             Ok(json!(true))
         }

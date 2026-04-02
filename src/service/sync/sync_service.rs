@@ -82,6 +82,44 @@ impl SyncService {
         }
     }
 
+    pub async fn append_server_event_commit(
+        &self,
+        channel_id: u64,
+        channel_type: u8,
+        message_type: impl Into<String>,
+        content: serde_json::Value,
+        sender_id: u64,
+    ) -> Result<ServerCommit> {
+        let new_pts = self.pts_dao.allocate_pts(channel_id).await?;
+        self.pts_generator.set_pts(channel_id, new_pts).await;
+        let commit = ServerCommit {
+            pts: new_pts,
+            server_msg_id: self.generate_msg_id().await,
+            local_message_id: None,
+            channel_id,
+            channel_type,
+            message_type: message_type.into(),
+            content,
+            server_timestamp: chrono::Utc::now().timestamp_millis(),
+            sender_id,
+            sender_info: self.get_sender_info(sender_id).await.ok(),
+        };
+        self.commit_dao.save_commit(&commit).await?;
+        self.cache.cache_commit(&commit).await?;
+        Ok(commit)
+    }
+
+    pub async fn record_existing_commit(&self, commit: &ServerCommit) -> Result<()> {
+        self.pts_dao
+            .bump_pts_to_at_least(commit.channel_id, commit.pts)
+            .await?;
+        self.pts_generator.set_pts(commit.channel_id, commit.pts).await;
+        self.commit_dao.save_commit(commit).await?;
+        self.cache.cache_pts(commit.channel_id, commit.pts).await?;
+        self.cache.cache_commit(commit).await?;
+        Ok(())
+    }
+
     // ============================================================
     // RPC 处理方法
     // ============================================================
@@ -181,6 +219,7 @@ impl SyncService {
         self.commit_dao.save_commit(&commit).await?;
 
         // 9. 缓存到 Redis ⭐
+        self.cache.cache_pts(req.channel_id, new_pts).await?;
         self.cache.cache_commit(&commit).await?;
 
         // [TRACE] Node 1: committed
@@ -296,7 +335,24 @@ impl SyncService {
             req.channel_id, req.channel_type, req.last_pts, limit
         );
 
-        // 1. 先查 Redis 缓存（快）⭐
+        // 1. 获取当前 pts，用于 recoverability 判断 ⭐
+        let current_pts = match self.cache.get_pts_from_cache(req.channel_id).await? {
+            Some(cached_pts) => cached_pts,
+            None => {
+                let db_pts = self.pts_dao.get_current_pts(req.channel_id).await?;
+                self.cache.cache_pts(req.channel_id, db_pts).await?;
+                db_pts
+            }
+        };
+
+        if req.last_pts > current_pts {
+            return Err(crate::error::ServerError::ChannelResyncRequired(format!(
+                "client last_pts {} is ahead of server current_pts {} for channel {}",
+                req.last_pts, current_pts, req.channel_id
+            )));
+        }
+
+        // 2. 先查 Redis 缓存（快）⭐
         let commits = match self
             .cache
             .query_commits_from_cache(req.channel_id, req.last_pts, limit)
@@ -342,17 +398,25 @@ impl SyncService {
             }
         };
 
-        // 3. 获取当前 pts ⭐
-        let current_pts = match self.cache.get_pts_from_cache(req.channel_id).await? {
-            Some(cached_pts) => cached_pts,
-            None => {
-                let db_pts = self.pts_dao.get_current_pts(req.channel_id).await?;
-                self.cache.cache_pts(req.channel_id, db_pts).await?;
-                db_pts
+        let expected_next_pts = req.last_pts.saturating_add(1);
+        if current_pts > req.last_pts {
+            if commits.is_empty() {
+                return Err(crate::error::ServerError::ChannelResyncRequired(format!(
+                    "message history window unavailable: channel={} last_pts={} current_pts={}",
+                    req.channel_id, req.last_pts, current_pts
+                )));
             }
-        };
+            if let Some(first_commit) = commits.first() {
+                if first_commit.pts != expected_next_pts {
+                    return Err(crate::error::ServerError::ChannelResyncRequired(format!(
+                        "non-contiguous difference: channel={} last_pts={} first_pts={} expected={}",
+                        req.channel_id, req.last_pts, first_commit.pts, expected_next_pts
+                    )));
+                }
+            }
+        }
 
-        // 4. 检查是否还有更多 ⭐
+        // 3. 检查是否还有更多 ⭐
         let has_more = if let Some(last_commit) = commits.last() {
             last_commit.pts < current_pts
         } else {
@@ -366,7 +430,7 @@ impl SyncService {
             current_pts
         );
 
-        // 5. 返回响应
+        // 4. 返回响应
         Ok(GetDifferenceResponse {
             commits,
             current_pts,
@@ -461,8 +525,6 @@ impl SyncService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_handle_client_submit() {
         // 测试客户端提交

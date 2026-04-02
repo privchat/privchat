@@ -144,8 +144,6 @@ pub struct RpcServiceContext {
     pub offline_worker: Arc<crate::infra::OfflineMessageWorker>,
     /// 用户设备仓库 - 用于推送设备管理
     pub user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
-    /// 用户设置仓库 - ENTITY_SYNC_V1 user_settings，表为主
-    pub user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
     /// 未读计数服务
     pub unread_count_service: Arc<UnreadCountService>,
     /// Typing 限频器 - (user_id, channel_id) 500ms/次
@@ -187,7 +185,6 @@ impl RpcServiceContext {
         auth_session_manager: Arc<crate::infra::SessionManager>,
         offline_worker: Arc<crate::infra::OfflineMessageWorker>,
         user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
-        user_settings_repo: Arc<crate::repository::UserSettingsRepository>,
         unread_count_service: Arc<UnreadCountService>,
         typing_rate_limiter: Arc<TypingRateLimiter>,
     ) -> Self {
@@ -225,7 +222,6 @@ impl RpcServiceContext {
             auth_session_manager,
             offline_worker,
             user_device_repo, // ✨ Phase 3.5
-            user_settings_repo,
             unread_count_service,
             typing_rate_limiter,
         }

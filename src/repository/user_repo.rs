@@ -28,6 +28,11 @@ pub struct UserRepository {
     pool: Arc<PgPool>,
 }
 
+pub struct RelatedUserSyncEntry {
+    pub user: User,
+    pub sync_version: u64,
+}
+
 impl UserRepository {
     /// 创建新的用户仓库
     pub fn new(pool: Arc<PgPool>) -> Self {
@@ -497,6 +502,91 @@ impl UserRepository {
         }
 
         Ok(())
+    }
+
+    /// 以单调 sync_version 作为集合型增量 cursor，获取相关用户资料。
+    pub async fn find_related_since(
+        &self,
+        related_user_ids: &[u64],
+        since_version: u64,
+        limit: u32,
+    ) -> Result<Vec<RelatedUserSyncEntry>, DatabaseError> {
+        if related_user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct UserRow {
+            user_id: i64,
+            username: String,
+            password_hash: Option<String>,
+            phone: Option<String>,
+            email: Option<String>,
+            display_name: Option<String>,
+            avatar_url: Option<String>,
+            user_type: Option<i16>,
+            status: Option<i16>,
+            privacy_settings: Option<serde_json::Value>,
+            created_at: i64,
+            updated_at: i64,
+            sync_version: i64,
+            last_active_at: Option<i64>,
+        }
+
+        let ids: Vec<i64> = related_user_ids.iter().map(|id| *id as i64).collect();
+        let rows = sqlx::query_as::<_, UserRow>(
+            r#"
+            SELECT
+                user_id,
+                username,
+                password_hash,
+                phone,
+                email,
+                display_name,
+                avatar_url,
+                user_type,
+                status,
+                privacy_settings,
+                created_at,
+                updated_at,
+                sync_version,
+                last_active_at
+            FROM privchat_users
+            WHERE user_id = ANY($1::BIGINT[])
+              AND sync_version > $2
+            ORDER BY sync_version ASC, user_id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(&ids)
+        .bind(since_version as i64)
+        .bind(limit.clamp(1, 200) as i64)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to query related users since: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| RelatedUserSyncEntry {
+                sync_version: r.sync_version as u64,
+                user: User::from_db_row(
+                    r.user_id,
+                    r.username,
+                    r.password_hash,
+                    r.phone,
+                    r.email,
+                    r.display_name,
+                    r.avatar_url,
+                    r.user_type.unwrap_or(0),
+                    r.status.unwrap_or(0),
+                    r.privacy_settings
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                    r.created_at,
+                    r.updated_at,
+                    r.last_active_at,
+                ),
+            })
+            .collect())
     }
 
     /// 获取所有用户（分页，管理 API）

@@ -2,6 +2,7 @@
 name = "privchat"
 version = "0.1.0"
 edition = "2021"
+autoexamples = false
 description = "A high-performance, secure instant messaging server built with Rust"
 authors = ["zoujiaqing <zoujiaqing@gmail.com>"]
 license = "Apache-2.0"
@@ -19,7 +20,7 @@ path = "src/main.rs"
 msgtrans = "~1.0.6"
 
 # 协议
-privchat-protocol = { path = "../privchat-protocol", version = "0.1" }
+privchat-protocol = { git = "https://github.com/privchat/privchat-protocol.git", rev = "c85937d3a325ea76c105b8166916e45b67ee53d7" }
 
 # 异步运行时
 tokio = { version = "1.0", features = ["full"] }
@@ -103,50 +104,8 @@ metrics-exporter-prometheus = { version = "0.13", default-features = false, feat
 default = []
 redis = []
 
-[[example]]
-name = "current_status_demo"
-path = "examples/current_status_demo.rs"
+[patch."https://github.com/privchat/privchat-protocol.git"]
+privchat-protocol = { path = "../privchat-protocol" }
 
-[[example]]
-name = "simple_server_demo"
-path = "examples/simple_server_demo.rs"
-
-[[example]]
-name = "logging_demo"
-path = "examples/logging_demo.rs"
-
-[[example]]
-name = "offline_worker_demo"
-path = "examples/offline_worker_demo.rs"
-
-[[example]]
-name = "simple_offline_worker_test"
-path = "examples/simple_offline_worker_test.rs"
-
-[[example]]
-name = "handler_demo"
-path = "examples/handler_demo.rs"
-
-[[example]]
-name = "core_chat_demo"
-path = "examples/core_chat_demo.rs"
-
-[[example]]
-name = "service_communication_demo"
-path = "examples/service_communication_demo.rs"
-
-[[example]]
-name = "simple_chat_demo"
-path = "examples/simple_chat_demo.rs"
-
-[[example]]
-name = "simple_dashmap_demo"
-path = "examples/simple_dashmap_demo.rs"
-
-[[example]]
-name = "simple_channel_test"
-path = "examples/simple_channel_test.rs"
-
-[[example]]
-name = "channel_architecture_demo"
-path = "examples/channel_architecture_demo.rs"
+[dev-dependencies]
+tempfile = "3"

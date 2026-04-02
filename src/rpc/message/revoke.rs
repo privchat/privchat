@@ -147,6 +147,37 @@ pub async fn handle(
         warn!("⚠️ 更新内存缓存失败: {}", e);
     }
 
+    let channel_type = services
+        .channel_service
+        .get_channel(&channel_id)
+        .await
+        .map(|channel| channel.channel_type.to_i16() as u8)
+        .unwrap_or(1);
+
+    let revoke_ts = Utc::now().timestamp_millis();
+    let revoke_payload = json!({
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "channel_type": channel_type,
+        "revoke": true,
+        "revoked_by": user_id,
+        "revoked_at": revoke_ts,
+    });
+
+    if let Err(e) = services
+        .sync_service
+        .append_server_event_commit(
+            channel_id,
+            channel_type,
+            "message.revoke",
+            revoke_payload,
+            user_id,
+        )
+        .await
+    {
+        warn!("⚠️ 写入 revoke pts commit 失败: {}", e);
+    }
+
     // 7. 推送撤回事件给所有参与者
     if let Err(e) = distribute_revoke_event(&services, channel_id, message_id, user_id).await {
         warn!("⚠️ 推送撤回事件失败: {}，但消息已撤回", e);

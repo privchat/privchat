@@ -88,6 +88,7 @@ impl TypingRateLimiter {
                 return false;
             }
             *entry = now;
+            drop(entry);
             self.maybe_cleanup();
             return true;
         }

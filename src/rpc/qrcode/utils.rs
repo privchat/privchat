@@ -22,9 +22,15 @@ use url::Url;
 ///
 /// # 示例
 /// ```
+/// use privchat::rpc::qrcode::extract_qr_key_from_url;
+/// use privchat::rpc::error::RpcError;
+///
+/// fn main() -> Result<(), RpcError> {
 /// let qr_code = "privchat://group/get?qrkey=abc123&token=xyz";
 /// let qr_key = extract_qr_key_from_url(qr_code)?;
 /// assert_eq!(qr_key, "abc123");
+/// # Ok(())
+/// # }
 /// ```
 pub fn extract_qr_key_from_url(qr_code: &str) -> Result<String, RpcError> {
     let url = Url::parse(qr_code)
@@ -40,6 +46,8 @@ pub fn extract_qr_key_from_url(qr_code: &str) -> Result<String, RpcError> {
 ///
 /// # 示例
 /// ```
+/// use privchat::rpc::qrcode::extract_token_from_url;
+///
 /// let qr_code = "privchat://group/get?qrkey=abc123&token=xyz";
 /// let token = extract_token_from_url(qr_code);
 /// assert_eq!(token, Some("xyz".to_string()));

@@ -265,8 +265,6 @@ impl CommitLogDao {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // TODO: 添加单元测试
     #[tokio::test]
     async fn test_save_and_query_commits() {

@@ -155,19 +155,19 @@ mod tests {
         let service = MessageDedupService::new();
 
         // 第一次检查应该返回 false（未处理过）
-        assert!(!service.is_duplicate("user1", "msg1").await);
+        assert!(!service.is_duplicate(1001, 2001).await);
 
         // 标记为已处理
-        service.mark_as_processed("user1", "msg1").await;
+        service.mark_as_processed(1001, 2001).await;
 
         // 再次检查应该返回 true（已处理过）
-        assert!(service.is_duplicate("user1", "msg1").await);
+        assert!(service.is_duplicate(1001, 2001).await);
 
         // 不同的消息应该返回 false
-        assert!(!service.is_duplicate("user1", "msg2").await);
+        assert!(!service.is_duplicate(1001, 2002).await);
 
         // 不同用户的消息应该返回 false
-        assert!(!service.is_duplicate("user2", "msg1").await);
+        assert!(!service.is_duplicate(1002, 2001).await);
     }
 
     #[tokio::test]
@@ -175,8 +175,8 @@ mod tests {
         let service = MessageDedupService::new();
 
         // 标记一些消息
-        service.mark_as_processed("user1", "msg1").await;
-        service.mark_as_processed("user1", "msg2").await;
+        service.mark_as_processed(1001, 2001).await;
+        service.mark_as_processed(1001, 2002).await;
 
         // 等待超过保留时间（这里需要修改测试以使用更短的保留时间）
         // 为了测试，我们直接调用清理，但实际中需要等待

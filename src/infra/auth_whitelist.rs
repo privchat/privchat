@@ -119,10 +119,10 @@ mod tests {
         // 系统信息应该在白名单中
         assert!(is_anonymous_rpc_route("system/health"));
         assert!(is_anonymous_rpc_route("system/info"));
+        assert!(is_anonymous_rpc_route("account/auth/login"));
+        assert!(is_anonymous_rpc_route("account/user/register"));
 
         // 其他所有 RPC 都不应该在白名单中
-        assert!(!is_anonymous_rpc_route("account/auth/login"));
-        assert!(!is_anonymous_rpc_route("account/user/register"));
         assert!(!is_anonymous_rpc_route("qrcode/resolve"));
         assert!(!is_anonymous_rpc_route("message/send"));
         assert!(!is_anonymous_rpc_route("group/member/remove"));

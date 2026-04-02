@@ -375,18 +375,18 @@ mod tests {
         let generator = PtsGenerator::new();
 
         // 测试生成 pts
-        let pts1 = generator.next_pts("alice").await;
+        let pts1 = generator.next_pts(1001).await;
         assert_eq!(pts1, 1);
 
-        let pts2 = generator.next_pts("alice").await;
+        let pts2 = generator.next_pts(1001).await;
         assert_eq!(pts2, 2);
 
         // 不同用户的 pts 独立
-        let pts3 = generator.next_pts("bob").await;
+        let pts3 = generator.next_pts(1002).await;
         assert_eq!(pts3, 1);
 
         // 获取当前 pts
-        let current = generator.current_pts("alice").await;
+        let current = generator.current_pts(1001).await;
         assert_eq!(current, 2);
     }
 
@@ -405,15 +405,15 @@ mod tests {
         let index = UserMessageIndex::new();
 
         // 添加消息
-        index.add_message("alice", 1, "msg_001".to_string()).await;
-        index.add_message("alice", 2, "msg_002".to_string()).await;
-        index.add_message("alice", 3, "msg_003".to_string()).await;
+        index.add_message(1001, 1, 2001).await;
+        index.add_message(1001, 2, 2002).await;
+        index.add_message(1001, 3, 2003).await;
 
         // 获取范围内的消息
-        let message_ids = index.get_message_ids("alice", 1, 2).await;
+        let message_ids = index.get_message_ids(1001, 1, 2).await;
         assert_eq!(message_ids.len(), 2);
-        assert_eq!(message_ids[0], "msg_001");
-        assert_eq!(message_ids[1], "msg_002");
+        assert_eq!(message_ids[0], 2001);
+        assert_eq!(message_ids[1], 2002);
     }
 
     #[tokio::test]
@@ -421,19 +421,19 @@ mod tests {
         let counter = UnreadCounter::new();
 
         // 增加未读计数
-        counter.increment("alice", "channel_001", 1).await;
-        counter.increment("alice", "channel_001", 1).await;
-        counter.increment("alice", "channel_002", 3).await;
+        counter.increment(1001, 3001, 1).await;
+        counter.increment(1001, 3001, 1).await;
+        counter.increment(1001, 3002, 3).await;
 
         // 获取未读计数
-        let unread = counter.get("alice").await;
-        assert_eq!(unread.get("channel_001"), Some(&2));
-        assert_eq!(unread.get("channel_002"), Some(&3));
+        let unread = counter.get(1001).await;
+        assert_eq!(unread.get(&3001), Some(&2));
+        assert_eq!(unread.get(&3002), Some(&3));
 
         // 清空特定会话
-        counter.clear_channel("alice", "channel_001").await;
-        let unread = counter.get("alice").await;
-        assert_eq!(unread.get("channel_001"), None);
-        assert_eq!(unread.get("channel_002"), Some(&3));
+        counter.clear_channel(1001, 3001).await;
+        let unread = counter.get(1001).await;
+        assert_eq!(unread.get(&3001), None);
+        assert_eq!(unread.get(&3002), Some(&3));
     }
 }

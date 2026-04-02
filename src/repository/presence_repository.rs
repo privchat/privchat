@@ -241,8 +241,6 @@ pub struct PresenceStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // 注意：这些测试需要数据库连接
     // 在实际运行前需要配置测试数据库
 

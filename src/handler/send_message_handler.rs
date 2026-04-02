@@ -25,6 +25,7 @@ use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::{MessageRepository, PgMessageRepository};
 use crate::service::message_history_service::MessageHistoryService;
 use crate::service::{MessageDedupService, OfflineQueueService, UnreadCountService};
+use crate::service::sync::get_global_sync_service;
 use crate::session::SessionManager;
 use crate::Result;
 use async_trait::async_trait;
@@ -146,6 +147,14 @@ impl SendMessageHandler {
     /// 设置传输层服务器（在服务器启动后调用）
     pub async fn set_transport(&self, transport: Arc<msgtrans::transport::TransportServer>) {
         *self.transport.write().await = Some(transport);
+    }
+
+    fn sync_commit_content_from_payload(payload: &[u8], fallback_text: &str) -> serde_json::Value {
+        if payload.is_empty() {
+            return serde_json::json!({ "text": fallback_text });
+        }
+        serde_json::from_slice::<serde_json::Value>(payload)
+            .unwrap_or_else(|_| serde_json::json!({ "text": fallback_text }))
     }
 }
 
@@ -1223,6 +1232,46 @@ impl MessageHandler for SendMessageHandler {
             "✅ SendMessageHandler: 消息已保存到数据库: {}",
             message.message_id
         );
+
+        if let Some(sync_service) = get_global_sync_service() {
+            let commit = privchat_protocol::rpc::sync::ServerCommit {
+                pts: pts as u64,
+                server_msg_id: message.message_id,
+                local_message_id: Some(send_message_request.local_message_id),
+                channel_id,
+                channel_type: match channel.channel_type {
+                    crate::model::channel::ChannelType::Direct => 1,
+                    crate::model::channel::ChannelType::Group => 2,
+                    crate::model::channel::ChannelType::Room => 3,
+                },
+                message_type: content_message_type.as_str().to_string(),
+                content: Self::sync_commit_content_from_payload(
+                    &send_message_request.payload,
+                    &content,
+                ),
+                server_timestamp: message.created_at.timestamp_millis(),
+                sender_id: from_uid,
+                sender_info: None,
+            };
+            if let Err(e) = sync_service.record_existing_commit(&commit).await {
+                error!(
+                    "❌ SendMessageHandler: 记录同步 commit 失败 channel_id={} message_id={} pts={} error={}",
+                    channel_id, message.message_id, pts, e
+                );
+                return self
+                    .create_error_response(
+                        &send_message_request,
+                        ErrorCode::DatabaseError,
+                        "消息同步日志记录失败",
+                    )
+                    .await;
+            }
+        } else {
+            warn!(
+                "⚠️ SendMessageHandler: SyncService 未就绪，跳过 commit 记录 channel_id={} message_id={}",
+                channel_id, message.message_id
+            );
+        }
 
         // ✨ 发布 MessageCommitted 事件（用于 Push）
         // MVP 阶段：使用全局 EventBus（临时方案）

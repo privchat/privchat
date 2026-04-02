@@ -339,8 +339,6 @@ impl SyncCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_cache_and_query_commits() {
         // 测试 Commit 缓存和查询
