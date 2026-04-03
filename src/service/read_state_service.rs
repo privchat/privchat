@@ -19,6 +19,7 @@ use crate::error::{Result, ServerError};
 use crate::infra::MessageRouter;
 use crate::model::channel::{ChannelId, ChannelKind, UserId};
 use crate::service::{ChannelService, UnreadCountService};
+use privchat_protocol::notification::ChannelReadCursorNotification;
 use privchat_protocol::protocol::PushMessageRequest;
 use std::sync::Arc;
 use sqlx::{PgPool, Row};
@@ -351,19 +352,14 @@ impl ReadStateService {
         reader_id: UserId,
         last_read_pts: u64,
     ) -> Result<()> {
-        let payload = serde_json::json!({
-            "message_type": "notification",
-            "content": "channel read cursor updated",
-            "metadata": {
-                "notification_type": "channel_read_cursor_updated",
-                "channel_id": channel_id,
-                "channel_type": channel_type,
-                "reader_id": reader_id.to_string(),
-                "read_pts": last_read_pts,
-                "visibility": notification_type,
-                "updated_at": chrono::Utc::now().timestamp_millis(),
-            }
-        });
+        let payload = ChannelReadCursorNotification::new(
+            channel_id,
+            channel_type,
+            reader_id,
+            last_read_pts,
+            notification_type,
+            chrono::Utc::now().timestamp_millis(),
+        );
         let notification = PushMessageRequest {
             setting: Default::default(),
             msg_key: String::new(),
