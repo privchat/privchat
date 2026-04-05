@@ -694,17 +694,11 @@ impl SecurityService {
     /// 解除用户所有设备的封禁（管理 API）
     ///
     /// 返回受影响的设备数
-    pub async fn unban_all_user_devices(
-        &self,
-        user_id: u64,
-        device_ids: &[String],
-    ) -> usize {
+    pub async fn unban_all_user_devices(&self, user_id: u64, device_ids: &[String]) -> usize {
         let mut client_states = self.client_states.write().await;
         let mut affected = 0;
         for device_id in device_ids {
-            if let Some(state_manager) =
-                client_states.get_mut(&(user_id, device_id.clone()))
-            {
+            if let Some(state_manager) = client_states.get_mut(&(user_id, device_id.clone())) {
                 state_manager.transition_to(
                     ClientState::Normal,
                     ViolationType::RateLimit, // 占位符
@@ -714,10 +708,7 @@ impl SecurityService {
             }
         }
         if affected > 0 {
-            info!(
-                "管理员批量解封用户 {} ({} 个设备)",
-                user_id, affected
-            );
+            info!("管理员批量解封用户 {} ({} 个设备)", user_id, affected);
         }
         affected
     }

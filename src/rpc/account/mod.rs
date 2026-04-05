@@ -29,8 +29,8 @@ pub async fn register_routes(services: RpcServiceContext) {
     auth::register_routes(services.clone()).await; // 测试用的认证接口
     search::register_routes(services.clone()).await; // 用户搜索接口
     privacy::register_routes(services.clone()).await; // 隐私设置接口
-    // TODO: 暂时注释 profile 模块
-    // profile::register_routes(services.clone()).await;
+                                                      // TODO: 暂时注释 profile 模块
+                                                      // profile::register_routes(services.clone()).await;
 
     tracing::debug!("📋 Account 系统路由注册完成 (user, auth, search, privacy 模块)");
 }

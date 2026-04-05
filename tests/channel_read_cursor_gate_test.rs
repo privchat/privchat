@@ -1,8 +1,8 @@
-use sqlx::postgres::PgPoolOptions;
-use sqlx::Row;
 use privchat::rpc::message::status::policy::{
     ensure_read_list_allowed, ensure_read_stats_allowed, ReadReceiptMode,
 };
+use sqlx::postgres::PgPoolOptions;
+use sqlx::Row;
 
 #[derive(Debug, Clone, Copy)]
 struct UpsertCursorResult {
@@ -22,11 +22,13 @@ async fn open_test_pool() -> Option<sqlx::PgPool> {
 }
 
 async fn cleanup(pool: &sqlx::PgPool, user_id: i64, channel_id: i64) {
-    let _ = sqlx::query("DELETE FROM privchat_channel_read_cursor WHERE user_id = $1 AND channel_id = $2")
-        .bind(user_id)
-        .bind(channel_id)
-        .execute(pool)
-        .await;
+    let _ = sqlx::query(
+        "DELETE FROM privchat_channel_read_cursor WHERE user_id = $1 AND channel_id = $2",
+    )
+    .bind(user_id)
+    .bind(channel_id)
+    .execute(pool)
+    .await;
 }
 
 async fn upsert_cursor(
@@ -320,7 +322,7 @@ async fn read_list_projects_from_cursor() {
     let _ = upsert_cursor(&pool, members[0], channel_id, 499).await; // < P
     let _ = upsert_cursor(&pool, members[1], channel_id, 500).await; // = P
     let _ = upsert_cursor(&pool, members[2], channel_id, 520).await; // > P
-    // members[3] 无 cursor
+                                                                     // members[3] 无 cursor
     let _ = upsert_cursor(&pool, non_member, channel_id, 900).await; // 非成员
 
     // 让排序稳定：members[1] 更新得更晚，应排前。

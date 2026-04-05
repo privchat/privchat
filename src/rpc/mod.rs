@@ -38,7 +38,10 @@ pub mod user;
 
 use crate::auth::{DeviceManager, DeviceManagerDb, TokenRevocationService};
 use crate::config::ServerConfig;
-use crate::infra::{CacheManager, ConnectionManager, MessageRouter, PresenceManager, SubscribeManager, TypingRateLimiter};
+use crate::infra::{
+    CacheManager, ConnectionManager, MessageRouter, PresenceManager, SubscribeManager,
+    TypingRateLimiter,
+};
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::UserRepository;
 use crate::service::sync::SyncService;
@@ -181,7 +184,7 @@ impl RpcServiceContext {
         message_repository: Arc<crate::repository::PgMessageRepository>,
         connection_manager: Arc<ConnectionManager>, // ✨ 新增参数
         subscribe_manager: Arc<SubscribeManager>,
-        sync_service: Arc<SyncService>,             // ✨ 新增参数
+        sync_service: Arc<SyncService>, // ✨ 新增参数
         auth_session_manager: Arc<crate::infra::SessionManager>,
         offline_worker: Arc<crate::infra::OfflineMessageWorker>,
         user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
@@ -218,7 +221,7 @@ impl RpcServiceContext {
             message_repository,
             connection_manager, // ✨ 新增
             subscribe_manager,
-            sync_service,       // ✨ 新增
+            sync_service, // ✨ 新增
             auth_session_manager,
             offline_worker,
             user_device_repo, // ✨ Phase 3.5

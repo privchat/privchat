@@ -71,7 +71,9 @@ impl MessageHandler for DisconnectMessageHandler {
         }
 
         // 清理频道订阅
-        let left_channels = self.subscribe_manager.on_session_disconnect(&context.session_id);
+        let left_channels = self
+            .subscribe_manager
+            .on_session_disconnect(&context.session_id);
         if !left_channels.is_empty() {
             info!(
                 "🔌 DisconnectMessageHandler: Session {} 离开频道 {:?}",

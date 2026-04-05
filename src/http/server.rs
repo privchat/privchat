@@ -29,7 +29,9 @@ use crate::http::routes;
 use crate::infra::{ConnectionManager, SubscribeManager};
 use crate::repository::{LoginLogRepository, PgMessageRepository, UserRepository};
 use crate::security::SecurityService;
-use crate::service::{AdminService, ChannelService, FileService, UploadTokenService};
+use crate::service::{
+    AdminService, ChannelService, FileService, RoomHistoryService, UploadTokenService,
+};
 
 /// 文件服务器共享状态
 #[derive(Clone)]
@@ -52,6 +54,7 @@ pub struct AdminServerState {
     pub security_service: Arc<SecurityService>,
     pub admin_service: Arc<AdminService>,
     pub subscribe_manager: Arc<SubscribeManager>,
+    pub room_history_service: Arc<RoomHistoryService>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -109,6 +112,7 @@ impl AdminHttpServer {
         connection_manager: Arc<ConnectionManager>,
         security_service: Arc<SecurityService>,
         subscribe_manager: Arc<SubscribeManager>,
+        room_history_service: Arc<RoomHistoryService>,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -132,6 +136,7 @@ impl AdminHttpServer {
                 security_service,
                 admin_service,
                 subscribe_manager,
+                room_history_service,
             },
             port,
         }

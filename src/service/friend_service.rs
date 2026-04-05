@@ -332,7 +332,9 @@ impl FriendService {
 
     /// 检查是否是好友
     pub async fn is_friend(&self, user_id: u64, friend_id: u64) -> bool {
-        self.try_is_friend(user_id, friend_id).await.unwrap_or(false)
+        self.try_is_friend(user_id, friend_id)
+            .await
+            .unwrap_or(false)
     }
 
     /// 检查是否是好友（保留数据库错误）

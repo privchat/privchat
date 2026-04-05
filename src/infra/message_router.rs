@@ -272,7 +272,11 @@ impl MessageRouter {
                 // 查找指定设备
                 if let Some(device) = status.devices.iter().find(|d| d.device_id == *device_id) {
                     if matches!(device.status, DeviceStatus::Online) {
-                        if !self.session_manager.is_session_online(&device.session_id).await {
+                        if !self
+                            .session_manager
+                            .is_session_online(&device.session_id)
+                            .await
+                        {
                             // 缓存中残留了失效会话，先清理再按离线消息处理
                             self.register_device_offline(
                                 user_id,
@@ -316,7 +320,11 @@ impl MessageRouter {
                                     message.channel_id,
                                     e
                                 );
-                                if !self.session_manager.is_session_online(&device.session_id).await {
+                                if !self
+                                    .session_manager
+                                    .is_session_online(&device.session_id)
+                                    .await
+                                {
                                     self.register_device_offline(
                                         user_id,
                                         device_id,
@@ -393,7 +401,11 @@ impl MessageRouter {
             });
         }
 
-        match self.session_manager.send_to_session(session_id, &message).await {
+        match self
+            .session_manager
+            .send_to_session(session_id, &message)
+            .await
+        {
             Ok(_) => {
                 let elapsed = start_time.elapsed().unwrap_or_default();
                 Ok(RouteResult {
@@ -752,7 +764,11 @@ impl MessageRouter {
 
         let mut stale_device_ids: Vec<DeviceId> = Vec::new();
         for device in online_devices {
-            if !self.session_manager.is_session_online(&device.session_id).await {
+            if !self
+                .session_manager
+                .is_session_online(&device.session_id)
+                .await
+            {
                 stale_device_ids.push(device.device_id.clone());
                 self.store_offline_message_with_device(
                     &user_status.user_id,
@@ -773,7 +789,11 @@ impl MessageRouter {
                 }
                 Err(_) => {
                     failed_count += 1;
-                    if !self.session_manager.is_session_online(&device.session_id).await {
+                    if !self
+                        .session_manager
+                        .is_session_online(&device.session_id)
+                        .await
+                    {
                         stale_device_ids.push(device.device_id.clone());
                         self.store_offline_message_with_device(
                             &user_status.user_id,
@@ -787,12 +807,15 @@ impl MessageRouter {
         }
 
         if !stale_device_ids.is_empty() {
-            if let Some(mut latest_status) = self.user_status_cache.get(&user_status.user_id).await {
+            if let Some(mut latest_status) = self.user_status_cache.get(&user_status.user_id).await
+            {
                 latest_status
                     .devices
                     .retain(|d| !stale_device_ids.contains(&d.device_id));
                 if latest_status.devices.is_empty() {
-                    self.user_status_cache.invalidate(&user_status.user_id).await;
+                    self.user_status_cache
+                        .invalidate(&user_status.user_id)
+                        .await;
                 } else {
                     self.user_status_cache
                         .put(user_status.user_id, latest_status, 3600)

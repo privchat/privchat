@@ -56,7 +56,10 @@ mod tests {
 
     #[test]
     fn parse_mode_defaults_to_full_list() {
-        assert_eq!(ReadReceiptMode::parse(None).expect("parse none"), ReadReceiptMode::FullList);
+        assert_eq!(
+            ReadReceiptMode::parse(None).expect("parse none"),
+            ReadReceiptMode::FullList
+        );
     }
 
     #[test]

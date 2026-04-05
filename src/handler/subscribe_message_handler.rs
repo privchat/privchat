@@ -17,9 +17,10 @@
 
 use crate::context::RequestContext;
 use crate::handler::MessageHandler;
-use crate::infra::SubscribeManager;
+use crate::infra::{ConnectionManager, SubscribeManager};
 use crate::Result;
 use async_trait::async_trait;
+use msgtrans::SessionId;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -29,17 +30,78 @@ const ACTION_UNSUBSCRIBE: u8 = 2;
 pub struct SubscribeMessageHandler {
     subscribe_manager: Arc<SubscribeManager>,
     channel_service: Arc<crate::service::ChannelService>,
+    connection_manager: Arc<ConnectionManager>,
+    room_history_service: Arc<crate::service::RoomHistoryService>,
 }
 
 impl SubscribeMessageHandler {
     pub fn new(
         subscribe_manager: Arc<SubscribeManager>,
         channel_service: Arc<crate::service::ChannelService>,
+        connection_manager: Arc<ConnectionManager>,
+        room_history_service: Arc<crate::service::RoomHistoryService>,
     ) -> Self {
         Self {
             subscribe_manager,
             channel_service,
+            connection_manager,
+            room_history_service,
         }
+    }
+
+    async fn replay_room_history_to_session(
+        connection_manager: Arc<ConnectionManager>,
+        room_history_service: Arc<crate::service::RoomHistoryService>,
+        session_id: SessionId,
+        channel_id: u64,
+    ) -> Result<()> {
+        let history = room_history_service.list_recent_history(channel_id).await?;
+        if history.is_empty() {
+            return Ok(());
+        }
+
+        let transport = connection_manager.transport_server.read().await;
+        let Some(server) = transport.as_ref() else {
+            warn!(
+                "⚠️ SubscribeMessageHandler: TransportServer 未就绪，跳过 Room 历史回放 channel_id={}, session={}",
+                channel_id, session_id
+            );
+            return Ok(());
+        };
+
+        let mut delivered = 0usize;
+        for publish_request in history {
+            let payload_bytes = match privchat_protocol::encode_message(&publish_request) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!(
+                        "⚠️ SubscribeMessageHandler: 编码 Room 历史失败 channel_id={}, session={}, error={}",
+                        channel_id, session_id, e
+                    );
+                    continue;
+                }
+            };
+
+            let mut packet = msgtrans::packet::Packet::one_way(0u32, payload_bytes);
+            packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
+
+            if let Err(e) = server.send_to_session(session_id.clone(), packet).await {
+                warn!(
+                    "⚠️ SubscribeMessageHandler: 回放 Room 历史失败 channel_id={}, session={}, error={}",
+                    channel_id, session_id, e
+                );
+                continue;
+            }
+
+            delivered += 1;
+        }
+
+        info!(
+            "📚 SubscribeMessageHandler: Room 历史回放完成 channel_id={}, session={}, delivered={}",
+            channel_id, session_id, delivered
+        );
+
+        Ok(())
     }
 }
 
@@ -66,6 +128,7 @@ impl MessageHandler for SubscribeMessageHandler {
         );
 
         let mut reason_code = 0u8;
+        let mut should_replay_room_history = false;
 
         // 授权检查（仅 subscribe 需要，unsubscribe 无条件放行）
         if action == ACTION_SUBSCRIBE {
@@ -100,7 +163,10 @@ impl MessageHandler for SubscribeMessageHandler {
                             }
                         }
                         None => {
-                            warn!("📡 SubscribeMessageHandler: 未认证的会话 {}", context.session_id);
+                            warn!(
+                                "📡 SubscribeMessageHandler: 未认证的会话 {}",
+                                context.session_id
+                            );
                             6 // 未认证
                         }
                     }
@@ -114,7 +180,10 @@ impl MessageHandler for SubscribeMessageHandler {
                 // reason_code: 4=TICKET_EXPIRED, 5=TICKET_INVALID, 6=ROOM_CLOSED, 7=NOT_ALLOWED
                 2 => {
                     if context.user_id.is_none() {
-                        warn!("📡 SubscribeMessageHandler: 未认证的会话 {} 尝试订阅 Room {}", context.session_id, channel_id);
+                        warn!(
+                            "📡 SubscribeMessageHandler: 未认证的会话 {} 尝试订阅 Room {}",
+                            context.session_id, channel_id
+                        );
                         6 // 未认证
                     } else {
                         0 // 已认证即放行（ticket 校验后续迭代）
@@ -122,7 +191,10 @@ impl MessageHandler for SubscribeMessageHandler {
                 }
                 // 未知 channel_type
                 _ => {
-                    warn!("📡 SubscribeMessageHandler: 不支持的 channel_type: {}", channel_type);
+                    warn!(
+                        "📡 SubscribeMessageHandler: 不支持的 channel_type: {}",
+                        channel_type
+                    );
                     2 // UNSUPPORTED_CHANNEL_TYPE
                 }
             };
@@ -132,12 +204,17 @@ impl MessageHandler for SubscribeMessageHandler {
         if reason_code == 0 {
             match action {
                 ACTION_SUBSCRIBE => {
-                    match self.subscribe_manager.subscribe(context.session_id.clone(), channel_id) {
+                    match self
+                        .subscribe_manager
+                        .subscribe(context.session_id.clone(), channel_id)
+                    {
                         Ok(()) => {
                             info!(
                                 "📡 SubscribeMessageHandler: Session {} 订阅频道 {}",
                                 context.session_id, channel_id
                             );
+                            should_replay_room_history = channel_type == 2
+                                && self.room_history_service.subscribe_history_enabled();
                         }
                         Err(e) => {
                             reason_code = if e == "too many subscriptions" { 8 } else { 3 };
@@ -149,7 +226,8 @@ impl MessageHandler for SubscribeMessageHandler {
                     }
                 }
                 ACTION_UNSUBSCRIBE => {
-                    self.subscribe_manager.unsubscribe(&context.session_id, channel_id);
+                    self.subscribe_manager
+                        .unsubscribe(&context.session_id, channel_id);
                     info!(
                         "📡 SubscribeMessageHandler: Session {} 取消订阅频道 {}",
                         context.session_id, channel_id
@@ -160,6 +238,27 @@ impl MessageHandler for SubscribeMessageHandler {
                     warn!("📡 SubscribeMessageHandler: 未知操作: {}", action);
                 }
             }
+        }
+
+        if should_replay_room_history {
+            let connection_manager = self.connection_manager.clone();
+            let room_history_service = self.room_history_service.clone();
+            let session_id = context.session_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = SubscribeMessageHandler::replay_room_history_to_session(
+                    connection_manager,
+                    room_history_service,
+                    session_id.clone(),
+                    channel_id,
+                )
+                .await
+                {
+                    warn!(
+                        "⚠️ SubscribeMessageHandler: Room 历史回放任务失败 channel_id={}, session={}, error={}",
+                        channel_id, session_id, e
+                    );
+                }
+            });
         }
 
         let subscribe_response = privchat_protocol::protocol::SubscribeResponse {

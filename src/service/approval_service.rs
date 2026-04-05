@@ -375,11 +375,7 @@ mod tests {
             .unwrap();
 
         let rejected = service
-            .reject_request(
-                &request.request_id,
-                9001,
-                Some("不符合要求".to_string()),
-            )
+            .reject_request(&request.request_id, 9001, Some("不符合要求".to_string()))
             .await
             .unwrap();
 
@@ -418,10 +414,7 @@ mod tests {
             .await
             .unwrap();
 
-        let requests = service
-            .get_pending_requests_by_group(3001)
-            .await
-            .unwrap();
+        let requests = service.get_pending_requests_by_group(3001).await.unwrap();
         assert_eq!(requests.len(), 2);
     }
 }

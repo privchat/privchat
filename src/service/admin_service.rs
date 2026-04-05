@@ -78,11 +78,7 @@ impl AdminService {
     /// 1. 将用户状态设为 Suspended
     /// 2. 撤销该用户的所有活跃设备
     /// 3. 断开所有在线连接
-    pub async fn suspend_user(
-        &self,
-        user_id: u64,
-        reason: &str,
-    ) -> Result<SuspendUserResult> {
+    pub async fn suspend_user(&self, user_id: u64, reason: &str) -> Result<SuspendUserResult> {
         // 1. 查找用户
         let mut user = self
             .user_repository
@@ -152,12 +148,7 @@ impl AdminService {
     ///
     /// 1. 数据库层面标记设备被踢
     /// 2. 断开在线连接
-    pub async fn revoke_device(
-        &self,
-        user_id: u64,
-        device_id: &str,
-        reason: &str,
-    ) -> Result<()> {
+    pub async fn revoke_device(&self, user_id: u64, device_id: &str, reason: &str) -> Result<()> {
         self.device_manager_db
             .kick_device(user_id, device_id, None, reason)
             .await?;
@@ -179,11 +170,7 @@ impl AdminService {
     ///
     /// 1. 数据库层面撤销所有设备
     /// 2. 断开所有在线连接
-    pub async fn revoke_all_devices(
-        &self,
-        user_id: u64,
-        reason: &str,
-    ) -> Result<usize> {
+    pub async fn revoke_all_devices(&self, user_id: u64, reason: &str) -> Result<usize> {
         let revoked_count = self
             .device_manager_db
             .revoke_all_devices(user_id, reason)
@@ -220,10 +207,7 @@ impl AdminService {
             .map_err(|e| ServerError::Database(format!("查询用户失败: {}", e)))?
             .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
 
-        let display_name = user
-            .display_name
-            .as_deref()
-            .unwrap_or(&user.username);
+        let display_name = user.display_name.as_deref().unwrap_or(&user.username);
 
         // 2. 添加用户到群组
         self.channel_service

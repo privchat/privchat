@@ -590,7 +590,7 @@ impl Channel {
         let creator_id = match conv_type {
             ChannelType::Direct => direct_user1_id.map(|id| id as u64).unwrap_or(0),
             ChannelType::Group => 0, // 需要从 group 表查询 owner_id
-            ChannelType::Room => 0, // Room 频道没有 creator_id
+            ChannelType::Room => 0,  // Room 频道没有 creator_id
         };
 
         Self {

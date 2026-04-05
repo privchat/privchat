@@ -22,10 +22,10 @@
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcContext;
 use crate::rpc::RpcServiceContext;
-use privchat_protocol::ErrorCode;
 use privchat_protocol::rpc::sync::{
     ChannelReadCursorSyncPayload, SyncEntitiesRequest, SyncEntitiesResponse, SyncEntityItem,
 };
+use privchat_protocol::ErrorCode;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -117,7 +117,11 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
             let mut related_user_ids = BTreeSet::new();
             related_user_ids.insert(user_id);
 
-            let channels = services.channel_service.get_user_channels(user_id).await.channels;
+            let channels = services
+                .channel_service
+                .get_user_channels(user_id)
+                .await
+                .channels;
             if let Some(scoped_channel_id) = parse_scope_channel_id(scope) {
                 if let Some(channel) = channels.iter().find(|ch| ch.id == scoped_channel_id) {
                     for uid in channel.get_member_ids().into_iter() {
@@ -207,7 +211,12 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
             let since_v = since_version.unwrap_or(0);
             let (rows, next_version, has_more) = services
                 .read_state_service
-                .sync_channel_read_cursor_page(user_id, since_v, parse_scope_channel_id(scope), limit)
+                .sync_channel_read_cursor_page(
+                    user_id,
+                    since_v,
+                    parse_scope_channel_id(scope),
+                    limit,
+                )
                 .await
                 .map_err(|e| RpcError::internal(format!("已读游标同步失败: {}", e)))?;
             let items: Vec<SyncEntityItem> = rows
@@ -274,10 +283,7 @@ mod tests {
     fn scope_parsers_extract_current_supported_formats() {
         assert_eq!(parse_scope_channel_id(Some("30001")), Some(30001));
         assert_eq!(parse_scope_channel_id(Some("group:30001")), Some(30001));
-        assert_eq!(
-            parse_scope_channel_id(Some("channel:2|30001")),
-            Some(30001)
-        );
+        assert_eq!(parse_scope_channel_id(Some("channel:2|30001")), Some(30001));
 
         assert_eq!(parse_scope_user_id(Some("20001")), Some(20001));
         assert_eq!(parse_scope_user_id(Some("user:20001")), Some(20001));

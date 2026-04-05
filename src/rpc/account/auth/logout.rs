@@ -46,7 +46,10 @@ pub async fn handle(
         .await
         .map_err(|e| RpcError::internal(format!("unregister connection failed: {}", e)))?;
 
-    services.auth_session_manager.unbind_session(&session_id).await;
+    services
+        .auth_session_manager
+        .unbind_session(&session_id)
+        .await;
 
     let mut cleanup_device_id = ctx.device_id.clone();
     if cleanup_device_id.is_none() {

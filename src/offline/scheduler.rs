@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(test))]
 use tokio::time::interval;
-use tracing::{debug, info, warn};
 #[cfg(not(test))]
 use tracing::error;
+use tracing::{debug, info, warn};
 
 /// 调度器配置
 #[derive(Debug, Clone)]
@@ -318,107 +318,109 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
     async fn start_delivery_loop(&self) {
         #[cfg(not(test))]
         {
-        let queue_manager = self.queue_manager.clone();
-        let message_deliverer = self.message_deliverer.clone();
-        let config = self.config.clone();
-        let stats = self.stats.clone();
-        let running = self.running.clone();
-        let active_deliveries = self.active_deliveries.clone();
+            let queue_manager = self.queue_manager.clone();
+            let message_deliverer = self.message_deliverer.clone();
+            let config = self.config.clone();
+            let stats = self.stats.clone();
+            let running = self.running.clone();
+            let active_deliveries = self.active_deliveries.clone();
 
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(config.delivery_check_interval_secs));
+            tokio::spawn(async move {
+                let mut interval =
+                    interval(Duration::from_secs(config.delivery_check_interval_secs));
 
-            loop {
-                interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-                // 检查是否还在运行
-                {
-                    let running_guard = running.lock().await;
-                    if !*running_guard {
-                        break;
-                    }
-                }
-
-                // 获取有消息的用户列表（这里简化，实际应该从队列管理器获取）
-                let users_with_messages: Vec<u64> = vec![]; // TODO: 从队列管理器获取实际用户列表
-
-                for user_id in users_with_messages {
-                    let mut deliveries = active_deliveries.lock().await;
-
-                    // 检查是否已经有该用户的投递任务在运行
-                    if deliveries.contains_key(&user_id) {
-                        continue;
+                    // 检查是否还在运行
+                    {
+                        let running_guard = running.lock().await;
+                        if !*running_guard {
+                            break;
+                        }
                     }
 
-                    // 检查并发投递限制
-                    if deliveries.len() >= config.max_concurrent_deliveries {
-                        continue;
-                    }
+                    // 获取有消息的用户列表（这里简化，实际应该从队列管理器获取）
+                    let users_with_messages: Vec<u64> = vec![]; // TODO: 从队列管理器获取实际用户列表
 
-                    let queue_manager_clone = queue_manager.clone();
-                    let deliverer_clone = message_deliverer.clone();
-                    let user_id_clone = user_id;
-                    let _config_clone = config.clone();
-                    let stats_clone = stats.clone();
-                    let batch_size = config.batch_delivery_size;
+                    for user_id in users_with_messages {
+                        let mut deliveries = active_deliveries.lock().await;
 
-                    let task = tokio::spawn(async move {
-                        match queue_manager_clone
-                            .get_messages_for_delivery(user_id_clone, Some(batch_size))
-                            .await
-                        {
-                            Ok(messages) => {
-                                if !messages.is_empty() {
-                                    let results = deliverer_clone
-                                        .deliver_messages(user_id_clone, &messages)
-                                        .await;
+                        // 检查是否已经有该用户的投递任务在运行
+                        if deliveries.contains_key(&user_id) {
+                            continue;
+                        }
 
-                                    let mut delivered_ids = Vec::new();
-                                    let mut failed_count = 0;
+                        // 检查并发投递限制
+                        if deliveries.len() >= config.max_concurrent_deliveries {
+                            continue;
+                        }
 
-                                    for result in results {
-                                        if result.success {
-                                            delivered_ids.push(result.message_id);
-                                        } else {
-                                            failed_count += 1;
+                        let queue_manager_clone = queue_manager.clone();
+                        let deliverer_clone = message_deliverer.clone();
+                        let user_id_clone = user_id;
+                        let _config_clone = config.clone();
+                        let stats_clone = stats.clone();
+                        let batch_size = config.batch_delivery_size;
+
+                        let task = tokio::spawn(async move {
+                            match queue_manager_clone
+                                .get_messages_for_delivery(user_id_clone, Some(batch_size))
+                                .await
+                            {
+                                Ok(messages) => {
+                                    if !messages.is_empty() {
+                                        let results = deliverer_clone
+                                            .deliver_messages(user_id_clone, &messages)
+                                            .await;
+
+                                        let mut delivered_ids = Vec::new();
+                                        let mut failed_count = 0;
+
+                                        for result in results {
+                                            if result.success {
+                                                delivered_ids.push(result.message_id);
+                                            } else {
+                                                failed_count += 1;
+                                                let _ = queue_manager_clone
+                                                    .mark_failed(user_id_clone, result.message_id)
+                                                    .await;
+                                            }
+                                        }
+
+                                        if !delivered_ids.is_empty() {
                                             let _ = queue_manager_clone
-                                                .mark_failed(user_id_clone, result.message_id)
+                                                .mark_delivered(user_id_clone, &delivered_ids)
                                                 .await;
                                         }
-                                    }
 
-                                    if !delivered_ids.is_empty() {
-                                        let _ = queue_manager_clone
-                                            .mark_delivered(user_id_clone, &delivered_ids)
-                                            .await;
-                                    }
-
-                                    // 更新统计
-                                    {
-                                        let mut stats_guard = stats_clone.lock().await;
-                                        stats_guard.total_delivered += delivered_ids.len() as u64;
-                                        stats_guard.total_failed += failed_count;
-                                        stats_guard.last_delivery_time = Some(Utc::now());
+                                        // 更新统计
+                                        {
+                                            let mut stats_guard = stats_clone.lock().await;
+                                            stats_guard.total_delivered +=
+                                                delivered_ids.len() as u64;
+                                            stats_guard.total_failed += failed_count;
+                                            stats_guard.last_delivery_time = Some(Utc::now());
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to get messages for user {}: {:?}",
+                                        user_id_clone, e
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                error!(
-                                    "Failed to get messages for user {}: {:?}",
-                                    user_id_clone, e
-                                );
-                            }
-                        }
-                    });
+                        });
 
-                    deliveries.insert(user_id, task);
+                        deliveries.insert(user_id, task);
+                    }
+
+                    // 清理已完成的任务
+                    let mut deliveries = active_deliveries.lock().await;
+                    deliveries.retain(|_user_id, handle| !handle.is_finished());
                 }
-
-                // 清理已完成的任务
-                let mut deliveries = active_deliveries.lock().await;
-                deliveries.retain(|_user_id, handle| !handle.is_finished());
-            }
-        });
+            });
         }
     }
 
@@ -426,34 +428,34 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
     async fn start_stats_reporter(&self) {
         #[cfg(not(test))]
         {
-        let _queue_manager = self.queue_manager.clone();
-        let stats = self.stats.clone();
-        let running = self.running.clone();
-        let interval_secs = self.config.stats_report_interval_secs;
+            let _queue_manager = self.queue_manager.clone();
+            let stats = self.stats.clone();
+            let running = self.running.clone();
+            let interval_secs = self.config.stats_report_interval_secs;
 
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(interval_secs));
+            tokio::spawn(async move {
+                let mut interval = interval(Duration::from_secs(interval_secs));
 
-            loop {
-                interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-                {
-                    let running_guard = running.lock().await;
-                    if !*running_guard {
-                        break;
+                    {
+                        let running_guard = running.lock().await;
+                        if !*running_guard {
+                            break;
+                        }
                     }
-                }
 
-                let stats_snapshot = stats.lock().await.clone();
-                info!(
-                    "Scheduler stats: delivered={}, failed={}, active={}, pending_retries={}",
-                    stats_snapshot.total_delivered,
-                    stats_snapshot.total_failed,
-                    stats_snapshot.active_deliveries,
-                    stats_snapshot.pending_retries
-                );
-            }
-        });
+                    let stats_snapshot = stats.lock().await.clone();
+                    info!(
+                        "Scheduler stats: delivered={}, failed={}, active={}, pending_retries={}",
+                        stats_snapshot.total_delivered,
+                        stats_snapshot.total_failed,
+                        stats_snapshot.active_deliveries,
+                        stats_snapshot.pending_retries
+                    );
+                }
+            });
         }
     }
 
@@ -461,35 +463,35 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
     async fn start_retry_loop(&self) {
         #[cfg(not(test))]
         {
-        let _queue_manager = self.queue_manager.clone();
-        let _message_deliverer = self.message_deliverer.clone();
-        let running = self.running.clone();
-        let interval_secs = self.config.retry_check_interval_secs;
+            let _queue_manager = self.queue_manager.clone();
+            let _message_deliverer = self.message_deliverer.clone();
+            let running = self.running.clone();
+            let interval_secs = self.config.retry_check_interval_secs;
 
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(interval_secs));
+            tokio::spawn(async move {
+                let mut interval = interval(Duration::from_secs(interval_secs));
 
-            loop {
-                interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-                {
-                    let running_guard = running.lock().await;
-                    if !*running_guard {
-                        break;
+                    {
+                        let running_guard = running.lock().await;
+                        if !*running_guard {
+                            break;
+                        }
                     }
+
+                    // 这里可以实现重试逻辑
+                    // 例如：查找失败的消息，重新尝试投递
+                    debug!("Checking for messages to retry...");
+
+                    // 示例：获取失败消息并重试
+                    // let failed_messages = queue_manager.get_failed_messages().await;
+                    // for message in failed_messages {
+                    //     // 重试逻辑
+                    // }
                 }
-
-                // 这里可以实现重试逻辑
-                // 例如：查找失败的消息，重新尝试投递
-                debug!("Checking for messages to retry...");
-
-                // 示例：获取失败消息并重试
-                // let failed_messages = queue_manager.get_failed_messages().await;
-                // for message in failed_messages {
-                //     // 重试逻辑
-                // }
-            }
-        });
+            });
         }
     }
 }
@@ -543,7 +545,8 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_basic_operations() {
         let queue_manager = Arc::new(create_memory_queue_manager(None).await.unwrap());
-        let online_status_manager = Arc::new(OnlineStatusManager::new(OnlineStatusConfig::default()));
+        let online_status_manager =
+            Arc::new(OnlineStatusManager::new(OnlineStatusConfig::default()));
         let message_deliverer = Arc::new(DeterministicSuccessDeliverer);
         let config = SchedulerConfig::default();
         let user_id = 1001_u64;
@@ -592,7 +595,8 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_with_failures() {
         let queue_manager = Arc::new(create_memory_queue_manager(None).await.unwrap());
-        let online_status_manager = Arc::new(OnlineStatusManager::new(OnlineStatusConfig::default()));
+        let online_status_manager =
+            Arc::new(OnlineStatusManager::new(OnlineStatusConfig::default()));
         let message_deliverer = Arc::new(DeterministicFlakyDeliverer::default());
         let config = SchedulerConfig::default();
         let user_id = 1001_u64;

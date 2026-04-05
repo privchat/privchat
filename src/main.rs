@@ -156,6 +156,10 @@ compression = true
 port = 9090
 master_key = "your-service-master-key"
 
+[room]
+subscribe_history = true
+subscribe_history_limit = 30
+
 [cache]
 l1_max_memory_mb = 256
 l1_ttl_secs = 3600

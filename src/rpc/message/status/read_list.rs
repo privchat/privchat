@@ -15,10 +15,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::policy::{ensure_read_list_allowed, parse_read_receipt_mode};
+use crate::repository::message_repo::MessageRepository;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
-use crate::repository::message_repo::MessageRepository;
-use super::policy::{ensure_read_list_allowed, parse_read_receipt_mode};
 use serde_json::{json, Value};
 
 /// 处理 查询群消息已读列表 请求

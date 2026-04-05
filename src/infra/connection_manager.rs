@@ -227,7 +227,10 @@ impl ConnectionManager {
 
     /// 获取所有活跃连接
     pub async fn get_all_connections(&self) -> Vec<DeviceConnection> {
-        self.connections.iter().map(|entry| entry.value().clone()).collect()
+        self.connections
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// 检查设备是否在线

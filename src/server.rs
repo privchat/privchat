@@ -121,6 +121,8 @@ pub struct ChatServer {
     offline_worker: Arc<crate::infra::OfflineMessageWorker>,
     /// Room 管理器（用于发布订阅频道管理）
     subscribe_manager: Arc<crate::infra::SubscribeManager>,
+    /// Room 订阅历史（Redis）
+    room_history_service: Arc<crate::service::RoomHistoryService>,
 }
 
 impl ChatServer {
@@ -542,12 +544,11 @@ impl ChatServer {
         );
 
         message_dispatcher.register_handler(
-            MessageType::SubscribeRequest,
-            Box::new(SubscribeMessageHandler::new(subscribe_manager.clone(), channel_service.clone())),
-        );
-        message_dispatcher.register_handler(
             MessageType::DisconnectRequest,
-            Box::new(DisconnectMessageHandler::new(connection_manager.clone(), subscribe_manager.clone())),
+            Box::new(DisconnectMessageHandler::new(
+                connection_manager.clone(),
+                subscribe_manager.clone(),
+            )),
         );
         message_dispatcher.register_handler(
             MessageType::RpcRequest,
@@ -565,8 +566,7 @@ impl ChatServer {
 
         // 创建 Reaction 服务
         info!("🔧 初始化 Reaction 服务...");
-        let reaction_service =
-            Arc::new(crate::service::ReactionService::new(pool.clone()));
+        let reaction_service = Arc::new(crate::service::ReactionService::new(pool.clone()));
         info!("✅ Reaction 服务初始化完成");
 
         // 创建在线状态管理器
@@ -601,6 +601,26 @@ impl ChatServer {
                 .map_err(|e| ServerError::Internal(format!("Redis 客户端初始化失败: {}", e)))?,
         );
         info!("✅ RedisClient 创建完成");
+
+        let room_history_service = Arc::new(crate::service::RoomHistoryService::new(
+            redis_client.clone(),
+            config.room.clone(),
+        ));
+        info!(
+            "✅ RoomHistoryService 创建完成 (subscribe_history={}, subscribe_history_limit={})",
+            config.room.subscribe_history,
+            config.room.subscribe_history_limit
+        );
+
+        message_dispatcher.register_handler(
+            MessageType::SubscribeRequest,
+            Box::new(SubscribeMessageHandler::new(
+                subscribe_manager.clone(),
+                channel_service.clone(),
+                connection_manager.clone(),
+                room_history_service.clone(),
+            )),
+        );
 
         // ✨ 初始化 Push 系统（Phase 2：带 Redis 和设备查询）
         info!("🔧 初始化 Push 系统...");
@@ -813,9 +833,7 @@ impl ChatServer {
                     )))
                 }
                 _ => {
-                    warn!(
-                        "⚠️ Honor Provider 已配置启用但缺少 app_id/access_token，已降级为禁用"
-                    );
+                    warn!("⚠️ Honor Provider 已配置启用但缺少 app_id/access_token，已降级为禁用");
                     None
                 }
             }
@@ -859,9 +877,7 @@ impl ChatServer {
                     )))
                 }
                 _ => {
-                    warn!(
-                        "⚠️ Xiaomi Provider 已配置启用但缺少 app_id/access_token，已降级为禁用"
-                    );
+                    warn!("⚠️ Xiaomi Provider 已配置启用但缺少 app_id/access_token，已降级为禁用");
                     None
                 }
             }
@@ -993,9 +1009,7 @@ impl ChatServer {
                     )))
                 }
                 _ => {
-                    warn!(
-                        "⚠️ Lenovo Provider 已配置启用但缺少 app_id/access_token，已降级为禁用"
-                    );
+                    warn!("⚠️ Lenovo Provider 已配置启用但缺少 app_id/access_token，已降级为禁用");
                     None
                 }
             }
@@ -1083,9 +1097,7 @@ impl ChatServer {
                     )))
                 }
                 _ => {
-                    warn!(
-                        "⚠️ Meizu Provider 已配置启用但缺少 app_id/access_token，已降级为禁用"
-                    );
+                    warn!("⚠️ Meizu Provider 已配置启用但缺少 app_id/access_token，已降级为禁用");
                     None
                 }
             }
@@ -1178,7 +1190,7 @@ impl ChatServer {
             message_repository.clone(),
             connection_manager.clone(), // ✨ 新增
             subscribe_manager.clone(),
-            sync_service.clone(),       // ✨ 新增
+            sync_service.clone(), // ✨ 新增
             auth_session_manager.clone(),
             offline_worker.clone(),
             user_device_repo.clone(), // ✨ Phase 3.5
@@ -1258,6 +1270,7 @@ impl ChatServer {
             redis_client: Some(redis_client.clone()),
             offline_worker: offline_worker.clone(),
             subscribe_manager,
+            room_history_service,
         })
     }
 
@@ -1455,7 +1468,10 @@ impl ChatServer {
                         // 清理频道订阅（防止幽灵 session 堆积）
                         let left_channels = subscribe_manager.on_session_disconnect(&session_id);
                         if !left_channels.is_empty() {
-                            info!("📡 连接关闭: session {} 离开频道 {:?}", session_id, left_channels);
+                            info!(
+                                "📡 连接关闭: session {} 离开频道 {:?}",
+                                session_id, left_channels
+                            );
                         }
 
                         // 清理连接管理 + 消息路由在线状态
@@ -1987,6 +2003,7 @@ impl ChatServer {
             self.connection_manager.clone(),
             self.security_service.clone(),
             self.subscribe_manager.clone(),
+            self.room_history_service.clone(),
             self.config.admin_api_port,
         );
 

@@ -67,7 +67,10 @@ impl MeizuProvider {
 #[async_trait]
 impl PushProvider for MeizuProvider {
     async fn send(&self, task: &PushTask) -> Result<()> {
-        let url = format!("{}/garcia/api/server/push/varnished/pushByPushId", self.endpoint);
+        let url = format!(
+            "{}/garcia/api/server/push/varnished/pushByPushId",
+            self.endpoint
+        );
         let payload = self.build_payload(task);
 
         info!(

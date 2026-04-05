@@ -113,7 +113,9 @@ impl SyncService {
         self.pts_dao
             .bump_pts_to_at_least(commit.channel_id, commit.pts)
             .await?;
-        self.pts_generator.set_pts(commit.channel_id, commit.pts).await;
+        self.pts_generator
+            .set_pts(commit.channel_id, commit.pts)
+            .await;
         self.commit_dao.save_commit(commit).await?;
         self.cache.cache_pts(commit.channel_id, commit.pts).await?;
         self.cache.cache_commit(commit).await?;

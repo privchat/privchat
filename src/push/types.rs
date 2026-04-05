@@ -52,9 +52,7 @@ impl PushVendor {
         match s.to_lowercase().as_str() {
             "apns" => Some(PushVendor::Apns),
             "fcm" => Some(PushVendor::Fcm),
-            "hms" | "huawei" | "huawei_push" | "harmony" | "harmonyos" => {
-                Some(PushVendor::Hms)
-            }
+            "hms" | "huawei" | "huawei_push" | "harmony" | "harmonyos" => Some(PushVendor::Hms),
             "xiaomi" | "mi" | "mipush" | "mi_push" => Some(PushVendor::Xiaomi),
             "oppo" | "heytap" | "heytap_push" => Some(PushVendor::Oppo),
             "vivo" | "vivo_push" => Some(PushVendor::Vivo),

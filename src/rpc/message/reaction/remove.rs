@@ -15,9 +15,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::repository::MessageRepository;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use crate::repository::MessageRepository;
 use privchat_protocol::rpc::message::reaction::MessageReactionRemoveRequest;
 use serde_json::{json, Value};
 
@@ -47,7 +47,12 @@ pub async fn handle(
         .await
     {
         Ok(removed) => {
-            if let Ok(Some(message)) = services.message_repository.as_ref().find_by_id(message_id).await {
+            if let Ok(Some(message)) = services
+                .message_repository
+                .as_ref()
+                .find_by_id(message_id)
+                .await
+            {
                 let channel_id = message.channel_id;
                 let channel_type = services
                     .channel_service

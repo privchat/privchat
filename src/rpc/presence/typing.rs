@@ -45,7 +45,10 @@ pub async fn handle(
     );
 
     // 2.5 限频检查：(user_id, channel_id) 500ms 内只允许 1 次广播
-    if !services.typing_rate_limiter.check_and_update(user_id, req.channel_id) {
+    if !services
+        .typing_rate_limiter
+        .check_and_update(user_id, req.channel_id)
+    {
         tracing::debug!(
             "⏱️ presence/typing: rate limited user {} in channel {} (dropped_total={})",
             user_id,
@@ -92,7 +95,9 @@ pub async fn handle(
         .map_err(|e| RpcError::internal(format!("Encode PublishRequest failed: {}", e)))?;
 
     // 5. 获取该频道的所有订阅者并广播
-    let sessions = services.subscribe_manager.get_channel_sessions(req.channel_id);
+    let sessions = services
+        .subscribe_manager
+        .get_channel_sessions(req.channel_id);
     let sender_session_id = ctx.session_id.clone();
 
     let transport = services.connection_manager.transport_server.read().await;
@@ -105,9 +110,7 @@ pub async fn handle(
             }
 
             let mut packet = msgtrans::packet::Packet::one_way(0u32, payload_bytes.clone());
-            packet.set_biz_type(
-                privchat_protocol::protocol::MessageType::PublishRequest as u8,
-            );
+            packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
 
             // best-effort：发送失败仅记录日志
             match server.send_to_session(sid.clone(), packet).await {

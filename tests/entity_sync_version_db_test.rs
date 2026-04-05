@@ -219,11 +219,13 @@ async fn channel_and_user_channel_sync_versions_advance_on_state_update() {
     )
     .await;
 
-    let _ = sqlx::query("UPDATE privchat_channels SET last_message_at = now_millis() WHERE channel_id = $1")
-        .bind(channel_id)
-        .execute(&pool)
-        .await
-        .expect("update channel");
+    let _ = sqlx::query(
+        "UPDATE privchat_channels SET last_message_at = now_millis() WHERE channel_id = $1",
+    )
+    .bind(channel_id)
+    .execute(&pool)
+    .await
+    .expect("update channel");
     let _ = sqlx::query(
         "UPDATE privchat_user_channels SET is_pinned = true, is_muted = true WHERE user_id = $1 AND channel_id = $2",
     )
@@ -248,7 +250,10 @@ async fn channel_and_user_channel_sync_versions_advance_on_state_update() {
     )
     .await;
 
-    assert!(after_channel > before_channel, "channel sync_version should advance");
+    assert!(
+        after_channel > before_channel,
+        "channel sync_version should advance"
+    );
     assert!(
         after_user_channel > before_user_channel,
         "user_channel sync_version should advance"
@@ -262,7 +267,9 @@ async fn channel_and_user_channel_sync_versions_advance_on_state_update() {
 #[tokio::test]
 async fn friend_and_group_sync_versions_advance_on_update() {
     let Some(pool) = open_test_pool().await else {
-        eprintln!("skip friend_and_group_sync_versions_advance_on_update: DATABASE_URL not configured");
+        eprintln!(
+            "skip friend_and_group_sync_versions_advance_on_update: DATABASE_URL not configured"
+        );
         return;
     };
     let user_a = 9_910_003_i64;
@@ -323,8 +330,14 @@ async fn friend_and_group_sync_versions_advance_on_update() {
     )
     .await;
 
-    assert!(after_friend > before_friend, "friend sync_version should advance");
-    assert!(after_group > before_group, "group sync_version should advance");
+    assert!(
+        after_friend > before_friend,
+        "friend sync_version should advance"
+    );
+    assert!(
+        after_group > before_group,
+        "group sync_version should advance"
+    );
 
     cleanup_group(&pool, group_id).await;
     cleanup_user(&pool, user_a).await;
@@ -334,7 +347,9 @@ async fn friend_and_group_sync_versions_advance_on_update() {
 #[tokio::test]
 async fn group_member_sync_version_advances_on_soft_delete() {
     let Some(pool) = open_test_pool().await else {
-        eprintln!("skip group_member_sync_version_advances_on_soft_delete: DATABASE_URL not configured");
+        eprintln!(
+            "skip group_member_sync_version_advances_on_soft_delete: DATABASE_URL not configured"
+        );
         return;
     };
     let owner_id = 9_910_005_i64;
@@ -379,7 +394,10 @@ async fn group_member_sync_version_advances_on_soft_delete() {
     let left_at = row.get::<Option<i64>, _>("left_at");
 
     assert!(after > before, "group_member sync_version should advance");
-    assert!(left_at.is_some(), "group_member tombstone should set left_at");
+    assert!(
+        left_at.is_some(),
+        "group_member tombstone should set left_at"
+    );
 
     cleanup_group(&pool, group_id).await;
     cleanup_user(&pool, owner_id).await;

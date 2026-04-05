@@ -954,8 +954,7 @@ impl MessageRepository for PgMessageRepository {
         bind_count += 1;
         sql.push_str(&format!(" OFFSET ${}", bind_count));
 
-        let mut query_builder = sqlx::query(&sql)
-            .bind(&keyword_pattern);
+        let mut query_builder = sqlx::query(&sql).bind(&keyword_pattern);
 
         if let Some(ch_id) = channel_id {
             query_builder = query_builder.bind(ch_id as i64);
@@ -980,28 +979,30 @@ impl MessageRepository for PgMessageRepository {
             .await
             .map_err(|e| DatabaseError::Database(format!("搜索消息失败: {}", e)))?;
 
-        let messages: Vec<serde_json::Value> = rows.iter().map(|row| {
-            let message_id: i64 = row.get("message_id");
-            let channel_id: i64 = row.get("channel_id");
-            let sender_id: i64 = row.get("sender_id");
-            let content: String = row.get("content");
-            let message_type: i32 = row.get("message_type");
-            let created_at: i64 = row.get("created_at");
+        let messages: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                let message_id: i64 = row.get("message_id");
+                let channel_id: i64 = row.get("channel_id");
+                let sender_id: i64 = row.get("sender_id");
+                let content: String = row.get("content");
+                let message_type: i32 = row.get("message_type");
+                let created_at: i64 = row.get("created_at");
 
-            serde_json::json!({
-                "message_id": message_id,
-                "channel_id": channel_id,
-                "sender_id": sender_id,
-                "content": content,
-                "message_type": message_type,
-                "created_at": created_at,
+                serde_json::json!({
+                    "message_id": message_id,
+                    "channel_id": channel_id,
+                    "sender_id": sender_id,
+                    "content": content,
+                    "message_type": message_type,
+                    "created_at": created_at,
+                })
             })
-        }).collect();
+            .collect();
 
         // 统计总数
-        let mut count_sql = String::from(
-            "SELECT COUNT(*) FROM privchat_messages WHERE 1=1 AND content ILIKE $1"
-        );
+        let mut count_sql =
+            String::from("SELECT COUNT(*) FROM privchat_messages WHERE 1=1 AND content ILIKE $1");
         bind_count = 1;
 
         if channel_id.is_some() {
@@ -1025,8 +1026,7 @@ impl MessageRepository for PgMessageRepository {
             count_sql.push_str(&format!(" AND created_at <= ${}", bind_count));
         }
 
-        let mut count_query = sqlx::query(&count_sql)
-            .bind(&keyword_pattern);
+        let mut count_query = sqlx::query(&count_sql).bind(&keyword_pattern);
 
         if let Some(ch_id) = channel_id {
             count_query = count_query.bind(ch_id as i64);

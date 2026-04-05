@@ -58,14 +58,21 @@ impl SubscribeManager {
             if channels.len() >= MAX_SUBSCRIPTIONS_PER_SESSION {
                 info!(
                     "Session {} reached subscription limit ({}/{}), rejecting channel {}",
-                    session_id, channels.len(), MAX_SUBSCRIPTIONS_PER_SESSION, channel_id
+                    session_id,
+                    channels.len(),
+                    MAX_SUBSCRIPTIONS_PER_SESSION,
+                    channel_id
                 );
                 return Err("too many subscriptions");
             }
         }
 
         // 检查频道在线人数限制
-        let current_count = self.channel_routes.get(&channel_id).map(|s| s.len()).unwrap_or(0);
+        let current_count = self
+            .channel_routes
+            .get(&channel_id)
+            .map(|s| s.len())
+            .unwrap_or(0);
         if current_count >= MAX_CHANNEL_SUBSCRIBERS_ONLINE {
             info!(
                 "Channel {} is full ({}/{}), rejecting session {}",
@@ -109,7 +116,10 @@ impl SubscribeManager {
         // 从 channel_routes 中移除
         if removed {
             self.unsubscribe_from_channel(session_id, channel_id);
-            info!("Session {} unsubscribed from channel {}", session_id, channel_id);
+            info!(
+                "Session {} unsubscribed from channel {}",
+                session_id, channel_id
+            );
         }
 
         removed
@@ -128,7 +138,9 @@ impl SubscribeManager {
 
     /// 连接断开时清理所有订阅
     pub fn on_session_disconnect(&self, session_id: &SessionId) -> Vec<u64> {
-        let channels = self.session_channels.remove(session_id)
+        let channels = self
+            .session_channels
+            .remove(session_id)
             .map(|(_, channels)| channels)
             .unwrap_or_default();
 
@@ -138,7 +150,10 @@ impl SubscribeManager {
 
         let result: Vec<u64> = channels.into_iter().collect();
         if !result.is_empty() {
-            info!("Session {} disconnected, left channels {:?}", session_id, result);
+            info!(
+                "Session {} disconnected, left channels {:?}",
+                session_id, result
+            );
         }
         result
     }
@@ -161,7 +176,10 @@ impl SubscribeManager {
 
     /// 获取频道在线人数
     pub fn get_channel_online_count(&self, channel_id: u64) -> usize {
-        self.channel_routes.get(&channel_id).map(|s| s.len()).unwrap_or(0)
+        self.channel_routes
+            .get(&channel_id)
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     /// 获取所有频道数

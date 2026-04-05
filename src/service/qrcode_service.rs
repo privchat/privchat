@@ -432,9 +432,7 @@ mod tests {
         assert_eq!(resolved.target_id, "group_123");
 
         // 使用错误的 token 应该失败
-        let result = service
-            .resolve(&record.qr_key, 1003, Some("wrong"))
-            .await;
+        let result = service.resolve(&record.qr_key, 1003, Some("wrong")).await;
         assert!(result.is_err());
     }
 
@@ -492,10 +490,7 @@ mod tests {
             .unwrap();
 
         // 第一次解析成功
-        let _ = service
-            .resolve(&record.qr_key, 1001, None)
-            .await
-            .unwrap();
+        let _ = service.resolve(&record.qr_key, 1001, None).await.unwrap();
 
         // 第二次解析应该失败（已达使用上限）
         let result = service.resolve(&record.qr_key, 1001, None).await;

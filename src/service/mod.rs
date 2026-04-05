@@ -61,6 +61,8 @@ pub mod message_dedup_service;
 pub mod reaction_service;
 // 新增 @提及服务
 pub mod mention_service;
+// Room 订阅历史服务（Redis）
+pub mod room_history_service;
 
 pub use admin_service::AdminService;
 pub use approval_service::{ApprovalService, JoinMethod, JoinRequest, JoinRequestStatus};
@@ -89,6 +91,7 @@ pub use qrcode_service::QRCodeService;
 pub use reaction_service::{Reaction, ReactionService, ReactionStats};
 pub use read_receipt_service::{GroupReadStats, ReadReceipt, ReadReceiptService};
 pub use read_state_service::{ChannelReadCursorRow, ReadPtsUpdateResult, ReadStateService};
+pub use room_history_service::RoomHistoryService;
 pub use sticker_service::{Sticker, StickerPackage, StickerService};
 pub use unread_count_service::UnreadCountService;
 pub use upload_token_service::{UploadToken, UploadTokenService};

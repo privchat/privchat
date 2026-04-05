@@ -69,7 +69,10 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/api/admin/room", post(create_room_channel))
         .route("/api/admin/room", get(list_room_channels))
         .route("/api/admin/room/{channel_id}", get(get_room_channel))
-        .route("/api/admin/room/{channel_id}/broadcast", post(room_broadcast))
+        .route(
+            "/api/admin/room/{channel_id}/broadcast",
+            post(room_broadcast),
+        )
         // 好友管理
         .route("/api/admin/friendships", post(create_friendship)) // 创建好友关系
         .route("/api/admin/friendships", get(list_friendships))
@@ -88,19 +91,10 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/api/admin/messages", get(list_messages))
         .route("/api/admin/messages/{message_id}", get(get_message))
         // === P0: 用户封禁/解封 ===
-        .route(
-            "/api/admin/users/{user_id}/suspend",
-            post(suspend_user),
-        )
-        .route(
-            "/api/admin/users/{user_id}/unsuspend",
-            post(unsuspend_user),
-        )
+        .route("/api/admin/users/{user_id}/suspend", post(suspend_user))
+        .route("/api/admin/users/{user_id}/unsuspend", post(unsuspend_user))
         // === P0: 设备强制踢出 ===
-        .route(
-            "/api/admin/devices/{device_id}/revoke",
-            post(revoke_device),
-        )
+        .route("/api/admin/devices/{device_id}/revoke", post(revoke_device))
         .route(
             "/api/admin/users/{user_id}/revoke-all-devices",
             post(revoke_all_user_devices),
@@ -119,16 +113,10 @@ pub fn create_route() -> Router<AdminServerState> {
             "/api/admin/messages/{message_id}/revoke",
             post(revoke_message),
         )
-        .route(
-            "/api/admin/messages/send-system",
-            post(send_system_message),
-        )
+        .route("/api/admin/messages/send-system", post(send_system_message))
         .route("/api/admin/messages/send", post(send_message))
         // === P0: 安全管控 ===
-        .route(
-            "/api/admin/security/shadow-banned",
-            get(list_shadow_banned),
-        )
+        .route("/api/admin/security/shadow-banned", get(list_shadow_banned))
         .route(
             "/api/admin/security/shadow-ban/{user_id}",
             delete(unshadow_ban_user),
@@ -142,53 +130,29 @@ pub fn create_route() -> Router<AdminServerState> {
             post(reset_user_security_state),
         )
         // === P0: 在线状态 ===
-        .route(
-            "/api/admin/presence/online-count",
-            get(get_online_count),
-        )
-        .route(
-            "/api/admin/presence/users",
-            get(list_online_users),
-        )
+        .route("/api/admin/presence/online-count", get(get_online_count))
+        .route("/api/admin/presence/users", get(list_online_users))
         .route(
             "/api/admin/presence/user/{user_id}",
             get(get_user_connection),
         )
         // === P1: 用户资源 ===
-        .route(
-            "/api/admin/users/{user_id}/friends",
-            get(get_user_friends),
-        )
-        .route(
-            "/api/admin/users/{user_id}/devices",
-            get(get_user_devices),
-        )
-        .route(
-            "/api/admin/users/{user_id}/groups",
-            get(get_user_groups),
-        )
+        .route("/api/admin/users/{user_id}/friends", get(get_user_friends))
+        .route("/api/admin/users/{user_id}/devices", get(get_user_devices))
+        .route("/api/admin/users/{user_id}/groups", get(get_user_groups))
         // === P1: 会话管理 ===
         .route(
             "/api/admin/users/{user_id}/channels",
             get(list_user_channels),
         )
-        .route(
-            "/api/admin/channels/{channel_id}",
-            get(get_channel),
-        )
+        .route("/api/admin/channels/{channel_id}", get(get_channel))
         .route(
             "/api/admin/channels/{channel_id}/participants",
             get(list_channel_participants),
         )
         // === P1: 消息广播与搜索 ===
-        .route(
-            "/api/admin/messages/broadcast",
-            post(broadcast_message),
-        )
-        .route(
-            "/api/admin/messages/search",
-            get(search_messages),
-        )
+        .route("/api/admin/messages/broadcast", post(broadcast_message))
+        .route("/api/admin/messages/search", get(search_messages))
         // === P0: 系统运维 ===
         .route("/api/admin/system/health", get(health_check))
 }
@@ -214,7 +178,11 @@ async fn verify_service_key(headers: &HeaderMap, state: &AdminServerState) -> Re
 
     // 验证 service key
     if !state.service_key_manager.verify(&service_key).await {
-        warn!("❌ 无效的 service key: {}, 期望: {}", service_key, state.service_key_manager.display_expected().await);
+        warn!(
+            "❌ 无效的 service key: {}, 期望: {}",
+            service_key,
+            state.service_key_manager.display_expected().await
+        );
         return Err(ServerError::Unauthorized("无效的 service key".to_string()));
     }
 
@@ -762,9 +730,14 @@ async fn create_room_channel(
     verify_service_key(&headers, &state).await?;
 
     let channel_id = next_channel_id();
-    let name = payload.name.unwrap_or_else(|| format!("Room-{}", channel_id));
+    let name = payload
+        .name
+        .unwrap_or_else(|| format!("Room-{}", channel_id));
 
-    info!("📡 Admin: 创建 Room 频道 channel_id={}, name={}", channel_id, name);
+    info!(
+        "📡 Admin: 创建 Room 频道 channel_id={}, name={}",
+        channel_id, name
+    );
 
     Ok(Json(json!({
         "success": true,
@@ -854,22 +827,6 @@ async fn room_broadcast(
     let sessions = state.subscribe_manager.get_channel_sessions(channel_id);
     let online_count = sessions.len();
 
-    if sessions.is_empty() {
-        debug!("📡 Room broadcast 跳过: channel_id={}, 无在线订阅者", channel_id);
-        return Ok(Json(json!({
-            "success": true,
-            "channel_id": channel_id,
-            "online_count": 0,
-            "delivered": 0,
-            "message": "频道内无在线订阅者"
-        })));
-    }
-
-    let transport = state.connection_manager.transport_server.read().await;
-    let Some(server) = transport.as_ref() else {
-        return Err(ServerError::Internal("TransportServer 未就绪".to_string()));
-    };
-
     let message_content = payload.content.clone();
     let publisher = payload.sender_id.map(|id| id.to_string());
     let server_msg_id = crate::infra::next_message_id();
@@ -887,6 +844,37 @@ async fn room_broadcast(
         server_message_id: Some(server_msg_id),
     };
 
+    if let Err(e) = state
+        .room_history_service
+        .append_history(channel_id, &publish_request)
+        .await
+    {
+        warn!(
+            "⚠️ Room history append 失败 channel_id={}, server_msg_id={}, error={}",
+            channel_id, server_msg_id, e
+        );
+    }
+
+    if sessions.is_empty() {
+        debug!(
+            "📡 Room broadcast: channel_id={}, 无在线订阅者，仅写入历史",
+            channel_id
+        );
+        return Ok(Json(json!({
+            "success": true,
+            "channel_id": channel_id,
+            "online_count": 0,
+            "delivered": 0,
+            "server_message_id": server_msg_id,
+            "message": "频道内无在线订阅者"
+        })));
+    }
+
+    let transport = state.connection_manager.transport_server.read().await;
+    let Some(server) = transport.as_ref() else {
+        return Err(ServerError::Internal("TransportServer 未就绪".to_string()));
+    };
+
     let payload_bytes = privchat_protocol::encode_message(&publish_request)
         .map_err(|e| ServerError::Protocol(format!("编码消息失败: {}", e)))?;
 
@@ -899,9 +887,7 @@ async fn room_broadcast(
         let bytes = payload_bytes.clone();
         handles.push(tokio::spawn(async move {
             let mut packet = msgtrans::packet::Packet::one_way(0u32, (*bytes).clone());
-            packet.set_biz_type(
-                privchat_protocol::protocol::MessageType::PublishRequest as u8,
-            );
+            packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
             // 每个 session 发送超时 500ms，避免慢连接阻塞整个广播
             match tokio::time::timeout(
                 std::time::Duration::from_millis(500),
@@ -1794,7 +1780,12 @@ async fn send_system_message(
 
     let (message_id, created_at) = state
         .message_repository
-        .send_system_message_admin(request.channel_id, &request.content, message_type, &metadata)
+        .send_system_message_admin(
+            request.channel_id,
+            &request.content,
+            message_type,
+            &metadata,
+        )
         .await
         .map_err(|e| ServerError::Database(format!("发送系统消息失败: {}", e)))?;
 
@@ -1824,12 +1815,14 @@ async fn list_shadow_banned(
 
     let users: Vec<dto::ShadowBannedItem> = banned
         .into_iter()
-        .map(|(user_id, device_id, state, trust_score)| dto::ShadowBannedItem {
-            user_id,
-            device_id,
-            state: format!("{:?}", state),
-            trust_score,
-        })
+        .map(
+            |(user_id, device_id, state, trust_score)| dto::ShadowBannedItem {
+                user_id,
+                device_id,
+                state: format!("{:?}", state),
+                trust_score,
+            },
+        )
         .collect();
 
     let total = users.len();
@@ -1891,13 +1884,15 @@ async fn get_user_security_state(
 
     let devices_dto: Vec<dto::DeviceSecurityState> = device_states
         .into_iter()
-        .map(|(device_id, client_state, trust_score)| dto::DeviceSecurityState {
-            device_id,
-            state: client_state
-                .map(|s| format!("{:?}", s))
-                .unwrap_or_else(|| "Unknown".to_string()),
-            trust_score,
-        })
+        .map(
+            |(device_id, client_state, trust_score)| dto::DeviceSecurityState {
+                device_id,
+                state: client_state
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                trust_score,
+            },
+        )
         .collect();
 
     Ok(Json(dto::UserSecurityStateResponse {
@@ -2103,7 +2098,7 @@ async fn list_online_users(
         .collect();
 
     Ok(Json(dto::ListOnlineUsersResponse {
-        users: vec![],  // TODO: 聚合用户信息
+        users: vec![], // TODO: 聚合用户信息
         total: total_online,
         page,
         page_size,
@@ -2120,12 +2115,14 @@ async fn get_user_connection(
 ) -> Result<Json<dto::UserConnectionResponse>> {
     verify_service_key(&headers, &state).await?;
 
-    let connections = state
-        .connection_manager
-        .get_user_connections(user_id)
-        .await;
+    let connections = state.connection_manager.get_user_connections(user_id).await;
 
-    let user_info = state.user_repository.find_by_id(user_id).await.ok().flatten();
+    let user_info = state
+        .user_repository
+        .find_by_id(user_id)
+        .await
+        .ok()
+        .flatten();
 
     Ok(Json(dto::UserConnectionResponse {
         user_id,
@@ -2173,17 +2170,37 @@ async fn list_user_channels(
         .await
         .map_err(|e| ServerError::Database(format!("获取用户会话列表失败: {}", e)))?;
 
-    let channels: Vec<dto::ChannelItem> = result.0.into_iter().map(|v| {
-        dto::ChannelItem {
-            channel_id: v.get("channel_id").and_then(|v: &serde_json::Value| v.as_u64()).unwrap_or(0),
-            channel_type: v.get("channel_type").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0) as i16,
-            name: v.get("name").and_then(|v: &serde_json::Value| v.as_str()).map(|s| s.to_string()),
-            avatar_url: v.get("avatar_url").and_then(|v: &serde_json::Value| v.as_str()).map(|s| s.to_string()),
-            member_count: v.get("member_count").and_then(|v: &serde_json::Value| v.as_u64()).map(|n| n as i32),
+    let channels: Vec<dto::ChannelItem> = result
+        .0
+        .into_iter()
+        .map(|v| dto::ChannelItem {
+            channel_id: v
+                .get("channel_id")
+                .and_then(|v: &serde_json::Value| v.as_u64())
+                .unwrap_or(0),
+            channel_type: v
+                .get("channel_type")
+                .and_then(|v: &serde_json::Value| v.as_i64())
+                .unwrap_or(0) as i16,
+            name: v
+                .get("name")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .map(|s| s.to_string()),
+            avatar_url: v
+                .get("avatar_url")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .map(|s| s.to_string()),
+            member_count: v
+                .get("member_count")
+                .and_then(|v: &serde_json::Value| v.as_u64())
+                .map(|n| n as i32),
             last_message: None,
-            created_at: v.get("created_at").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
-        }
-    }).collect();
+            created_at: v
+                .get("created_at")
+                .and_then(|v: &serde_json::Value| v.as_i64())
+                .unwrap_or(0),
+        })
+        .collect();
 
     Ok(Json(dto::ListChannelsResponse {
         channels,
@@ -2257,12 +2274,12 @@ async fn broadcast_message(
     let target_scope = request.target_scope.unwrap_or_else(|| "all".to_string());
     let message_type = request.message_type.unwrap_or(5);
 
-    let online_count = state
-        .connection_manager
-        .get_connection_count()
-        .await;
+    let online_count = state.connection_manager.get_connection_count().await;
 
-    info!("开始全局广播, target_scope={}, online={}", target_scope, online_count);
+    info!(
+        "开始全局广播, target_scope={}, online={}",
+        target_scope, online_count
+    );
 
     Ok(Json(dto::BroadcastResponse {
         success: true,
@@ -2308,16 +2325,37 @@ async fn search_messages(
         .await
         .map_err(|e| ServerError::Database(format!("搜索消息失败: {}", e)))?;
 
-    let messages: Vec<dto::SearchMessageItem> = result.0.into_iter().map(|v| {
-        dto::SearchMessageItem {
-            message_id: v.get("message_id").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
-            channel_id: v.get("channel_id").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
-            sender_id: v.get("sender_id").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
-            content: v.get("content").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string(),
-            message_type: v.get("message_type").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0) as i16,
-            created_at: v.get("created_at").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0),
-        }
-    }).collect();
+    let messages: Vec<dto::SearchMessageItem> = result
+        .0
+        .into_iter()
+        .map(|v| dto::SearchMessageItem {
+            message_id: v
+                .get("message_id")
+                .and_then(|v: &serde_json::Value| v.as_i64())
+                .unwrap_or(0),
+            channel_id: v
+                .get("channel_id")
+                .and_then(|v: &serde_json::Value| v.as_i64())
+                .unwrap_or(0),
+            sender_id: v
+                .get("sender_id")
+                .and_then(|v: &serde_json::Value| v.as_i64())
+                .unwrap_or(0),
+            content: v
+                .get("content")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            message_type: v
+                .get("message_type")
+                .and_then(|v: &serde_json::Value| v.as_i64())
+                .unwrap_or(0) as i16,
+            created_at: v
+                .get("created_at")
+                .and_then(|v: &serde_json::Value| v.as_i64())
+                .unwrap_or(0),
+        })
+        .collect();
 
     Ok(Json(dto::SearchMessagesResponse {
         messages,

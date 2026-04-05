@@ -23,10 +23,10 @@ use crate::handler::MessageHandler;
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::model::user::DeviceInfo;
 use crate::repository::MessageRepository;
+use crate::service::sync::get_global_sync_service;
 use crate::service::{
     ChannelService, NotificationService, OfflineQueueService, UnreadCountService,
 };
-use crate::service::sync::get_global_sync_service;
 use crate::session::SessionManager;
 use crate::Result;
 use async_trait::async_trait;

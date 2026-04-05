@@ -294,7 +294,8 @@ impl ChannelService {
     }
 
     pub async fn clear_user_channel_unread(&self, user_id: u64, channel_id: u64) -> Result<()> {
-        self.ensure_user_channel_rows(channel_id, &[user_id]).await?;
+        self.ensure_user_channel_rows(channel_id, &[user_id])
+            .await?;
 
         sqlx::query(
             r#"
@@ -656,10 +657,7 @@ impl ChannelService {
     }
 
     /// 获取会话详情（管理 API）
-    pub async fn get_channel_admin(
-        &self,
-        channel_id: u64,
-    ) -> Result<Option<serde_json::Value>> {
+    pub async fn get_channel_admin(&self, channel_id: u64) -> Result<Option<serde_json::Value>> {
         let channel = sqlx::query!(
             r#"
             SELECT
@@ -754,13 +752,12 @@ impl ChannelService {
             .collect();
 
         // 统计总数
-        let count_row = sqlx::query(
-            "SELECT COUNT(*) as count FROM privchat_group_members WHERE group_id = $1"
-        )
-        .bind(channel_id as i64)
-        .fetch_one(self.pool())
-        .await
-        .map_err(|e| ServerError::Database(format!("统计参与者数失败: {}", e)))?;
+        let count_row =
+            sqlx::query("SELECT COUNT(*) as count FROM privchat_group_members WHERE group_id = $1")
+                .bind(channel_id as i64)
+                .fetch_one(self.pool())
+                .await
+                .map_err(|e| ServerError::Database(format!("统计参与者数失败: {}", e)))?;
 
         let total: i64 = count_row.get("count");
 
@@ -1584,7 +1581,8 @@ impl ChannelService {
         drop(channels);
 
         let member_ids: Vec<u64> = channel.members.keys().cloned().collect();
-        self.ensure_user_channel_rows(channel_id, &member_ids).await?;
+        self.ensure_user_channel_rows(channel_id, &member_ids)
+            .await?;
 
         // 更新用户会话索引
         let mut user_channels = self.user_channels.write().await;
@@ -1947,9 +1945,7 @@ impl ChannelService {
                         (Some(left), Some(right)) if right == user_id => Some(left),
                         _ => None,
                     };
-                    peer_id
-                        .map(|uid| uid.to_string())
-                        .unwrap_or_default()
+                    peer_id.map(|uid| uid.to_string()).unwrap_or_default()
                 } else {
                     row.group_name.clone().unwrap_or_default()
                 };
@@ -2099,7 +2095,8 @@ impl ChannelService {
         .map_err(|e| ServerError::Database(format!("查询群成员同步分页失败: {}", e)))?;
 
         let (page_rows, has_more) = take_sync_page(rows, page_limit as usize);
-        let next_version = next_version_from_page(&page_rows, since_v, |row| row.sync_version as u64);
+        let next_version =
+            next_version_from_page(&page_rows, since_v, |row| row.sync_version as u64);
 
         let items: Vec<SyncEntityItem> = page_rows
             .into_iter()
@@ -2116,7 +2113,9 @@ impl ChannelService {
                             role: Some(i32::from(row.role)),
                             status: Some(0),
                             alias: row.nickname,
-                            is_muted: Some(row.mute_until.unwrap_or(0) > chrono::Utc::now().timestamp_millis()),
+                            is_muted: Some(
+                                row.mute_until.unwrap_or(0) > chrono::Utc::now().timestamp_millis(),
+                            ),
                             joined_at: Some(row.joined_at),
                             updated_at: Some(row.updated_at),
                             version: Some(row.sync_version),
@@ -2166,7 +2165,8 @@ impl ChannelService {
                 Ok(_) => {
                     drop(channels);
 
-                    self.ensure_user_channel_rows(channel_id, &[user_id]).await?;
+                    self.ensure_user_channel_rows(channel_id, &[user_id])
+                        .await?;
 
                     // 更新用户会话索引
                     let mut user_channels = self.user_channels.write().await;
@@ -2394,7 +2394,7 @@ impl ChannelService {
             match conv.channel_type {
                 ChannelType::Direct => direct_channels += 1,
                 ChannelType::Group => group_channels += 1,
-                ChannelType::Room => {},
+                ChannelType::Room => {}
             }
 
             total_members += conv.members.len();
@@ -3368,10 +3368,7 @@ mod tests {
             max_members: None,
         };
 
-        let response = service
-            .create_channel(creator_id, request)
-            .await
-            .unwrap();
+        let response = service.create_channel(creator_id, request).await.unwrap();
         assert!(response.success);
         assert_eq!(response.channel.channel_type, ChannelType::Direct);
         assert_eq!(response.channel.members.len(), 2);
@@ -3395,10 +3392,7 @@ mod tests {
             max_members: Some(10),
         };
 
-        let response = service
-            .create_channel(creator_id, request)
-            .await
-            .unwrap();
+        let response = service.create_channel(creator_id, request).await.unwrap();
         assert!(response.success);
         assert_eq!(response.channel.channel_type, ChannelType::Group);
         assert_eq!(response.channel.members.len(), 3); // creator + 2 members
@@ -3423,10 +3417,7 @@ mod tests {
             max_members: None,
         };
 
-        let response = service
-            .create_channel(creator_id, request)
-            .await
-            .unwrap();
+        let response = service.create_channel(creator_id, request).await.unwrap();
         assert!(response.success);
 
         let conv_id = response.channel.id.clone();
@@ -3456,10 +3447,7 @@ mod tests {
             max_members: None,
         };
 
-        let response = service
-            .create_channel(creator_id, request)
-            .await
-            .unwrap();
+        let response = service.create_channel(creator_id, request).await.unwrap();
         let conv_id = response.channel.id;
 
         // 加入会话

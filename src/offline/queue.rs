@@ -22,9 +22,9 @@ use std::sync::Arc;
 #[cfg(not(test))]
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
 #[cfg(not(test))]
 use tracing::error;
+use tracing::{debug, info};
 
 use super::message::{DeliveryStatus, MessagePriority, OfflineMessage};
 use super::storage::{MemoryStorage, StorageBackend};
@@ -585,38 +585,38 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
     async fn start_persistence_task(&self) {
         #[cfg(not(test))]
         {
-        let storage = self.storage.clone();
-        let queues = self.user_queues.clone();
-        let running = self.running.clone();
-        let interval = self.config.persistence_interval_secs;
+            let storage = self.storage.clone();
+            let queues = self.user_queues.clone();
+            let running = self.running.clone();
+            let interval = self.config.persistence_interval_secs;
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval));
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(interval));
 
-            loop {
-                interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-                {
-                    let running = running.lock().await;
-                    if !*running {
-                        break;
+                    {
+                        let running = running.lock().await;
+                        if !*running {
+                            break;
+                        }
                     }
-                }
 
-                // 持久化消息
-                let queues = queues.read().await;
-                for (user_id, queue) in queues.iter() {
-                    for message in &queue.messages {
-                        if let Err(e) = storage.store_message(message).await {
-                            error!(
-                                "Failed to persist message {} for user {}: {}",
-                                message.message_id, user_id, e
-                            );
+                    // 持久化消息
+                    let queues = queues.read().await;
+                    for (user_id, queue) in queues.iter() {
+                        for message in &queue.messages {
+                            if let Err(e) = storage.store_message(message).await {
+                                error!(
+                                    "Failed to persist message {} for user {}: {}",
+                                    message.message_id, user_id, e
+                                );
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
         }
     }
 
@@ -624,52 +624,52 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
     async fn start_cleanup_task(&self) {
         #[cfg(not(test))]
         {
-        let queues = self.user_queues.clone();
-        let storage = self.storage.clone();
-        let running = self.running.clone();
-        let enable_persistence = self.config.enable_persistence;
+            let queues = self.user_queues.clone();
+            let storage = self.storage.clone();
+            let running = self.running.clone();
+            let enable_persistence = self.config.enable_persistence;
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5分钟清理一次
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5分钟清理一次
 
-            loop {
-                interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-                {
-                    let running = running.lock().await;
-                    if !*running {
-                        break;
-                    }
-                }
-
-                // 清理过期消息
-                let mut total_cleaned = 0;
-                {
-                    let mut queues = queues.write().await;
-                    for (user_id, queue) in queues.iter_mut() {
-                        let cleaned = queue.cleanup_expired();
-                        if cleaned > 0 {
-                            total_cleaned += cleaned;
-                            debug!("Cleaned {} expired messages for user {}", cleaned, user_id);
+                    {
+                        let running = running.lock().await;
+                        if !*running {
+                            break;
                         }
                     }
 
-                    // 移除空队列
-                    queues.retain(|_, queue| !queue.messages.is_empty());
-                }
+                    // 清理过期消息
+                    let mut total_cleaned = 0;
+                    {
+                        let mut queues = queues.write().await;
+                        for (user_id, queue) in queues.iter_mut() {
+                            let cleaned = queue.cleanup_expired();
+                            if cleaned > 0 {
+                                total_cleaned += cleaned;
+                                debug!("Cleaned {} expired messages for user {}", cleaned, user_id);
+                            }
+                        }
 
-                // 清理存储中的过期消息
-                if enable_persistence && total_cleaned > 0 {
-                    if let Err(e) = storage.cleanup_expired_messages().await {
-                        error!("Failed to cleanup expired messages from storage: {}", e);
+                        // 移除空队列
+                        queues.retain(|_, queue| !queue.messages.is_empty());
+                    }
+
+                    // 清理存储中的过期消息
+                    if enable_persistence && total_cleaned > 0 {
+                        if let Err(e) = storage.cleanup_expired_messages().await {
+                            error!("Failed to cleanup expired messages from storage: {}", e);
+                        }
+                    }
+
+                    if total_cleaned > 0 {
+                        info!("Cleaned up {} expired messages", total_cleaned);
                     }
                 }
-
-                if total_cleaned > 0 {
-                    info!("Cleaned up {} expired messages", total_cleaned);
-                }
-            }
-        });
+            });
         }
     }
 
@@ -677,47 +677,47 @@ impl<S: StorageBackend + 'static> OfflineQueueManager<S> {
     async fn start_delivery_retry_task(&self) {
         #[cfg(not(test))]
         {
-        let queues = self.user_queues.clone();
-        let running = self.running.clone();
-        let interval = self.config.delivery_retry_interval_secs;
+            let queues = self.user_queues.clone();
+            let running = self.running.clone();
+            let interval = self.config.delivery_retry_interval_secs;
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval));
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(interval));
 
-            loop {
-                interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-                {
-                    let running = running.lock().await;
-                    if !*running {
-                        break;
-                    }
-                }
-
-                // 重试失败的消息
-                let mut queues = queues.write().await;
-                for (user_id, queue) in queues.iter_mut() {
-                    // 将失败的消息重新设置为待投递状态
-                    let mut messages: Vec<_> = queue.messages.drain().collect();
-                    for message in &mut messages {
-                        if message.status == DeliveryStatus::Failed && message.can_retry() {
-                            if message
-                                .next_retry_at
-                                .map_or(true, |retry_at| chrono::Utc::now() >= retry_at)
-                            {
-                                message.status = DeliveryStatus::Pending;
-                                debug!(
-                                    "Retrying message {} for user {}",
-                                    message.message_id, user_id
-                                );
-                            }
+                    {
+                        let running = running.lock().await;
+                        if !*running {
+                            break;
                         }
                     }
-                    queue.messages = messages.into_iter().collect();
-                    queue.rebuild_message_map();
+
+                    // 重试失败的消息
+                    let mut queues = queues.write().await;
+                    for (user_id, queue) in queues.iter_mut() {
+                        // 将失败的消息重新设置为待投递状态
+                        let mut messages: Vec<_> = queue.messages.drain().collect();
+                        for message in &mut messages {
+                            if message.status == DeliveryStatus::Failed && message.can_retry() {
+                                if message
+                                    .next_retry_at
+                                    .map_or(true, |retry_at| chrono::Utc::now() >= retry_at)
+                                {
+                                    message.status = DeliveryStatus::Pending;
+                                    debug!(
+                                        "Retrying message {} for user {}",
+                                        message.message_id, user_id
+                                    );
+                                }
+                            }
+                        }
+                        queue.messages = messages.into_iter().collect();
+                        queue.rebuild_message_map();
+                    }
                 }
-            }
-        });
+            });
         }
     }
 }

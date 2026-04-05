@@ -244,15 +244,12 @@ async fn handle_session_ready_rpc(
     }
 
     let user_id = sync_authenticated_user_id(&ctx)?;
-    let session_id_str = ctx
-        .session_id
-        .as_ref()
-        .ok_or_else(|| {
-            RpcError::from_code(
-                privchat_protocol::ErrorCode::SyncFullRebuildRequired,
-                "missing session_id for sync/session_ready".to_string(),
-            )
-        })?;
+    let session_id_str = ctx.session_id.as_ref().ok_or_else(|| {
+        RpcError::from_code(
+            privchat_protocol::ErrorCode::SyncFullRebuildRequired,
+            "missing session_id for sync/session_ready".to_string(),
+        )
+    })?;
     let session_id = parse_session_id(session_id_str)?;
 
     let transitioned = services
@@ -296,14 +293,20 @@ mod tests {
     #[test]
     fn missing_session_ready_user_requires_full_rebuild() {
         let err = sync_authenticated_user_id(&crate::rpc::RpcContext::new()).expect_err("missing");
-        assert_eq!(err.code, privchat_protocol::ErrorCode::SyncFullRebuildRequired);
+        assert_eq!(
+            err.code,
+            privchat_protocol::ErrorCode::SyncFullRebuildRequired
+        );
     }
 
     #[test]
     fn invalid_session_ready_user_requires_full_rebuild() {
         let ctx = crate::rpc::RpcContext::new().with_user_id("not-a-u64".to_string());
         let err = sync_authenticated_user_id(&ctx).expect_err("invalid");
-        assert_eq!(err.code, privchat_protocol::ErrorCode::SyncFullRebuildRequired);
+        assert_eq!(
+            err.code,
+            privchat_protocol::ErrorCode::SyncFullRebuildRequired
+        );
     }
 }
 

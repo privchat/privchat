@@ -50,6 +50,8 @@ pub struct ServerConfig {
     pub tls_key_path: Option<String>,
     /// 缓存配置
     pub cache: CacheConfig,
+    /// Room 订阅回放配置
+    pub room: RoomConfig,
     /// 启用的协议
     pub enabled_protocols: Vec<String>,
     /// TCP 监听地址（由 gateway_listeners 中首个 tcp 推导，供当前 msgtrans 单协议单地址使用）
@@ -110,6 +112,7 @@ impl Default for ServerConfig {
             tls_cert_path: None,
             tls_key_path: None,
             cache: CacheConfig::default(),
+            room: RoomConfig::default(),
             enabled_protocols: vec![
                 "tcp".to_string(),
                 "websocket".to_string(),
@@ -577,6 +580,7 @@ impl ServerConfig {
 struct TomlConfig {
     gateway: Option<TomlGatewayConfig>,
     cache: Option<TomlCacheConfig>,
+    room: Option<TomlRoomConfig>,
     file: Option<TomlFileConfig>,
     admin: Option<TomlAdminConfig>,
     logging: Option<TomlLoggingConfig>,
@@ -821,6 +825,12 @@ struct TomlOnlineStatusConfig {
     cleanup_interval_seconds: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TomlRoomConfig {
+    subscribe_history: Option<bool>,
+    subscribe_history_limit: Option<usize>,
+}
+
 /// 单个存储源（storage_source_id）配置：无 region 字段，按 default_storage_source_id 选择
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStorageSourceConfig {
@@ -1015,6 +1025,15 @@ impl From<TomlConfig> for ServerConfig {
                 if let Some(interval) = online_status.cleanup_interval_seconds {
                     config.cache.online_status.cleanup_interval_secs = interval;
                 }
+            }
+        }
+
+        if let Some(room) = toml.room {
+            if let Some(subscribe_history) = room.subscribe_history {
+                config.room.subscribe_history = subscribe_history;
+            }
+            if let Some(subscribe_history_limit) = room.subscribe_history_limit {
+                config.room.subscribe_history_limit = subscribe_history_limit;
             }
         }
 
@@ -1256,6 +1275,24 @@ impl CacheConfig {
     /// 检查是否有Redis配置
     pub fn has_redis(&self) -> bool {
         self.redis.is_some()
+    }
+}
+
+/// Room 订阅配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomConfig {
+    /// 新订阅时是否自动推送近期历史
+    pub subscribe_history: bool,
+    /// 新订阅时推送的历史条数上限
+    pub subscribe_history_limit: usize,
+}
+
+impl Default for RoomConfig {
+    fn default() -> Self {
+        Self {
+            subscribe_history: true,
+            subscribe_history_limit: 30,
+        }
     }
 }
 

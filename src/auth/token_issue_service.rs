@@ -203,8 +203,12 @@ mod tests {
 
         let device_manager = Arc::new(DeviceManager::new());
 
-        let service =
-            TokenIssueService::new(jwt_service, service_key_manager, device_manager.clone(), None);
+        let service = TokenIssueService::new(
+            jwt_service,
+            service_key_manager,
+            device_manager.clone(),
+            None,
+        );
 
         let request = IssueTokenRequest {
             user_id: 12345,
@@ -246,7 +250,8 @@ mod tests {
 
         let device_manager = Arc::new(DeviceManager::new());
 
-        let service = TokenIssueService::new(jwt_service, service_key_manager, device_manager, None);
+        let service =
+            TokenIssueService::new(jwt_service, service_key_manager, device_manager, None);
 
         let request = IssueTokenRequest {
             user_id: 12345,

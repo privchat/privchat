@@ -254,13 +254,7 @@ mod tests {
         let service = UploadTokenService::new();
 
         let token = service
-            .generate_token(
-                1001,
-                FileType::Image,
-                10485760,
-                "message".to_string(),
-                None,
-            )
+            .generate_token(1001, FileType::Image, 10485760, "message".to_string(), None)
             .await
             .unwrap();
 

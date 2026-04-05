@@ -58,8 +58,7 @@ impl DailyRenameAppender {
             .to_string_lossy()
             .to_string();
 
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("创建日志目录失败: {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("创建日志目录失败: {}", dir.display()))?;
 
         rotate_stale_base_log(&dir, &filename)?;
 

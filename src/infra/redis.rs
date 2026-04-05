@@ -317,6 +317,56 @@ impl RedisClient {
     }
 
     // ============================================================
+    // List 操作
+    // ============================================================
+
+    /// LPUSH key value
+    pub async fn lpush(&self, key: &str, value: &str) -> Result<(), crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            conn.lpush::<_, _, ()>(key, value).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!("Redis LPUSH failed: {}", e))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// LTRIM key start stop
+    pub async fn ltrim(
+        &self,
+        key: &str,
+        start: isize,
+        stop: isize,
+    ) -> Result<(), crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            conn.ltrim::<_, ()>(key, start, stop).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!("Redis LTRIM failed: {}", e))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// LRANGE key start stop
+    pub async fn lrange(
+        &self,
+        key: &str,
+        start: isize,
+        stop: isize,
+    ) -> Result<Vec<String>, crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let result: Vec<String> = conn.lrange(key, start, stop).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!("Redis LRANGE failed: {}", e))
+            })?;
+            Ok(result)
+        })
+        .await
+    }
+
+    // ============================================================
     // Pub/Sub 操作
     // ============================================================
 

@@ -563,7 +563,9 @@ impl UserRepository {
         .bind(limit.clamp(1, 200) as i64)
         .fetch_all(self.pool.as_ref())
         .await
-        .map_err(|e| DatabaseError::Database(format!("Failed to query related users since: {}", e)))?;
+        .map_err(|e| {
+            DatabaseError::Database(format!("Failed to query related users since: {}", e))
+        })?;
 
         Ok(rows
             .into_iter()

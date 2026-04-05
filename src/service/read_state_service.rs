@@ -21,8 +21,8 @@ use crate::model::channel::{ChannelId, ChannelKind, UserId};
 use crate::service::{ChannelService, UnreadCountService};
 use privchat_protocol::notification::ChannelReadCursorNotification;
 use privchat_protocol::protocol::PushMessageRequest;
-use std::sync::Arc;
 use sqlx::{PgPool, Row};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ReadPtsUpdateResult {
@@ -137,11 +137,13 @@ impl ReadStateService {
         channel_id: ChannelId,
         read_pts: u64,
     ) -> Result<ReadPtsUpdateResult> {
-        let max_pts_row = sqlx::query("SELECT COALESCE(MAX(pts), 0) AS max_pts FROM privchat_messages WHERE channel_id = $1")
-            .bind(channel_id as i64)
-            .fetch_one(self.pool.as_ref())
-            .await
-            .map_err(|e| ServerError::Database(format!("查询频道最大 pts 失败: {}", e)))?;
+        let max_pts_row = sqlx::query(
+            "SELECT COALESCE(MAX(pts), 0) AS max_pts FROM privchat_messages WHERE channel_id = $1",
+        )
+        .bind(channel_id as i64)
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询频道最大 pts 失败: {}", e)))?;
         let max_pts = max_pts_row.get::<i64, _>("max_pts") as u64;
         if read_pts > max_pts {
             return Err(ServerError::Validation(format!(
@@ -163,7 +165,9 @@ impl ReadStateService {
             None,
         )
         .await
-        .map_err(|e| ServerError::Database(format!("更新 privchat_channel_read_cursor 失败: {}", e)))?;
+        .map_err(|e| {
+            ServerError::Database(format!("更新 privchat_channel_read_cursor 失败: {}", e))
+        })?;
 
         self.channel_service
             .clear_user_channel_unread(reader_id, channel_id)
@@ -214,9 +218,15 @@ impl ReadStateService {
         .bind((limit + 1) as i64)
         .fetch_all(self.pool.as_ref())
         .await
-        .map_err(|e| ServerError::Database(format!("同步 privchat_channel_read_cursor 失败: {}", e)))?;
+        .map_err(|e| {
+            ServerError::Database(format!("同步 privchat_channel_read_cursor 失败: {}", e))
+        })?;
 
-        let channels = self.channel_service.get_user_channels(user_id).await.channels;
+        let channels = self
+            .channel_service
+            .get_user_channels(user_id)
+            .await
+            .channels;
         let has_more = db_rows.len() > limit as usize;
         let mut rows: Vec<ChannelReadCursorRow> = Vec::new();
         for row in db_rows.into_iter().take(limit as usize) {

@@ -10,7 +10,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[test]
 fn anonymous_whitelist_is_protocol_safe() {
-    assert!(is_anonymous_message_type(&MessageType::AuthorizationRequest));
+    assert!(is_anonymous_message_type(
+        &MessageType::AuthorizationRequest
+    ));
     assert!(!is_anonymous_message_type(&MessageType::SendMessageRequest));
 
     assert!(is_anonymous_rpc_route("system/health"));

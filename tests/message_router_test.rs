@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use privchat::infra::{DeviceId, MessageRouter, MessageRouterConfig, SessionId, UserId};
 use privchat::infra::cache::{L1L2Cache, TwoLevelCache};
-use privchat::infra::message_router::{OfflineMessage, SessionManager as RouterSessionManager, UserOnlineStatus};
+use privchat::infra::message_router::{
+    OfflineMessage, SessionManager as RouterSessionManager, UserOnlineStatus,
+};
+use privchat::infra::{DeviceId, MessageRouter, MessageRouterConfig, SessionId, UserId};
 use privchat_protocol::protocol::PushMessageRequest;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -19,7 +21,10 @@ struct TestSessionManager {
 
 impl TestSessionManager {
     async fn set_online(&self, session_id: &str) {
-        self.online_sessions.write().await.insert(session_id.to_string());
+        self.online_sessions
+            .write()
+            .await
+            .insert(session_id.to_string());
     }
 
     async fn delivered_count(&self, session_id: &str) -> usize {
@@ -183,7 +188,12 @@ async fn route_message_to_online_user_delivers_to_all_online_devices() {
     ] {
         session_manager.set_online(session_id).await;
         router
-            .register_device_online(&user_id, &device_id.to_string(), &session_id.to_string(), "mobile")
+            .register_device_online(
+                &user_id,
+                &device_id.to_string(),
+                &session_id.to_string(),
+                "mobile",
+            )
             .await
             .expect("register online");
     }

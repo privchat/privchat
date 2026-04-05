@@ -211,7 +211,11 @@ impl ReadReceiptService {
         let mut rows: Vec<ReadReceipt> = read_receipts
             .values()
             .filter(|r| r.user_id == user_id)
-            .filter(|r| scope_channel_id.map(|cid| cid == r.channel_id).unwrap_or(true))
+            .filter(|r| {
+                scope_channel_id
+                    .map(|cid| cid == r.channel_id)
+                    .unwrap_or(true)
+            })
             .filter(|r| (r.read_at.timestamp_millis().max(1) as u64) > since_version)
             .cloned()
             .collect();

@@ -80,7 +80,11 @@ fn location_label(last_ip: Option<&str>) -> String {
     match last_ip {
         Some(ip) if !ip.trim().is_empty() => {
             // 当前未接入 IP 地理库，先返回占位，避免前端空值。
-            if ip == "127.0.0.1" || ip == "::1" || ip.starts_with("192.168.") || ip.starts_with("10.") {
+            if ip == "127.0.0.1"
+                || ip == "::1"
+                || ip.starts_with("192.168.")
+                || ip.starts_with("10.")
+            {
                 "LAN / Local Network".to_string()
             } else {
                 "Unknown".to_string()
