@@ -145,7 +145,7 @@ pub async fn handle(
                         "name": name,
                         "description": description,
                         "member_count": 1,
-                        "created_at": chrono::Utc::now().to_rfc3339(),
+                        "created_at": chrono::Utc::now().timestamp_millis(),
                         "creator_id": creator_id
                     }))
                 }

@@ -150,6 +150,6 @@ pub async fn handle(
         "data": data,
         "used_count": record.used_count,
         "max_usage": record.max_usage,
-        "expire_at": record.expire_at.map(|t| t.to_rfc3339()),
+        "expire_at": record.expire_at.map(|t| t.timestamp_millis()),
     }))
 }

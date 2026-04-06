@@ -32,6 +32,6 @@ pub async fn handle(
     Ok(json!({
         "status": "success",
         "action": "内容列表",
-        "timestamp": chrono::Utc::now().to_rfc3339()
+        "timestamp": chrono::Utc::now().timestamp_millis()
     }))
 }

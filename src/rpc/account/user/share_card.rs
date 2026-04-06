@@ -79,7 +79,7 @@ pub async fn handle(
                 "share_id": share_record.share_id,
                 "target_user_id": target_user_id,
                 "receiver_id": receiver_id,
-                "created_at": share_record.created_at.to_rfc3339(),
+                "created_at": share_record.created_at.timestamp_millis(),
             }))
         }
         Err(e) => {

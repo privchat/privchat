@@ -128,6 +128,6 @@ pub async fn handle(
         "previous_owner": current_owner_id_str,
         "new_owner": new_owner_id_str,
         "message": "群主转让成功",
-        "transferred_at": chrono::Utc::now().to_rfc3339()
+        "transferred_at": chrono::Utc::now().timestamp_millis()
     }))
 }

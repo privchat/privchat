@@ -95,6 +95,6 @@ pub async fn handle(
         "old_qr_key": old_qr_key,
         "new_qr_key": new_qr_key,
         "new_qr_code": new_record.to_qr_code_string(),
-        "revoked_at": chrono::Utc::now().to_rfc3339(),
+        "revoked_at": chrono::Utc::now().timestamp_millis(),
     }))
 }

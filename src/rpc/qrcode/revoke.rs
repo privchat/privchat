@@ -66,6 +66,6 @@ pub async fn handle(
     Ok(json!({
         "success": true,
         "qr_key": qr_key,
-        "revoked_at": chrono::Utc::now().to_rfc3339(),
+        "revoked_at": chrono::Utc::now().timestamp_millis(),
     }))
 }

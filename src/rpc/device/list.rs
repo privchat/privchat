@@ -142,10 +142,10 @@ pub async fn handle(ctx: &RpcServiceContext, params: Value) -> RpcResult<Value> 
         let location = location_label(row.last_ip.as_deref());
         let last_active_at_ms = row.last_active_at.unwrap_or(0);
         let last_active_at = chrono::DateTime::from_timestamp_millis(last_active_at_ms)
-            .map(|dt| dt.to_rfc3339())
+            .map(|dt| dt.timestamp_millis())
             .unwrap_or_default();
         let created_at = chrono::DateTime::from_timestamp_millis(row.created_at)
-            .map(|dt| dt.to_rfc3339())
+            .map(|dt| dt.timestamp_millis())
             .unwrap_or_default();
 
         devices.push(json!({

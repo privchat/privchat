@@ -78,7 +78,7 @@ pub async fn handle(
                 "allow_search_by_qrcode": settings.allow_search_by_qrcode,
                 "allow_view_by_non_friend": settings.allow_view_by_non_friend,
                 "allow_receive_message_from_non_friend": settings.allow_receive_message_from_non_friend,
-                "updated_at": settings.updated_at.to_rfc3339()
+                "updated_at": settings.updated_at.timestamp_millis()
             }))
         }
         Err(e) => {

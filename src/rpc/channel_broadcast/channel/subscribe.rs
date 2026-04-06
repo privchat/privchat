@@ -55,7 +55,7 @@ pub async fn handle(
                 "message": "频道订阅成功",
                 "channel_id": channel_id,
                 "user_id": user_id,
-                "subscribed_at": chrono::Utc::now().to_rfc3339()
+                "subscribed_at": chrono::Utc::now().timestamp_millis()
             }))
         }
         Err(e) => {

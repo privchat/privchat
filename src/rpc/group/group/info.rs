@@ -68,8 +68,8 @@ pub async fn handle(
                     "description": channel.metadata.description,
                     "avatar_url": channel.metadata.avatar_url,
                     "owner_id": channel.creator_id,
-                    "created_at": channel.created_at.to_rfc3339(),
-                    "updated_at": channel.updated_at.to_rfc3339(),
+                    "created_at": channel.created_at.timestamp_millis(),
+                    "updated_at": channel.updated_at.timestamp_millis(),
                     "member_count": stats.member_count,
                     "message_count": stats.message_count,
                     "is_archived": matches!(channel.status, crate::model::channel::ChannelStatus::Archived),
@@ -79,12 +79,12 @@ pub async fn handle(
                 "members": members.iter().map(|member| json!({
                     "user_id": member.user_id,
                     "role": format!("{:?}", member.role),
-                    "joined_at": member.joined_at.to_rfc3339(),
-                    "last_active": member.last_active_at.to_rfc3339(),
+                    "joined_at": member.joined_at.timestamp_millis(),
+                    "last_active": member.last_active_at.timestamp_millis(),
                     "is_muted": member.is_muted,
                     "display_name": member.display_name,
                 })).collect::<Vec<_>>(),
-                "timestamp": chrono::Utc::now().to_rfc3339()
+                "timestamp": chrono::Utc::now().timestamp_millis()
             }))
         }
         Err(e) => {

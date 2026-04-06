@@ -27,6 +27,6 @@ pub async fn handle(body: Value) -> RpcResult<Value> {
     Ok(json!({
         "status": "success",
         "action": "添加黑名单",
-        "timestamp": chrono::Utc::now().to_rfc3339()
+        "timestamp": chrono::Utc::now().timestamp_millis()
     }))
 }

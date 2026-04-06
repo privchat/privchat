@@ -56,7 +56,7 @@ pub async fn handle(body: Value) -> RpcResult<Value> {
         "group_id": group_id,
         "user_id": user_id,
         "inviter_id": inviter_id,
-        "joined_at": chrono::Utc::now().to_rfc3339(),
+        "joined_at": chrono::Utc::now().timestamp_millis(),
         "role": "member"
     }))
 }

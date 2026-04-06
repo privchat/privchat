@@ -78,9 +78,12 @@ pub async fn handle(
                 .map_err(|_| RpcError::validation(format!("Invalid share_id: {}", source_id)))?;
             UserDetailSource::CardShare { share_id }
         }
+        "friend_pending" => {
+            UserDetailSource::Friend { friend_id: None }
+        }
         _ => {
             return Err(RpcError::validation(format!(
-                "Invalid source type: {}. Must be one of: search, group, friend, card_share",
+                "Invalid source type: {}. Must be one of: search, group, friend, card_share, friend_pending",
                 source_str
             )));
         }

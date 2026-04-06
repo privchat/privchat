@@ -173,7 +173,7 @@ pub async fn handle(
 
     // 8. 计算过期时间
     let token_ttl = services.jwt_service.default_ttl();
-    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(token_ttl)).to_rfc3339();
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(token_ttl)).timestamp_millis();
 
     // TODO: 生成 refresh_token（目前暂时使用相同的 token）
     let refresh_token = token.clone();

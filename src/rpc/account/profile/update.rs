@@ -27,6 +27,6 @@ pub async fn handle(body: Value, ctx: crate::rpc::RpcContext) -> RpcResult<Value
     Ok(json!({
         "status": "success",
         "action": "更新个人资料",
-        "timestamp": chrono::Utc::now().to_rfc3339()
+        "timestamp": chrono::Utc::now().timestamp_millis()
     }))
 }

@@ -60,7 +60,7 @@ pub async fn handle(
                         "nickname": profile.nickname, // 昵称
                         "avatar_url": profile.avatar_url, // 头像
                         "role": format!("{:?}", member.role),
-                        "joined_at": member.joined_at.to_rfc3339(),
+                        "joined_at": member.joined_at.timestamp_millis(),
                         "is_muted": member.is_muted,
                     }));
                 }

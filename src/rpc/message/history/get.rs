@@ -91,7 +91,7 @@ pub async fn handle(
                         "sender_id": msg.sender_id,
                         "content": content,
                         "message_type": msg.message_type.as_str(),
-                        "timestamp": msg.created_at.to_rfc3339(),
+                        "timestamp": msg.created_at.timestamp_millis(),
                         "reply_to_message_id": msg.reply_to_message_id,
                         "metadata": msg.metadata,
                         "revoked": msg.revoked,  // 客户端根据此字段和语言设置显示占位符

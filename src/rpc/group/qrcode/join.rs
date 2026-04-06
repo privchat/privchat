@@ -183,7 +183,7 @@ pub async fn handle(
             "group_id": group_id,
             "request_id": join_request.request_id,
             "message": "申请已提交，等待管理员审批",
-            "expires_at": join_request.expires_at.map(|dt| dt.to_rfc3339())
+            "expires_at": join_request.expires_at.map(|dt| dt.timestamp_millis())
         }))
     } else {
         // 无需审批 - 直接加入群组
@@ -208,7 +208,7 @@ pub async fn handle(
             "group_id": group_id,
             "message": "已成功加入群组",
             "user_id": user_id,
-            "joined_at": chrono::Utc::now().to_rfc3339()
+            "joined_at": chrono::Utc::now().timestamp_millis()
         }))
     }
 }

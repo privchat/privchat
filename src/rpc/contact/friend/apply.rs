@@ -220,7 +220,7 @@ pub async fn handle(
                         "user_id": target_user_id,
                         "username": target_user.username,
                         "status": "pending",
-                        "added_at": chrono::Utc::now().to_rfc3339(),
+                        "added_at": chrono::Utc::now().timestamp_millis(),
                         "message": message
                     }))
                 }

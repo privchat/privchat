@@ -116,8 +116,8 @@ pub async fn handle(
     Ok(json!({
         "qr_key": record.qr_key,
         "qr_code": record.to_qr_code_string(),  // privchat://group/get?qrkey=xxx&token=yyy
-        "expire_at": record.expire_at.map(|t| t.to_rfc3339()),
+        "expire_at": record.expire_at.map(|t| t.timestamp_millis()),
         "group_id": group_id,
-        "created_at": record.created_at.to_rfc3339(),
+        "created_at": record.created_at.timestamp_millis(),
     }))
 }

@@ -96,8 +96,8 @@ pub async fn handle(
             .unwrap_or(500),
         "announcement": channel.metadata.announcement,
         "description": channel.metadata.description,
-        "created_at": channel.created_at.to_rfc3339(),
-        "updated_at": channel.updated_at.to_rfc3339()
+        "created_at": channel.created_at.timestamp_millis(),
+        "updated_at": channel.updated_at.timestamp_millis()
     });
 
     tracing::debug!("✅ 获取群设置成功: group_id={}", group_id);

@@ -198,6 +198,6 @@ pub async fn handle(
         "group_id": group_id_str,
         "message": format!("群设置更新成功，共更新 {} 项", update_count),
         "updated_count": update_count,
-        "updated_at": chrono::Utc::now().to_rfc3339()
+        "updated_at": chrono::Utc::now().timestamp_millis()
     }))
 }

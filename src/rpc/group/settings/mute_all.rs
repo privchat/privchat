@@ -117,6 +117,6 @@ pub async fn handle(
         "all_muted": muted,
         "message": format!("已{}全员禁言", action),
         "operator_id": operator_id_str,
-        "updated_at": chrono::Utc::now().to_rfc3339()
+        "updated_at": chrono::Utc::now().timestamp_millis()
     }))
 }

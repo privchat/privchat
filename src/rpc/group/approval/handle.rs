@@ -153,7 +153,7 @@ pub async fn handle(
             "group_id": updated_request.group_id,
             "user_id": updated_request.user_id,
             "message": "已同意加群申请",
-            "handled_at": chrono::Utc::now().to_rfc3339()
+            "handled_at": chrono::Utc::now().timestamp_millis()
         }))
     } else {
         // 5.3. 拒绝申请
@@ -180,7 +180,7 @@ pub async fn handle(
             "user_id": updated_request.user_id,
             "reject_reason": reject_reason,
             "message": "已拒绝加群申请",
-            "handled_at": chrono::Utc::now().to_rfc3339()
+            "handled_at": chrono::Utc::now().timestamp_millis()
         }))
     }
 }

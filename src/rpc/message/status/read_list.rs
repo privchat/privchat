@@ -89,7 +89,7 @@ pub async fn handle(
                 "username": profile.username,
                 "nickname": profile.nickname,
                 "avatar_url": profile.avatar_url,
-                "read_at": reader.updated_at.to_rfc3339()
+                "read_at": reader.updated_at.timestamp_millis()
             }));
         }
     }

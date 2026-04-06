@@ -75,7 +75,7 @@ pub async fn generate(
     Ok(json!({
         "qr_key": record.qr_key,
         "qr_code": record.to_qr_code_string(),  // privchat://user/get?qrkey=xxx
-        "created_at": record.created_at.to_rfc3339(),
+        "created_at": record.created_at.timestamp_millis(),
     }))
 }
 
@@ -136,7 +136,7 @@ pub async fn refresh(
         "old_qr_key": old_qr_key,
         "new_qr_key": new_qr_key,
         "new_qr_code": new_record.to_qr_code_string(),
-        "revoked_at": chrono::Utc::now().to_rfc3339(),
+        "revoked_at": chrono::Utc::now().timestamp_millis(),
     }))
 }
 
@@ -194,7 +194,7 @@ pub async fn get(
     Ok(json!({
         "qr_key": record.qr_key,
         "qr_code": record.to_qr_code_string(),
-        "created_at": record.created_at.to_rfc3339(),
+        "created_at": record.created_at.timestamp_millis(),
         "used_count": record.used_count,
     }))
 }

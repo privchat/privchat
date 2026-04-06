@@ -119,8 +119,8 @@ pub async fn handle(
                     }
                 },
                 "message": req.message,
-                "created_at": req.created_at.to_rfc3339(),
-                "expires_at": req.expires_at.map(|dt| dt.to_rfc3339())
+                "created_at": req.created_at.timestamp_millis(),
+                "expires_at": req.expires_at.map(|dt| dt.timestamp_millis())
             })
         })
         .collect();
