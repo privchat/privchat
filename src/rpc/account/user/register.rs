@@ -210,8 +210,22 @@ pub async fn handle(
                 if services.config.system_message.auto_send_welcome {
                     let now = chrono::Utc::now();
                     let message_id = crate::infra::next_message_id();
-                    // pts 为 per-channel，Direct 类型=0
-                    let pts = services.pts_generator.next_pts(channel_id).await;
+                    // pts 为 per-channel，优先使用数据库分配，避免重启后内存计数器回退。
+                    let pts = if let Some(sync_service) = get_global_sync_service() {
+                        match sync_service.allocate_next_pts(channel_id).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "⚠️ 欢迎消息分配同步 pts 失败，回退内存计数器: channel_id={}, error={}",
+                                    channel_id,
+                                    e
+                                );
+                                services.pts_generator.next_pts(channel_id).await
+                            }
+                        }
+                    } else {
+                        services.pts_generator.next_pts(channel_id).await
+                    };
                     let content = services.config.system_message.welcome_message.clone();
 
                     let welcome_msg = crate::model::message::Message {

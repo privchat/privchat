@@ -619,7 +619,20 @@ impl ConnectMessageHandler {
 
         let now = Utc::now();
         let message_id = crate::infra::next_message_id();
-        let pts = self.pts_generator.next_pts(channel_id).await;
+        let pts = if let Some(sync_service) = get_global_sync_service() {
+            match sync_service.allocate_next_pts(channel_id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "⚠️ 登录通知分配同步 pts 失败，回退内存计数器: channel_id={}, error={}",
+                        channel_id, e
+                    );
+                    self.pts_generator.next_pts(channel_id).await
+                }
+            }
+        } else {
+            self.pts_generator.next_pts(channel_id).await
+        };
         let device_label = {
             let name = connect_request.device_info.device_name.trim();
             if name.is_empty() {
@@ -743,7 +756,20 @@ impl ConnectMessageHandler {
 
         let now = Utc::now();
         let message_id = crate::infra::next_message_id();
-        let pts = pts_generator.next_pts(channel_id).await;
+        let pts = if let Some(sync_service) = get_global_sync_service() {
+            match sync_service.allocate_next_pts(channel_id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "⚠️ 后台登录通知分配同步 pts 失败，回退内存计数器: channel_id={}, error={}",
+                        channel_id, e
+                    );
+                    pts_generator.next_pts(channel_id).await
+                }
+            }
+        } else {
+            pts_generator.next_pts(channel_id).await
+        };
         let device_label = {
             let name = connect_request.device_info.device_name.trim();
             if name.is_empty() {

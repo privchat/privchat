@@ -1176,11 +1176,20 @@ impl MessageHandler for SendMessageHandler {
         }
 
         // 生成 pts（per-channel，Phase 8）
-        // key 仅使用 channel_id。
-        let pts = self
-            .pts_generator
-            .next_pts(send_message_request.channel_id)
-            .await;
+        // 优先走 SyncService 的数据库分配，避免重启后内存计数器回退。
+        let pts = if let Some(sync_service) = get_global_sync_service() {
+            sync_service.allocate_next_pts(send_message_request.channel_id).await.map_err(|e| {
+                error!(
+                    "❌ SendMessageHandler: 分配同步 pts 失败 channel_id={} error={}",
+                    send_message_request.channel_id, e
+                );
+                e
+            })?
+        } else {
+            self.pts_generator
+                .next_pts(send_message_request.channel_id)
+                .await
+        };
 
         // 创建 Message 模型
         use crate::model::message::Message;
@@ -1258,6 +1267,19 @@ impl MessageHandler for SendMessageHandler {
                     "❌ SendMessageHandler: 记录同步 commit 失败 channel_id={} message_id={} pts={} error={}",
                     channel_id, message.message_id, pts, e
                 );
+                // 同步 commit 失败时回滚已写入的业务消息，避免出现“发送失败但历史可见”的脏数据。
+                if let Err(clean_err) = sqlx::query(
+                    "DELETE FROM privchat_messages WHERE message_id = $1",
+                )
+                .bind(message.message_id as i64)
+                .execute(self.message_repository.pool())
+                .await
+                {
+                    warn!(
+                        "⚠️ SendMessageHandler: 回滚失败消息记录失败 message_id={} error={}",
+                        message.message_id, clean_err
+                    );
+                }
                 return self
                     .create_error_response(
                         &send_message_request,
@@ -1817,7 +1839,11 @@ impl SendMessageHandler {
 
         let message_id = push_message_request.local_message_id;
 
-        // 1. 批量分配 PTS + 写 UserMessageIndex（一次 write lock）
+        // 1. 写 UserMessageIndex
+        //
+        // 注意：这里不能再分配新的 channel pts。
+        // sync/get_difference 的权威序列只能由 commit log 路径消耗，
+        // 否则会出现「pts 被占用但没有对应 commit」的历史空洞。
         let receiver_ids: Vec<UserId> = all_member_ids
             .iter()
             .filter(|id| *id != sender_id)
@@ -1825,13 +1851,8 @@ impl SendMessageHandler {
             .collect();
 
         if !receiver_ids.is_empty() {
-            let receiver_count = receiver_ids.len() as u64;
-            let base_pts = self
-                .pts_generator
-                .allocate_range(channel.id, receiver_count)
-                .await;
-            for (i, &member_id) in receiver_ids.iter().enumerate() {
-                let pts = base_pts + i as u64;
+            let pts = push_message_request.message_seq as u64;
+            for &member_id in &receiver_ids {
                 debug!(
                     "✨ 为频道 {} 生成 pts={} (用户: {})",
                     channel.id, pts, member_id

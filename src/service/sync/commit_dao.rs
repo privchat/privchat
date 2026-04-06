@@ -18,6 +18,7 @@
 use crate::error::Result;
 use crate::infra::database::Database;
 use privchat_protocol::rpc::sync::ServerCommit;
+use sqlx::Row;
 /// Commit Log 数据库操作
 ///
 /// 负责 privchat_commit_log 表的 CRUD 操作
@@ -73,6 +74,100 @@ impl CommitLogDao {
                 commit.channel_id, commit.pts, e
             );
             crate::error::ServerError::Database(format!("Failed to save commit: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// 在单个事务内完成「分配 pts + 写入 commit」
+    ///
+    /// 目的：避免先分配 pts 再写 commit 失败导致 pts 空洞。
+    /// 成功后会回写 `commit.pts`。
+    pub async fn allocate_pts_and_save_commit(&self, commit: &mut ServerCommit) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let sender_username = commit.sender_info.as_ref().map(|s| s.username.as_str());
+
+        let mut tx = self.db.pool().begin().await.map_err(|e| {
+            error!(
+                "开启事务失败: channel_id={}, error={}",
+                commit.channel_id, e
+            );
+            crate::error::ServerError::Database(format!(
+                "Failed to begin commit transaction: {}",
+                e
+            ))
+        })?;
+
+        let pts_row = sqlx::query(
+            r#"
+            INSERT INTO privchat_channel_pts
+            (channel_id, current_pts, created_at, updated_at)
+            VALUES ($1, 1, $2, $2)
+            ON CONFLICT (channel_id) DO UPDATE
+            SET current_pts = privchat_channel_pts.current_pts + 1,
+                updated_at = $2
+            RETURNING current_pts
+            "#,
+        )
+        .bind(commit.channel_id as i64)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(
+                "事务内分配 pts 失败: channel_id={}, error={}",
+                commit.channel_id, e
+            );
+            crate::error::ServerError::Database(format!(
+                "Failed to allocate pts in transaction: {}",
+                e
+            ))
+        })?;
+
+        let new_pts = pts_row.get::<i64, _>("current_pts") as u64;
+        commit.pts = new_pts;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO privchat_commit_log
+            (pts, server_msg_id, local_message_id, channel_id, channel_type,
+             message_type, content, server_timestamp, sender_id, sender_username, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+            commit.pts as i64,
+            commit.server_msg_id as i64,
+            commit.local_message_id.map(|v| v as i64),
+            commit.channel_id as i64,
+            commit.channel_type as i16,
+            commit.message_type.as_str(),
+            commit.content.clone(),
+            commit.server_timestamp,
+            commit.sender_id as i64,
+            sender_username,
+            now
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(
+                "事务内保存 Commit 失败: channel_id={}, pts={}, error={}",
+                commit.channel_id, commit.pts, e
+            );
+            crate::error::ServerError::Database(format!(
+                "Failed to save commit in transaction: {}",
+                e
+            ))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            error!(
+                "提交事务失败: channel_id={}, pts={}, error={}",
+                commit.channel_id, commit.pts, e
+            );
+            crate::error::ServerError::Database(format!(
+                "Failed to commit commit transaction: {}",
+                e
+            ))
         })?;
 
         Ok(())

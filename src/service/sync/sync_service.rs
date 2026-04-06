@@ -90,10 +90,8 @@ impl SyncService {
         content: serde_json::Value,
         sender_id: u64,
     ) -> Result<ServerCommit> {
-        let new_pts = self.pts_dao.allocate_pts(channel_id).await?;
-        self.pts_generator.set_pts(channel_id, new_pts).await;
-        let commit = ServerCommit {
-            pts: new_pts,
+        let mut commit = ServerCommit {
+            pts: 0,
             server_msg_id: self.generate_msg_id().await,
             local_message_id: None,
             channel_id,
@@ -104,9 +102,24 @@ impl SyncService {
             sender_id,
             sender_info: self.get_sender_info(sender_id).await.ok(),
         };
-        self.commit_dao.save_commit(&commit).await?;
+        self.commit_dao
+            .allocate_pts_and_save_commit(&mut commit)
+            .await?;
+        self.pts_generator.set_pts(channel_id, commit.pts).await;
+        self.cache.cache_pts(channel_id, commit.pts).await?;
         self.cache.cache_commit(&commit).await?;
         Ok(commit)
+    }
+
+    /// 为既有业务消息分配下一个可用 pts（以数据库为准）
+    ///
+    /// 用于发送链路先写业务消息、后写同步 commit 的场景，
+    /// 避免进程重启后仅依赖内存计数器导致 pts 回退。
+    pub async fn allocate_next_pts(&self, channel_id: u64) -> Result<u64> {
+        let pts = self.pts_dao.allocate_pts(channel_id).await?;
+        self.pts_generator.set_pts(channel_id, pts).await;
+        self.cache.cache_pts(channel_id, pts).await?;
+        Ok(pts)
     }
 
     pub async fn record_existing_commit(&self, commit: &ServerCommit) -> Result<()> {
@@ -194,18 +207,12 @@ impl SyncService {
             );
         }
 
-        // 5. 分配新的 pts（数据库原子操作）⭐⭐⭐
-        let new_pts = self.pts_dao.allocate_pts(req.channel_id).await?;
-
-        // 同步到内存 PtsGenerator（可选，提高性能）
-        self.pts_generator.set_pts(req.channel_id, new_pts).await;
-
         // 6. 生成 server_msg_id（使用 snowflake）
         let server_msg_id = self.generate_msg_id().await;
 
         // 7. 构造 ServerCommit ⭐
-        let commit = ServerCommit {
-            pts: new_pts,
+        let mut commit = ServerCommit {
+            pts: 0,
             server_msg_id,
             local_message_id: Some(req.local_message_id),
             channel_id: req.channel_id,
@@ -217,8 +224,14 @@ impl SyncService {
             sender_info: self.get_sender_info(sender_id).await.ok(),
         };
 
-        // 8. 保存到数据库（Commit Log）⭐
-        self.commit_dao.save_commit(&commit).await?;
+        // 8. 事务内分配 pts + 保存 Commit（避免 pts 空洞）⭐
+        self.commit_dao
+            .allocate_pts_and_save_commit(&mut commit)
+            .await?;
+        let new_pts = commit.pts;
+
+        // 同步到内存 PtsGenerator（可选，提高性能）
+        self.pts_generator.set_pts(req.channel_id, new_pts).await;
 
         // 9. 缓存到 Redis ⭐
         self.cache.cache_pts(req.channel_id, new_pts).await?;
