@@ -17,10 +17,12 @@
 
 //! 文件相关 RPC 接口
 
+pub mod get_url;
 pub mod request_upload_token;
 pub mod upload_callback;
 pub mod validate_token;
 
+pub use get_url::get_file_url;
 pub use request_upload_token::request_upload_token;
 pub use upload_callback::upload_callback;
 pub use validate_token::validate_upload_token;
@@ -53,6 +55,14 @@ pub async fn register_routes(services: RpcServiceContext) {
         .register("file/upload_callback", move |params, _ctx| {
             let services = services3.clone();
             Box::pin(async move { upload_callback(services, params).await })
+        })
+        .await;
+
+    let services4 = services.clone();
+    GLOBAL_RPC_ROUTER
+        .register("file/get_url", move |params, ctx| {
+            let services = services4.clone();
+            Box::pin(async move { get_file_url(services, params, ctx).await })
         })
         .await;
 

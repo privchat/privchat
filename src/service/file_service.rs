@@ -372,14 +372,11 @@ impl FileService {
         format!("{}/{}.{}", subdir, file_id, extension)
     }
 
-    pub async fn get_file_url(&self, file_id: u64, user_id: u64) -> Result<FileUrlResponse> {
+    pub async fn get_file_url(&self, file_id: u64, _user_id: u64) -> Result<FileUrlResponse> {
         let metadata = self
             .get_file_metadata(file_id)
             .await?
             .ok_or_else(|| ServerError::NotFound("文件不存在".to_string()))?;
-        if metadata.uploader_id != user_id {
-            return Err(ServerError::Forbidden("无权访问此文件".to_string()));
-        }
         let file_url = self.build_access_url(&metadata.file_path, metadata.storage_source_id);
         let expires_at = Utc::now().timestamp() + 3600 * 24 * 365;
         Ok(FileUrlResponse {
@@ -427,17 +424,10 @@ impl FileService {
         if let Some(src) = self.sources_by_id.get(&storage_source_id) {
             if let Some(base_url) = &src.base_url {
                 let base = base_url.trim_end_matches('/');
-                return if src.storage_type == "s3" {
-                    format!("{}/{}", base, file_path)
-                } else {
-                    format!("{}/api/app/files/{}", base, file_path)
-                };
+                // base_url 已包含完整路径，直接拼接 file_path
+                return format!("{}/{}", base, file_path);
             }
-            return if src.storage_type == "s3" {
-                format!("/{}", file_path)
-            } else {
-                format!("/api/app/files/{}", file_path)
-            };
+            return format!("/{}", file_path);
         }
         format!("{{unsupported:storage_source_id={}}}", storage_source_id)
     }
