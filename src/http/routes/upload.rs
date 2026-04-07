@@ -20,7 +20,7 @@
 //! 路由：POST /api/app/files/upload
 //! 认证：需要 X-Upload-Token header
 
-use axum::{extract::State, response::Json, routing::post, Router};
+use axum::{extract::DefaultBodyLimit, extract::State, response::Json, routing::post, Router};
 use axum_extra::extract::Multipart;
 use serde_json::{json, Value};
 use tracing::info;
@@ -53,7 +53,11 @@ fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
 
 /// 创建上传路由
 pub fn create_route() -> Router<FileServerState> {
-    Router::new().route("/api/app/files/upload", post(upload_file))
+    Router::new()
+        .route("/api/app/files/upload", post(upload_file))
+        // Keep this above token max_size (100MB) so multipart parsing won't fail
+        // before business validation runs.
+        .layer(DefaultBodyLimit::max(120 * 1024 * 1024))
 }
 
 /// 文件上传处理器
