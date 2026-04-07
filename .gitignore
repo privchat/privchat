@@ -5,3 +5,5 @@ config.toml
 
 # macOS
 .DS_Store
+
+/storage
