@@ -68,19 +68,16 @@ pub async fn request_upload_token(services: RpcServiceContext, params: Value) ->
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
 
-    // 构建上传 URL（使用配置的文件服务 API 基础 URL）
+    // 构建上传 URL（必须使用显式配置，禁止默认值回退）
     let upload_url = services
         .config
         .file_api_base_url
         .as_ref()
-        .map(|base_url| format!("{}/files/upload", base_url.trim_end_matches('/')))
-        .unwrap_or_else(|| {
-            // 如果没有配置，使用默认值（仅用于开发环境）
-            format!(
-                "http://localhost:{}/api/app/files/upload",
-                services.config.http_file_server_port
-            )
-        });
+        .filter(|base_url| !base_url.trim().is_empty())
+        .map(|base_url| format!("{}/api/app/files/upload", base_url.trim_end_matches('/')))
+        .ok_or_else(|| {
+            RpcError::internal("缺少配置: file_api_base_url，拒绝签发上传 token".to_string())
+        })?;
 
     Ok(json!({
         "upload_token": token.token,
