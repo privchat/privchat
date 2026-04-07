@@ -59,7 +59,7 @@ server_api_base_url = "http://localhost:9083/api/app"
 id = 0
 storage_type = "local"
 storage_root = "./storage/files"
-base_url = "http://localhost:8080/files"
+base_url = "http://127.0.0.1:8000"
 
 # 多数据中心示例：再增加 id=1、id=2 等，不同机房设置不同 default_storage_source_id 即可
 # [[file.storage_sources]]
