@@ -18,6 +18,7 @@
 use crate::context::RequestContext;
 use crate::handler::MessageHandler;
 use crate::infra::SubscribeManager;
+use crate::service::PresenceService;
 use crate::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -26,16 +27,19 @@ use tracing::{info, warn};
 pub struct DisconnectMessageHandler {
     connection_manager: Arc<crate::infra::ConnectionManager>,
     subscribe_manager: Arc<SubscribeManager>,
+    presence_service: Arc<PresenceService>,
 }
 
 impl DisconnectMessageHandler {
     pub fn new(
         connection_manager: Arc<crate::infra::ConnectionManager>,
         subscribe_manager: Arc<SubscribeManager>,
+        presence_service: Arc<PresenceService>,
     ) -> Self {
         Self {
             connection_manager,
             subscribe_manager,
+            presence_service,
         }
     }
 }
@@ -59,6 +63,11 @@ impl MessageHandler for DisconnectMessageHandler {
             disconnect_request.reason
         );
 
+        let disconnected_connection = self
+            .connection_manager
+            .get_connection_by_session(&context.session_id)
+            .await;
+
         // 注销连接
         if let Err(e) = self
             .connection_manager
@@ -68,6 +77,16 @@ impl MessageHandler for DisconnectMessageHandler {
             warn!("⚠️ DisconnectMessageHandler: 注销连接失败: {}", e);
         } else {
             info!("✅ DisconnectMessageHandler: 连接已注销");
+        }
+
+        if let Some(connection) = disconnected_connection {
+            if let Err(e) = self
+                .presence_service
+                .on_device_disconnected(connection.user_id, &connection.device_id)
+                .await
+            {
+                warn!("⚠️ DisconnectMessageHandler: 更新 Presence 下线失败: {}", e);
+            }
         }
 
         // 清理频道订阅

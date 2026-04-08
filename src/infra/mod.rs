@@ -36,8 +36,8 @@ pub mod message_router;
 pub mod metrics;
 pub mod offline_worker;
 pub mod online_status_manager;
-pub mod presence_manager;
 pub mod presence_manager_with_db;
+pub mod presence_tracker;
 pub mod redis;
 pub mod session_manager;
 pub mod snowflake;
@@ -68,13 +68,12 @@ pub use event_bus::EventBus;
 pub use message_router::{MessageRouter, MessageRouterConfig, RouteResult, SessionManagerAdapter};
 pub use offline_worker::{DeliveryStats, OfflineMessageWorker, OfflineWorkerConfig};
 pub use online_status_manager::{OnlineSession, OnlineStatusManager, OnlineStatusStats};
-pub use presence_manager::{
-    PresenceConfig as BasicPresenceConfig, PresenceManager as BasicPresenceManager,
-    PresenceStats as BasicPresenceStats,
-};
 pub use presence_manager_with_db::{
-    PresenceConfig, PresenceManagerWithDb as PresenceManager, PresenceStats,
+    PresenceConfig as PresenceStateStoreConfig,
+    PresenceManagerWithDb as PresenceStateStore,
+    PresenceStats as PresenceStateStoreStats,
 };
+pub use presence_tracker::PresenceTracker;
 pub use session_manager::{SessionInfo, SessionManager}; // ✨ 新增
 pub use subscribe_manager::{
     SubscribeManager, MAX_CHANNEL_SUBSCRIBERS_ONLINE, MAX_SUBSCRIPTIONS_PER_SESSION,

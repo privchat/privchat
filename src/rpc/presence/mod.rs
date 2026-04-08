@@ -16,9 +16,7 @@
 // limitations under the License.
 
 pub mod status;
-pub mod subscribe;
 pub mod typing;
-pub mod unsubscribe;
 
 use super::router::GLOBAL_RPC_ROUTER;
 use super::RpcServiceContext;
@@ -26,28 +24,6 @@ use privchat_protocol::rpc::routes;
 
 /// 注册在线状态系统的所有路由
 pub async fn register_routes(services: RpcServiceContext) {
-    // presence/subscribe - 订阅在线状态
-    GLOBAL_RPC_ROUTER
-        .register(routes::presence::SUBSCRIBE, {
-            let services = services.clone();
-            move |params, ctx| {
-                let services = services.clone();
-                Box::pin(async move { subscribe::handle(params, services, ctx).await })
-            }
-        })
-        .await;
-
-    // presence/unsubscribe - 取消订阅
-    GLOBAL_RPC_ROUTER
-        .register(routes::presence::UNSUBSCRIBE, {
-            let services = services.clone();
-            move |params, ctx| {
-                let services = services.clone();
-                Box::pin(async move { unsubscribe::handle(params, services, ctx).await })
-            }
-        })
-        .await;
-
     // presence/typing - 输入状态通知
     GLOBAL_RPC_ROUTER
         .register(routes::presence::TYPING, {
@@ -70,5 +46,5 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    tracing::debug!("🔔 Presence 系统路由注册完成 (subscribe, unsubscribe, typing, status)");
+    tracing::debug!("🔔 Presence 系统路由注册完成 (typing, status)");
 }

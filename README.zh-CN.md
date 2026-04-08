@@ -561,7 +561,7 @@ privchat-server/
 ├── 📦 缓存模块 (cache)          - L1内存缓存、L2 Redis缓存
 ├── 📁 文件模块 (file)           - 文件上传、Token管理、URL验证；多存储源（local + S3/OSS/COS/MinIO，OpenDAL）
 ├── 🔔 通知模块 (notification)   - 系统通知、事件驱动、推送
-├── 👁️ 在线状态 (presence)       - 在线状态、输入状态、订阅管理
+├── 👁️ 在线状态 (presence)       - 在线状态聚合、状态查询、realtime 投递
 ├── 🔒 隐私模块 (privacy)        - 隐私设置、来源验证、权限控制
 ├── 🛡️ 安全模块 (security)       - 速率限制、IP黑名单、防刷机制
 ├── 📊 监控模块 (monitoring)     - Prometheus指标、健康检查
@@ -594,7 +594,7 @@ privchat-server/
 | **会话管理** | ✅ | ✅ | ✅ 100% | 列表由 entity/sync_entities 同步、客户端 get_channels；pin, hide, mute, direct/get_or_create 已实现 |
 | **好友管理** | ✅ | ✅ | ✅ 100% | apply, accept, reject, remove, list 全部支持 |
 | **群组管理** | ✅ | ✅ | ✅ 100% | create, invite, remove, leave, settings 全部支持 |
-| **在线状态** | ✅ | ✅ | ✅ 100% | subscribe, unsubscribe, query, batch_query 全部支持 |
+| **在线状态** | ✅ | ✅ | ✅ 100% | `batch_status(user_ids)` + `presence_changed(channelId)` |
 | **输入状态** | ✅ | ✅ | ✅ 100% | send_typing, stop_typing 全部支持 |
 | **文件上传/下载** | ✅ | ✅ | ✅ 100% | request_upload_token, HTTP 上传/下载 全部支持 |
 | **同步机制** | ✅ | ✅ | ✅ 100% | 完整实现：幂等性检查、间隙检测、Redis缓存、Commit Log、Fan-out机制 |
@@ -663,6 +663,9 @@ privchat-server/
 - ✅ 接受申请：`contact/friend/accept` (返回来源信息)
 - ✅ 好友列表：`contact/friend/list`
 - ✅ 删除好友：`contact/friend/remove`
+  - 删除好友是“关系删除 + friend entity tombstone 收敛”
+  - 服务端通过 `sync_entities("friend")` 下发 `deleted=true` tombstone
+  - 客户端收到后删除本地 `friend` 行；不会通过“静默少一行”自行猜测删除
 - ✅ 待处理申请：`contact/friend/pending`
 - ✅ 黑名单管理：`contact/blacklist/add`, `remove`, `list`, `check`
 - ✅ 消息拦截：自动拦截黑名单用户消息
@@ -696,12 +699,10 @@ privchat-server/
 - ✅ 已读列表：`message/status/read_list`
 - ✅ 已读统计：`message/status/read_stats`
 
-#### 在线状态 (100%)
-- ✅ 在线状态订阅：`presence/subscribe`（Phase 21 测试通过）
-- ✅ 在线状态查询：`presence/query`
-- ✅ 批量查询：`presence/batch_query`（Phase 24 测试通过）
-- ✅ 取消订阅：`presence/unsubscribe`
-- ✅ 在线状态统计（Phase 25 测试通过）
+#### 在线状态
+- ✅ 当前态查询：`presence/status/get`
+- ✅ 实时变化投递：复用现有 `channelId` 发布订阅（`topic = "presence_changed"`）
+- ✅ 在线状态聚合状态存储
 
 #### 输入状态 (100%)
 - ✅ 输入状态发送：`typing/send`（Phase 22 测试通过）
@@ -811,10 +812,9 @@ privchat-server/
 
 #### 状态管理功能
 - ✅ **在线状态管理** (Phase 21, 24 测试通过)
-  - 订阅/查询/取消订阅
-  - 批量查询
-  - 服务器获取
-  - 在线状态统计
+  - `batch_status(user_ids)`
+  - `presence_changed` 按 `channelId` 投递
+  - user-scoped 聚合 + channel-scoped realtime delivery
 
 - ✅ **输入状态** (Phase 22 测试通过)
   - 输入状态发送
@@ -935,7 +935,7 @@ privchat-server/
 | **群组管理** | 100% | ✅✅ 完整 | 完整实现 + 测试通过 |
 | **文件存储** | 98% | ✅✅ 优秀 | 本地 + S3/OSS 多存储源（OpenDAL）+ Token + 上传 + 测试通过 |
 | **好友系统** | 100% | ✅✅ 完整 | 申请 + 黑名单 + 非好友消息 + 测试通过 |
-| **在线状态** | 100% | ✅✅ 完整 | 订阅 + 查询 + 统计 + 测试通过 |
+| **在线状态** | 100% | ✅✅ 完整 | user 聚合 + user_ids 查询 + channelId realtime + 测试通过 |
 | **输入状态** | 100% | ✅✅ 完整 | 发送 + 接收 + 测试通过 |
 | **系统通知** | 100% | ✅✅ 完整 | 5种通知类型 + 测试通过 |
 | **表情包** | 60% | ⚠️ 待完善 | RPC接口 + 基础测试 |
@@ -1249,7 +1249,7 @@ privchat-server/
 - ✅ 消息系统（发送、接收、撤回、@提及、回复、Reaction）
 - ✅ 好友系统（申请、接受、黑名单、非好友消息）
 - ✅ 群组系统（创建、管理、权限、设置、二维码）
-- ✅ 在线状态（订阅、查询、统计）
+- ✅ 在线状态（聚合、查询、realtime 投递）
 - ✅ 输入状态（发送、接收、统计）
 - ✅ 系统通知（5种通知类型）
 - ✅ pts同步机制（Telegram式同步）

@@ -315,13 +315,16 @@ impl FriendService {
 
         sqlx::query(
             r#"
-            DELETE FROM privchat_friendships
+            UPDATE privchat_friendships
+            SET status = 2,
+                updated_at = $3
             WHERE (user_id = $1 AND friend_id = $2)
                OR (user_id = $2 AND friend_id = $1)
             "#,
         )
         .bind(user_id as i64)
         .bind(friend_id as i64)
+        .bind(chrono::Utc::now().timestamp_millis())
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("Failed to remove friendship: {}", e)))?;
@@ -504,6 +507,7 @@ impl FriendService {
         #[derive(sqlx::FromRow)]
         struct FriendSyncRow {
             friend_id: i64,
+            status: i16,
             created_at: i64,
             updated_at: i64,
             sync_version: i64,
@@ -511,10 +515,10 @@ impl FriendService {
 
         let rows = sqlx::query_as::<_, FriendSyncRow>(
             r#"
-            SELECT friend_id, created_at, updated_at, sync_version
+            SELECT friend_id, status, created_at, updated_at, sync_version
             FROM privchat_friendships
             WHERE user_id = $1
-              AND status = 1
+              AND status != 0
               AND sync_version > $2
             ORDER BY sync_version ASC, friend_id ASC
             LIMIT $3
@@ -537,6 +541,15 @@ impl FriendService {
         let mut items = Vec::with_capacity(page.len());
         for row in &page {
             let friend_id = row.friend_id as u64;
+            if row.status != 1 {
+                items.push(SyncEntityItem {
+                    entity_id: friend_id.to_string(),
+                    version: row.sync_version as u64,
+                    deleted: true,
+                    payload: None,
+                });
+                continue;
+            }
             let profile_opt =
                 get_user_profile_with_fallback(friend_id, user_repository, cache_manager)
                     .await
@@ -622,5 +635,200 @@ fn source_from_strings(
             Some(crate::model::privacy::FriendRequestSource::Phone { phone })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CacheConfig;
+    use crate::infra::CacheManager;
+    use crate::repository::UserRepository;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    struct FriendServiceTestContext {
+        service: FriendService,
+        pool: Arc<PgPool>,
+        user_repository: Arc<UserRepository>,
+        cache_manager: Arc<CacheManager>,
+    }
+
+    async fn open_test_context() -> Option<FriendServiceTestContext> {
+        let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        let pool = Arc::new(
+            PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&url)
+                .await
+                .ok()?,
+        );
+        let cache_manager = Arc::new(CacheManager::new(CacheConfig::default()).await.ok()?);
+        let user_repository = Arc::new(UserRepository::new(pool.clone()));
+        let service = FriendService::new(pool.clone());
+        Some(FriendServiceTestContext {
+            service,
+            pool,
+            user_repository,
+            cache_manager,
+        })
+    }
+
+    async fn ensure_user(pool: &PgPool, user_id: u64, username: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_users (user_id, username, display_name)
+            VALUES ($1, $2, $2)
+            ON CONFLICT (user_id) DO UPDATE
+            SET username = EXCLUDED.username,
+                display_name = EXCLUDED.display_name
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(username)
+        .execute(pool)
+        .await
+        .expect("ensure user");
+    }
+
+    async fn cleanup_friendship(pool: &PgPool, user_a: u64, user_b: u64) {
+        let _ = sqlx::query(
+            r#"
+            DELETE FROM privchat_friendships
+            WHERE (user_id = $1 AND friend_id = $2)
+               OR (user_id = $2 AND friend_id = $1)
+            "#,
+        )
+        .bind(user_a as i64)
+        .bind(user_b as i64)
+        .execute(pool)
+        .await;
+    }
+
+    async fn cleanup_user(pool: &PgPool, user_id: u64) {
+        let _ = sqlx::query("DELETE FROM privchat_users WHERE user_id = $1")
+            .bind(user_id as i64)
+            .execute(pool)
+            .await;
+    }
+
+    async fn ensure_friendship(pool: &PgPool, user_a: u64, user_b: u64, now_ms: i64) {
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_friendships (
+                user_id, friend_id, status, created_at, updated_at
+            )
+            VALUES
+                ($1, $2, 1, $3, $3),
+                ($2, $1, 1, $3, $3)
+            ON CONFLICT (user_id, friend_id) DO UPDATE
+            SET status = EXCLUDED.status,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(user_a as i64)
+        .bind(user_b as i64)
+        .bind(now_ms)
+        .execute(pool)
+        .await
+        .expect("ensure friendship");
+    }
+
+    #[tokio::test]
+    async fn remove_friend_emits_deleted_tombstones_in_friend_sync() {
+        let Some(ctx) = open_test_context().await else {
+            eprintln!("skip remove_friend_emits_deleted_tombstones_in_friend_sync: DATABASE_URL not configured");
+            return;
+        };
+
+        let alice_id = 9_810_001_u64;
+        let bob_id = 9_810_002_u64;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        cleanup_friendship(&ctx.pool, alice_id, bob_id).await;
+        cleanup_user(&ctx.pool, alice_id).await;
+        cleanup_user(&ctx.pool, bob_id).await;
+
+        ensure_user(&ctx.pool, alice_id, "friend_tombstone_alice").await;
+        ensure_user(&ctx.pool, bob_id, "friend_tombstone_bob").await;
+        ensure_friendship(&ctx.pool, alice_id, bob_id, now_ms).await;
+
+        let initial = ctx
+            .service
+            .sync_entities_page(
+                alice_id,
+                None,
+                None,
+                50,
+                &ctx.user_repository,
+                &ctx.cache_manager,
+            )
+            .await
+            .expect("initial friend sync");
+        let initial_item = initial
+            .items
+            .iter()
+            .find(|item| item.entity_id == bob_id.to_string())
+            .expect("initial friend sync item");
+        assert!(
+            !initial_item.deleted,
+            "initial friend sync should expose active friend entry"
+        );
+        let since_version = initial.next_version;
+
+        ctx.service
+            .remove_friend(alice_id, bob_id)
+            .await
+            .expect("remove friend");
+
+        let alice_delta = ctx
+            .service
+            .sync_entities_page(
+                alice_id,
+                Some(since_version),
+                None,
+                50,
+                &ctx.user_repository,
+                &ctx.cache_manager,
+            )
+            .await
+            .expect("alice friend tombstone sync");
+        let alice_tombstone = alice_delta
+            .items
+            .iter()
+            .find(|item| item.entity_id == bob_id.to_string())
+            .expect("alice tombstone item");
+        assert!(alice_tombstone.deleted);
+        assert!(
+            alice_tombstone.version > since_version,
+            "friend tombstone should advance sync_version"
+        );
+        assert!(alice_tombstone.payload.is_none());
+
+        let bob_delta = ctx
+            .service
+            .sync_entities_page(
+                bob_id,
+                None,
+                None,
+                50,
+                &ctx.user_repository,
+                &ctx.cache_manager,
+            )
+            .await
+            .expect("bob friend tombstone sync");
+        let bob_tombstone = bob_delta
+            .items
+            .iter()
+            .find(|item| item.entity_id == alice_id.to_string())
+            .expect("bob tombstone item");
+        assert!(bob_tombstone.deleted);
+        assert!(bob_tombstone.payload.is_none());
+
+        cleanup_friendship(&ctx.pool, alice_id, bob_id).await;
+        cleanup_user(&ctx.pool, alice_id).await;
+        cleanup_user(&ctx.pool, bob_id).await;
     }
 }

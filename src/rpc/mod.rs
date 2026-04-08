@@ -39,16 +39,16 @@ pub mod user;
 use crate::auth::{DeviceManager, DeviceManagerDb, TokenRevocationService};
 use crate::config::ServerConfig;
 use crate::infra::{
-    CacheManager, ConnectionManager, MessageRouter, PresenceManager, SubscribeManager,
-    TypingRateLimiter,
+    CacheManager, ConnectionManager, MessageRouter, SubscribeManager, TypingRateLimiter,
 };
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::UserRepository;
 use crate::service::sync::SyncService;
 use crate::service::{
     ApprovalService, BlacklistService, ChannelService, FileService, FriendService,
-    MessageHistoryService, OfflineQueueService, PrivacyService, QRCodeService, ReactionService,
-    ReadReceiptService, ReadStateService, StickerService, UnreadCountService, UploadTokenService,
+    MessageHistoryService, OfflineQueueService, PresenceService, PrivacyService, QRCodeService,
+    ReactionService, ReadReceiptService, ReadStateService, StickerService, UnreadCountService,
+    UploadTokenService,
 };
 use router::GLOBAL_RPC_ROUTER;
 use std::sync::Arc;
@@ -108,7 +108,7 @@ pub struct RpcServiceContext {
     // channel_service 已合并到 channel_service
     pub message_history_service: Arc<MessageHistoryService>,
     pub cache_manager: Arc<CacheManager>,
-    pub presence_manager: Arc<PresenceManager>,
+    pub presence_service: Arc<PresenceService>,
     pub friend_service: Arc<FriendService>,
     pub privacy_service: Arc<PrivacyService>,
     pub read_receipt_service: Arc<ReadReceiptService>,
@@ -158,7 +158,7 @@ impl RpcServiceContext {
         // channel_service 已合并到 channel_service
         message_history_service: Arc<MessageHistoryService>,
         cache_manager: Arc<CacheManager>,
-        presence_manager: Arc<PresenceManager>,
+        presence_service: Arc<PresenceService>,
         friend_service: Arc<FriendService>,
         privacy_service: Arc<PrivacyService>,
         read_receipt_service: Arc<ReadReceiptService>,
@@ -195,7 +195,7 @@ impl RpcServiceContext {
             // channel_service 已合并到 channel_service
             message_history_service,
             cache_manager,
-            presence_manager,
+            presence_service,
             friend_service,
             privacy_service,
             read_receipt_service,

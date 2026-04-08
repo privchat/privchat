@@ -853,6 +853,46 @@ impl ChannelService {
         Ok(friend_ids)
     }
 
+    /// 判断两个用户之间是否存在可承载 Presence 可见性的合法直聊会话。
+    pub async fn has_presence_context(&self, viewer_user_id: u64, target_user_id: u64) -> bool {
+        let result = sqlx::query!(
+            r#"
+            SELECT channel_id
+            FROM privchat_channels
+            WHERE channel_type = 0
+              AND (
+                    (direct_user1_id = $1 AND direct_user2_id = $2)
+                 OR (direct_user1_id = $2 AND direct_user2_id = $1)
+              )
+            LIMIT 1
+            "#,
+            viewer_user_id as i64,
+            target_user_id as i64,
+        )
+        .fetch_optional(self.pool())
+        .await;
+
+        matches!(result, Ok(Some(_)))
+    }
+
+    /// 获取某个用户相关的可发布 Presence 的直聊 channelId 列表。
+    pub async fn list_presence_channels_for_user(&self, user_id: u64) -> Result<Vec<u64>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT channel_id
+            FROM privchat_channels
+            WHERE channel_type = 0
+              AND (direct_user1_id = $1 OR direct_user2_id = $1)
+            "#,
+            user_id as i64,
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询 Presence 关联会话失败: {}", e)))?;
+
+        Ok(rows.into_iter().map(|row| row.channel_id as u64).collect())
+    }
+
     /// 获取用户加入的群组列表（管理 API）
     pub async fn get_user_groups_admin(&self, user_id: u64) -> Result<Vec<serde_json::Value>> {
         let groups = sqlx::query!(

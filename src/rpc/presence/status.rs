@@ -17,7 +17,7 @@
 
 use serde_json::Value;
 
-use crate::rpc::{RpcContext, RpcError, RpcResult, RpcServiceContext};
+use crate::rpc::{get_current_user_id, RpcContext, RpcError, RpcResult, RpcServiceContext};
 use privchat_protocol::presence::*;
 
 /// RPC Handler: presence/status/get
@@ -26,10 +26,12 @@ use privchat_protocol::presence::*;
 pub async fn handle(
     params: Value,
     services: RpcServiceContext,
-    _ctx: RpcContext,
+    ctx: RpcContext,
 ) -> RpcResult<Value> {
+    let viewer_user_id = get_current_user_id(&ctx)?;
+
     // 1. 解析请求参数
-    let req: GetOnlineStatusRequest = serde_json::from_value(params)
+    let req: PresenceBatchStatusRequest = serde_json::from_value(params)
         .map_err(|e| RpcError::validation(format!("Invalid params: {}", e)))?;
 
     tracing::debug!(
@@ -49,21 +51,15 @@ pub async fn handle(
     }
 
     // 3. 批量查询
-    let statuses = services
-        .presence_manager
-        .batch_get_status(req.user_ids)
+    let response = services
+        .presence_service
+        .batch_get_status(viewer_user_id, req.user_ids)
         .await;
 
-    // 4. 返回响应
-    let response = GetOnlineStatusResponse {
-        code: 0,
-        message: "OK".to_string(),
-        statuses,
-    };
-
     tracing::debug!(
-        "✅ Returned online status for {} users",
-        response.statuses.len()
+        "✅ Returned online status items={} denied={}",
+        response.items.len(),
+        response.denied_user_ids.len()
     );
 
     serde_json::to_value(response)

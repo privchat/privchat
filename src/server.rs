@@ -107,6 +107,8 @@ pub struct ChatServer {
     connection_manager: Arc<crate::infra::ConnectionManager>,
     /// 通知服务（向客户端推送消息等，未来可扩展更多联系用户的能力）
     notification_service: Arc<crate::service::NotificationService>,
+    /// Presence 服务（user_id 聚合 / user_ids 查询 / channelId 投递）
+    presence_service: Arc<crate::service::PresenceService>,
     /// 消息路由器（维护 user/device/session 在线状态）
     message_router: Arc<crate::infra::MessageRouter>,
     /// MessageRouter 的会话发送适配器（绑定 TransportServer 后可真实下发 PushMessageRequest）
@@ -383,12 +385,6 @@ impl ChatServer {
         info!("🏗️ 构建消息分发器...");
         let mut message_dispatcher = MessageDispatcher::new();
 
-        // 先注册 PingRequest；AuthorizationRequest 需在 channel_service 与 notification_service 创建后注册
-        message_dispatcher.register_handler(
-            MessageType::PingRequest,
-            Box::new(PingMessageHandler::new()),
-        );
-
         // 创建好友服务
         let friend_service = Arc::new(crate::service::FriendService::new(pool.clone()));
 
@@ -415,34 +411,6 @@ impl ChatServer {
         // 创建通知服务（欢迎消息等推送，未来可扩展更多联系用户能力）
         let notification_service = Arc::new(crate::service::NotificationService::new());
         info!("✅ NotificationService 创建完成");
-
-        // 注册连接/认证处理器（需 channel_service、notification_service、welcome_message）
-        message_dispatcher.register_handler(
-            MessageType::AuthorizationRequest,
-            Box::new(ConnectMessageHandler::new(
-                session_manager.clone(),
-                jwt_service.clone(),
-                token_revocation_service.clone(),
-                device_manager.clone(),
-                device_manager_db.clone(),
-                offline_worker.clone(),
-                message_router.clone(),
-                pts_generator.clone(),
-                offline_queue_service.clone(),
-                unread_count_service.clone(),
-                auth_session_manager.clone(),
-                login_log_repository.clone(),
-                connection_manager.clone(),
-                notification_service.clone(),
-                channel_service.clone(),
-                message_repository.clone(),
-                user_message_index.clone(),
-                config.system_message.enabled,
-                config.system_message.auto_create_channel,
-                config.system_message.welcome_message.clone(),
-            )),
-        );
-        info!("✅ ConnectMessageHandler（含欢迎 PushMessageRequest）已注册");
 
         // 创建隐私服务
         let privacy_service = Arc::new(crate::service::PrivacyService::new(
@@ -544,13 +512,6 @@ impl ChatServer {
         );
 
         message_dispatcher.register_handler(
-            MessageType::DisconnectRequest,
-            Box::new(DisconnectMessageHandler::new(
-                connection_manager.clone(),
-                subscribe_manager.clone(),
-            )),
-        );
-        message_dispatcher.register_handler(
             MessageType::RpcRequest,
             Box::new(RPCMessageHandler::new(auth_middleware.clone())),
         );
@@ -573,11 +534,21 @@ impl ChatServer {
         info!("🔧 初始化在线状态管理器...");
         let presence_repository =
             Arc::new(crate::repository::PresenceRepository::new((*pool).clone()));
-        let presence_manager = crate::infra::PresenceManager::new(
-            crate::infra::PresenceConfig::default(),
+        let presence_state_store = crate::infra::PresenceStateStore::new(
+            crate::infra::PresenceStateStoreConfig::default(),
             Some(presence_repository),
-        ); // 注意：PresenceManager::new() 返回 Arc<Self>
+        ); // 注意：PresenceStateStore::new() 返回 Arc<Self>
         info!("✅ 在线状态管理器初始化完成");
+        let presence_tracker = Arc::new(crate::infra::PresenceTracker::new(
+            presence_state_store.clone(),
+        ));
+        let presence_service = Arc::new(crate::service::PresenceService::new(
+            presence_tracker,
+            channel_service.clone(),
+            subscribe_manager.clone(),
+            connection_manager.clone(),
+        ));
+        info!("✅ PresenceService 初始化完成");
 
         // 初始化 SyncService（pts 同步机制）
         info!("🔧 初始化 SyncService...");
@@ -1158,13 +1129,58 @@ impl ChatServer {
         // Typing 限频器
         let typing_rate_limiter = Arc::new(crate::infra::TypingRateLimiter::new());
 
+        message_dispatcher.register_handler(
+            MessageType::PingRequest,
+            Box::new(PingMessageHandler::new(
+                connection_manager.clone(),
+                presence_service.clone(),
+            )),
+        );
+
+        message_dispatcher.register_handler(
+            MessageType::AuthorizationRequest,
+            Box::new(ConnectMessageHandler::new(
+                session_manager.clone(),
+                jwt_service.clone(),
+                token_revocation_service.clone(),
+                device_manager.clone(),
+                device_manager_db.clone(),
+                offline_worker.clone(),
+                message_router.clone(),
+                pts_generator.clone(),
+                offline_queue_service.clone(),
+                unread_count_service.clone(),
+                auth_session_manager.clone(),
+                login_log_repository.clone(),
+                connection_manager.clone(),
+                notification_service.clone(),
+                presence_service.clone(),
+                channel_service.clone(),
+                message_repository.clone(),
+                user_message_index.clone(),
+                config.system_message.enabled,
+                config.system_message.auto_create_channel,
+                config.system_message.welcome_message.clone(),
+            )),
+        );
+        info!("✅ ConnectMessageHandler（含欢迎 PushMessageRequest）已注册");
+
+        message_dispatcher.register_handler(
+            MessageType::DisconnectRequest,
+            Box::new(DisconnectMessageHandler::new(
+                connection_manager.clone(),
+                subscribe_manager.clone(),
+                presence_service.clone(),
+            )),
+        );
+
         // 初始化 RPC 系统
         info!("🔧 初始化 RPC 系统...");
         let rpc_services = crate::rpc::RpcServiceContext::new(
             // channel_service 已合并到 channel_service，不再单独传递
             message_history_service.clone(),
             cache_manager.clone(),
-            presence_manager,
+            presence_service.clone(),
             friend_service.clone(),
             privacy_service.clone(),
             read_receipt_service.clone(),
@@ -1263,6 +1279,7 @@ impl ChatServer {
             login_log_repository, // ✨ 新增
             connection_manager,   // ✨ 新增
             notification_service,
+            presence_service,
             message_router,
             message_router_session_adapter,
             handler_limiter,
@@ -1427,6 +1444,7 @@ impl ChatServer {
         let message_router = self.message_router.clone();
         let handler_limiter = self.handler_limiter.clone();
         let subscribe_manager = self.subscribe_manager.clone();
+        let presence_service = self.presence_service.clone();
 
         tokio::spawn(async move {
             info!("📡 事件处理器开始监听...");
@@ -1477,6 +1495,15 @@ impl ChatServer {
                         // 清理连接管理 + 消息路由在线状态
                         match connection_manager.unregister_connection(session_id).await {
                             Ok(Some((user_id, device_id))) => {
+                                if let Err(e) = presence_service
+                                    .on_device_disconnected(user_id, &device_id)
+                                    .await
+                                {
+                                    warn!(
+                                        "⚠️ 连接关闭后更新 Presence 下线失败: user_id={}, error={}",
+                                        user_id, e
+                                    );
+                                }
                                 if let Err(e) = message_router
                                     .register_device_offline(
                                         &user_id,

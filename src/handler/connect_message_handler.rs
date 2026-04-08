@@ -25,7 +25,7 @@ use crate::model::user::DeviceInfo;
 use crate::repository::MessageRepository;
 use crate::service::sync::get_global_sync_service;
 use crate::service::{
-    ChannelService, NotificationService, OfflineQueueService, UnreadCountService,
+    ChannelService, NotificationService, OfflineQueueService, PresenceService, UnreadCountService,
 };
 use crate::session::SessionManager;
 use crate::Result;
@@ -57,6 +57,7 @@ pub struct ConnectMessageHandler {
     connection_manager: Arc<crate::infra::ConnectionManager>,
     // ✨ 新增：通知服务（欢迎消息等推送，未来可扩展更多联系用户能力）
     notification_service: Arc<NotificationService>,
+    presence_service: Arc<PresenceService>,
     channel_service: Arc<ChannelService>,
     message_repository: Arc<crate::repository::PgMessageRepository>,
     user_message_index: Arc<UserMessageIndex>,
@@ -82,6 +83,7 @@ impl ConnectMessageHandler {
         login_log_repository: Arc<crate::repository::LoginLogRepository>, // ✨ 新增参数
         connection_manager: Arc<crate::infra::ConnectionManager>,         // ✨ 新增参数
         notification_service: Arc<NotificationService>,
+        presence_service: Arc<PresenceService>,
         channel_service: Arc<ChannelService>,
         message_repository: Arc<crate::repository::PgMessageRepository>,
         user_message_index: Arc<UserMessageIndex>,
@@ -104,6 +106,7 @@ impl ConnectMessageHandler {
             login_log_repository, // ✨ 新增
             connection_manager,   // ✨ 新增
             notification_service,
+            presence_service,
             channel_service,
             message_repository,
             user_message_index,
@@ -338,6 +341,13 @@ impl MessageHandler for ConnectMessageHandler {
             warn!("⚠️ ConnectMessageHandler: 注册设备连接失败: {}", e);
         } else {
             info!("✅ ConnectMessageHandler: 设备连接已注册到 ConnectionManager");
+            if let Err(e) = self
+                .presence_service
+                .on_device_connected(user_id, device_id.clone())
+                .await
+            {
+                warn!("⚠️ ConnectMessageHandler: 更新 Presence 上线失败: {}", e);
+            }
         }
 
         // ✨ Phase 3: 发布 UserOnline 事件（用于取消推送）

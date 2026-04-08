@@ -19,7 +19,6 @@ use chrono::Utc;
 use dashmap::DashMap;
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
@@ -29,21 +28,22 @@ use crate::error::ServerError;
 use crate::repository::PresenceRepository;
 use privchat_protocol::presence::{OnlineStatus, OnlineStatusInfo};
 
-/// 带数据库持久化的在线状态管理器
+/// Presence 运行态状态存储（带数据库持久化）
 ///
 /// 三层存储架构：
 /// 1. L1: 内存 (DashMap) - 实时数据，最快
 /// 2. L2: Redis (可选) - 热数据，7天TTL
 /// 3. L3: 数据库 (MySQL) - 冷数据，30天保留
 ///
-/// 更新策略：
-/// - 心跳/上线：立即更新内存，异步更新数据库
-/// - 下线：更新内存、立即更新数据库（保证数据一致性）
-/// - 批量更新：后台任务每5分钟批量更新数据库
+/// 该类型是 Presence v1 的低层 runtime store：
+/// - 维护 user_id -> last_seen / status 的底层状态
+/// - 提供 batch_status 所需的直接查询能力
+/// - 为 PresenceTracker 提供 connect / disconnect / heartbeat 的事实落地
+///
+/// 注意：
+/// - 它不是 Presence v1 的对外业务入口
+/// - channel fanout / batch_status 判权 / realtime delivery 均不在这里处理
 pub struct PresenceManagerWithDb {
-    /// 订阅关系：target_user_id -> Set<subscriber_user_id>
-    subscriptions: Arc<DashMap<u64, HashSet<u64>>>,
-
     /// 在线状态缓存：user_id -> OnlineStatusInfo
     status_cache: Cache<u64, OnlineStatusInfo>,
 
@@ -102,8 +102,6 @@ impl Default for PresenceConfig {
 /// 在线状态统计
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresenceStats {
-    pub total_subscriptions: usize,
-    pub total_subscribers: usize,
     pub cached_statuses: u64,
     pub tracked_users: usize,
     pub pending_db_updates: usize,
@@ -118,13 +116,12 @@ impl PresenceManagerWithDb {
             .build();
 
         info!(
-            "🔔 PresenceManagerWithDb initialized: online_threshold={}s, cache_ttl={}s, capacity={}, db={}",
+            "🔔 PresenceStateStore initialized: online_threshold={}s, cache_ttl={}s, capacity={}, db={}",
             config.online_threshold_secs, config.cache_ttl_secs, config.cache_capacity,
             if db_repo.is_some() { "enabled" } else { "disabled" }
         );
 
         let manager = Arc::new(Self {
-            subscriptions: Arc::new(DashMap::new()),
             status_cache,
             last_seen: Arc::new(DashMap::new()),
             db_repo: db_repo.clone(),
@@ -144,80 +141,6 @@ impl PresenceManagerWithDb {
     /// 使用默认配置创建
     pub fn with_default_config(db_repo: Option<Arc<PresenceRepository>>) -> Arc<Self> {
         Self::new(PresenceConfig::default(), db_repo)
-    }
-
-    // ==================== 订阅管理 ====================
-
-    /// 订阅用户在线状态
-    pub async fn subscribe(
-        &self,
-        subscriber_id: u64,
-        target_user_id: u64,
-    ) -> Result<OnlineStatusInfo, ServerError> {
-        // 1. 添加订阅关系
-        self.subscriptions
-            .entry(target_user_id)
-            .or_insert_with(HashSet::new)
-            .insert(subscriber_id);
-
-        debug!(
-            "👁️ User {} subscribed to user {}'s presence",
-            subscriber_id, target_user_id
-        );
-
-        // 2. 返回当前在线状态（三层查询）
-        let status = self.get_status_with_db(target_user_id).await;
-        Ok(status)
-    }
-
-    /// 取消订阅
-    pub fn unsubscribe(&self, subscriber_id: u64, target_user_id: u64) {
-        if let Some(mut subscribers) = self.subscriptions.get_mut(&target_user_id) {
-            subscribers.remove(&subscriber_id);
-
-            debug!(
-                "👁️ User {} unsubscribed from user {}'s presence",
-                subscriber_id, target_user_id
-            );
-
-            if subscribers.is_empty() {
-                drop(subscribers);
-                self.subscriptions.remove(&target_user_id);
-                debug!(
-                    "🧹 Removed empty subscription entry for user {}",
-                    target_user_id
-                );
-            }
-        }
-    }
-
-    /// 取消所有订阅
-    pub fn unsubscribe_all(&self, user_id: u64) {
-        let mut removed_count = 0;
-
-        for mut entry in self.subscriptions.iter_mut() {
-            if entry.value_mut().remove(&user_id) {
-                removed_count += 1;
-            }
-        }
-
-        self.subscriptions
-            .retain(|_, subscribers| !subscribers.is_empty());
-
-        if removed_count > 0 {
-            debug!(
-                "🧹 User {} offline: removed {} subscriptions",
-                user_id, removed_count
-            );
-        }
-    }
-
-    /// 获取订阅者列表
-    pub fn get_subscribers(&self, user_id: u64) -> Vec<u64> {
-        self.subscriptions
-            .get(&user_id)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default()
     }
 
     // ==================== 状态管理 ====================
@@ -355,15 +278,11 @@ impl PresenceManagerWithDb {
         };
         self.status_cache.insert(user_id, new_info.clone()).await;
 
-        // 如果状态改变，通知订阅者
         if old_status != OnlineStatus::Online {
             debug!(
-                "🟢 User {} is now online (first_time={})",
+                "🟢 PresenceStateStore: user {} is now online (first_time={})",
                 user_id, is_first_time
             );
-            if self.config.enable_push_notification {
-                self.notify_subscribers(user_id, new_info).await;
-            }
         }
 
         Ok(())
@@ -395,15 +314,7 @@ impl PresenceManagerWithDb {
         };
         self.status_cache.insert(user_id, new_info.clone()).await;
 
-        debug!("⚪ User {} is now offline", user_id);
-
-        // 通知订阅者
-        if self.config.enable_push_notification {
-            self.notify_subscribers(user_id, new_info).await;
-        }
-
-        // 取消该用户的所有订阅
-        self.unsubscribe_all(user_id);
+        debug!("⚪ PresenceStateStore: user {} is now offline", user_id);
 
         Ok(())
     }
@@ -519,43 +430,10 @@ impl PresenceManagerWithDb {
         Ok(())
     }
 
-    // ==================== 通知推送 ====================
-
-    async fn notify_subscribers(&self, user_id: u64, status_info: OnlineStatusInfo) {
-        let subscribers = self.get_subscribers(user_id);
-
-        if subscribers.is_empty() {
-            return;
-        }
-
-        debug!(
-            "📢 Notifying {} subscribers about user {} status change to {:?}",
-            subscribers.len(),
-            user_id,
-            status_info.status
-        );
-
-        // TODO: 实现实际的推送逻辑
-        for subscriber_id in subscribers {
-            debug!(
-                "  → Will notify user {} about user {} status: {:?}",
-                subscriber_id, user_id, status_info.status
-            );
-        }
-    }
-
     // ==================== 统计信息 ====================
 
     pub fn get_stats(&self) -> PresenceStats {
-        let total_subscribers: usize = self
-            .subscriptions
-            .iter()
-            .map(|entry| entry.value().len())
-            .sum();
-
         PresenceStats {
-            total_subscriptions: self.subscriptions.len(),
-            total_subscribers,
             cached_statuses: self.status_cache.entry_count(),
             tracked_users: self.last_seen.len(),
             pending_db_updates: self.pending_updates.len(),
@@ -566,18 +444,6 @@ impl PresenceManagerWithDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_subscribe_without_db() {
-        let manager = PresenceManagerWithDb::with_default_config(None);
-
-        let status = manager.subscribe(1, 2).await.unwrap();
-        assert_eq!(status.status, OnlineStatus::LongTimeAgo);
-
-        let subscribers = manager.get_subscribers(2);
-        assert_eq!(subscribers.len(), 1);
-        assert!(subscribers.contains(&1));
-    }
 
     #[tokio::test]
     async fn test_user_online_offline_without_db() {

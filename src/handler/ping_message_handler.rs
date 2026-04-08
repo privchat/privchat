@@ -17,16 +17,28 @@
 
 use crate::context::RequestContext;
 use crate::handler::MessageHandler;
+use crate::infra::ConnectionManager;
+use crate::service::PresenceService;
 use crate::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tracing::trace;
 
 /// Ping消息处理器
-pub struct PingMessageHandler;
+pub struct PingMessageHandler {
+    connection_manager: Arc<ConnectionManager>,
+    presence_service: Arc<PresenceService>,
+}
 
 impl PingMessageHandler {
-    pub fn new() -> Self {
-        Self
+    pub fn new(
+        connection_manager: Arc<ConnectionManager>,
+        presence_service: Arc<PresenceService>,
+    ) -> Self {
+        Self {
+            connection_manager,
+            presence_service,
+        }
     }
 }
 
@@ -43,6 +55,20 @@ impl MessageHandler for PingMessageHandler {
             privchat_protocol::decode_message(&context.data).map_err(|e| {
                 crate::error::ServerError::Protocol(format!("解码Ping请求失败: {}", e))
             })?;
+
+        // 心跳只更新 Presence 活跃时间，不主动广播。
+        if let Some(connection) = self
+            .connection_manager
+            .get_connection_by_session(&context.session_id)
+            .await
+        {
+            if let Err(e) = self.presence_service.on_heartbeat(connection.user_id).await {
+                trace!(
+                    "⚠️ PingMessageHandler: 更新 Presence 心跳失败 session={} user={} error={}",
+                    context.session_id, connection.user_id, e
+                );
+            }
+        }
 
         // 创建Pong响应
         let pong_response = privchat_protocol::protocol::PongResponse {

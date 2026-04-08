@@ -220,6 +220,14 @@ impl ConnectionManager {
             .collect()
     }
 
+    /// 通过 session_id 获取当前连接信息。
+    pub async fn get_connection_by_session(&self, session_id: &SessionId) -> Option<DeviceConnection> {
+        let (user_id, device_id) = self.session_index.get(session_id).map(|entry| entry.clone())?;
+        self.connections
+            .get(&(user_id, device_id))
+            .map(|entry| entry.clone())
+    }
+
     /// 获取活跃连接数
     pub async fn get_connection_count(&self) -> usize {
         self.connections.len()
