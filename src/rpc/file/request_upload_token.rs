@@ -17,12 +17,12 @@
 
 //! RPC: 请求上传许可
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use tracing::warn;
 
 use crate::rpc::{RpcError, RpcResult, RpcServiceContext};
 use crate::service::FileType;
-use privchat_protocol::rpc::FileRequestUploadTokenRequest;
+use privchat_protocol::rpc::{FileRequestUploadTokenRequest, FileRequestUploadTokenResponse};
 
 /// 请求上传 token
 pub async fn request_upload_token(services: RpcServiceContext, params: Value) -> RpcResult<Value> {
@@ -79,12 +79,17 @@ pub async fn request_upload_token(services: RpcServiceContext, params: Value) ->
             RpcError::internal("缺少配置: file_api_base_url，拒绝签发上传 token".to_string())
         })?;
 
-    Ok(json!({
-        "upload_token": token.token,
-        "upload_url": upload_url,
-        "expires_at": token.expires_at.timestamp(),
-        "max_size": token.max_size,
-    }))
+    let response = FileRequestUploadTokenResponse {
+        token: token.token.clone(),
+        upload_url,
+        // request_upload_token 阶段尚未落盘具体文件，保留兼容空值
+        file_id: String::new(),
+        expires_at: Some(token.expires_at.timestamp()),
+        max_size: Some(token.max_size),
+    };
+
+    serde_json::to_value(response)
+        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
 
 /// 根据文件类型获取最大文件大小限制

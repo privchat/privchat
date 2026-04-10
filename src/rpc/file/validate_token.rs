@@ -27,9 +27,10 @@ use crate::rpc::{RpcError, RpcResult, RpcServiceContext};
 /// 验证上传 token
 pub async fn validate_upload_token(services: RpcServiceContext, params: Value) -> RpcResult<Value> {
     // 解析参数
-    let upload_token = params["upload_token"]
-        .as_str()
-        .ok_or_else(|| RpcError::validation("缺少 upload_token 参数".to_string()))?;
+    let upload_token = params
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::validation("缺少 token 参数".to_string()))?;
 
     tracing::debug!("🔐 验证上传 token: {}", upload_token);
 
