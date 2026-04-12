@@ -41,7 +41,7 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 
 # ID生成
-snowflake_me = { version = "0.5", features = ["ip-fallback"] }
+snowflake_me = "0.5"
 
 # 并发数据结构
 dashmap = "5.5"

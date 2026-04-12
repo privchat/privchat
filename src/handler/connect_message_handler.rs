@@ -391,6 +391,7 @@ impl MessageHandler for ConnectMessageHandler {
             let user_message_index = self.user_message_index.clone();
             let offline_queue_service = self.offline_queue_service.clone();
             let connection_manager = self.connection_manager.clone();
+            let unread_count_service = self.unread_count_service.clone();
             let system_message_enabled = self.system_message_enabled;
             let connect_req = connect_request.clone();
             tokio::spawn(async move {
@@ -406,6 +407,7 @@ impl MessageHandler for ConnectMessageHandler {
                     user_message_index,
                     offline_queue_service,
                     connection_manager,
+                    unread_count_service,
                 )
                 .await
                 {
@@ -699,13 +701,32 @@ impl ConnectMessageHandler {
             .add_message(user_id, pts, message_id)
             .await;
 
+        // 登录通知与普通消息保持一致：更新未读计数
+        if let Err(e) = self.unread_count_service.increment(user_id, channel_id, 1).await {
+            warn!(
+                "⚠️ 登录通知更新 unread_count_service 失败: user_id={}, channel_id={}, error={}",
+                user_id, channel_id, e
+            );
+        }
+        if let Err(e) = self
+            .channel_service
+            .increment_user_channel_unread(channel_id, &[user_id], 1)
+            .await
+        {
+            warn!(
+                "⚠️ 登录通知更新 privchat_user_channels 未读失败: user_id={}, channel_id={}, error={}",
+                user_id, channel_id, e
+            );
+        }
+
         let payload = serde_json::to_vec(&json!({ "content": content }))
             .map_err(|e| anyhow::anyhow!("encode login notice payload failed: {}", e))?;
         let push_msg = privchat_protocol::protocol::PushMessageRequest {
             setting: privchat_protocol::protocol::MessageSetting::default(),
             msg_key: format!("msg_{}", message_id),
             server_message_id: message_id,
-            message_seq: 1,
+            // Must align with allocated channel pts; fixed `1` breaks unread/read-cursor projection.
+            message_seq: u32::try_from(pts).unwrap_or(u32::MAX),
             local_message_id: message_id,
             stream_no: String::new(),
             stream_seq: 0,
@@ -753,6 +774,7 @@ impl ConnectMessageHandler {
         user_message_index: Arc<UserMessageIndex>,
         offline_queue_service: Arc<OfflineQueueService>,
         connection_manager: Arc<crate::infra::ConnectionManager>,
+        unread_count_service: Arc<UnreadCountService>,
     ) -> anyhow::Result<()> {
         let (channel_id, _) = channel_service
             .get_or_create_direct_channel(
@@ -836,13 +858,31 @@ impl ConnectMessageHandler {
             .add_message(user_id, pts, message_id)
             .await;
 
+        // 登录通知与普通消息保持一致：更新未读计数
+        if let Err(e) = unread_count_service.increment(user_id, channel_id, 1).await {
+            warn!(
+                "⚠️ 异步登录通知更新 unread_count_service 失败: user_id={}, channel_id={}, error={}",
+                user_id, channel_id, e
+            );
+        }
+        if let Err(e) = channel_service
+            .increment_user_channel_unread(channel_id, &[user_id], 1)
+            .await
+        {
+            warn!(
+                "⚠️ 异步登录通知更新 privchat_user_channels 未读失败: user_id={}, channel_id={}, error={}",
+                user_id, channel_id, e
+            );
+        }
+
         let payload = serde_json::to_vec(&json!({ "content": content }))
             .map_err(|e| anyhow::anyhow!("encode login notice payload failed: {}", e))?;
         let push_msg = privchat_protocol::protocol::PushMessageRequest {
             setting: privchat_protocol::protocol::MessageSetting::default(),
             msg_key: format!("msg_{}", message_id),
             server_message_id: message_id,
-            message_seq: 1,
+            // Must align with allocated channel pts; fixed `1` breaks unread/read-cursor projection.
+            message_seq: u32::try_from(pts).unwrap_or(u32::MAX),
             local_message_id: message_id,
             stream_no: String::new(),
             stream_seq: 0,

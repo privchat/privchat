@@ -362,6 +362,12 @@ impl ReadStateService {
         reader_id: UserId,
         last_read_pts: u64,
     ) -> Result<()> {
+        // 已读游标事件必须带非零序列，避免客户端把该事件当作无效/旧版本丢弃。
+        // 这里使用 read_pts 作为单调序列来源（同频道内只增不减）。
+        let seq_u32 = u32::try_from(last_read_pts)
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let server_message_id = u64::from(seq_u32);
         let payload = ChannelReadCursorNotification::new(
             channel_id,
             channel_type,
@@ -373,8 +379,8 @@ impl ReadStateService {
         let notification = PushMessageRequest {
             setting: Default::default(),
             msg_key: String::new(),
-            server_message_id: 0,
-            message_seq: 0,
+            server_message_id,
+            message_seq: seq_u32,
             local_message_id: 0,
             stream_no: String::new(),
             stream_seq: 0,
@@ -385,7 +391,7 @@ impl ReadStateService {
             message_type: privchat_protocol::ContentMessageType::System.as_u32(),
             expire: 0,
             topic: String::new(),
-            from_uid: 0,
+            from_uid: reader_id,
             payload: serde_json::to_vec(&payload)
                 .map_err(|e| ServerError::Serialization(e.to_string()))?,
         };
