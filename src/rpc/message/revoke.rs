@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 use crate::repository::MessageRepository;
+use crate::error::ServerError;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 
@@ -141,10 +142,22 @@ pub async fn handle(
     // 6. 同时更新内存缓存
     if let Err(e) = services
         .message_history_service
-        .revoke_message(&channel_id, &message_id)
+        .revoke_message(&message_id, &user_id)
         .await
     {
-        warn!("⚠️ 更新内存缓存失败: {}", e);
+        match e {
+            ServerError::NotFound(_) | ServerError::MessageNotFound(_) => {
+                tracing::debug!(
+                    "ℹ️ 内存缓存未命中，跳过撤回状态同步: channel_id={}, message_id={}, user_id={}",
+                    channel_id,
+                    message_id,
+                    user_id
+                );
+            }
+            other => {
+                warn!("⚠️ 更新内存缓存失败: {}", other);
+            }
+        }
     }
 
     let channel_type = services
@@ -153,6 +166,7 @@ pub async fn handle(
         .await
         .map(|channel| channel.channel_type.to_i16() as u8)
         .unwrap_or(1);
+    let channel_type = if channel_type == 0 { 1 } else { channel_type };
 
     let revoke_ts = Utc::now().timestamp_millis();
     let revoke_payload = json!({
@@ -179,7 +193,9 @@ pub async fn handle(
     }
 
     // 7. 推送撤回事件给所有参与者
-    if let Err(e) = distribute_revoke_event(&services, channel_id, message_id, user_id).await {
+    if let Err(e) =
+        distribute_revoke_event(&services, channel_id, channel_type, message_id, user_id).await
+    {
         warn!("⚠️ 推送撤回事件失败: {}，但消息已撤回", e);
     }
 
@@ -219,15 +235,15 @@ pub async fn handle(
 async fn distribute_revoke_event(
     services: &RpcServiceContext,
     channel_id: u64,
+    channel_type: u8,
     message_id: u64,
     revoked_by: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
-    // 构造撤回事件
+    // 构造撤回事件：同一 server_message_id 再推一条，deleted=true
+    // SDK 收到后通过 item.deleted 判断走 set_message_revoke 路径
     let event_payload = json!({
-        "message_id": message_id,
-        "channel_id": channel_id,
         "revoked_by": revoked_by,
         "revoked_at": now,
     });
@@ -238,7 +254,7 @@ async fn distribute_revoke_event(
             signal: 0,
         },
         msg_key: format!("revoke_{}", message_id),
-        server_message_id: message_id,
+        server_message_id: message_id,   // 与原消息相同的 ID
         message_seq: 0,
         local_message_id: 0,
         stream_no: String::new(),
@@ -246,12 +262,13 @@ async fn distribute_revoke_event(
         stream_flag: 0,
         timestamp: (now / 1000) as u32,
         channel_id,
-        channel_type: 1,
+        channel_type,
         message_type: privchat_protocol::ContentMessageType::System.as_u32(),
         expire: 0,
         topic: "message.revoke".to_string(),
         from_uid: revoked_by,
         payload: event_payload.to_string().into_bytes(),
+        deleted: true,                   // 标记为删除，SDK 走 set_message_revoke
     };
 
     // 获取会话参与者
@@ -260,16 +277,35 @@ async fn distribute_revoke_event(
         .get_channel_participants(channel_id)
         .await?;
 
+    tracing::info!(
+        "📣 开始分发撤回事件: channel_id={}, channel_type={}, message_id={}, revoked_by={}, participants={}",
+        channel_id,
+        channel_type,
+        message_id,
+        revoked_by,
+        participants.len()
+    );
+
     // 推送给所有参与者
     for participant in participants {
-        if let Err(e) = services
+        match services
             .message_router
             .route_message_to_user(&participant.user_id, revoke_event.clone())
             .await
         {
-            warn!("⚠️ 推送撤回事件给用户 {} 失败: {}", participant.user_id, e);
-        } else {
-            tracing::debug!("📤 成功推送撤回事件给用户 {}", participant.user_id);
+            Ok(result) => {
+                tracing::info!(
+                    "📤 撤回事件路由结果: target_user={}, message_id={}, success={}, failed={}, offline={}",
+                    participant.user_id,
+                    message_id,
+                    result.success_count,
+                    result.failed_count,
+                    result.offline_count
+                );
+            }
+            Err(e) => {
+                warn!("⚠️ 推送撤回事件给用户 {} 失败: {}", participant.user_id, e);
+            }
         }
     }
 

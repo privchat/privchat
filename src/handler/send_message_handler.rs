@@ -2017,6 +2017,7 @@ impl SendMessageHandler {
             topic: String::new(),
             from_uid: *sender_id,
             payload,
+            deleted: false,
         };
 
         Ok(push_message_request)

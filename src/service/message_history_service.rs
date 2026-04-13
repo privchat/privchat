@@ -613,3 +613,37 @@ pub struct ChannelMessageStats {
     /// 统计时间
     pub stats_time: DateTime<Utc>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MessageHistoryService;
+
+    #[tokio::test]
+    async fn revoke_message_marks_cached_message_revoked() {
+        let service = MessageHistoryService::new(100);
+        let channel_id = 42_u64;
+        let sender_id = 1001_u64;
+        let revoker_id = 1002_u64;
+
+        let record = service
+            .store_message(
+                &channel_id,
+                &sender_id,
+                "hello".to_string(),
+                1,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let revoked = service
+            .revoke_message(&record.message_id, &revoker_id)
+            .await
+            .unwrap();
+
+        assert!(revoked.is_revoked);
+        assert_eq!(revoked.revoker_id, Some(revoker_id));
+        assert_eq!(revoked.message_id, record.message_id);
+    }
+}

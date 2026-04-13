@@ -1022,17 +1022,26 @@ impl SessionManager for SessionManagerAdapter {
             .await
             .map(|_| {
                 info!(
-                    "📤 SessionManagerAdapter send_to_session ok: session_id={}, server_message_id={}, channel_id={}, from_uid={}",
+                    "📤 SessionManagerAdapter send_to_session ok: session_id={}, server_message_id={}, channel_id={}, channel_type={}, from_uid={}, topic={}, deleted={}",
                     session_id,
                     message.server_message_id,
                     message.channel_id,
-                    message.from_uid
+                    message.channel_type,
+                    message.from_uid,
+                    message.topic,
+                    message.deleted
                 );
             })
             .map_err(|e| {
                 warn!(
-                    "❌ SessionManagerAdapter send_to_session failed: session_id={}, server_message_id={}, channel_id={}, error={}",
-                    session_id, message.server_message_id, message.channel_id, e
+                    "❌ SessionManagerAdapter send_to_session failed: session_id={}, server_message_id={}, channel_id={}, channel_type={}, topic={}, deleted={}, error={}",
+                    session_id,
+                    message.server_message_id,
+                    message.channel_id,
+                    message.channel_type,
+                    message.topic,
+                    message.deleted,
+                    e
                 );
                 anyhow::anyhow!("send_to_session({}) failed: {}", session_id, e)
             })

@@ -301,6 +301,7 @@ pub async fn handle(
                                 topic: String::new(),
                                 from_uid: crate::config::SYSTEM_USER_ID,
                                 payload,
+                                deleted: false,
                             };
 
                             if let Err(e) =

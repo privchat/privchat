@@ -739,6 +739,7 @@ impl ConnectMessageHandler {
             topic: String::new(),
             from_uid: crate::config::SYSTEM_USER_ID,
             payload,
+            deleted: false,
         };
         if let Err(e) = self.offline_queue_service.add(user_id, &push_msg).await {
             warn!("⚠️ 登录通知加入离线队列失败: {:?}", e);
@@ -895,6 +896,7 @@ impl ConnectMessageHandler {
             topic: String::new(),
             from_uid: crate::config::SYSTEM_USER_ID,
             payload,
+            deleted: false,
         };
         if let Err(e) = offline_queue_service.add(user_id, &push_msg).await {
             warn!("⚠️ 登录通知加入离线队列失败: {:?}", e);

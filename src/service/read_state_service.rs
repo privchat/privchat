@@ -394,6 +394,7 @@ impl ReadStateService {
             from_uid: reader_id,
             payload: serde_json::to_vec(&payload)
                 .map_err(|e| ServerError::Serialization(e.to_string()))?,
+            deleted: false,
         };
         self.message_router
             .route_message_to_user(&target_user_id, notification)
