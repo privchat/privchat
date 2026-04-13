@@ -46,11 +46,7 @@ pub async fn handle(
         .await
         .map_err(|e| RpcError::internal(format!("unregister connection failed: {}", e)))?;
 
-    services
-        .auth_session_manager
-        .unbind_session(&session_id)
-        .await;
-
+    // 获取设备信息用于后续清理
     let mut cleanup_device_id = ctx.device_id.clone();
     if cleanup_device_id.is_none() {
         if let Some((removed_uid, removed_device_id)) = removed {
@@ -60,11 +56,47 @@ pub async fn handle(
         }
     }
 
+    // 通知 Presence 服务用户下线（修复：之前缺少此调用，导致订阅者收不到离线状态）
+    if let Some(device_id) = &cleanup_device_id {
+        if let Err(e) = services
+            .presence_service
+            .on_device_disconnected(user_id, device_id)
+            .await
+        {
+            // 记录警告但不阻止 logout 流程
+            tracing::warn!(
+                "⚠️ LogoutHandler: 更新 Presence 下线失败: user_id={}, error={}",
+                user_id,
+                e
+            );
+        }
+    }
+
+    // 解绑认证会话
+    services
+        .auth_session_manager
+        .unbind_session(&session_id)
+        .await;
+
+    // 清理消息路由和设备状态
     if let Some(device_id) = cleanup_device_id {
         let _ = services
             .message_router
             .register_device_offline(&user_id, &device_id, Some(session_id_raw))
             .await;
+
+        // 递增会话版本号（AUTH_SPEC 2.5：主动登出应递增 session_version）
+        if let Err(e) = services
+            .device_manager_db
+            .increment_session_version(user_id, &device_id, "user_logout")
+            .await
+        {
+            tracing::warn!(
+                "⚠️ LogoutHandler: 递增 session_version 失败: user_id={}, error={}",
+                user_id,
+                e
+            );
+        }
     }
 
     Ok(json!({

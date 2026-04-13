@@ -1752,6 +1752,7 @@ impl ChatServer {
     /// 启动在线状态清理任务
     async fn start_online_status_cleaner(&self) {
         let online_status_manager = self.online_status_manager.clone();
+        let presence_service = self.presence_service.clone();
         let cleanup_interval = self.config.cache.online_status.cleanup_interval_secs;
 
         tokio::spawn(async move {
@@ -1759,9 +1760,18 @@ impl ChatServer {
             loop {
                 interval.tick().await;
 
-                let cleaned = online_status_manager.cleanup_expired_sessions();
-                if cleaned > 0 {
-                    info!("🧹 清理过期会话: {} 个", cleaned);
+                // 清理过期会话，并获取过期的用户 ID 列表
+                let expired_users = online_status_manager.cleanup_expired_sessions();
+
+                if !expired_users.is_empty() {
+                    info!("🧹 清理过期会话: {} 个", expired_users.len());
+
+                    // 为每个过期用户触发 presence timeout，通知订阅者
+                    for user_id in &expired_users {
+                        if let Err(e) = presence_service.on_timeout(*user_id).await {
+                            warn!("Failed to publish presence timeout for user {}: {}", user_id, e);
+                        }
+                    }
                 }
             }
         });

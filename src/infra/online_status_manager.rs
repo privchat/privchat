@@ -409,7 +409,9 @@ impl OnlineStatusManager {
     }
 
     /// 清理过期的会话
-    pub fn cleanup_expired_sessions(&self) -> usize {
+    ///
+    /// 返回过期用户的 ID 列表，以便触发 presence timeout 通知
+    pub fn cleanup_expired_sessions(&self) -> Vec<u64> {
         let timeout = Duration::from_secs(self.config.offline_timeout_secs);
         let mut expired_keys = Vec::new();
         let mut expired_session_ids = Vec::new();
@@ -435,7 +437,8 @@ impl OnlineStatusManager {
             self.session_to_key.remove(&session_id);
         }
 
-        // 清理空的用户设备列表
+        // 清理空的用户设备列表，并收集过期用户 ID
+        let mut expired_user_ids = Vec::new();
         let mut empty_users = Vec::new();
         for user_entry in self.user_devices.iter() {
             let user_id = user_entry.key();
@@ -455,15 +458,16 @@ impl OnlineStatusManager {
             }
         }
 
-        for user_id in empty_users {
-            self.user_devices.remove(&user_id);
+        for user_id in &empty_users {
+            expired_user_ids.push(*user_id);
+            self.user_devices.remove(user_id);
         }
 
         if expired_count > 0 {
-            info!("🧹 Cleaned up {} expired sessions", expired_count);
+            info!("🧹 Cleaned up {} expired sessions, {} users offline", expired_count, expired_user_ids.len());
         }
 
-        expired_count
+        expired_user_ids
     }
 
     /// 启动清理任务

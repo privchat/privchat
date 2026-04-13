@@ -422,4 +422,64 @@ mod tests {
         assert_eq!(queried.device_count, notified.device_count);
         assert_eq!(queried.version, notified.version);
     }
+
+    /// 验证：当用户会话因超时被清理时，PresenceService.on_timeout 会正确发布离线状态给订阅者
+    /// 这是 privchat-iced 能够收到对方离线状态更新的关键路径
+    #[tokio::test]
+    async fn cleanup_timeout_publishes_offline_to_subscribers() {
+        let service = test_service();
+
+        // 设置用户 100 的订阅者
+        service.set_test_visibility(200, 100, true);
+        service.set_test_presence_channels(100, vec![3001]);
+        service.subscribe_manager.subscribe(SessionId::from(200_u64), 3001).unwrap();
+
+        // 用户 100 上线
+        service.on_device_connected(100, "device-100").await.unwrap();
+        let _ = service.take_test_published_events(); // 清除上线事件
+
+        // 模拟会话超时清理（这应该是服务器清理过期会话时调用的路径）
+        service.on_timeout(100).await.unwrap();
+
+        // 验证订阅者收到了离线状态更新
+        let published = service.take_test_published_events();
+        assert_eq!(published.len(), 1);
+
+        let (channel_id, notification) = &published[0];
+        assert_eq!(*channel_id, 3001);
+        assert_eq!(notification.user_id, 100);
+        assert!(!notification.snapshot.is_online, "用户应该被标记为离线");
+        assert_eq!(notification.snapshot.device_count, 0, "设备数应该为 0");
+        assert!(notification.version > 0, "version 应该递增");
+    }
+
+    /// 验证：用户主动登出（logout）时，on_device_disconnected 会正确发布离线状态给订阅者
+    /// 这是 account/auth/logout RPC 的关键路径，确保订阅者能看到用户下线
+    #[tokio::test]
+    async fn logout_publishes_offline_to_subscribers() {
+        let service = test_service();
+
+        // 设置用户 200 的订阅者（用户 300 在关注 200 的状态）
+        service.set_test_visibility(300, 200, true);
+        service.set_test_presence_channels(200, vec![4001]);
+        service.subscribe_manager.subscribe(SessionId::from(300_u64), 4001).unwrap();
+
+        // 用户 200 上线（模拟登录成功）
+        service.on_device_connected(200, "device-200").await.unwrap();
+        let _ = service.take_test_published_events(); // 清除上线事件
+
+        // 用户点击登出（调用 on_device_disconnected，与 transport close 路径相同）
+        service.on_device_disconnected(200, "device-200").await.unwrap();
+
+        // 验证订阅者收到了离线状态更新
+        let published = service.take_test_published_events();
+        assert_eq!(published.len(), 1);
+
+        let (channel_id, notification) = &published[0];
+        assert_eq!(*channel_id, 4001);
+        assert_eq!(notification.user_id, 200);
+        assert!(!notification.snapshot.is_online, "登出后用户应该被标记为离线");
+        assert_eq!(notification.snapshot.device_count, 0, "登出后设备数应该为 0");
+        assert!(notification.version > 1, "登出后 version 应该递增");
+    }
 }

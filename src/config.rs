@@ -1584,7 +1584,7 @@ impl Default for OnlineStatusConfig {
     fn default() -> Self {
         Self {
             offline_timeout_secs: 300,
-            cleanup_interval_secs: 60,
+            cleanup_interval_secs: 30, // 30秒扫描一次超时，确保快速检测离线状态
         }
     }
 }

@@ -392,6 +392,7 @@ mod tests {
             topic: String::new(),
             from_uid: 1001,
             payload: format!("hello-{server_message_id}").into_bytes(),
+            deleted: false,
         }
     }
 
