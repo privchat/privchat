@@ -34,9 +34,10 @@ pub async fn handle(
     let req: PresenceBatchStatusRequest = serde_json::from_value(params)
         .map_err(|e| RpcError::validation(format!("Invalid params: {}", e)))?;
 
-    tracing::debug!(
-        "📥 presence/status/get: querying {} users",
-        req.user_ids.len()
+    tracing::info!(
+        "📥 presence/status/get: viewer_user_id={} querying_user_ids={:?}",
+        viewer_user_id,
+        req.user_ids
     );
 
     // 2. 验证参数
@@ -56,10 +57,21 @@ pub async fn handle(
         .batch_get_status(viewer_user_id, req.user_ids)
         .await;
 
-    tracing::debug!(
-        "✅ Returned online status items={} denied={}",
-        response.items.len(),
-        response.denied_user_ids.len()
+    tracing::info!(
+        "✅ presence/status/get: viewer_user_id={} items={:?} denied_user_ids={:?}",
+        viewer_user_id,
+        response
+            .items
+            .iter()
+            .map(|item| (
+                item.user_id,
+                item.is_online,
+                item.last_seen_at,
+                item.device_count,
+                item.version
+            ))
+            .collect::<Vec<_>>(),
+        response.denied_user_ids
     );
 
     serde_json::to_value(response)
