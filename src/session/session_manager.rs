@@ -49,6 +49,18 @@ impl SessionManager {
     ) -> Result<()> {
         info!("Adding user session: {} -> {:?}", user_id, session_id);
 
+        // 若用户已有旧会话，先清理旧 session_id -> user_id 映射，避免遗留脏映射影响后续断线处理
+        if let Some(old_entry) = self.user_sessions.get(&user_id) {
+            let old_session_id = old_entry.session_id;
+            if old_session_id != session_id {
+                self.session_to_user.remove(&old_session_id);
+                info!(
+                    "Rebinding user session: removed stale session mapping user={} old_session={:?} new_session={:?}",
+                    user_id, old_session_id, session_id
+                );
+            }
+        }
+
         // 创建新的用户会话
         let user_session = Arc::new(UserSession::new(user_id, session_id, device_info));
 
@@ -93,8 +105,26 @@ impl SessionManager {
         info!("Removing user session by session ID: {:?}", session_id);
 
         if let Some((_, user_id)) = self.session_to_user.remove(session_id) {
-            self.user_sessions.remove(&user_id);
-            info!("User session removed for session: {:?}", session_id);
+            // 仅当当前 user_sessions 中绑定的仍是这个 session_id 时才删除，
+            // 防止“旧连接断开”误删“新连接已重绑”的在线会话。
+            let should_remove_user_entry = self
+                .user_sessions
+                .get(&user_id)
+                .map(|entry| entry.session_id == *session_id)
+                .unwrap_or(false);
+
+            if should_remove_user_entry {
+                self.user_sessions.remove(&user_id);
+                info!(
+                    "User session removed for session: {:?}, user_id={}",
+                    session_id, user_id
+                );
+            } else {
+                info!(
+                    "Skip removing user session for stale session: {:?}, user_id={}",
+                    session_id, user_id
+                );
+            }
         } else {
             warn!("Session not found: {:?}", session_id);
         }

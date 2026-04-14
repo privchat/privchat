@@ -205,6 +205,9 @@ pub trait SessionManager: Send + Sync {
 
     /// 获取在线会话列表
     async fn get_online_sessions(&self) -> Vec<SessionId>;
+
+    /// 获取指定用户当前在线会话列表（实时源）
+    async fn get_user_online_sessions(&self, user_id: &UserId) -> Vec<SessionId>;
 }
 
 impl MessageRouter {
@@ -231,6 +234,26 @@ impl MessageRouter {
         message: PushMessageRequest,
     ) -> Result<RouteResult> {
         let start_time = SystemTime::now();
+
+        // 优先使用实时会话源，避免 user_status_cache 与实际在线态短暂不一致导致误判离线。
+        let direct_sessions = self.session_manager.get_user_online_sessions(user_id).await;
+        if !direct_sessions.is_empty() {
+            let results = self
+                .session_manager
+                .send_to_sessions(&direct_sessions, &message)
+                .await?;
+            let success_count = results.iter().filter(|r| r.is_ok()).count();
+            let failed_count = results.len().saturating_sub(success_count);
+            if success_count > 0 {
+                let elapsed = start_time.elapsed().unwrap_or_default();
+                return Ok(RouteResult {
+                    success_count,
+                    failed_count,
+                    offline_count: 0,
+                    latency_ms: elapsed.as_millis() as u64,
+                });
+            }
+        }
 
         // 检查用户在线状态
         let user_status = self.user_status_cache.get(user_id).await;
@@ -1095,5 +1118,19 @@ impl SessionManager for SessionManagerAdapter {
             .into_iter()
             .map(|sid| sid.to_string())
             .collect()
+    }
+
+    async fn get_user_online_sessions(&self, user_id: &UserId) -> Vec<SessionId> {
+        let Some(info) = self.inner.get_user_session_info(*user_id).await else {
+            return vec![];
+        };
+        let Ok(parsed) = Self::parse_session_id(&info.session_id) else {
+            return vec![];
+        };
+        if self.is_session_online(&parsed.to_string()).await {
+            vec![parsed.to_string()]
+        } else {
+            vec![]
+        }
     }
 }
