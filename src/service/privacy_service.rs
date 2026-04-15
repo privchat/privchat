@@ -73,6 +73,10 @@ impl PrivacyService {
                 self.validate_card_share_source(searcher_id, target_id, share_id)
                     .await?;
             }
+            UserDetailSource::Conversation { channel_id: _ } => {
+                // 临时会话来源：用户在聊天界面点击查看对方资料。
+                // 能进入会话说明已有权限，不做额外限制。
+            }
         }
 
         Ok(())

@@ -81,9 +81,15 @@ pub async fn handle(
         "friend_pending" => {
             UserDetailSource::Friend { friend_id: None }
         }
+        "conversation" => {
+            let channel_id = source_id
+                .parse::<u64>()
+                .map_err(|_| RpcError::validation(format!("Invalid channel_id: {}", source_id)))?;
+            UserDetailSource::Conversation { channel_id }
+        }
         _ => {
             return Err(RpcError::validation(format!(
-                "Invalid source type: {}. Must be one of: search, group, friend, card_share, friend_pending",
+                "Invalid source type: {}. Must be one of: search, group, friend, card_share, friend_pending, conversation",
                 source_str
             )));
         }
@@ -143,8 +149,9 @@ pub async fn handle(
                         }
                     };
 
+                    let uid: u64 = user_profile.user_id.parse().unwrap_or(user_id);
                     Ok(json!({
-                        "user_id": user_profile.user_id,
+                        "user_id": uid,
                         "username": user_profile.username, // 账号
                         "nickname": user_profile.nickname, // 昵称
                         "avatar_url": user_profile.avatar_url, // 头像

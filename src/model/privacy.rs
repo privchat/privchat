@@ -105,6 +105,10 @@ pub enum UserDetailSource {
     /// 名片分享来源
     /// source_id: 分享ID
     CardShare { share_id: u64 },
+
+    /// 临时会话来源（聊天界面查看对方资料）
+    /// source_id: channel_id
+    Conversation { channel_id: u64 },
 }
 
 /// 搜索记录
