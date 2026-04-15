@@ -53,13 +53,13 @@ subscribe_history_limit = 30
 [file]
 default_storage_source_id = 0
 server_port = 9083
-server_api_base_url = "http://localhost:9083/api/app"
+server_api_base_url = "http://192.168.1.9:9083/api/app"
 
 [[file.storage_sources]]
 id = 0
 storage_type = "local"
 storage_root = "./storage/files"
-base_url = "http://127.0.0.1:8000"
+base_url = "http://192.168.1.9:8000"
 
 # 多数据中心示例：再增加 id=1、id=2 等，不同机房设置不同 default_storage_source_id 即可
 # [[file.storage_sources]]
