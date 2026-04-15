@@ -18,19 +18,14 @@
 use crate::model::privacy::UserDetailSource;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
-use privchat_protocol::rpc::account::user::AccountUserDetailRequest;
+use privchat_protocol::rpc::account::user::{AccountUserDetailRequest, DetailSourceType};
 use serde_json::{json, Value};
 
 /// 处理 获取用户详情 请求
 ///
 /// 通过 user_id 获取用户完整信息
 /// 必须提供来源（source）和来源ID（source_id）进行权限验证
-///
-/// 来源类型：
-/// - search: 搜索来源，source_id 是搜索会话ID
-/// - group: 群组来源，source_id 是群ID
-/// - friend: 好友来源，source_id 是好友的 user_id（可选）
-/// - card_share: 名片分享来源，source_id 是分享ID
+/// 来源类型定义见 `privchat_protocol::rpc::account::user::DetailSourceType`
 pub async fn handle(
     body: Value,
     services: RpcServiceContext,
@@ -50,21 +45,29 @@ pub async fn handle(
     let source_str = &request.source;
     let source_id = &request.source_id;
 
+    // 使用协议层枚举解析来源类型
+    let source_type = DetailSourceType::from_str(source_str).ok_or_else(|| {
+        RpcError::validation(format!(
+            "Invalid source type: {}. Must be one of: search, group, friend, card_share, friend_pending, conversation",
+            source_str
+        ))
+    })?;
+
     // 构建来源对象
-    let source = match source_str.as_str() {
-        "search" => {
+    let source = match source_type {
+        DetailSourceType::Search => {
             let search_session_id = source_id.parse::<u64>().map_err(|_| {
                 RpcError::validation(format!("Invalid search_session_id: {}", source_id))
             })?;
             UserDetailSource::Search { search_session_id }
         }
-        "group" => {
+        DetailSourceType::Group => {
             let group_id = source_id
                 .parse::<u64>()
                 .map_err(|_| RpcError::validation(format!("Invalid group_id: {}", source_id)))?;
             UserDetailSource::Group { group_id }
         }
-        "friend" => {
+        DetailSourceType::Friend => {
             let friend_id = source_id
                 .parse::<u64>()
                 .map_err(|_| RpcError::validation(format!("Invalid friend_id: {}", source_id)))?;
@@ -72,26 +75,20 @@ pub async fn handle(
                 friend_id: Some(friend_id),
             }
         }
-        "card_share" => {
+        DetailSourceType::CardShare => {
             let share_id = source_id
                 .parse::<u64>()
                 .map_err(|_| RpcError::validation(format!("Invalid share_id: {}", source_id)))?;
             UserDetailSource::CardShare { share_id }
         }
-        "friend_pending" => {
+        DetailSourceType::FriendPending => {
             UserDetailSource::Friend { friend_id: None }
         }
-        "conversation" => {
+        DetailSourceType::Conversation => {
             let channel_id = source_id
                 .parse::<u64>()
                 .map_err(|_| RpcError::validation(format!("Invalid channel_id: {}", source_id)))?;
             UserDetailSource::Conversation { channel_id }
-        }
-        _ => {
-            return Err(RpcError::validation(format!(
-                "Invalid source type: {}. Must be one of: search, group, friend, card_share, friend_pending, conversation",
-                source_str
-            )));
         }
     };
 
