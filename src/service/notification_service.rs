@@ -21,7 +21,7 @@
 //! UI 通过 get_channels / get_messages 从 SQLite 读取。
 //! 未来可扩展：其他联系用户的功能（如系统通知、提醒等）均可通过本服务下发。
 
-use msgtrans::{packet::Packet, SessionId};
+use msgtrans::SessionId;
 use privchat_protocol::protocol::{MessageType, PushMessageRequest};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -61,10 +61,8 @@ impl NotificationService {
         let recv_data = privchat_protocol::encode_message(message)
             .map_err(|e| ServerError::Protocol(format!("编码 PushMessageRequest 失败: {}", e)))?;
 
-        let message_id = 0u32;
-        let mut packet = Packet::one_way(message_id, recv_data);
+        let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), recv_data);
         packet.set_biz_type(MessageType::PushMessageRequest as u8);
-
         transport
             .send_to_session(session_id.clone(), packet)
             .await

@@ -82,14 +82,20 @@ impl SubscribeMessageHandler {
                 }
             };
 
-            let mut packet = msgtrans::packet::Packet::one_way(0u32, payload_bytes);
+            let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload_bytes);
             packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
 
-            if let Err(e) = server.send_to_session(session_id.clone(), packet).await {
-                warn!(
-                    "⚠️ SubscribeMessageHandler: 回放 Room 历史失败 channel_id={}, session={}, error={}",
-                    channel_id, session_id, e
-                );
+            let send_ok = match server.send_to_session(session_id.clone(), packet).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        "⚠️ SubscribeMessageHandler: 回放 Room 历史失败 channel_id={}, session={}, error={}",
+                        channel_id, session_id, e
+                    );
+                    false
+                }
+            };
+            if !send_ok {
                 continue;
             }
 

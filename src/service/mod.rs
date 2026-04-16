@@ -63,6 +63,8 @@ pub mod reaction_service;
 pub mod mention_service;
 // Room 订阅历史服务（Redis）
 pub mod room_history_service;
+// 送达水位追踪服务
+pub mod delivery_tracker;
 
 pub use admin_service::AdminService;
 pub use approval_service::{ApprovalService, JoinMethod, JoinRequest, JoinRequestStatus};
@@ -96,3 +98,4 @@ pub use sticker_service::{Sticker, StickerPackage, StickerService};
 pub use unread_count_service::UnreadCountService;
 pub use upload_token_service::{UploadToken, UploadTokenService};
 pub use user_service::UserService;
+pub use delivery_tracker::DeliveryTracker;

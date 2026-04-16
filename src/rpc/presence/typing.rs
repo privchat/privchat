@@ -109,16 +109,15 @@ pub async fn handle(
                 continue;
             }
 
-            let mut packet = msgtrans::packet::Packet::one_way(0u32, payload_bytes.clone());
+            let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload_bytes.clone());
             packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
-
-            // best-effort：发送失败仅记录日志
             match server.send_to_session(sid.clone(), packet).await {
-                Ok(_) => {
+                Ok(()) => {
                     delivered += 1;
                 }
                 Err(e) => {
                     warn!("Failed to send typing to session {}: {}", sid, e);
+                    services.subscribe_manager.unsubscribe(sid, req.channel_id);
                 }
             }
         }

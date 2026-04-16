@@ -886,25 +886,15 @@ async fn room_broadcast(
         let server_clone = server.clone();
         let bytes = payload_bytes.clone();
         handles.push(tokio::spawn(async move {
-            let mut packet = msgtrans::packet::Packet::one_way(0u32, (*bytes).clone());
+            let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), (*bytes).clone());
             packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
-            // 每个 session 发送超时 500ms，避免慢连接阻塞整个广播
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                server_clone.send_to_session(sid.clone(), packet),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
+            match server_clone.send_to_session(sid.clone(), packet).await {
+                Ok(()) => {
                     debug!("📡 Room publish -> session {} 成功", sid);
                     true
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     warn!("📡 Room publish -> session {} 失败: {}", sid, e);
-                    false
-                }
-                Err(_) => {
-                    warn!("📡 Room publish -> session {} 超时", sid);
                     false
                 }
             }

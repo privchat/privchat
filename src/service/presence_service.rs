@@ -198,15 +198,17 @@ impl PresenceService {
 
             let mut delivered = 0usize;
             for session_id in sessions {
-                let mut packet = Packet::one_way(0u32, encoded.clone());
+                let mut packet = Packet::one_way(crate::infra::next_packet_id(), encoded.clone());
                 packet.set_biz_type(MessageType::PublishRequest as u8);
-
                 match server.send_to_session(session_id.clone(), packet).await {
-                    Ok(_) => delivered += 1,
-                    Err(e) => warn!(
-                        "⚠️ PresenceService: failed to publish presence_changed to session {} for channel {}: {}",
-                        session_id, channel_id, e
-                    ),
+                    Ok(()) => delivered += 1,
+                    Err(e) => {
+                        warn!(
+                            "⚠️ PresenceService: failed to publish presence_changed to session {} for channel {}: {}",
+                            session_id, channel_id, e
+                        );
+                        self.subscribe_manager.unsubscribe(&session_id, channel_id);
+                    }
                 }
             }
 

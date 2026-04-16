@@ -138,6 +138,8 @@ pub struct OfflineMessageWorker {
     try_send_fail_count: Arc<AtomicU64>,
     /// 降级（慢路径）计数
     fallback_count: Arc<AtomicU64>,
+    /// 送达水位追踪器
+    delivery_tracker: Option<Arc<crate::service::DeliveryTracker>>,
 }
 
 impl OfflineMessageWorker {
@@ -175,7 +177,12 @@ impl OfflineMessageWorker {
             delivery_semaphore: Arc::new(Semaphore::new(max_concurrent)),
             try_send_fail_count: Arc::new(AtomicU64::new(0)),
             fallback_count: Arc::new(AtomicU64::new(0)),
+            delivery_tracker: None,
         }
+    }
+
+    pub fn set_delivery_tracker(&mut self, tracker: Arc<crate::service::DeliveryTracker>) {
+        self.delivery_tracker = Some(tracker);
     }
 
     /// 触发推送（ConnectHandler / SyncRPC 调用）
@@ -579,6 +586,21 @@ impl OfflineMessageWorker {
 
             // 短暂延迟，避免过快推送
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // 5.5 推进送达水位：按 channel 分组，batch_advance 每个频道的 pts
+        if let Some(tracker) = &self.delivery_tracker {
+            use std::collections::HashMap as StdHashMap;
+            let mut channel_pts: StdHashMap<u64, Vec<u64>> = StdHashMap::new();
+            for msg in &filtered_messages {
+                if let Some(&pts) = message_pts_map.get(&msg.local_message_id) {
+                    channel_pts.entry(msg.channel_id).or_default().push(pts);
+                }
+            }
+            for (channel_id, mut pts_list) in channel_pts {
+                pts_list.sort();
+                tracker.batch_advance(*user_id, channel_id, &pts_list).await;
+            }
         }
 
         // ✨ 6. 推送完成后，更新 session 的 client_pts

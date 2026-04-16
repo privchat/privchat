@@ -114,6 +114,7 @@ pub struct ReadStateService {
     unread_count_service: Arc<UnreadCountService>,
     message_router: Arc<MessageRouter>,
     pool: Arc<PgPool>,
+    delivery_tracker: Option<Arc<crate::service::DeliveryTracker>>,
 }
 
 impl ReadStateService {
@@ -128,6 +129,19 @@ impl ReadStateService {
             unread_count_service,
             message_router,
             pool,
+            delivery_tracker: None,
+        }
+    }
+
+    pub fn set_delivery_tracker(&mut self, tracker: Arc<crate::service::DeliveryTracker>) {
+        self.delivery_tracker = Some(tracker);
+    }
+
+    /// 获取指定用户在指定频道的连续送达水位
+    pub async fn get_server_delivered_pts(&self, user_id: UserId, channel_id: ChannelId) -> u64 {
+        match &self.delivery_tracker {
+            Some(tracker) => tracker.get_delivered_pts(user_id, channel_id).await,
+            None => u64::MAX,
         }
     }
 
@@ -136,6 +150,19 @@ impl ReadStateService {
         reader_id: UserId,
         channel_id: ChannelId,
         read_pts: u64,
+    ) -> Result<ReadPtsUpdateResult> {
+        self.mark_read_pts_with_visible(reader_id, channel_id, read_pts, None).await
+    }
+
+    /// 双重水位裁剪版 mark_read_pts
+    ///
+    /// accepted_read_pts = min(requested_read_pts, client_visible_pts, server_delivered_contiguous_pts)
+    pub async fn mark_read_pts_with_visible(
+        &self,
+        reader_id: UserId,
+        channel_id: ChannelId,
+        read_pts: u64,
+        client_visible_pts: Option<u64>,
     ) -> Result<ReadPtsUpdateResult> {
         let max_pts_row = sqlx::query(
             "SELECT COALESCE(MAX(pts), 0) AS max_pts FROM privchat_messages WHERE channel_id = $1",
@@ -152,9 +179,39 @@ impl ReadStateService {
             )));
         }
 
+        // 双重水位裁剪：accepted = min(requested, client_visible, server_delivered)
+        let mut effective_read_pts = read_pts;
+
+        if let Some(visible) = client_visible_pts {
+            effective_read_pts = effective_read_pts.min(visible);
+        }
+
+        if let Some(tracker) = &self.delivery_tracker {
+            let delivered = tracker.get_delivered_pts(reader_id, channel_id).await;
+            if delivered > 0 {
+                effective_read_pts = effective_read_pts.min(delivered);
+            }
+            // delivered == 0 表示 DeliveryTracker 尚未初始化该用户/频道的数据，
+            // 此时不裁剪（兼容历史数据 / 旧客户端）
+        }
+
+        if effective_read_pts < read_pts {
+            tracing::info!(
+                "📏 mark_read_pts 水位裁剪: user={} channel={} requested={} accepted={} client_visible={:?}",
+                reader_id, channel_id, read_pts, effective_read_pts, client_visible_pts
+            );
+        }
+
+        if effective_read_pts == 0 {
+            return Ok(ReadPtsUpdateResult {
+                channel_id,
+                last_read_pts: 0,
+            });
+        }
+
         let new_last_read_pts = self
             .channel_service
-            .mark_read_pts(&reader_id, &channel_id, read_pts)
+            .mark_read_pts(&reader_id, &channel_id, effective_read_pts)
             .await?
             .ok_or_else(|| ServerError::Validation("用户不在该频道".to_string()))?;
         let upserted = upsert_channel_read_cursor_row(

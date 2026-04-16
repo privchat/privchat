@@ -29,9 +29,14 @@ pub async fn handle(
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
     let req: MessageStatusReadPtsRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
+    let server_delivered_pts = services
+        .read_state_service
+        .get_server_delivered_pts(user_id, req.channel_id)
+        .await;
+
     let result = services
         .read_state_service
-        .mark_read_pts(user_id, req.channel_id, req.read_pts)
+        .mark_read_pts_with_visible(user_id, req.channel_id, req.read_pts, req.client_visible_pts)
         .await
         .map_err(|e| RpcError::internal(format!("更新已读 pts 失败: {}", e)))?;
     serde_json::to_value(MessageStatusReadPtsResponse {
@@ -40,6 +45,8 @@ pub async fn handle(
         channel_id: result.channel_id,
         last_read_pts: result.last_read_pts,
         last_read_message_id: req.last_read_message_id,
+        accepted_read_pts: Some(result.last_read_pts),
+        server_delivered_pts: if server_delivered_pts < u64::MAX { Some(server_delivered_pts) } else { None },
     })
     .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }

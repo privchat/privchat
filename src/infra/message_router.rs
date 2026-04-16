@@ -812,19 +812,13 @@ impl MessageRouter {
                 }
                 Err(_) => {
                     failed_count += 1;
-                    if !self
-                        .session_manager
-                        .is_session_online(&device.session_id)
-                        .await
-                    {
-                        stale_device_ids.push(device.device_id.clone());
-                        self.store_offline_message_with_device(
-                            &user_status.user_id,
-                            &device.device_id,
-                            message.clone(),
-                        )
-                        .await?;
-                    }
+                    stale_device_ids.push(device.device_id.clone());
+                    self.store_offline_message_with_device(
+                        &user_status.user_id,
+                        &device.device_id,
+                        message.clone(),
+                    )
+                    .await?;
                 }
             }
         }
@@ -1034,16 +1028,14 @@ impl SessionManager for SessionManagerAdapter {
         session_id: &SessionId,
         message: &PushMessageRequest,
     ) -> Result<()> {
-        let transport = self.get_transport().await?;
+        let server = self.get_transport().await?;
         let sid = Self::parse_session_id(session_id)?;
         let recv_data = privchat_protocol::encode_message(message)
             .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
-        let mut packet = msgtrans::packet::Packet::one_way(0u32, recv_data);
+        let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), recv_data);
         packet.set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
-        transport
-            .send_to_session(sid, packet)
-            .await
-            .map(|_| {
+        match server.send_to_session(sid, packet).await {
+            Ok(()) => {
                 info!(
                     "📤 SessionManagerAdapter send_to_session ok: session_id={}, server_message_id={}, channel_id={}, channel_type={}, from_uid={}, topic={}, deleted={}",
                     session_id,
@@ -1054,20 +1046,34 @@ impl SessionManager for SessionManagerAdapter {
                     message.topic,
                     message.deleted
                 );
-            })
-            .map_err(|e| {
+                Ok(())
+            }
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                let is_connection_dead = err_msg.contains("Broken pipe")
+                    || err_msg.contains("Connection reset")
+                    || err_msg.contains("Connection closed")
+                    || err_msg.contains("not found")
+                    || err_msg.contains("Actor channel closed");
                 warn!(
-                    "❌ SessionManagerAdapter send_to_session failed: session_id={}, server_message_id={}, channel_id={}, channel_type={}, topic={}, deleted={}, error={}",
+                    "❌ SessionManagerAdapter send_to_session failed: session_id={}, server_message_id={}, channel_id={}, channel_type={}, error={}, connection_dead={}",
                     session_id,
                     message.server_message_id,
                     message.channel_id,
                     message.channel_type,
-                    message.topic,
-                    message.deleted,
-                    e
+                    e,
+                    is_connection_dead,
                 );
-                anyhow::anyhow!("send_to_session({}) failed: {}", session_id, e)
-            })
+                if is_connection_dead {
+                    if let Err(cleanup_err) = self.inner.remove_user_session_by_session_id(&sid).await {
+                        warn!("⚠️ SessionManagerAdapter: cleanup stale session {} failed: {}", session_id, cleanup_err);
+                    } else {
+                        info!("🧹 SessionManagerAdapter: cleaned up dead session {} after connection error", session_id);
+                    }
+                }
+                Err(anyhow::anyhow!("send_to_session({}) failed: {}", session_id, e))
+            }
+        }
     }
 
     async fn send_to_sessions(

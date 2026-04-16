@@ -351,9 +351,14 @@ impl ChatServer {
             Arc::new(crate::service::OfflineQueueService::new(&config.redis_url)?);
         info!("✅ OfflineQueueService 创建完成");
 
+        // 2.5 创建 DeliveryTracker（送达水位追踪）
+        let delivery_tracker =
+            Arc::new(crate::service::DeliveryTracker::new(&config.redis_url)?);
+        info!("✅ DeliveryTracker 创建完成");
+
         // 3. 创建 OfflineMessageWorker
         let offline_worker_config = crate::infra::OfflineWorkerConfig::default();
-        let offline_worker = Arc::new(crate::infra::OfflineMessageWorker::new(
+        let mut offline_worker_inner = crate::infra::OfflineMessageWorker::new(
             offline_worker_config,
             message_router.clone(),
             user_status_cache.clone(),
@@ -361,7 +366,9 @@ impl ChatServer {
             auth_session_manager.clone(),  // ✨ 用于获取 local_pts
             user_message_index.clone(),    // ✨ 用于 pts -> message_id 映射
             offline_queue_service.clone(), // ✨ 用于从 Redis 获取消息
-        ));
+        );
+        offline_worker_inner.set_delivery_tracker(delivery_tracker.clone());
+        let offline_worker = Arc::new(offline_worker_inner);
         info!("✅ OfflineMessageWorker 创建完成");
 
         // 4. 启动 OfflineWorker 后台任务
@@ -421,12 +428,14 @@ impl ChatServer {
 
         // 创建已读回执服务
         let read_receipt_service = Arc::new(crate::service::ReadReceiptService::new());
-        let read_state_service = Arc::new(crate::service::ReadStateService::new(
+        let mut read_state_inner = crate::service::ReadStateService::new(
             channel_service.clone(),
             unread_count_service.clone(),
             message_router.clone(),
             pool.clone(),
-        ));
+        );
+        read_state_inner.set_delivery_tracker(delivery_tracker.clone());
+        let read_state_service = Arc::new(read_state_inner);
 
         // 创建文件服务（多数据中心：按 current_region 或 default_storage_source_id 选择存储源）
         info!("🔧 初始化文件服务...");
@@ -469,7 +478,7 @@ impl ChatServer {
         info!("✅ UserDeviceRepository 创建完成（提前创建）");
 
         // 创建 SendMessageHandler（需要 SessionManager、FileService、ChannelService 和 MessageRouter）
-        let send_message_handler = Arc::new(SendMessageHandler::new(
+        let mut send_handler_inner = SendMessageHandler::new(
             message_history_service.clone(),
             session_manager.clone(),
             file_service.clone(),
@@ -487,7 +496,9 @@ impl ChatServer {
             message_repository.clone(),
             auth_session_manager.clone(),
             Some(user_device_repo.clone()), // ✨ Phase 3.5: 传递 user_device_repo
-        ));
+        );
+        send_handler_inner.set_delivery_tracker(delivery_tracker.clone());
+        let send_message_handler = Arc::new(send_handler_inner);
 
         // 5. 将 EventBus 传递给 SendMessageHandler
         // 注意：SendMessageHandler 需要支持设置 event_bus

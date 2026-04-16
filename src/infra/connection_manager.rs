@@ -275,10 +275,10 @@ impl ConnectionManager {
 
         let mut success = 0usize;
         for sid in sessions {
-            let mut packet = msgtrans::packet::Packet::one_way(0u32, payload.clone());
+            let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload.clone());
             packet.set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
             match server.send_to_session(sid, packet).await {
-                Ok(_) => success += 1,
+                Ok(()) => success += 1,
                 Err(e) => {
                     warn!(
                         "⚠️ ConnectionManager: 实时推送失败 user={}, session={}, server_message_id={}, error={}",

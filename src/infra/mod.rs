@@ -19,6 +19,13 @@
 // 负责各种基础服务：缓存、消息路由、离线投递、会话管理等
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static PACKET_ID_COUNTER: AtomicU32 = AtomicU32::new(100_000);
+
+pub fn next_packet_id() -> u32 {
+    PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 // TODO: cache 模块依赖 message_router，需要一起集成
 // pub mod cache;

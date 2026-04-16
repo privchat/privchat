@@ -37,6 +37,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 /// 发送消息处理器
+#[derive(Clone)]
 pub struct SendMessageHandler {
     // channel_service 已合并到 channel_service
     /// 消息历史服务
@@ -77,6 +78,8 @@ pub struct SendMessageHandler {
     user_device_repo: Option<Arc<crate::repository::UserDeviceRepository>>,
     /// 认证会话管理器（用于 READY 推送闸门）
     auth_session_manager: Arc<AuthSessionManager>,
+    /// 送达水位追踪器
+    delivery_tracker: Option<Arc<crate::service::DeliveryTracker>>,
 }
 
 // 临时全局 EventBus（MVP 阶段简化方案）
@@ -136,7 +139,12 @@ impl SendMessageHandler {
             event_bus: None,
             auth_session_manager,
             user_device_repo, // ✨ Phase 3.5
+            delivery_tracker: None,
         }
+    }
+
+    pub fn set_delivery_tracker(&mut self, tracker: Arc<crate::service::DeliveryTracker>) {
+        self.delivery_tracker = Some(tracker);
     }
 
     /// 设置事件总线（在服务器启动后调用）
@@ -1440,17 +1448,10 @@ impl MessageHandler for SendMessageHandler {
             }
         }
 
-        // 7. 分发消息到其他在线成员（传递引用消息预览和@提及信息）
-        self.distribute_message_to_members(
-            &channel,
-            &from_uid,
-            send_message_request.local_message_id,
-            &message_record,
-            reply_to_message_preview.as_ref(),
-            &mentioned_user_ids, // ✨ 传递@提及的用户ID列表
-            is_mention_all,      // ✨ 传递是否@全体成员
-        )
-        .await?;
+        // 7. 先创建成功响应（不阻塞客户端）
+        let response = self
+            .create_success_response(&send_message_request, &message_record, pts as u64)
+            .await;
 
         // 7.5. 标记消息为已处理（去重）
         self.message_dedup_service
@@ -1459,9 +1460,31 @@ impl MessageHandler for SendMessageHandler {
 
         crate::infra::metrics::record_message_sent();
 
-        // 8. 创建成功响应
-        self.create_success_response(&send_message_request, &message_record)
-            .await
+        // 8. 后台分发消息到其他在线成员（不阻塞响应返回）
+        let this = self.clone();
+        let channel_clone = channel.clone();
+        let message_record_clone = message_record.clone();
+        let reply_preview = reply_to_message_preview.map(|r| r.clone());
+        let mentioned = mentioned_user_ids.to_vec();
+        tokio::spawn(async move {
+            if let Err(e) = this
+                .distribute_message_to_members(
+                    &channel_clone,
+                    &from_uid,
+                    send_message_request.local_message_id,
+                    &message_record_clone,
+                    reply_preview.as_ref(),
+                    &mentioned,
+                    is_mention_all,
+                    pts as u64,
+                )
+                .await
+            {
+                warn!("⚠️ SendMessageHandler: 后台分发消息失败: {}", e);
+            }
+        });
+
+        response
     }
 
     fn name(&self) -> &'static str {
@@ -1803,6 +1826,7 @@ impl SendMessageHandler {
         reply_to_message_preview: Option<&crate::service::ReplyMessagePreview>,
         mentioned_user_ids: &[u64],
         is_mention_all: bool,
+        pts: u64,
     ) -> Result<()> {
         info!(
             "📡 SendMessageHandler: 分发消息 {} 到频道 {}",
@@ -1834,6 +1858,7 @@ impl SendMessageHandler {
                 reply_to_message_preview,
                 mentioned_user_ids,
                 is_mention_all,
+                pts,
             )
             .await?;
 
@@ -1851,7 +1876,6 @@ impl SendMessageHandler {
             .collect();
 
         if !receiver_ids.is_empty() {
-            let pts = push_message_request.message_seq as u64;
             for &member_id in &receiver_ids {
                 debug!(
                     "✨ 为频道 {} 生成 pts={} (用户: {})",
@@ -1877,10 +1901,11 @@ impl SendMessageHandler {
             .collect()
             .await;
 
-        // 3. 汇总结果 + 收集离线用户
+        // 3. 汇总结果 + 收集离线用户 + 收集已送达用户
         let mut success_count = 0usize;
         let mut failed_count = 0usize;
         let mut offline_user_ids: Vec<u64> = Vec::new();
+        let mut delivered_to_peer = false;
 
         for (member_id, result) in &results {
             match result {
@@ -1889,6 +1914,10 @@ impl SendMessageHandler {
                     failed_count += route_result.failed_count;
                     if route_result.offline_count > 0 {
                         offline_user_ids.push(*member_id);
+                    }
+                    // 非发送者成功收到 ACK → 已送达
+                    if member_id != sender_id && route_result.success_count > 0 {
+                        delivered_to_peer = true;
                     }
                     debug!(
                         "📡 route user={} success={} failed={} offline={}",
@@ -1908,6 +1937,17 @@ impl SendMessageHandler {
             }
         }
 
+        // 3.5 推进送达水位：推送成功的成员推进 delivered_contiguous_pts
+        if let Some(tracker) = &self.delivery_tracker {
+            for (member_id, result) in &results {
+                if let Ok(route_result) = result {
+                    if route_result.success_count > 0 {
+                        tracker.try_advance(*member_id, channel.id, pts).await;
+                    }
+                }
+            }
+        }
+
         // 4. 离线消息批量写入 Redis（Pipeline，单次网络往返）
         if !offline_user_ids.is_empty() {
             if let Err(e) = self
@@ -1919,11 +1959,63 @@ impl SendMessageHandler {
             }
         }
 
+        // 5. 已送达通知：至少一个非发送者 ACK 了推送 → 通知发送者
+        if delivered_to_peer {
+            let channel_type_i32 = match channel.channel_type {
+                crate::model::channel::ChannelType::Direct => 1i32,
+                crate::model::channel::ChannelType::Group => 2i32,
+                crate::model::channel::ChannelType::Room => 2i32,
+            };
+            let delivered_at = chrono::Utc::now().timestamp_millis() as u64;
+            let receipt_notification = privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
+                channel.id,
+                channel_type_i32,
+                push_message_request.server_message_id,
+                delivered_at,
+            );
+            let receipt_bytes = serde_json::to_vec(&receipt_notification).unwrap_or_default();
+            let receipt_push = privchat_protocol::protocol::PushMessageRequest {
+                setting: Default::default(),
+                msg_key: String::new(),
+                server_message_id: push_message_request.server_message_id,
+                message_seq: pts as u32,
+                local_message_id: 0,
+                stream_no: String::new(),
+                stream_seq: 0,
+                stream_flag: 0,
+                timestamp: chrono::Utc::now().timestamp() as u32,
+                channel_id: channel.id,
+                channel_type: push_message_request.channel_type,
+                message_type: privchat_protocol::ContentMessageType::System.as_u32(),
+                expire: 0,
+                topic: String::new(),
+                from_uid: *sender_id,
+                payload: receipt_bytes,
+                deleted: false,
+            };
+            if let Err(e) = self
+                .message_router
+                .route_message_to_user(sender_id, receipt_push)
+                .await
+            {
+                warn!(
+                    "⚠️ SendMessageHandler: 推送 delivered 通知失败 sender={} error={}",
+                    sender_id, e
+                );
+            } else {
+                debug!(
+                    "✅ SendMessageHandler: delivered 通知已推送 sender={} server_message_id={}",
+                    sender_id, push_message_request.server_message_id
+                );
+            }
+        }
+
         info!(
-            "📡 SendMessageHandler: 消息分发完成 - 成功: {}, 失败: {}, 离线: {}",
+            "📡 SendMessageHandler: 消息分发完成 - 成功: {}, 失败: {}, 离线: {}, delivered={}",
             success_count,
             failed_count,
-            offline_user_ids.len()
+            offline_user_ids.len(),
+            delivered_to_peer
         );
 
         Ok(())
@@ -1939,6 +2031,7 @@ impl SendMessageHandler {
         reply_to_message_preview: Option<&crate::service::ReplyMessagePreview>,
         mentioned_user_ids: &[u64], // ✨ @提及的用户ID列表
         is_mention_all: bool,       // ✨ 是否@全体成员
+        pts: u64,                   // ✨ 真实 pts（来自 SyncService/DB）
     ) -> Result<privchat_protocol::protocol::PushMessageRequest> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2000,7 +2093,7 @@ impl SendMessageHandler {
             setting: privchat_protocol::protocol::MessageSetting::default(),
             msg_key: msg_key.clone(),
             server_message_id: message_record.message_id,
-            message_seq: message_record.seq as u32,
+            message_seq: pts as u32,
             local_message_id: original_local_message_id,
             stream_no: String::new(),
             stream_seq: 0,
@@ -2028,12 +2121,13 @@ impl SendMessageHandler {
         &self,
         request: &privchat_protocol::protocol::SendMessageRequest,
         message_record: &crate::service::message_history_service::MessageHistoryRecord,
+        pts: u64,
     ) -> Result<Option<Vec<u8>>> {
         // message_id 现在已经是 u64 类型，直接使用
         let response = privchat_protocol::protocol::SendMessageResponse {
             client_seq: request.client_seq,
             server_message_id: message_record.message_id,
-            message_seq: message_record.seq as u32,
+            message_seq: pts as u32,
             reason_code: 0, // 成功
         };
 

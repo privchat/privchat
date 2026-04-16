@@ -341,13 +341,16 @@ impl MessageHandler for ConnectMessageHandler {
             warn!("⚠️ ConnectMessageHandler: 注册设备连接失败: {}", e);
         } else {
             info!("✅ ConnectMessageHandler: 设备连接已注册到 ConnectionManager");
-            if let Err(e) = self
-                .presence_service
-                .on_device_connected(user_id, device_id.clone())
-                .await
-            {
-                warn!("⚠️ ConnectMessageHandler: 更新 Presence 上线失败: {}", e);
-            }
+            let presence_service = self.presence_service.clone();
+            let dev_id = device_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = presence_service
+                    .on_device_connected(user_id, dev_id)
+                    .await
+                {
+                    warn!("⚠️ ConnectMessageHandler: 更新 Presence 上线失败: {}", e);
+                }
+            });
         }
 
         // ✨ Phase 3: 发布 UserOnline 事件（用于取消推送）
