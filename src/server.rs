@@ -1540,6 +1540,7 @@ impl ChatServer {
                         context,
                     } => {
                         // [FIX] Extract data before moving context into the async task
+                        let msg_data = context.data.clone();
                         let msg_text = context.as_text_lossy();
                         let biz_type = context.biz_type;
                         let user_id = auth_session_manager.get_user_id(&session_id).await;
@@ -1590,7 +1591,7 @@ impl ChatServer {
                                     let msg_type = MessageType::from(biz_type);
                                     let mut request_context = crate::context::RequestContext::new(
                                         session_id_clone.clone(),
-                                        msg_text.as_bytes().to_vec(),
+                                        msg_data,
                                         "127.0.0.1:0".parse().unwrap(),
                                     );
                                     if let Some(uid) = dispatch_user_id {
