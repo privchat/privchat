@@ -73,6 +73,8 @@ pub struct Friendship {
     pub source: Option<String>,
     /// 来源 ID（数据库字段，可追溯）
     pub source_id: Option<String>,
+    /// 好友备注
+    pub alias: Option<String>,
     /// 创建时间（数据库存储为 BIGINT 毫秒时间戳）
     pub created_at: DateTime<Utc>,
     /// 更新时间（数据库存储为 BIGINT 毫秒时间戳）
@@ -90,6 +92,7 @@ impl Friendship {
             status: FriendshipStatus::Pending,
             source: None,
             source_id: None,
+            alias: None,
             created_at: now,
             updated_at: now,
         }
@@ -102,6 +105,7 @@ impl Friendship {
         status: i16,
         source: Option<String>,
         source_id: Option<String>,
+        alias: Option<String>,
         created_at: i64, // 毫秒时间戳
         updated_at: i64, // 毫秒时间戳
     ) -> Self {
@@ -112,6 +116,7 @@ impl Friendship {
             status: FriendshipStatus::from_i16(status),
             source,
             source_id,
+            alias,
             created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
             updated_at: DateTime::from_timestamp_millis(updated_at).unwrap_or_else(|| Utc::now()),
         }

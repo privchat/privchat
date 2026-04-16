@@ -20,6 +20,7 @@ pub mod apply;
 pub mod check;
 pub mod pending;
 pub mod remove;
+pub mod set_alias;
 
 use super::super::router::GLOBAL_RPC_ROUTER;
 use super::super::RpcServiceContext;
@@ -79,6 +80,16 @@ pub async fn register_routes(services: RpcServiceContext) {
             Box::new(move |body, ctx| {
                 let services = services.clone();
                 Box::pin(async move { check::handle(body, services, ctx).await })
+            })
+        })
+        .await;
+
+    router
+        .register(routes::friend::SET_ALIAS, {
+            let services = services.clone();
+            Box::new(move |body, ctx| {
+                let services = services.clone();
+                Box::pin(async move { set_alias::handle(body, services, ctx).await })
             })
         })
         .await;

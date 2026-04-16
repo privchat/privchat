@@ -364,9 +364,9 @@ impl FriendService {
 
     /// 获取与某用户的好友关系（用于列表返回 source_type/source_id）
     pub async fn get_friendship(&self, user_id: u64, friend_id: u64) -> Option<Friendship> {
-        let row = sqlx::query_as::<_, (i64, i64, i16, Option<String>, Option<String>, i64, i64)>(
+        let row = sqlx::query_as::<_, (i64, i64, i16, Option<String>, Option<String>, Option<String>, i64, i64)>(
             r#"
-            SELECT user_id, friend_id, status, source, source_id, created_at, updated_at
+            SELECT user_id, friend_id, status, source, source_id, alias, created_at, updated_at
             FROM privchat_friendships
             WHERE user_id = $1
               AND friend_id = $2
@@ -381,8 +381,40 @@ impl FriendService {
         .flatten()?;
 
         Some(Friendship::from_db_row(
-            row.0, row.1, row.2, row.3, row.4, row.5, row.6,
+            row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7,
         ))
+    }
+
+    /// 设置好友备注
+    pub async fn set_alias(&self, user_id: u64, friend_id: u64, alias: Option<String>) -> Result<bool> {
+        // 先检查好友关系
+        let is_friend = self.is_friend(user_id, friend_id).await;
+        if !is_friend {
+            return Err(ServerError::Validation("不是好友关系，无法设置备注".to_string()));
+        }
+
+        let alias_val = alias.filter(|a| !a.trim().is_empty());
+
+        sqlx::query(
+            r#"
+            UPDATE privchat_friendships
+            SET alias = $3, updated_at = now_millis()
+            WHERE user_id = $1 AND friend_id = $2
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(friend_id as i64)
+        .bind(&alias_val)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("Failed to set alias: {}", e)))?;
+
+        tracing::info!(
+            "✅ 设置好友备注: user_id={}, friend_id={}, alias={:?}",
+            user_id, friend_id, alias_val
+        );
+
+        Ok(true)
     }
 
     /// 获取待处理的好友申请列表（接收到的）
@@ -508,6 +540,7 @@ impl FriendService {
         struct FriendSyncRow {
             friend_id: i64,
             status: i16,
+            alias: Option<String>,
             created_at: i64,
             updated_at: i64,
             sync_version: i64,
@@ -515,7 +548,7 @@ impl FriendService {
 
         let rows = sqlx::query_as::<_, FriendSyncRow>(
             r#"
-            SELECT friend_id, status, created_at, updated_at, sync_version
+            SELECT friend_id, status, alias, created_at, updated_at, sync_version
             FROM privchat_friendships
             WHERE user_id = $1
               AND status != 0
@@ -578,7 +611,7 @@ impl FriendService {
                     username: Some(profile.username.clone()),
                     nickname: Some(profile.nickname.clone()),
                     name: Some(profile.nickname.clone()),
-                    alias: None,
+                    alias: row.alias.clone(),
                     avatar: Some(profile.avatar_url.as_deref().unwrap_or("").to_string()),
                     user_type: Some(i32::from(profile.user_type)),
                     type_field: Some(i32::from(profile.user_type)),
