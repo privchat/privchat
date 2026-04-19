@@ -83,7 +83,9 @@ pub use message_history_service::{
     ChannelMessageStats, MessageHistoryRecord, MessageHistoryService, MessageQueryParams,
     ReplyMessagePreview,
 };
-pub use message_service::{MessageService, ServerSendMessageRequest, ServerSendMessageResult};
+pub use message_service::{
+    MessageService, RevokedMessageSummary, ServerSendMessageRequest, ServerSendMessageResult,
+};
 pub use notification_service::NotificationService;
 pub use offline_queue_service::OfflineQueueService;
 pub use presence_service::PresenceService;
@@ -97,5 +99,5 @@ pub use room_history_service::RoomHistoryService;
 pub use sticker_service::{Sticker, StickerPackage, StickerService};
 pub use unread_count_service::UnreadCountService;
 pub use upload_token_service::{UploadToken, UploadTokenService};
-pub use user_service::UserService;
+pub use user_service::{CreateUserAdminParams, UpdateUserAdminParams, UserService};
 pub use delivery_tracker::DeliveryTracker;

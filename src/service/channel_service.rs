@@ -965,20 +965,17 @@ impl ChannelService {
 
     /// 创建好友关系（管理 API）
     ///
-    /// 让两个用户互为好友，并自动创建私聊会话：
-    /// 1. 在 privchat_friendships 写入双向 status=1 行（等价于「接受好友请求」后的终态）
-    /// 2. 复用 create_or_get_direct_channel 建立 Direct Channel（规范化 + advisory lock + ON CONFLICT）
-    pub async fn create_friendship_admin(
-        &self,
-        user1_id: u64,
-        user2_id: u64,
-        channel_service: &crate::service::ChannelService,
-    ) -> Result<u64> {
+    /// 严格遵守 ADMIN_API_SPEC §1.4「Admin Path Convergence Rule」：
+    /// admin 仅负责 admin 特有的数据主表写入（跳过 pending，直接落 status=1），
+    /// direct channel 的建立 / 缓存同步 / user_channel 行补齐 / hidden 清理
+    /// 全部委托给与 RPC accept 共用的 `get_or_create_direct_channel`，
+    /// 禁止在 admin 路径自建平行 side-effect。
+    pub async fn create_friendship_admin(&self, user1_id: u64, user2_id: u64) -> Result<u64> {
         if user1_id == user2_id {
             return Err(ServerError::Validation("不能添加自己为好友".to_string()));
         }
 
-        // 1. 写入双向好友关系（status=1 已接受），幂等 upsert
+        // admin 特有：跳过 pending 流程，直接 upsert 双向 status=1
         let now = chrono::Utc::now().timestamp_millis();
         sqlx::query(
             r#"
@@ -1000,26 +997,10 @@ impl ChannelService {
         .await
         .map_err(|e| ServerError::Database(format!("写入好友关系失败: {}", e)))?;
 
-        // 2. 建立 / 复用 Direct Channel
-        let (channel, created) = self
-            .channel_repository
-            .create_or_get_direct_channel(user1_id, user2_id, None, None)
-            .await
-            .map_err(|e| ServerError::Database(format!("创建或获取私聊会话失败: {}", e)))?;
-
-        let channel_id = channel.id;
-
-        if created {
-            // 新创建的会话需要同步到内存缓存 + user_channels 行
-            if let Err(e) = channel_service
-                .create_private_chat_with_id(user1_id, user2_id, channel_id)
-                .await
-            {
-                warn!("⚠️ 创建私聊频道缓存失败: {}，频道可能已存在", e);
-            }
-            self.ensure_user_channel_rows(channel_id, &[user1_id, user2_id])
-                .await?;
-        }
+        // direct channel 建立 + 完整 side-effect 编排收敛到主路径
+        let (channel_id, created) = self
+            .get_or_create_direct_channel(user1_id, user2_id, None, None)
+            .await?;
 
         info!(
             "✅ 好友关系建立成功: {} <-> {}, channel_id={}, created={}",

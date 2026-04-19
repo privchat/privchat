@@ -28,10 +28,12 @@ use crate::auth::{ServiceKeyManager, TokenIssueService};
 use crate::http::routes;
 use crate::infra::{ConnectionManager, SubscribeManager};
 use crate::repository::{LoginLogRepository, PgMessageRepository, UserRepository};
+// UserRepository is not exposed in AdminServerState — admin handlers must go through UserService.
+// It is still needed as a constructor dependency for AdminService (until that also converges).
 use crate::security::SecurityService;
 use crate::service::{
     AdminService, ChannelService, FileService, MessageService, RoomHistoryService,
-    UploadTokenService,
+    UploadTokenService, UserService,
 };
 
 /// 文件服务器共享状态
@@ -46,10 +48,8 @@ pub struct FileServerState {
 pub struct AdminServerState {
     pub service_key_manager: Arc<ServiceKeyManager>,
     pub token_issue_service: Arc<TokenIssueService>,
-    pub user_repository: Arc<UserRepository>,
     pub login_log_repository: Arc<LoginLogRepository>,
     pub device_manager_db: Arc<DeviceManagerDb>,
-    pub message_repository: Arc<PgMessageRepository>,
     pub channel_service: Arc<ChannelService>,
     pub connection_manager: Arc<ConnectionManager>,
     pub security_service: Arc<SecurityService>,
@@ -57,6 +57,7 @@ pub struct AdminServerState {
     pub subscribe_manager: Arc<SubscribeManager>,
     pub room_history_service: Arc<RoomHistoryService>,
     pub message_service: Arc<MessageService>,
+    pub user_service: Arc<UserService>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -116,6 +117,7 @@ impl AdminHttpServer {
         subscribe_manager: Arc<SubscribeManager>,
         room_history_service: Arc<RoomHistoryService>,
         message_service: Arc<MessageService>,
+        user_service: Arc<UserService>,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -130,10 +132,8 @@ impl AdminHttpServer {
             state: AdminServerState {
                 service_key_manager,
                 token_issue_service,
-                user_repository,
                 login_log_repository,
                 device_manager_db,
-                message_repository,
                 channel_service,
                 connection_manager,
                 security_service,
@@ -141,6 +141,7 @@ impl AdminHttpServer {
                 subscribe_manager,
                 room_history_service,
                 message_service,
+                user_service,
             },
             port,
         }

@@ -24,18 +24,26 @@
 //! 供登录通知、Admin API 发消息、系统公告等所有服务端主动发消息场景复用。
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
+use privchat_protocol::protocol::{MessageSetting, PushMessageRequest};
 use privchat_protocol::ContentMessageType;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use crate::error::ServerError;
 use crate::infra::ConnectionManager;
+use crate::model::channel::MemberRole;
 use crate::model::message::Message;
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::{MessageRepository, PgMessageRepository};
+use crate::service::message_history_service::MessageHistoryService;
 use crate::service::sync::get_global_sync_service;
 use crate::service::{ChannelService, OfflineQueueService, UnreadCountService};
+
+/// 撤回时限（秒）——普通用户在此窗口内才能撤回自己的消息；群主/管理员不受限。
+pub const DEFAULT_REVOKE_TIME_LIMIT_SECS: i64 = 172800; // 48h
 
 /// 服务端发消息的请求参数
 pub struct ServerSendMessageRequest {
@@ -65,6 +73,16 @@ pub struct ServerSendMessageResult {
     pub created_at: i64,
 }
 
+/// 撤回成功后的摘要——供 HTTP / RPC 入口层装配响应。
+pub struct RevokedMessageSummary {
+    pub message_id: u64,
+    pub channel_id: u64,
+    pub channel_type: u8,
+    pub revoker_id: u64,
+    /// 撤回事件推送时间戳（毫秒）
+    pub revoked_at_ms: i64,
+}
+
 pub struct MessageService {
     channel_service: Arc<ChannelService>,
     pts_generator: Arc<PtsGenerator>,
@@ -73,6 +91,7 @@ pub struct MessageService {
     offline_queue_service: Arc<OfflineQueueService>,
     connection_manager: Arc<ConnectionManager>,
     unread_count_service: Arc<UnreadCountService>,
+    message_history_service: Arc<MessageHistoryService>,
 }
 
 impl MessageService {
@@ -84,6 +103,7 @@ impl MessageService {
         offline_queue_service: Arc<OfflineQueueService>,
         connection_manager: Arc<ConnectionManager>,
         unread_count_service: Arc<UnreadCountService>,
+        message_history_service: Arc<MessageHistoryService>,
     ) -> Self {
         Self {
             channel_service,
@@ -93,6 +113,7 @@ impl MessageService {
             offline_queue_service,
             connection_manager,
             unread_count_service,
+            message_history_service,
         }
     }
 
@@ -298,5 +319,376 @@ impl MessageService {
             pts,
             created_at: now.timestamp_millis(),
         })
+    }
+
+    /// RPC 入口——带权限与时限校验的撤回（`rpc/message/revoke.rs` 使用）。
+    ///
+    /// - 发送者或群主/管理员可撤回
+    /// - 普通发送者受 [`DEFAULT_REVOKE_TIME_LIMIT_SECS`] 限制
+    /// - 权限通过后进入 [`revoke_message_core`] 执行完整副作用编排
+    pub async fn revoke_message_with_auth(
+        &self,
+        message_id: u64,
+        channel_id: u64,
+        user_id: u64,
+    ) -> std::result::Result<RevokedMessageSummary, ServerError> {
+        let message = self
+            .message_repository
+            .find_by_id(message_id)
+            .await
+            .map_err(|e| ServerError::Database(format!("查询消息失败: {}", e)))?
+            .ok_or_else(|| ServerError::NotFound("消息不存在".to_string()))?;
+
+        if message.revoked {
+            return Err(ServerError::Validation("消息已被撤回".to_string()));
+        }
+
+        let is_sender = message.sender_id == user_id;
+        let is_admin = self
+            .channel_service
+            .get_channel(&channel_id)
+            .await
+            .ok()
+            .and_then(|ch| ch.members.get(&user_id).map(|m| m.role))
+            .map(|role| matches!(role, MemberRole::Owner | MemberRole::Admin))
+            .unwrap_or(false);
+
+        if !is_sender && !is_admin {
+            return Err(ServerError::Forbidden(
+                "只有发送者或群管理员可以撤回消息".to_string(),
+            ));
+        }
+
+        if is_sender && !is_admin {
+            let now_ts = Utc::now().timestamp();
+            let msg_ts = message.created_at.timestamp();
+            if now_ts - msg_ts > DEFAULT_REVOKE_TIME_LIMIT_SECS {
+                return Err(ServerError::Validation(format!(
+                    "消息发送已超过 {} 小时，无法撤回",
+                    DEFAULT_REVOKE_TIME_LIMIT_SECS / 3600
+                )));
+            }
+        }
+
+        self.revoke_message_core(message_id, message.channel_id, user_id)
+            .await
+    }
+
+    /// Admin 入口——跳过发送者/时限校验，仅做"消息存在且未撤回"前置。
+    ///
+    /// `admin_revoker_id` 必须是真实管理员上下文的用户 ID，禁止传 0。系统级默认
+    /// 使用 [`crate::config::SYSTEM_USER_ID`]。
+    pub async fn revoke_message_admin(
+        &self,
+        message_id: u64,
+        admin_revoker_id: u64,
+    ) -> std::result::Result<RevokedMessageSummary, ServerError> {
+        debug_assert!(
+            admin_revoker_id != 0,
+            "revoke_message_admin 禁止使用 0 作为 revoker_id，请传入真实管理员或 SYSTEM_USER_ID"
+        );
+
+        let message = self
+            .message_repository
+            .find_by_id(message_id)
+            .await
+            .map_err(|e| ServerError::Database(format!("查询消息失败: {}", e)))?
+            .ok_or_else(|| ServerError::NotFound(format!("消息 {} 不存在", message_id)))?;
+
+        if message.revoked {
+            return Err(ServerError::Validation("消息已被撤回".to_string()));
+        }
+
+        self.revoke_message_core(message_id, message.channel_id, admin_revoker_id)
+            .await
+    }
+
+    /// 撤回的完整副作用编排——**唯一**写点，供 `_with_auth` / `_admin` 共享。
+    ///
+    /// 步骤：
+    /// 1. DB 标记撤回
+    /// 2. 发 `DomainEvent::MessageRevoked` 到 event_bus
+    /// 3. 更新 `message_history_service` 内存缓存
+    /// 4. 写 sync `message.revoke` commit（PTS）
+    /// 5. 推送撤回事件给所有参与者
+    /// 6. 从所有参与者的离线队列中删除该消息
+    async fn revoke_message_core(
+        &self,
+        message_id: u64,
+        channel_id: u64,
+        revoker_id: u64,
+    ) -> std::result::Result<RevokedMessageSummary, ServerError> {
+        // 1. DB 标记撤回
+        let revoked_msg = self
+            .message_repository
+            .revoke_message(message_id, revoker_id)
+            .await
+            .map_err(|e| match e {
+                crate::error::DatabaseError::NotFound(msg) => ServerError::NotFound(msg),
+                crate::error::DatabaseError::Validation(msg) => ServerError::Validation(msg),
+                _ => ServerError::Database(format!("撤回消息失败: {}", e)),
+            })?;
+
+        tracing::debug!(
+            "✅ 消息已在数据库中标记为撤回: message_id={}, revoked_by={}",
+            message_id,
+            revoker_id
+        );
+
+        // 2. 发布 MessageRevoked 事件
+        if let Some(event_bus) = crate::handler::send_message_handler::get_global_event_bus() {
+            let event = crate::domain::events::DomainEvent::MessageRevoked {
+                message_id,
+                conversation_id: channel_id,
+                revoker_id,
+                timestamp: Utc::now().timestamp(),
+            };
+            if let Err(e) = event_bus.publish(event) {
+                warn!("⚠️ 发布 MessageRevoked 事件失败: {}", e);
+            }
+        }
+
+        // 3. 更新内存缓存
+        if let Err(e) = self
+            .message_history_service
+            .revoke_message(&message_id, &revoker_id)
+            .await
+        {
+            match e {
+                ServerError::NotFound(_) | ServerError::MessageNotFound(_) => {
+                    tracing::debug!(
+                        "ℹ️ 内存缓存未命中，跳过撤回状态同步: channel_id={}, message_id={}",
+                        channel_id,
+                        message_id
+                    );
+                }
+                other => warn!("⚠️ 更新内存缓存失败: {}", other),
+            }
+        }
+
+        // 解析 channel_type
+        let channel_type = self
+            .channel_service
+            .get_channel(&channel_id)
+            .await
+            .ok()
+            .map(|ch| ch.channel_type.to_i16() as u8)
+            .unwrap_or(1);
+        let channel_type = if channel_type == 0 { 1 } else { channel_type };
+
+        // 4. 写 sync commit
+        let revoke_ts_ms = Utc::now().timestamp_millis();
+        let revoke_payload = json!({
+            "message_id": message_id,
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "revoke": true,
+            "revoked_by": revoker_id,
+            "revoked_at": revoke_ts_ms,
+        });
+        if let Some(sync_service) = get_global_sync_service() {
+            if let Err(e) = sync_service
+                .append_server_event_commit(
+                    channel_id,
+                    channel_type,
+                    "message.revoke",
+                    revoke_payload,
+                    revoker_id,
+                )
+                .await
+            {
+                warn!("⚠️ 写入 revoke pts commit 失败: {}", e);
+            }
+        } else {
+            warn!("⚠️ SyncService 未初始化，跳过 revoke pts commit");
+        }
+
+        // 5. 推送撤回事件给所有参与者
+        if let Err(e) = self
+            .distribute_revoke_event(channel_id, channel_type, message_id, revoker_id)
+            .await
+        {
+            warn!("⚠️ 推送撤回事件失败: {}，但消息已撤回", e);
+        }
+
+        // 6. 清理所有参与者的离线队列
+        match self.channel_service.get_channel_participants(channel_id).await {
+            Ok(participants) => {
+                for p in participants {
+                    if let Err(e) = self
+                        .offline_queue_service
+                        .remove_message_by_id(p.user_id, message_id)
+                        .await
+                    {
+                        warn!(
+                            "⚠️ 从用户 {} 的离线队列中删除消息 {} 失败: {}",
+                            p.user_id, message_id, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ 获取会话参与者失败，离线队列清理跳过: {}", e);
+            }
+        }
+
+        tracing::debug!("✅ 消息撤回完成: message_id={}", message_id);
+
+        let revoked_at_ms = revoked_msg
+            .revoked_at
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(revoke_ts_ms);
+
+        Ok(RevokedMessageSummary {
+            message_id,
+            channel_id,
+            channel_type,
+            revoker_id,
+            revoked_at_ms,
+        })
+    }
+
+    /// 推送撤回事件给会话内所有参与者——使用与主发消息相同的 `ConnectionManager`
+    /// 入口（`CONNECTION_LIFECYCLE_SPEC §8.8`），不走离线队列（撤回事件只通知在线端，
+    /// 离线用户通过离线队列清理保证不会再收到原消息）。
+    async fn distribute_revoke_event(
+        &self,
+        channel_id: u64,
+        channel_type: u8,
+        message_id: u64,
+        revoked_by: u64,
+    ) -> std::result::Result<(), ServerError> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let event_payload = json!({
+            "revoked_by": revoked_by,
+            "revoked_at": now_ms,
+        });
+
+        let revoke_event = PushMessageRequest {
+            setting: MessageSetting {
+                need_receipt: false,
+                signal: 0,
+            },
+            msg_key: format!("revoke_{}", message_id),
+            server_message_id: message_id,
+            message_seq: 0,
+            local_message_id: 0,
+            stream_no: String::new(),
+            stream_seq: 0,
+            stream_flag: 0,
+            timestamp: (now_ms / 1000) as u32,
+            channel_id,
+            channel_type,
+            message_type: ContentMessageType::System.as_u32(),
+            expire: 0,
+            topic: "message.revoke".to_string(),
+            from_uid: revoked_by,
+            payload: event_payload.to_string().into_bytes(),
+            deleted: true,
+        };
+
+        let participants = self
+            .channel_service
+            .get_channel_participants(channel_id)
+            .await
+            .map_err(|e| ServerError::Database(format!("获取会话参与者失败: {}", e)))?;
+
+        info!(
+            "📣 开始分发撤回事件: channel_id={}, channel_type={}, message_id={}, revoked_by={}, participants={}",
+            channel_id,
+            channel_type,
+            message_id,
+            revoked_by,
+            participants.len()
+        );
+
+        for participant in participants {
+            match self
+                .connection_manager
+                .send_push_to_user(participant.user_id, &revoke_event)
+                .await
+            {
+                Ok(success_count) => {
+                    info!(
+                        "📤 撤回事件推送: target_user={}, message_id={}, success_sessions={}",
+                        participant.user_id, message_id, success_count
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ 推送撤回事件给用户 {} 失败: {:?}",
+                        participant.user_id, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // ============================================================
+    // admin 只读聚合（ADMIN_PATH_CONVERGENCE_AUDIT §3）
+    //
+    // admin handler 不得直连 PgMessageRepository —— 下列方法是纯 pass-through + 错误映射,
+    // 若未来要加缓存 / 审计 / 限流 hook,都收敛在这里。
+    // ============================================================
+
+    pub async fn admin_list(
+        &self,
+        channel_id: Option<u64>,
+        user_id: Option<u64>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<Value>, u32), ServerError> {
+        self.message_repository
+            .list_messages_admin(channel_id, user_id, start_time, end_time, page, page_size)
+            .await
+            .map_err(|e| ServerError::Database(format!("查询消息列表失败: {}", e)))
+    }
+
+    pub async fn admin_get(&self, message_id: u64) -> Result<Option<Value>, ServerError> {
+        self.message_repository
+            .get_message_admin(message_id)
+            .await
+            .map_err(|e| ServerError::Database(format!("查询消息详情失败: {}", e)))
+    }
+
+    pub async fn admin_search(
+        &self,
+        keyword: &str,
+        channel_id: Option<u64>,
+        user_id: Option<u64>,
+        message_type: Option<i16>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<Value>, u32), ServerError> {
+        MessageRepository::search_messages(
+            self.message_repository.as_ref(),
+            keyword,
+            channel_id,
+            user_id,
+            message_type,
+            start_time,
+            end_time,
+            page,
+            page_size,
+        )
+        .await
+        .map_err(|e| ServerError::Database(format!("搜索消息失败: {}", e)))
+    }
+
+    pub async fn admin_stats(&self) -> Result<Value, ServerError> {
+        self.message_repository
+            .get_message_stats_admin()
+            .await
+            .map_err(|e| ServerError::Database(format!("获取消息统计失败: {}", e)))
     }
 }

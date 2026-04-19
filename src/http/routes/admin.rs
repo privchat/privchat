@@ -36,7 +36,6 @@ use crate::auth::{IssueTokenRequest, IssueTokenResponse};
 use crate::error::{Result, ServerError};
 use crate::http::dto::admin as dto;
 use crate::http::AdminServerState;
-use crate::repository::MessageRepository;
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::HeaderMap,
@@ -331,70 +330,19 @@ async fn create_user(
         user_type,
     } = request;
 
-    let normalized_username = username.trim().to_lowercase();
-    let normalized_email = email
-        .as_ref()
-        .map(|val| val.trim().to_lowercase())
-        .filter(|val| !val.is_empty());
+    info!("创建用户: username={}", username);
 
-    info!("创建用户: username={}", normalized_username);
-
-    // 验证用户名
-    if normalized_username.is_empty() {
-        return Err(ServerError::Validation("用户名不能为空".to_string()));
-    }
-
-    // 检查用户名是否已存在
-    if let Ok(Some(_)) = state
-        .user_repository
-        .find_by_username(&normalized_username)
-        .await
-    {
-        return Err(ServerError::Validation(format!(
-            "用户名 {} 已存在",
-            normalized_username
-        )));
-    }
-
-    // 检查邮箱是否已存在
-    if let Some(ref email) = normalized_email {
-        if let Ok(Some(_)) = state.user_repository.find_by_email(email).await {
-            return Err(ServerError::Validation(format!("邮箱 {} 已存在", email)));
-        }
-    }
-
-    // 创建用户对象（user_id 由数据库自动生成）
-    let user = crate::model::user::User::new_with_details(
-        0, // 数据库会自动生成
-        normalized_username,
-        display_name,
-        normalized_email,
-        avatar_url,
-    );
-
-    // 如果提供了 phone，设置它
-    let mut user = user;
-    if let Some(phone) = phone {
-        user.phone = Some(phone);
-    }
-    if let Some(user_type) = user_type {
-        user.user_type = user_type;
-    }
-
-    // 保存到数据库
     let created_user = state
-        .user_repository
-        .create(&user)
-        .await
-        .map_err(|e| match e {
-            crate::error::DatabaseError::DuplicateEntry(msg) => ServerError::Validation(msg),
-            _ => ServerError::Database(format!("创建用户失败: {}", e)),
-        })?;
-
-    info!(
-        "✅ 用户创建成功: user_id={}, username={}",
-        created_user.id, created_user.username
-    );
+        .user_service
+        .create_user_admin(crate::service::CreateUserAdminParams {
+            username,
+            display_name,
+            email,
+            phone,
+            avatar_url,
+            user_type,
+        })
+        .await?;
 
     Ok(Json(json!({
         "success": true,
@@ -433,21 +381,14 @@ async fn list_users(
     let page_size = params.page_size.unwrap_or(20).min(100); // 最大 100
 
     let (users, total) = if let Some(ref search) = params.search {
-        // 搜索用户（暂时不支持分页，返回所有结果）
-        let users = state
-            .user_repository
-            .search(search)
-            .await
-            .map_err(|e| ServerError::Database(format!("搜索用户失败: {}", e)))?;
+        let users = state.user_service.search(search).await?;
         let total = users.len() as u32;
         (users, total)
     } else {
-        // 分页查询所有用户
         state
-            .user_repository
+            .user_service
             .find_all_paginated(page, page_size)
-            .await
-            .map_err(|e| ServerError::Database(format!("获取用户列表失败: {}", e)))?
+            .await?
     };
 
     let user_list: Vec<Value> = users
@@ -487,10 +428,9 @@ async fn get_user(
     verify_service_key(&headers, &state).await?;
 
     let user = state
-        .user_repository
+        .user_service
         .find_by_id(user_id)
-        .await
-        .map_err(|e| ServerError::Database(format!("查询用户失败: {}", e)))?
+        .await?
         .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
 
     Ok(Json(json!({
@@ -529,13 +469,6 @@ async fn update_user(
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
 
-    let mut user = state
-        .user_repository
-        .find_by_id(user_id)
-        .await
-        .map_err(|e| ServerError::Database(format!("查询用户失败: {}", e)))?
-        .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
-
     let UpdateUserRequest {
         display_name,
         email,
@@ -544,44 +477,19 @@ async fn update_user(
         status,
     } = request;
 
-    // 更新字段
-    if let Some(display_name) = display_name {
-        user.display_name = Some(display_name);
-    }
-    if let Some(email) = email {
-        let normalized_email = email.trim().to_lowercase();
-        if normalized_email.is_empty() {
-            user.email = None;
-        } else {
-            if let Ok(Some(existing_user)) =
-                state.user_repository.find_by_email(&normalized_email).await
-            {
-                if existing_user.id != user_id {
-                    return Err(ServerError::Validation(format!(
-                        "邮箱 {} 已存在",
-                        normalized_email
-                    )));
-                }
-            }
-            user.email = Some(normalized_email);
-        }
-    }
-    if let Some(phone) = phone {
-        user.phone = Some(phone);
-    }
-    if let Some(avatar_url) = avatar_url {
-        user.avatar_url = Some(avatar_url);
-    }
-    if let Some(status) = status {
-        user.status = crate::model::user::UserStatus::from_i16(status);
-    }
-
-    // 保存更新
     state
-        .user_repository
-        .update(&user)
-        .await
-        .map_err(|e| ServerError::Database(format!("更新用户失败: {}", e)))?;
+        .user_service
+        .update_user_admin(
+            user_id,
+            crate::service::UpdateUserAdminParams {
+                display_name,
+                email,
+                phone,
+                avatar_url,
+                status,
+            },
+        )
+        .await?;
 
     Ok(Json(json!({
         "success": true,
@@ -600,25 +508,7 @@ async fn delete_user(
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
 
-    // 检查用户是否存在
-    let exists = state
-        .user_repository
-        .exists(user_id)
-        .await
-        .map_err(|e| ServerError::Database(format!("检查用户失败: {}", e)))?;
-
-    if !exists {
-        return Err(ServerError::NotFound(format!("用户 {} 不存在", user_id)));
-    }
-
-    // 删除用户（软删除：标记为禁用）
-    state
-        .user_repository
-        .delete(user_id)
-        .await
-        .map_err(|e| ServerError::Database(format!("删除用户失败: {}", e)))?;
-
-    info!("✅ 用户已删除（软删除）: user_id={}", user_id);
+    state.user_service.delete_user_admin(user_id).await?;
 
     Ok(Json(json!({
         "success": true,
@@ -944,27 +834,16 @@ async fn create_friendship(
 
     info!("创建好友关系: {} <-> {}", user1_id, user2_id);
 
-    let user1_exists = state
-        .user_repository
-        .exists(user1_id)
-        .await
-        .map_err(|e| ServerError::Database(format!("检查用户失败: {}", e)))?;
-    if !user1_exists {
+    if !state.user_service.exists(user1_id).await? {
         return Err(ServerError::NotFound(format!("用户 {} 不存在", user1_id)));
     }
-
-    let user2_exists = state
-        .user_repository
-        .exists(user2_id)
-        .await
-        .map_err(|e| ServerError::Database(format!("检查用户失败: {}", e)))?;
-    if !user2_exists {
+    if !state.user_service.exists(user2_id).await? {
         return Err(ServerError::NotFound(format!("用户 {} 不存在", user2_id)));
     }
 
     let channel_id = state
         .channel_service
-        .create_friendship_admin(user1_id, user2_id, &state.channel_service)
+        .create_friendship_admin(user1_id, user2_id)
         .await
         .map_err(|e| match e {
             ServerError::Validation(msg) => ServerError::Validation(msg),
@@ -1037,7 +916,7 @@ async fn get_user_friends(
     let mut friends = Vec::new();
     for friend_id in friend_ids {
         // 获取好友用户信息
-        if let Ok(Some(friend_user)) = state.user_repository.find_by_id(friend_id).await {
+        if let Ok(Some(friend_user)) = state.user_service.find_by_id(friend_id).await {
             friends.push(json!({
                 "user_id": friend_id,
                 "username": friend_user.username,
@@ -1374,11 +1253,7 @@ async fn get_stats(
     verify_service_key(&headers, &state).await?;
 
     // 用户数
-    let user_count = state
-        .user_repository
-        .count()
-        .await
-        .map_err(|e| ServerError::Database(format!("统计用户数失败: {}", e)))?;
+    let user_count = state.user_service.count().await?;
 
     // 群组数
     let group_stats = state
@@ -1389,11 +1264,7 @@ async fn get_stats(
     let group_total = group_stats["total"].as_u64().unwrap_or(0) as usize;
 
     // 消息数
-    let message_stats = state
-        .message_repository
-        .get_message_stats_admin()
-        .await
-        .map_err(|e| ServerError::Database(format!("获取消息统计失败: {}", e)))?;
+    let message_stats = state.message_service.admin_stats().await?;
     let message_total = message_stats["total"].as_u64().unwrap_or(0) as usize;
 
     // 设备数
@@ -1428,11 +1299,7 @@ async fn get_user_stats(
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
 
-    let total = state
-        .user_repository
-        .count()
-        .await
-        .map_err(|e| ServerError::Database(format!("统计用户数失败: {}", e)))?;
+    let total = state.user_service.count().await?;
 
     Ok(Json(json!({
         "total": total,
@@ -1468,11 +1335,7 @@ async fn get_message_stats(
 ) -> Result<Json<Value>> {
     verify_service_key(&headers, &state).await?;
 
-    let stats = state
-        .message_repository
-        .get_message_stats_admin()
-        .await
-        .map_err(|e| ServerError::Database(format!("获取消息统计失败: {}", e)))?;
+    let stats = state.message_service.admin_stats().await?;
 
     Ok(Json(stats))
 }
@@ -1506,8 +1369,8 @@ async fn list_messages(
     let page_size = params.page_size.unwrap_or(20).min(100);
 
     let (message_list, total) = state
-        .message_repository
-        .list_messages_admin(
+        .message_service
+        .admin_list(
             params.channel_id,
             params.user_id,
             params.start_time,
@@ -1515,8 +1378,7 @@ async fn list_messages(
             page,
             page_size,
         )
-        .await
-        .map_err(|e| ServerError::Database(format!("查询消息列表失败: {}", e)))?;
+        .await?;
 
     Ok(Json(json!({
         "messages": message_list,
@@ -1537,10 +1399,9 @@ async fn get_message(
     verify_service_key(&headers, &state).await?;
 
     let message = state
-        .message_repository
-        .get_message_admin(message_id)
-        .await
-        .map_err(|e| ServerError::Database(format!("查询消息详情失败: {}", e)))?
+        .message_service
+        .admin_get(message_id)
+        .await?
         .ok_or_else(|| ServerError::NotFound(format!("消息 {} 不存在", message_id)))?;
 
     Ok(Json(message))
@@ -1717,6 +1578,10 @@ async fn remove_group_member(
 /// 管理员撤回消息
 ///
 /// POST /api/admin/messages/:message_id/revoke
+///
+/// admin 入口只做权限校验（`verify_service_key`）+ 委托到 `MessageService::revoke_message_admin`。
+/// 跳过发送者/48h 限制，但共享 RPC 侧同一套副作用编排（事件/缓存/PTS/推送/离线清理）。
+/// 见 `ADMIN_API_SPEC §1.4 Global Service Convergence Rule`。
 async fn revoke_message(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1725,24 +1590,16 @@ async fn revoke_message(
 ) -> Result<Json<dto::RevokeMessageResponse>> {
     verify_service_key(&headers, &state).await?;
 
-    let revoked_msg = state
-        .message_repository
-        .revoke_message(message_id, 0)
-        .await
-        .map_err(|e| match e {
-            crate::error::DatabaseError::NotFound(msg) => ServerError::NotFound(msg),
-            crate::error::DatabaseError::Validation(msg) => ServerError::Validation(msg),
-            _ => ServerError::Database(format!("撤回消息失败: {}", e)),
-        })?;
+    let summary = state
+        .message_service
+        .revoke_message_admin(message_id, crate::config::SYSTEM_USER_ID)
+        .await?;
 
     Ok(Json(dto::RevokeMessageResponse {
         success: true,
-        message_id,
-        channel_id: revoked_msg.channel_id,
-        revoked_at: revoked_msg
-            .revoked_at
-            .map(|dt| dt.timestamp_millis())
-            .unwrap_or(0),
+        message_id: summary.message_id,
+        channel_id: summary.channel_id,
+        revoked_at: summary.revoked_at_ms,
         message: "消息已撤回".to_string(),
     }))
 }
@@ -2129,7 +1986,7 @@ async fn get_user_connection(
     let connections = state.connection_manager.get_user_connections(user_id).await;
 
     let user_info = state
-        .user_repository
+        .user_service
         .find_by_id(user_id)
         .await
         .ok()
@@ -2322,8 +2179,8 @@ async fn search_messages(
     let page_size = params.page_size.unwrap_or(20).min(100);
 
     let result = state
-        .message_repository
-        .search_messages(
+        .message_service
+        .admin_search(
             &params.keyword,
             params.channel_id,
             params.user_id,
@@ -2333,8 +2190,7 @@ async fn search_messages(
             page,
             page_size,
         )
-        .await
-        .map_err(|e| ServerError::Database(format!("搜索消息失败: {}", e)))?;
+        .await?;
 
     let messages: Vec<dto::SearchMessageItem> = result
         .0

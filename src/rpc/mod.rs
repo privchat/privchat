@@ -46,9 +46,9 @@ use crate::repository::UserRepository;
 use crate::service::sync::SyncService;
 use crate::service::{
     ApprovalService, BlacklistService, ChannelService, FileService, FriendService,
-    MessageHistoryService, OfflineQueueService, PresenceService, PrivacyService, QRCodeService,
-    ReactionService, ReadReceiptService, ReadStateService, StickerService, UnreadCountService,
-    UploadTokenService,
+    MessageHistoryService, MessageService, OfflineQueueService, PresenceService, PrivacyService,
+    QRCodeService, ReactionService, ReadReceiptService, ReadStateService, StickerService,
+    UnreadCountService, UploadTokenService, UserService,
 };
 use router::GLOBAL_RPC_ROUTER;
 use std::sync::Arc;
@@ -151,6 +151,10 @@ pub struct RpcServiceContext {
     pub unread_count_service: Arc<UnreadCountService>,
     /// Typing 限频器 - (user_id, channel_id) 500ms/次
     pub typing_rate_limiter: Arc<TypingRateLimiter>,
+    /// 通用消息服务 - 发消息 / 撤回 的唯一入口（与 admin 共享同一 Arc 实例）
+    pub message_service: Arc<MessageService>,
+    /// 用户服务 - 用户 CRUD / 查询的唯一入口（与 admin 共享同一 Arc 实例）
+    pub user_service: Arc<UserService>,
 }
 
 impl RpcServiceContext {
@@ -190,6 +194,8 @@ impl RpcServiceContext {
         user_device_repo: Arc<crate::repository::UserDeviceRepository>, // ✨ Phase 3.5
         unread_count_service: Arc<UnreadCountService>,
         typing_rate_limiter: Arc<TypingRateLimiter>,
+        message_service: Arc<MessageService>,
+        user_service: Arc<UserService>,
     ) -> Self {
         Self {
             // channel_service 已合并到 channel_service
@@ -227,6 +233,8 @@ impl RpcServiceContext {
             user_device_repo, // ✨ Phase 3.5
             unread_count_service,
             typing_rate_limiter,
+            message_service,
+            user_service,
         }
     }
 }

@@ -123,6 +123,8 @@ pub struct ChatServer {
     room_history_service: Arc<crate::service::RoomHistoryService>,
     /// 通用服务端发消息服务（供登录通知、Admin API 等复用）
     message_service: Arc<crate::service::MessageService>,
+    /// 用户服务（admin / RPC / job 统一入口，见 ADMIN_API_SPEC §1.4）
+    user_service: Arc<crate::service::UserService>,
 }
 
 impl ChatServer {
@@ -489,8 +491,13 @@ impl ChatServer {
             offline_queue_service.clone(),
             connection_manager.clone(),
             unread_count_service.clone(),
+            message_history_service.clone(),
         ));
         info!("✅ MessageService 创建完成");
+
+        // 用户服务：admin / RPC / job 对 User 领域对象的唯一入口
+        let user_service = Arc::new(crate::service::UserService::new(user_repository.clone()));
+        info!("✅ UserService 创建完成");
 
         // 5. 将 EventBus 传递给 SendMessageHandler
         // 注意：SendMessageHandler 需要支持设置 event_bus
@@ -1215,6 +1222,8 @@ impl ChatServer {
             user_device_repo.clone(), // ✨ Phase 3.5
             unread_count_service.clone(),
             typing_rate_limiter.clone(),
+            message_service.clone(),
+            user_service.clone(),
         );
         crate::rpc::init_rpc_system(rpc_services).await;
         info!("✅ RPC 系统初始化完成");
@@ -1290,6 +1299,7 @@ impl ChatServer {
             subscribe_manager,
             room_history_service,
             message_service,
+            user_service,
         })
     }
 
@@ -2034,6 +2044,7 @@ impl ChatServer {
             self.subscribe_manager.clone(),
             self.room_history_service.clone(),
             self.message_service.clone(),
+            self.user_service.clone(),
             self.config.admin_api_port,
         );
 
