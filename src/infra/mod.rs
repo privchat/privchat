@@ -72,7 +72,7 @@ pub use cache_manager_simple::{
 };
 pub use connection_manager::{ConnectionManager, DeviceConnection}; // ✨ 新增
 pub use event_bus::EventBus;
-pub use message_router::{MessageRouter, MessageRouterConfig, RouteResult, SessionManagerAdapter};
+pub use message_router::{MessageRouter, MessageRouterConfig, RouteResult};
 pub use offline_worker::{DeliveryStats, OfflineMessageWorker, OfflineWorkerConfig};
 pub use online_status_manager::{OnlineSession, OnlineStatusManager, OnlineStatusStats};
 pub use presence_manager_with_db::{

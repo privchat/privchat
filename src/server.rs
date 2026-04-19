@@ -38,7 +38,6 @@ use crate::handler::{
 };
 use crate::infra::{database::Database, CacheManager, OnlineStatusManager, OnlineStatusStats};
 use crate::repository::{PgChannelRepository, PgMessageRepository, UserRepository};
-use crate::session::SessionManager;
 // ChannelService 现在从 channel_service 导出
 use crate::context::RequestContext;
 use crate::service::message_history_service::MessageHistoryService;
@@ -69,7 +68,6 @@ impl ServerStats {
 pub struct ChatServer {
     config: ServerConfig,
     token_auth: Arc<TokenAuth>,
-    session_manager: Arc<SessionManager>,
     cache_manager: Arc<CacheManager>,
     online_status_manager: Arc<OnlineStatusManager>,
     stats: Arc<tokio::sync::RwLock<ServerStats>>,
@@ -111,8 +109,6 @@ pub struct ChatServer {
     presence_service: Arc<crate::service::PresenceService>,
     /// 消息路由器（维护 user/device/session 在线状态）
     message_router: Arc<crate::infra::MessageRouter>,
-    /// MessageRouter 的会话发送适配器（绑定 TransportServer 后可真实下发 PushMessageRequest）
-    message_router_session_adapter: Arc<crate::infra::message_router::SessionManagerAdapter>,
     /// 业务 Handler 并发限流器（STABILITY_SPEC 禁令 2）
     handler_limiter: crate::infra::handler_limiter::HandlerLimiter,
     /// 事件总线（用于 lagged 指标上报）
@@ -218,7 +214,6 @@ impl ChatServer {
         }
 
         let token_auth = Arc::new(TokenAuth::new());
-        let session_manager = Arc::new(SessionManager::new());
 
         // 创建缓存管理器
         let cache_manager = Arc::new(CacheManager::new(config.cache.clone()).await?);
@@ -301,16 +296,7 @@ impl ChatServer {
         // 🔧 初始化消息路由和离线消息系统
         info!("🔧 初始化消息路由系统...");
 
-        // 1. 创建简单的内存缓存用于消息路由（使用 message_router 模块的类型）
-        let user_status_cache: Arc<
-            dyn crate::infra::TwoLevelCache<
-                crate::infra::message_router::UserId,
-                crate::infra::message_router::UserOnlineStatus,
-            >,
-        > = Arc::new(crate::infra::L1L2Cache::local_only(
-            10000,
-            Duration::from_secs(3600),
-        ));
+        // 1. 创建离线消息队列缓存（由 OfflineMessageWorker 使用）
         let offline_queue_cache: Arc<
             dyn crate::infra::TwoLevelCache<
                 crate::infra::message_router::UserId,
@@ -320,20 +306,13 @@ impl ChatServer {
             10000,
             Duration::from_secs(3600),
         ));
-        info!("✅ 消息路由缓存创建完成");
+        info!("✅ 离线消息队列缓存创建完成");
 
-        // 2. 创建 MessageRouter (暂时使用简化的 SessionManager 适配器)
+        // 2. 创建 MessageRouter —— 投递与离线判定全部走 ConnectionManager
         let message_router_config = crate::infra::message_router::MessageRouterConfig::default();
-        let message_router_session_adapter = Arc::new(
-            crate::infra::message_router::SessionManagerAdapter::new(session_manager.clone()),
-        );
-        let session_manager_for_router: Arc<dyn crate::infra::message_router::SessionManager> =
-            message_router_session_adapter.clone();
         let message_router = Arc::new(crate::infra::MessageRouter::new(
             message_router_config,
-            user_status_cache.clone(),
-            offline_queue_cache.clone(),
-            session_manager_for_router,
+            connection_manager.clone(),
         ));
         info!("✅ MessageRouter 创建完成");
 
@@ -363,11 +342,11 @@ impl ChatServer {
         let mut offline_worker_inner = crate::infra::OfflineMessageWorker::new(
             offline_worker_config,
             message_router.clone(),
-            user_status_cache.clone(),
             offline_queue_cache.clone(),
             auth_session_manager.clone(),  // ✨ 用于获取 local_pts
             user_message_index.clone(),    // ✨ 用于 pts -> message_id 映射
             offline_queue_service.clone(), // ✨ 用于从 Redis 获取消息
+            connection_manager.clone(),    // ✨ Step 2：在线态唯一真源
         );
         offline_worker_inner.set_delivery_tracker(delivery_tracker.clone());
         let offline_worker = Arc::new(offline_worker_inner);
@@ -479,10 +458,9 @@ impl ChatServer {
         ));
         info!("✅ UserDeviceRepository 创建完成（提前创建）");
 
-        // 创建 SendMessageHandler（需要 SessionManager、FileService、ChannelService 和 MessageRouter）
+        // 创建 SendMessageHandler（需要 FileService、ChannelService 和 MessageRouter）
         let mut send_handler_inner = SendMessageHandler::new(
             message_history_service.clone(),
-            session_manager.clone(),
             file_service.clone(),
             channel_service.clone(),
             message_router.clone(),
@@ -1165,7 +1143,6 @@ impl ChatServer {
         message_dispatcher.register_handler(
             MessageType::AuthorizationRequest,
             Box::new(ConnectMessageHandler::new(
-                session_manager.clone(),
                 jwt_service.clone(),
                 token_revocation_service.clone(),
                 device_manager.clone(),
@@ -1283,7 +1260,6 @@ impl ChatServer {
         Ok(Self {
             config,
             token_auth,
-            session_manager,
             cache_manager,
             online_status_manager,
             stats,
@@ -1307,7 +1283,6 @@ impl ChatServer {
             notification_service,
             presence_service,
             message_router,
-            message_router_session_adapter,
             handler_limiter,
             event_bus,
             redis_client: Some(redis_client.clone()),
@@ -1342,11 +1317,6 @@ impl ChatServer {
             .set_transport(transport.clone())
             .await;
         info!("✅ TransportServer 已设置到 NotificationService");
-
-        self.message_router_session_adapter
-            .set_transport(transport.clone())
-            .await;
-        info!("✅ TransportServer 已设置到 MessageRouter SessionAdapter");
 
         // 设置 TransportServer 到 ConnectionManager（✨ 新增）
         self.connection_manager
@@ -1519,7 +1489,7 @@ impl ChatServer {
                             );
                         }
 
-                        // 清理连接管理 + 消息路由在线状态
+                        // 清理 ConnectionManager —— spec §1 唯一在线态真源
                         match connection_manager.unregister_connection(session_id).await {
                             Ok(Some((user_id, device_id))) => {
                                 if let Err(e) = presence_service
@@ -1529,19 +1499,6 @@ impl ChatServer {
                                     warn!(
                                         "⚠️ 连接关闭后更新 Presence 下线失败: user_id={}, error={}",
                                         user_id, e
-                                    );
-                                }
-                                if let Err(e) = message_router
-                                    .register_device_offline(
-                                        &user_id,
-                                        &device_id,
-                                        Some(&session_id.to_string()),
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        "⚠️ 连接关闭后清理 MessageRouter 在线状态失败: user_id={}, device_id={}, error={}",
-                                        user_id, device_id, e
                                     );
                                 }
                             }
@@ -1706,6 +1663,7 @@ impl ChatServer {
         let redis_client = self.redis_client.clone();
         let database = self.database.clone();
         let offline_worker = self.offline_worker.clone();
+        let connection_manager = self.connection_manager.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -1747,6 +1705,12 @@ impl ChatServer {
                 crate::infra::metrics::record_offline_queue_depth(queue_depth);
                 crate::infra::metrics::record_offline_try_send_fail(try_send_fail);
                 crate::infra::metrics::record_offline_fallback(fallback);
+
+                // ConnectionManager 在线态 Gauge 上报（spec §1 真源快照）
+                let online_users = connection_manager.online_users_count() as u64;
+                let online_sessions = connection_manager.online_sessions_count() as u64;
+                crate::infra::metrics::record_online_users(online_users);
+                crate::infra::metrics::record_online_sessions(online_sessions);
 
                 let secs = stats_guard.uptime_seconds;
                 let days = secs / 86400;

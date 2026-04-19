@@ -27,9 +27,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::infra::cache::TwoLevelCache;
-use crate::infra::message_router::{
-    MessagePriority, MessageRouter, OfflineMessage, UserId, UserOnlineStatus,
-};
+use crate::infra::message_router::{MessagePriority, MessageRouter, OfflineMessage, UserId};
 use crate::infra::SessionManager;
 use crate::model::pts::UserMessageIndex;
 use msgtrans::SessionId;
@@ -112,10 +110,10 @@ pub struct OfflineMessageWorker {
     config: OfflineWorkerConfig,
     /// 消息路由器
     router: Arc<MessageRouter>,
-    /// 用户在线状态缓存
-    user_status_cache: Arc<dyn TwoLevelCache<UserId, UserOnlineStatus>>,
     /// 离线消息队列缓存
     offline_queue_cache: Arc<dyn TwoLevelCache<UserId, Vec<OfflineMessage>>>,
+    /// 连接管理器（spec §1 在线态真源）
+    connection_manager: Arc<crate::infra::ConnectionManager>,
     /// 投递统计
     stats: Arc<RwLock<DeliveryStats>>,
     /// 用户投递状态
@@ -147,11 +145,11 @@ impl OfflineMessageWorker {
     pub fn new(
         config: OfflineWorkerConfig,
         router: Arc<MessageRouter>,
-        user_status_cache: Arc<dyn TwoLevelCache<UserId, UserOnlineStatus>>,
         offline_queue_cache: Arc<dyn TwoLevelCache<UserId, Vec<OfflineMessage>>>,
         session_manager: Arc<SessionManager>,
         user_message_index: Arc<UserMessageIndex>,
         offline_queue_service: Arc<crate::service::OfflineQueueService>,
+        connection_manager: Arc<crate::infra::ConnectionManager>,
     ) -> Self {
         let (trigger_tx, trigger_rx) = mpsc::channel(OFFLINE_QUEUE_CAPACITY);
         let max_concurrent = config.max_concurrent_users;
@@ -164,8 +162,8 @@ impl OfflineMessageWorker {
         Self {
             config,
             router,
-            user_status_cache,
             offline_queue_cache,
+            connection_manager,
             stats: Arc::new(RwLock::new(DeliveryStats::default())),
             user_states: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(RwLock::new(false)),
@@ -725,20 +723,8 @@ impl OfflineMessageWorker {
             return Ok(0);
         }
 
-        // 获取用户在线状态
-        let user_status = self
-            .user_status_cache
-            .get(user_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("用户不在线"))?;
-
-        // 获取在线设备
-        let online_devices: Vec<_> = user_status
-            .devices
-            .iter()
-            .filter(|d| matches!(d.status, crate::infra::message_router::DeviceStatus::Online))
-            .collect();
-
+        // 从连接管理器（spec §1 真源）取当前 Authenticated 设备列表
+        let online_devices = self.connection_manager.get_user_connections(*user_id).await;
         if online_devices.is_empty() {
             return Err(anyhow::anyhow!("用户没有在线设备"));
         }
@@ -802,24 +788,8 @@ impl OfflineMessageWorker {
 
     /// 为特定用户投递离线消息
     async fn deliver_user_messages(&self, user_id: &UserId) -> Result<usize> {
-        // 检查用户是否在线
-        let user_status = self.user_status_cache.get(user_id).await;
-
-        let user_status = match user_status {
-            Some(status) => status,
-            None => {
-                debug!("用户 {} 不在线，跳过投递", user_id);
-                return Ok(0);
-            }
-        };
-
-        // 检查用户是否有在线设备
-        let online_devices: Vec<_> = user_status
-            .devices
-            .iter()
-            .filter(|d| matches!(d.status, crate::infra::message_router::DeviceStatus::Online))
-            .collect();
-
+        // 从连接管理器（spec §1 真源）取当前 Authenticated 设备列表
+        let online_devices = self.connection_manager.get_user_connections(*user_id).await;
         if online_devices.is_empty() {
             debug!("用户 {} 没有在线设备，跳过投递", user_id);
             return Ok(0);

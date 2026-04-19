@@ -262,9 +262,13 @@ impl MessageService {
                     uid, online_sessions
                 );
             } else {
-                info!(
-                    "📭 MessageService: 用户离线，写入离线队列 user_id={}",
-                    uid
+                crate::infra::metrics::increment_offline_enqueue(1);
+                tracing::info!(
+                    target: "delivery.offline_enqueue",
+                    user_id = uid,
+                    server_message_id = push_msg.server_message_id,
+                    source = "MessageService",
+                    "zero-success delivery queued to offline"
                 );
                 if let Err(e) = self.offline_queue_service.add(uid, &push_msg).await {
                     warn!(

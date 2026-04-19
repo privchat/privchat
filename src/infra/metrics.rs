@@ -40,6 +40,30 @@ const GAUGE_OFFLINE_QUEUE_DEPTH: &str = "privchat_offline_queue_depth";
 const COUNTER_OFFLINE_TRY_SEND_FAIL: &str = "privchat_offline_try_send_fail_total";
 const COUNTER_OFFLINE_FALLBACK: &str = "privchat_offline_fallback_total";
 
+// ---------------------------------------------------------------------------
+// CONNECTION_LIFECYCLE_SPEC 观测指标
+// ---------------------------------------------------------------------------
+
+/// 当前在线用户数（Index A 不同 user_id 数，Authenticated）
+const GAUGE_CONN_ONLINE_USERS: &str = "privchat_connection_online_users";
+/// 当前在线 session 数（Index B 状态为 Authenticated 的条目数）
+const GAUGE_CONN_ONLINE_SESSIONS: &str = "privchat_connection_online_sessions";
+/// 累计 replaced session 数（同设备新连接接管时 +1）
+const COUNTER_CONN_REPLACED: &str = "privchat_connection_replaced_sessions_total";
+/// 累计 Connecting 超时清理数（spec §5 GC）
+const COUNTER_CONN_CONNECTING_TIMEOUT: &str = "privchat_connection_connecting_timeout_total";
+
+/// 累计投递尝试数（spec §6.1 入口调用）
+const COUNTER_DELIVERY_ATTEMPT: &str = "privchat_delivery_attempt_total";
+/// 累计成功投递的 session 次数（每成功送到一个 session +1）
+const COUNTER_DELIVERY_SUCCESS_SESSIONS: &str = "privchat_delivery_success_sessions_total";
+/// 累计投递尝试但成功数 = 0 的次数（spec §6.3 触发离线落盘的前置信号）
+const COUNTER_DELIVERY_ZERO_SUCCESS: &str = "privchat_delivery_zero_success_total";
+/// 累计写入离线队列次数（success_count == 0 时触发）
+const COUNTER_OFFLINE_ENQUEUE: &str = "privchat_offline_enqueue_total";
+/// 累计被 A→B 二次校验过滤掉的 session 次数（带 reason label）
+const COUNTER_DELIVERY_FILTERED: &str = "privchat_delivery_filtered_total";
+
 /// 初始化 Prometheus 指标（安装全局 Recorder，返回 Handle 用于 HTTP 暴露）。
 /// 仅需在进程内调用一次；重复调用会返回 Err。
 pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -116,4 +140,55 @@ pub fn record_offline_try_send_fail(count: u64) {
 /// 记录离线队列降级（fallback）次数（Counter）。
 pub fn record_offline_fallback(count: u64) {
     metrics::counter!(COUNTER_OFFLINE_FALLBACK).absolute(count);
+}
+
+// ---------------------------------------------------------------------------
+// CONNECTION_LIFECYCLE_SPEC 观测埋点
+// ---------------------------------------------------------------------------
+
+/// 更新在线用户数（Gauge）。由 60s 轮询 ConnectionManager 写入。
+pub fn record_online_users(count: u64) {
+    metrics::gauge!(GAUGE_CONN_ONLINE_USERS).set(count as f64);
+}
+
+/// 更新在线 session 数（Gauge）。由 60s 轮询 ConnectionManager 写入。
+pub fn record_online_sessions(count: u64) {
+    metrics::gauge!(GAUGE_CONN_ONLINE_SESSIONS).set(count as f64);
+}
+
+/// 累计 replaced session 次数 +1（同设备新连接接管时触发）。
+pub fn increment_connection_replaced(by: u64) {
+    metrics::counter!(COUNTER_CONN_REPLACED).increment(by);
+}
+
+/// 累计 Connecting 超时清理次数 +by（spec §5 GC 调用）。
+pub fn increment_connecting_timeout(by: u64) {
+    metrics::counter!(COUNTER_CONN_CONNECTING_TIMEOUT).increment(by);
+}
+
+/// 累计投递尝试次数 +1（spec §6.1 入口调用）。
+pub fn increment_delivery_attempt(by: u64) {
+    metrics::counter!(COUNTER_DELIVERY_ATTEMPT).increment(by);
+}
+
+/// 累计成功投递 session 次数 +by。
+pub fn increment_delivery_success_sessions(by: u64) {
+    metrics::counter!(COUNTER_DELIVERY_SUCCESS_SESSIONS).increment(by);
+}
+
+/// 累计 zero-success 投递尝试 +1（success_count == 0 时调用）。
+pub fn increment_delivery_zero_success(by: u64) {
+    metrics::counter!(COUNTER_DELIVERY_ZERO_SUCCESS).increment(by);
+}
+
+/// 累计离线队列入队次数 +by（实际写 Redis 的调用点）。
+pub fn increment_offline_enqueue(by: u64) {
+    metrics::counter!(COUNTER_OFFLINE_ENQUEUE).increment(by);
+}
+
+/// 累计因 A→B 过滤被丢弃的 session 次数 +by（spec §6.1 二次校验）。
+///
+/// reason 取值：`not_authenticated` / `superseded` / `missing_in_b`
+pub fn increment_delivery_filtered(reason: &'static str, by: u64) {
+    metrics::counter!(COUNTER_DELIVERY_FILTERED, "reason" => reason).increment(by);
 }

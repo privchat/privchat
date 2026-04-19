@@ -21,12 +21,10 @@ use crate::auth::{
 use crate::context::RequestContext;
 use crate::handler::MessageHandler;
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
-use crate::model::user::DeviceInfo;
 use crate::service::{
     ChannelService, MessageService, NotificationService, OfflineQueueService, PresenceService,
     ServerSendMessageRequest, UnreadCountService,
 };
-use crate::session::SessionManager;
 use crate::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -36,7 +34,6 @@ use tracing::{debug, info, warn};
 
 /// 连接消息处理器
 pub struct ConnectMessageHandler {
-    session_manager: Arc<SessionManager>,
     jwt_service: Arc<JwtService>,
     token_revocation_service: Arc<TokenRevocationService>,
     device_manager: Arc<DeviceManager>,
@@ -68,7 +65,6 @@ pub struct ConnectMessageHandler {
 
 impl ConnectMessageHandler {
     pub fn new(
-        session_manager: Arc<SessionManager>,
         jwt_service: Arc<JwtService>,
         token_revocation_service: Arc<TokenRevocationService>,
         device_manager: Arc<DeviceManager>,
@@ -92,7 +88,6 @@ impl ConnectMessageHandler {
         welcome_message: String,
     ) -> Self {
         Self {
-            session_manager,
             jwt_service,
             token_revocation_service,
             device_manager,
@@ -300,40 +295,7 @@ impl MessageHandler for ConnectMessageHandler {
             }
         }
 
-        // 6. 注册用户会话到 SessionManager
-        let device_info = DeviceInfo::new(
-            device_id.clone(),
-            claims.app_id.clone(),
-            "1.0.0".to_string(), // TODO: 从 token 或请求中获取版本
-        );
-
-        if let Err(e) = self
-            .session_manager
-            .add_user_session(user_id.clone(), context.session_id, device_info)
-            .await
-        {
-            warn!("⚠️ ConnectMessageHandler: 注册用户会话失败: {}", e);
-            // 不返回错误，继续处理连接请求
-        } else {
-            info!(
-                "✅ ConnectMessageHandler: 用户 {} 会话已注册 (会话ID: {})",
-                user_id, context.session_id
-            );
-        }
-
-        // 6.5. 注册用户在线状态到 MessageRouter
-        let session_id_str = context.session_id.to_string();
-        if let Err(e) = self
-            .message_router
-            .register_device_online(&user_id, &device_id, &session_id_str, &claims.app_id)
-            .await
-        {
-            warn!("⚠️ ConnectMessageHandler: 注册用户在线状态失败: {}", e);
-        } else {
-            info!("✅ ConnectMessageHandler: 用户 {} 在线状态已注册", user_id);
-        }
-
-        // 6.6. ✨ 注册设备连接到 ConnectionManager
+        // 6. ✨ 注册设备连接到 ConnectionManager —— spec §1 唯一在线态真源
         if let Err(e) = self
             .connection_manager
             .register_connection(user_id, device_id.clone(), context.session_id)

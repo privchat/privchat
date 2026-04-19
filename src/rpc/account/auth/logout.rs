@@ -78,14 +78,8 @@ pub async fn handle(
         .unbind_session(&session_id)
         .await;
 
-    // 清理消息路由和设备状态
+    // 递增会话版本号（AUTH_SPEC 2.5：主动登出应递增 session_version）
     if let Some(device_id) = cleanup_device_id {
-        let _ = services
-            .message_router
-            .register_device_offline(&user_id, &device_id, Some(session_id_raw))
-            .await;
-
-        // 递增会话版本号（AUTH_SPEC 2.5：主动登出应递增 session_version）
         if let Err(e) = services
             .device_manager_db
             .increment_session_version(user_id, &device_id, "user_logout")

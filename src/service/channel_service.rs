@@ -965,9 +965,9 @@ impl ChannelService {
 
     /// 创建好友关系（管理 API）
     ///
-    /// 让两个用户成为好友，并自动创建私聊会话。
-    /// 会话创建统一走 ChannelRepository::create_or_get_direct_channel —
-    /// 那里统一做 smaller/larger 规范化、advisory lock 和 ON CONFLICT 兜底。
+    /// 让两个用户互为好友，并自动创建私聊会话：
+    /// 1. 在 privchat_friendships 写入双向 status=1 行（等价于「接受好友请求」后的终态）
+    /// 2. 复用 create_or_get_direct_channel 建立 Direct Channel（规范化 + advisory lock + ON CONFLICT）
     pub async fn create_friendship_admin(
         &self,
         user1_id: u64,
@@ -978,6 +978,29 @@ impl ChannelService {
             return Err(ServerError::Validation("不能添加自己为好友".to_string()));
         }
 
+        // 1. 写入双向好友关系（status=1 已接受），幂等 upsert
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_friendships (
+                user_id, friend_id, status, source, source_id, request_message, created_at, updated_at
+            )
+            VALUES
+                ($1, $2, 1, NULL, NULL, NULL, $3, $3),
+                ($2, $1, 1, NULL, NULL, NULL, $3, $3)
+            ON CONFLICT (user_id, friend_id) DO UPDATE
+            SET status = 1,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(user1_id as i64)
+        .bind(user2_id as i64)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("写入好友关系失败: {}", e)))?;
+
+        // 2. 建立 / 复用 Direct Channel
         let (channel, created) = self
             .channel_repository
             .create_or_get_direct_channel(user1_id, user2_id, None, None)
@@ -999,8 +1022,8 @@ impl ChannelService {
         }
 
         info!(
-            "✅ 会话创建成功: channel_id={}, created={}",
-            channel_id, created
+            "✅ 好友关系建立成功: {} <-> {}, channel_id={}, created={}",
+            user1_id, user2_id, channel_id, created
         );
         Ok(channel_id)
     }

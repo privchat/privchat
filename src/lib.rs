@@ -37,7 +37,6 @@ pub mod rpc; // 添加 RPC 模块
 pub mod security; // 安全模块
 pub mod server;
 pub mod service;
-pub mod session;
 pub mod sync; // ✨ 新增：Push 模块
 
 pub use config::ServerConfig;
@@ -56,4 +55,3 @@ pub use handler::{
 pub use infra::{CacheManager, OnlineStatusManager};
 pub use model::*;
 pub use server::ChatServer;
-pub use session::SessionManager;

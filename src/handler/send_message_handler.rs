@@ -26,7 +26,6 @@ use crate::repository::{MessageRepository, PgMessageRepository};
 use crate::service::message_history_service::MessageHistoryService;
 use crate::service::sync::get_global_sync_service;
 use crate::service::{MessageDedupService, OfflineQueueService, UnreadCountService};
-use crate::session::SessionManager;
 use crate::Result;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
@@ -42,8 +41,6 @@ pub struct SendMessageHandler {
     // channel_service 已合并到 channel_service
     /// 消息历史服务
     message_history_service: Arc<MessageHistoryService>,
-    /// 会话管理器
-    session_manager: Arc<SessionManager>,
     /// 文件服务（用于验证 file_id）
     file_service: Arc<crate::service::FileService>,
     /// 会话服务（用于更新会话列表）
@@ -101,7 +98,6 @@ impl SendMessageHandler {
     pub fn new(
         // channel_service 已合并到 channel_service
         message_history_service: Arc<MessageHistoryService>,
-        session_manager: Arc<SessionManager>,
         file_service: Arc<crate::service::FileService>,
         channel_service: Arc<crate::service::ChannelService>,
         message_router: Arc<crate::infra::MessageRouter>,
@@ -121,7 +117,6 @@ impl SendMessageHandler {
         Self {
             // channel_service 已合并到 channel_service
             message_history_service,
-            session_manager,
             file_service,
             channel_service,
             transport: Arc::new(RwLock::new(None)),
@@ -1950,6 +1945,14 @@ impl SendMessageHandler {
 
         // 4. 离线消息批量写入 Redis（Pipeline，单次网络往返）
         if !offline_user_ids.is_empty() {
+            crate::infra::metrics::increment_offline_enqueue(offline_user_ids.len() as u64);
+            tracing::info!(
+                target: "delivery.offline_enqueue",
+                channel_id = channel.id,
+                server_message_id = push_message_request.server_message_id,
+                offline_user_count = offline_user_ids.len(),
+                "fanout zero-success users queued to offline"
+            );
             if let Err(e) = self
                 .offline_queue_service
                 .add_batch_users(&offline_user_ids, &push_message_request)
