@@ -83,7 +83,7 @@ pub use message_history_service::{
     ChannelMessageStats, MessageHistoryRecord, MessageHistoryService, MessageQueryParams,
     ReplyMessagePreview,
 };
-pub use message_service::MessageService;
+pub use message_service::{MessageService, ServerSendMessageRequest, ServerSendMessageResult};
 pub use notification_service::NotificationService;
 pub use offline_queue_service::OfflineQueueService;
 pub use presence_service::PresenceService;

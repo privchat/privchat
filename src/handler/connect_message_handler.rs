@@ -22,17 +22,15 @@ use crate::context::RequestContext;
 use crate::handler::MessageHandler;
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::model::user::DeviceInfo;
-use crate::repository::MessageRepository;
-use crate::service::sync::get_global_sync_service;
 use crate::service::{
-    ChannelService, NotificationService, OfflineQueueService, PresenceService, UnreadCountService,
+    ChannelService, MessageService, NotificationService, OfflineQueueService, PresenceService,
+    ServerSendMessageRequest, UnreadCountService,
 };
 use crate::session::SessionManager;
 use crate::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use privchat_protocol::ContentMessageType;
-use serde_json::json;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -61,6 +59,7 @@ pub struct ConnectMessageHandler {
     channel_service: Arc<ChannelService>,
     message_repository: Arc<crate::repository::PgMessageRepository>,
     user_message_index: Arc<UserMessageIndex>,
+    message_service: Arc<MessageService>,
     system_message_enabled: bool,
     auto_create_system_channel: bool,
     /// 认证成功后下发的欢迎消息正文
@@ -87,6 +86,7 @@ impl ConnectMessageHandler {
         channel_service: Arc<ChannelService>,
         message_repository: Arc<crate::repository::PgMessageRepository>,
         user_message_index: Arc<UserMessageIndex>,
+        message_service: Arc<MessageService>,
         system_message_enabled: bool,
         auto_create_system_channel: bool,
         welcome_message: String,
@@ -110,6 +110,7 @@ impl ConnectMessageHandler {
             channel_service,
             message_repository,
             user_message_index,
+            message_service,
             system_message_enabled,
             auto_create_system_channel,
             welcome_message,
@@ -389,12 +390,7 @@ impl MessageHandler for ConnectMessageHandler {
         if first_token_auth && token_age_secs <= 120 {
             // spawn 到后台，不阻塞认证响应
             let channel_service = self.channel_service.clone();
-            let pts_generator = self.pts_generator.clone();
-            let message_repository = self.message_repository.clone();
-            let user_message_index = self.user_message_index.clone();
-            let offline_queue_service = self.offline_queue_service.clone();
-            let connection_manager = self.connection_manager.clone();
-            let unread_count_service = self.unread_count_service.clone();
+            let message_service = self.message_service.clone();
             let system_message_enabled = self.system_message_enabled;
             let connect_req = connect_request.clone();
             tokio::spawn(async move {
@@ -405,12 +401,7 @@ impl MessageHandler for ConnectMessageHandler {
                     user_id,
                     &connect_req,
                     channel_service,
-                    pts_generator,
-                    message_repository,
-                    user_message_index,
-                    offline_queue_service,
-                    connection_manager,
-                    unread_count_service,
+                    message_service,
                 )
                 .await
                 {
@@ -621,151 +612,13 @@ impl ConnectMessageHandler {
             return Ok(());
         }
 
-        let (channel_id, _) = self
-            .channel_service
-            .get_or_create_direct_channel(
-                user_id,
-                crate::config::SYSTEM_USER_ID,
-                Some("system_login_notice"),
-                None,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("get_or_create system channel failed: {}", e))?;
-
-        let now = Utc::now();
-        let message_id = crate::infra::next_message_id();
-        let pts = if let Some(sync_service) = get_global_sync_service() {
-            match sync_service.allocate_next_pts(channel_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "⚠️ 登录通知分配同步 pts 失败，回退内存计数器: channel_id={}, error={}",
-                        channel_id, e
-                    );
-                    self.pts_generator.next_pts(channel_id).await
-                }
-            }
-        } else {
-            self.pts_generator.next_pts(channel_id).await
-        };
-        let device_label = {
-            let name = connect_request.device_info.device_name.trim();
-            if name.is_empty() {
-                format!("{:?}", connect_request.device_info.device_type).to_lowercase()
-            } else {
-                name.to_string()
-            }
-        };
-        let content = format!("您的账号在 {} 设备登录了。", device_label);
-
-        let login_notice_msg = crate::model::message::Message {
-            message_id,
-            channel_id,
-            sender_id: crate::config::SYSTEM_USER_ID,
-            pts: Some(pts as i64),
-            local_message_id: Some(message_id),
-            content: content.clone(),
-            message_type: ContentMessageType::Text,
-            metadata: serde_json::Value::Object(serde_json::Map::new()),
-            reply_to_message_id: None,
-            created_at: now,
-            updated_at: now,
-            deleted: false,
-            deleted_at: None,
-            revoked: false,
-            revoked_at: None,
-            revoked_by: None,
-        };
-        self.message_repository
-            .create(&login_notice_msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("persist login notice failed: {}", e))?;
-
-        if let Some(sync_service) = get_global_sync_service() {
-            let commit = privchat_protocol::rpc::sync::ServerCommit {
-                pts,
-                server_msg_id: message_id,
-                local_message_id: Some(message_id),
-                channel_id,
-                channel_type: 1,
-                message_type: ContentMessageType::Text.as_str().to_string(),
-                content: serde_json::json!({ "text": content.clone() }),
-                server_timestamp: now.timestamp_millis(),
-                sender_id: crate::config::SYSTEM_USER_ID,
-                sender_info: None,
-            };
-            sync_service
-                .record_existing_commit(&commit)
-                .await
-                .map_err(|e| anyhow::anyhow!("record login notice commit failed: {}", e))?;
-        }
-
-        self.user_message_index
-            .add_message(user_id, pts, message_id)
-            .await;
-
-        // 登录通知与普通消息保持一致：更新未读计数
-        if let Err(e) = self.unread_count_service.increment(user_id, channel_id, 1).await {
-            warn!(
-                "⚠️ 登录通知更新 unread_count_service 失败: user_id={}, channel_id={}, error={}",
-                user_id, channel_id, e
-            );
-        }
-        if let Err(e) = self
-            .channel_service
-            .increment_user_channel_unread(channel_id, &[user_id], 1)
-            .await
-        {
-            warn!(
-                "⚠️ 登录通知更新 privchat_user_channels 未读失败: user_id={}, channel_id={}, error={}",
-                user_id, channel_id, e
-            );
-        }
-
-        let payload = serde_json::to_vec(&json!({ "content": content }))
-            .map_err(|e| anyhow::anyhow!("encode login notice payload failed: {}", e))?;
-        let push_msg = privchat_protocol::protocol::PushMessageRequest {
-            setting: privchat_protocol::protocol::MessageSetting::default(),
-            msg_key: format!("msg_{}", message_id),
-            server_message_id: message_id,
-            // Must align with allocated channel pts; fixed `1` breaks unread/read-cursor projection.
-            message_seq: u32::try_from(pts).unwrap_or(u32::MAX),
-            local_message_id: message_id,
-            stream_no: String::new(),
-            stream_seq: 0,
-            stream_flag: 0,
-            timestamp: now.timestamp().max(0) as u32,
-            channel_id,
-            channel_type: 1,
-            message_type: ContentMessageType::Text.as_u32(),
-            expire: 0,
-            topic: String::new(),
-            from_uid: crate::config::SYSTEM_USER_ID,
-            payload,
-            deleted: false,
-        };
-        if let Err(e) = self.offline_queue_service.add(user_id, &push_msg).await {
-            warn!("⚠️ 登录通知加入离线队列失败: {:?}", e);
-        }
-        match self
-            .connection_manager
-            .send_push_to_user(user_id, &push_msg)
-            .await
-        {
-            Ok(success) => {
-                debug!(
-                    "✅ 登录通知实时推送完成: user_id={}, success_sessions={}",
-                    user_id, success
-                );
-            }
-            Err(e) => warn!("⚠️ 登录通知实时推送失败: {:?}", e),
-        }
-
-        let _ = self
-            .channel_service
-            .update_last_message(channel_id, message_id)
-            .await;
-        Ok(())
+        Self::send_login_notice_message_bg(
+            user_id,
+            connect_request,
+            self.channel_service.clone(),
+            self.message_service.clone(),
+        )
+        .await
     }
 
     /// 后台发送登录通知（static 版本，用于 tokio::spawn）
@@ -773,12 +626,7 @@ impl ConnectMessageHandler {
         user_id: u64,
         connect_request: &privchat_protocol::protocol::AuthorizationRequest,
         channel_service: Arc<ChannelService>,
-        pts_generator: Arc<PtsGenerator>,
-        message_repository: Arc<crate::repository::PgMessageRepository>,
-        user_message_index: Arc<UserMessageIndex>,
-        offline_queue_service: Arc<OfflineQueueService>,
-        connection_manager: Arc<crate::infra::ConnectionManager>,
-        unread_count_service: Arc<UnreadCountService>,
+        message_service: Arc<MessageService>,
     ) -> anyhow::Result<()> {
         let (channel_id, _) = channel_service
             .get_or_create_direct_channel(
@@ -790,22 +638,6 @@ impl ConnectMessageHandler {
             .await
             .map_err(|e| anyhow::anyhow!("get_or_create system channel failed: {}", e))?;
 
-        let now = Utc::now();
-        let message_id = crate::infra::next_message_id();
-        let pts = if let Some(sync_service) = get_global_sync_service() {
-            match sync_service.allocate_next_pts(channel_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "⚠️ 后台登录通知分配同步 pts 失败，回退内存计数器: channel_id={}, error={}",
-                        channel_id, e
-                    );
-                    pts_generator.next_pts(channel_id).await
-                }
-            }
-        } else {
-            pts_generator.next_pts(channel_id).await
-        };
         let device_label = {
             let name = connect_request.device_info.device_name.trim();
             if name.is_empty() {
@@ -816,110 +648,19 @@ impl ConnectMessageHandler {
         };
         let content = format!("您的账号在 {} 设备登录了。", device_label);
 
-        let login_notice_msg = crate::model::message::Message {
-            message_id,
-            channel_id,
-            sender_id: crate::config::SYSTEM_USER_ID,
-            pts: Some(pts as i64),
-            local_message_id: Some(message_id),
-            content: content.clone(),
-            message_type: ContentMessageType::Text,
-            metadata: serde_json::Value::Object(serde_json::Map::new()),
-            reply_to_message_id: None,
-            created_at: now,
-            updated_at: now,
-            deleted: false,
-            deleted_at: None,
-            revoked: false,
-            revoked_at: None,
-            revoked_by: None,
-        };
-        message_repository
-            .create(&login_notice_msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("persist login notice failed: {}", e))?;
-
-        if let Some(sync_service) = get_global_sync_service() {
-            let commit = privchat_protocol::rpc::sync::ServerCommit {
-                pts,
-                server_msg_id: message_id,
-                local_message_id: Some(message_id),
+        message_service
+            .send_message(ServerSendMessageRequest {
                 channel_id,
-                channel_type: 1,
-                message_type: ContentMessageType::Text.as_str().to_string(),
-                content: serde_json::json!({ "text": content.clone() }),
-                server_timestamp: now.timestamp_millis(),
                 sender_id: crate::config::SYSTEM_USER_ID,
-                sender_info: None,
-            };
-            sync_service
-                .record_existing_commit(&commit)
-                .await
-                .map_err(|e| anyhow::anyhow!("record login notice commit failed: {}", e))?;
-        }
-
-        user_message_index
-            .add_message(user_id, pts, message_id)
-            .await;
-
-        // 登录通知与普通消息保持一致：更新未读计数
-        if let Err(e) = unread_count_service.increment(user_id, channel_id, 1).await {
-            warn!(
-                "⚠️ 异步登录通知更新 unread_count_service 失败: user_id={}, channel_id={}, error={}",
-                user_id, channel_id, e
-            );
-        }
-        if let Err(e) = channel_service
-            .increment_user_channel_unread(channel_id, &[user_id], 1)
+                content,
+                message_type: ContentMessageType::Text,
+                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                channel_type: 1, // DM (system ↔ user)
+                recipient_user_ids: vec![user_id],
+            })
             .await
-        {
-            warn!(
-                "⚠️ 异步登录通知更新 privchat_user_channels 未读失败: user_id={}, channel_id={}, error={}",
-                user_id, channel_id, e
-            );
-        }
+            .map_err(|e| anyhow::anyhow!("send login notice failed: {}", e))?;
 
-        let payload = serde_json::to_vec(&json!({ "content": content }))
-            .map_err(|e| anyhow::anyhow!("encode login notice payload failed: {}", e))?;
-        let push_msg = privchat_protocol::protocol::PushMessageRequest {
-            setting: privchat_protocol::protocol::MessageSetting::default(),
-            msg_key: format!("msg_{}", message_id),
-            server_message_id: message_id,
-            // Must align with allocated channel pts; fixed `1` breaks unread/read-cursor projection.
-            message_seq: u32::try_from(pts).unwrap_or(u32::MAX),
-            local_message_id: message_id,
-            stream_no: String::new(),
-            stream_seq: 0,
-            stream_flag: 0,
-            timestamp: now.timestamp().max(0) as u32,
-            channel_id,
-            channel_type: 1,
-            message_type: ContentMessageType::Text.as_u32(),
-            expire: 0,
-            topic: String::new(),
-            from_uid: crate::config::SYSTEM_USER_ID,
-            payload,
-            deleted: false,
-        };
-        if let Err(e) = offline_queue_service.add(user_id, &push_msg).await {
-            warn!("⚠️ 登录通知加入离线队列失败: {:?}", e);
-        }
-        match connection_manager
-            .send_push_to_user(user_id, &push_msg)
-            .await
-        {
-            Ok(success) => {
-                debug!(
-                    "✅ 登录通知实时推送完成: user_id={}, success_sessions={}",
-                    user_id, success
-                );
-            }
-            Err(e) => warn!("⚠️ 登录通知实时推送失败: {:?}", e),
-        }
-
-        let _ = channel_service
-            .update_last_message(channel_id, message_id)
-            .await;
         Ok(())
     }
 }

@@ -1757,33 +1757,34 @@ async fn send_system_message(
 ) -> Result<Json<dto::SendSystemMessageResponse>> {
     verify_service_key(&headers, &state).await?;
 
-    let message_type: i16 = match request.message_type.as_deref() {
-        Some("image") => 1,
-        Some("file") => 2,
-        Some("system") => 10,
-        _ => 0,
-    };
+    let message_type = parse_content_message_type(request.message_type.as_deref());
 
     let metadata = request
         .metadata
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-    let (message_id, created_at) = state
-        .message_repository
-        .send_system_message_admin(
-            request.channel_id,
-            &request.content,
+    let (channel_type, recipients) =
+        resolve_channel_type_and_members(&state, request.channel_id).await?;
+
+    let result = state
+        .message_service
+        .send_message(crate::service::ServerSendMessageRequest {
+            channel_id: request.channel_id,
+            sender_id: crate::config::SYSTEM_USER_ID,
+            content: request.content.clone(),
             message_type,
-            &metadata,
-        )
+            metadata,
+            channel_type,
+            recipient_user_ids: recipients,
+        })
         .await
-        .map_err(|e| ServerError::Database(format!("发送系统消息失败: {}", e)))?;
+        .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
 
     Ok(Json(dto::SendSystemMessageResponse {
         success: true,
-        message_id,
+        message_id: result.message_id,
         channel_id: request.channel_id,
-        created_at,
+        created_at: result.created_at,
         message: "系统消息已发送".to_string(),
     }))
 }
@@ -1981,35 +1982,55 @@ async fn send_message(
 ) -> Result<Json<dto::SendMessageResponse>> {
     verify_service_key(&headers, &state).await?;
 
-    let message_type: i16 = match request.message_type.as_deref() {
-        Some("image") => 1,
-        Some("file") => 2,
-        Some("system") => 10,
-        _ => 0,
-    };
+    let message_type = parse_content_message_type(request.message_type.as_deref());
+
+    let content_len = request.content.chars().count();
+    info!(
+        "管理端发送消息: channel_id={}, sender_id={}, type={}, content_len={}",
+        request.channel_id,
+        request.sender_id,
+        request.message_type.as_deref().unwrap_or("text"),
+        content_len
+    );
 
     let metadata = request
         .metadata
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-    let (message_id, created_at) = state
-        .message_repository
-        .send_message_admin(
-            request.channel_id,
-            request.sender_id,
-            &request.content,
+    let (channel_type, recipients) =
+        resolve_channel_type_and_members(&state, request.channel_id).await?;
+
+    let result = state
+        .message_service
+        .send_message(crate::service::ServerSendMessageRequest {
+            channel_id: request.channel_id,
+            sender_id: request.sender_id,
+            content: request.content.clone(),
             message_type,
-            &metadata,
-        )
+            metadata,
+            channel_type,
+            recipient_user_ids: recipients,
+        })
         .await
-        .map_err(|e| ServerError::Database(format!("发送消息失败: {}", e)))?;
+        .map_err(|e| {
+            warn!(
+                "管理端发送消息失败: channel_id={}, sender_id={}, error={}",
+                request.channel_id, request.sender_id, e
+            );
+            ServerError::Internal(format!("发送消息失败: {}", e))
+        })?;
+
+    info!(
+        "管理端发送消息成功: channel_id={}, sender_id={}, message_id={}, pts={}",
+        request.channel_id, request.sender_id, result.message_id, result.pts
+    );
 
     Ok(Json(dto::SendMessageResponse {
         success: true,
-        message_id,
+        message_id: result.message_id,
         channel_id: request.channel_id,
         sender_id: request.sender_id,
-        created_at,
+        created_at: result.created_at,
         message: "消息已发送".to_string(),
     }))
 }
@@ -2354,3 +2375,71 @@ async fn search_messages(
         page_size,
     }))
 }
+
+/// 解析消息类型字符串为 ContentMessageType
+fn parse_content_message_type(s: Option<&str>) -> privchat_protocol::ContentMessageType {
+    use privchat_protocol::ContentMessageType;
+    match s {
+        Some("image") => ContentMessageType::Image,
+        Some("file") => ContentMessageType::File,
+        Some("voice") => ContentMessageType::Voice,
+        Some("video") => ContentMessageType::Video,
+        Some("system") => ContentMessageType::System,
+        Some("audio") => ContentMessageType::Audio,
+        Some("location") => ContentMessageType::Location,
+        Some("contact_card") => ContentMessageType::ContactCard,
+        Some("sticker") => ContentMessageType::Sticker,
+        Some("forward") => ContentMessageType::Forward,
+        _ => ContentMessageType::Text,
+    }
+}
+
+/// 获取频道类型和成员 ID 列表（用于 Admin 主动发消息）
+///
+/// Direct 频道的权威成员源是 `privchat_channels.direct_user1_id / direct_user2_id`，
+/// 不走 `members` HashMap（历史数据 participants 表可能缺行，SendMessageHandler
+/// 对等路径也是直接读 direct_userX_id，此处对齐）。
+/// Group / Room 才读 participants。
+async fn resolve_channel_type_and_members(
+    state: &AdminServerState,
+    channel_id: u64,
+) -> Result<(u8, Vec<u64>)> {
+    use crate::model::channel::ChannelType;
+
+    if let Some(channel) = state.channel_service.get_channel_opt(channel_id).await {
+        let channel_type: u8 = match channel.channel_type {
+            ChannelType::Direct => 1,
+            ChannelType::Group => 2,
+            ChannelType::Room => 2,
+        };
+
+        let members = if matches!(channel.channel_type, ChannelType::Direct) {
+            let mut v = Vec::with_capacity(2);
+            if let Some(u) = channel.direct_user1_id {
+                v.push(u);
+            }
+            if let Some(u) = channel.direct_user2_id {
+                if !v.contains(&u) {
+                    v.push(u);
+                }
+            }
+            v
+        } else {
+            channel.get_member_ids()
+        };
+        return Ok((channel_type, members));
+    }
+
+    // 内存里没有，从数据库查询参与者
+    let participants = state
+        .channel_service
+        .get_channel_participants(channel_id)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询频道参与者失败: {}", e)))?;
+
+    let members: Vec<u64> = participants.iter().map(|p| p.user_id).collect();
+    // 无法从参与者列表推断类型，保守按群组处理
+    let channel_type: u8 = if members.len() <= 2 { 1 } else { 2 };
+    Ok((channel_type, members))
+}
+

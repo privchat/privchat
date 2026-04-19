@@ -308,9 +308,11 @@ impl ChannelRepository for PgChannelRepository {
         }
 
         // 创建新会话 - channel_id 由数据库自动生成（BIGSERIAL），写入来源
+        // 使用 ON CONFLICT DO NOTHING 兜底：若唯一部分索引已有记录，则不写入，
+        // 下面回退到按 (left, right) / (right, left) 反查已存在行。
         let now = chrono::Utc::now().timestamp_millis();
 
-        let conv_id = sqlx::query_as::<_, (i64,)>(
+        let inserted = sqlx::query_as::<_, (i64,)>(
             r#"
             INSERT INTO privchat_channels (
                 channel_type, direct_user1_id, direct_user2_id,
@@ -318,6 +320,7 @@ impl ChannelRepository for PgChannelRepository {
                 created_at, updated_at
             )
             VALUES (0, $1, $2, $3, $4, $5, $5)
+            ON CONFLICT DO NOTHING
             RETURNING channel_id
             "#,
         )
@@ -326,11 +329,52 @@ impl ChannelRepository for PgChannelRepository {
         .bind(source)
         .bind(source_id)
         .bind(now)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create channel: {}", e)))?;
 
-        let conv_id_u64 = conv_id.0 as u64;
+        let conv_id_u64 = match inserted {
+            Some((id,)) => id as u64,
+            None => {
+                // 并发窗口下另一个事务抢先插入，按规范化方向回查
+                let existing = sqlx::query_as::<_, (i64,)>(
+                    r#"
+                    SELECT channel_id
+                    FROM privchat_channels
+                    WHERE channel_type = 0
+                      AND (
+                          (direct_user1_id = $1 AND direct_user2_id = $2)
+                          OR (direct_user1_id = $2 AND direct_user2_id = $1)
+                      )
+                    LIMIT 1
+                    "#,
+                )
+                .bind(left as i64)
+                .bind(right as i64)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Database(format!("Failed to re-query channel after conflict: {}", e))
+                })?;
+
+                match existing {
+                    Some((id,)) => {
+                        tx.commit().await.map_err(|e| {
+                            DatabaseError::Database(format!("Failed to commit tx: {}", e))
+                        })?;
+                        let ch = self.find_by_id(id as u64).await.and_then(|opt| {
+                            opt.ok_or_else(|| DatabaseError::NotFound("Channel not found".to_string()))
+                        })?;
+                        return Ok((ch, false));
+                    }
+                    None => {
+                        return Err(DatabaseError::Database(
+                            "INSERT returned no row but no existing direct channel found".to_string(),
+                        ));
+                    }
+                }
+            }
+        };
 
         // 创建参与者记录
         sqlx::query(

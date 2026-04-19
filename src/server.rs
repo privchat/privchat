@@ -125,6 +125,8 @@ pub struct ChatServer {
     subscribe_manager: Arc<crate::infra::SubscribeManager>,
     /// Room 订阅历史（Redis）
     room_history_service: Arc<crate::service::RoomHistoryService>,
+    /// 通用服务端发消息服务（供登录通知、Admin API 等复用）
+    message_service: Arc<crate::service::MessageService>,
 }
 
 impl ChatServer {
@@ -499,6 +501,18 @@ impl ChatServer {
         );
         send_handler_inner.set_delivery_tracker(delivery_tracker.clone());
         let send_message_handler = Arc::new(send_handler_inner);
+
+        // 创建通用服务端发消息服务（供登录通知、Admin API 等复用）
+        let message_service = Arc::new(crate::service::MessageService::new(
+            channel_service.clone(),
+            pts_generator.clone(),
+            message_repository.clone(),
+            user_message_index.clone(),
+            offline_queue_service.clone(),
+            connection_manager.clone(),
+            unread_count_service.clone(),
+        ));
+        info!("✅ MessageService 创建完成");
 
         // 5. 将 EventBus 传递给 SendMessageHandler
         // 注意：SendMessageHandler 需要支持设置 event_bus
@@ -1169,6 +1183,7 @@ impl ChatServer {
                 channel_service.clone(),
                 message_repository.clone(),
                 user_message_index.clone(),
+                message_service.clone(),
                 config.system_message.enabled,
                 config.system_message.auto_create_channel,
                 config.system_message.welcome_message.clone(),
@@ -1299,6 +1314,7 @@ impl ChatServer {
             offline_worker: offline_worker.clone(),
             subscribe_manager,
             room_history_service,
+            message_service,
         })
     }
 
@@ -2053,6 +2069,7 @@ impl ChatServer {
             self.security_service.clone(),
             self.subscribe_manager.clone(),
             self.room_history_service.clone(),
+            self.message_service.clone(),
             self.config.admin_api_port,
         );
 

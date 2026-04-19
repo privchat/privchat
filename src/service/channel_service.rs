@@ -965,7 +965,9 @@ impl ChannelService {
 
     /// 创建好友关系（管理 API）
     ///
-    /// 让两个用户成为好友，并自动创建私聊会话
+    /// 让两个用户成为好友，并自动创建私聊会话。
+    /// 会话创建统一走 ChannelRepository::create_or_get_direct_channel —
+    /// 那里统一做 smaller/larger 规范化、advisory lock 和 ON CONFLICT 兜底。
     pub async fn create_friendship_admin(
         &self,
         user1_id: u64,
@@ -976,78 +978,30 @@ impl ChannelService {
             return Err(ServerError::Validation("不能添加自己为好友".to_string()));
         }
 
-        // 确定较小的用户ID在前（用于数据库查询）
-        let (smaller_id, larger_id) = if user1_id < user2_id {
-            (user1_id, user2_id)
-        } else {
-            (user2_id, user1_id)
-        };
-
-        let pool = self.pool();
-        let mut tx = pool
-            .begin()
+        let (channel, created) = self
+            .channel_repository
+            .create_or_get_direct_channel(user1_id, user2_id, None, None)
             .await
-            .map_err(|e| ServerError::Database(format!("开启事务失败: {}", e)))?;
+            .map_err(|e| ServerError::Database(format!("创建或获取私聊会话失败: {}", e)))?;
 
-        // 检查是否已存在私聊会话
-        let existing_channel: Option<(i64,)> = sqlx::query_as(
-            r#"
-            SELECT channel_id
-            FROM privchat_channels
-            WHERE channel_type = 0
-              AND direct_user1_id = $1
-              AND direct_user2_id = $2
-            LIMIT 1
-            "#,
-        )
-        .bind(smaller_id as i64)
-        .bind(larger_id as i64)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| ServerError::Database(format!("查询会话失败: {}", e)))?;
+        let channel_id = channel.id;
 
-        let channel_id = if let Some((id,)) = existing_channel {
-            info!("✅ 私聊会话已存在: {}", id);
-            id as u64
-        } else {
-            // 创建新的私聊会话
-            let now = chrono::Utc::now().timestamp_millis();
-            let result = sqlx::query!(
-                r#"
-                INSERT INTO privchat_channels (
-                    channel_type, direct_user1_id, direct_user2_id,
-                    created_at, updated_at
-                )
-                VALUES (0, $1, $2, $3, $3)
-                RETURNING channel_id
-                "#,
-                smaller_id as i64,
-                larger_id as i64,
-                now
-            )
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| ServerError::Database(format!("创建会话失败: {}", e)))?;
-
-            let channel_id = result.channel_id as u64;
-
-            // 创建 Channel（内存操作）
+        if created {
+            // 新创建的会话需要同步到内存缓存 + user_channels 行
             if let Err(e) = channel_service
                 .create_private_chat_with_id(user1_id, user2_id, channel_id)
                 .await
             {
-                warn!("⚠️ 创建私聊频道失败: {}，频道可能已存在", e);
+                warn!("⚠️ 创建私聊频道缓存失败: {}，频道可能已存在", e);
             }
+            self.ensure_user_channel_rows(channel_id, &[user1_id, user2_id])
+                .await?;
+        }
 
-            channel_id
-        };
-
-        // 提交事务
-        tx.commit()
-            .await
-            .map_err(|e| ServerError::Database(format!("提交事务失败: {}", e)))?;
-
-        info!("✅ 会话创建成功: channel_id={}", channel_id);
+        info!(
+            "✅ 会话创建成功: channel_id={}, created={}",
+            channel_id, created
+        );
         Ok(channel_id)
     }
 
@@ -1241,10 +1195,6 @@ impl ChannelService {
 
         tracing::info!("✅ 验证通过");
 
-        // 注意：channel_id 应该由数据库自动生成（BIGSERIAL）
-        // 这里先使用0作为占位符，实际ID会在数据库插入后返回
-        let channel_id = 0; // 需要从数据库获取
-
         let mut channel = match request.channel_type {
             ChannelType::Direct => {
                 // 私聊必须有且仅有一个目标用户
@@ -1258,21 +1208,52 @@ impl ChannelService {
 
                 let target_user_id = request.member_ids[0];
 
-                // 检查是否已存在私聊会话
-                if let Some(existing_id) =
-                    self.find_direct_channel(creator_id, target_user_id).await
+                // Direct 频道统一走 create_or_get_direct_channel
+                // （smaller/larger 规范化 + advisory lock + ON CONFLICT 兜底）。
+                let (channel, created) = match self
+                    .channel_repository
+                    .create_or_get_direct_channel(creator_id, target_user_id, None, None)
+                    .await
                 {
-                    let channels = self.channels.read().await;
-                    if let Some(existing_conv) = channels.get(&existing_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("❌ 创建或获取私聊会话失败: {}", e);
                         return Ok(ChannelResponse {
-                            channel: existing_conv.clone(),
-                            success: true,
-                            error: None,
+                            channel: Channel::new_direct(0, 0, 0),
+                            success: false,
+                            error: Some(format!("创建私聊会话失败: {}", e)),
                         });
+                    }
+                };
+
+                let channel_id = channel.id;
+
+                if created {
+                    if let Err(e) = self
+                        .create_private_chat_with_id(creator_id, target_user_id, channel_id)
+                        .await
+                    {
+                        warn!("⚠️ 同步私聊频道到缓存失败: {}", e);
+                    }
+                    if let Err(e) = self
+                        .ensure_user_channel_rows(channel_id, &[creator_id, target_user_id])
+                        .await
+                    {
+                        warn!("⚠️ ensure_user_channel_rows 失败: {}", e);
                     }
                 }
 
-                Channel::new_direct(channel_id, creator_id, target_user_id)
+                // 从缓存读回带成员的 Channel；若缓存未命中则返回 DB 版本
+                let final_channel = self
+                    .get_channel_opt(channel_id)
+                    .await
+                    .unwrap_or(channel);
+
+                return Ok(ChannelResponse {
+                    channel: final_channel,
+                    success: true,
+                    error: None,
+                });
             }
             ChannelType::Group => {
                 // 群聊需要名称
@@ -1510,17 +1491,21 @@ impl ChannelService {
 
         let channel = match request.channel_type {
             ChannelType::Direct => {
-                // 私聊必须有且仅有一个目标用户
-                if request.member_ids.len() != 1 {
-                    return Ok(ChannelResponse {
-                        channel: Channel::new_direct(0, 0, 0),
-                        success: false,
-                        error: Some("Direct channel must have exactly one target user".to_string()),
-                    });
-                }
-
-                let target_user_id = request.member_ids[0];
-                Channel::new_direct(channel_id, creator_id, target_user_id)
+                // Direct 频道必须走 create_or_get_direct_channel
+                // （channel_id 由数据库 BIGSERIAL 分配，方向规范化 + 唯一约束）。
+                // 任何走到这里的调用都是编程错误，历史上这条路径会产生
+                // 反向 / 重复的 privchat_channels 行。
+                warn!(
+                    "❌ create_channel_with_id 不支持 Direct 频道，请改用 get_or_create_direct_channel：creator={}, channel_id={}",
+                    creator_id, channel_id
+                );
+                return Ok(ChannelResponse {
+                    channel: Channel::new_direct(0, 0, 0),
+                    success: false,
+                    error: Some(
+                        "Direct channels must be created via get_or_create_direct_channel".to_string(),
+                    ),
+                });
             }
             ChannelType::Group => {
                 let mut conv = Channel::new_group(channel_id, creator_id, request.name.clone());
@@ -2384,12 +2369,10 @@ impl ChannelService {
         };
 
         if updated_channel.is_none() {
-            if let Some(mut channel) = self
-                .channel_repository
-                .find_by_id(channel_id)
-                .await
-                .map_err(|e| ServerError::Database(format!("查询会话失败: {}", e)))?
-            {
+            // cache miss：走 get_channel_opt 加载（会一并读取 participants 填充 members），
+            // 避免把 members 为空的 Channel 塞进缓存，导致后续 get_member_ids() 返回空
+            // （曾导致 admin 发消息 recipients=0）。
+            if let Some(mut channel) = self.get_channel_opt(channel_id).await {
                 channel.update_last_message(message_id);
                 updated_channel = Some(channel.clone());
 
