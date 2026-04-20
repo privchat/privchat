@@ -385,14 +385,15 @@ fn normalize_submit_payload(
     let cmd = request.command_type.to_lowercase();
     let msg_type = match cmd.as_str() {
         "image" => privchat_protocol::ContentMessageType::Image,
-        "file" => privchat_protocol::ContentMessageType::File,
+        // 普通音频文件以 File 消息发送，不再有独立 Audio 消息类型
+        "file" | "audio" => privchat_protocol::ContentMessageType::File,
         "voice" => privchat_protocol::ContentMessageType::Voice,
         "video" => privchat_protocol::ContentMessageType::Video,
-        "audio" => privchat_protocol::ContentMessageType::Audio,
         "location" => privchat_protocol::ContentMessageType::Location,
         "contact_card" => privchat_protocol::ContentMessageType::ContactCard,
         "sticker" => privchat_protocol::ContentMessageType::Sticker,
         "forward" => privchat_protocol::ContentMessageType::Forward,
+        "link" => privchat_protocol::ContentMessageType::Link,
         "system" => privchat_protocol::ContentMessageType::System,
         _ => privchat_protocol::ContentMessageType::Text,
     };

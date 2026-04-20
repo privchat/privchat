@@ -19,12 +19,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 文件类型
+/// 文件类型（存储层分类）
+///
+/// 与消息类型分层：Image / Video / Voice 各自有独立的尺寸限制、存储目录、
+/// 清理策略（比如语音通常远小于视频，单独限额）；其它文件（含普通音频 mp3/wav 等）
+/// 一律归入 File。Voice 在存储层独立，是因为业务侧需要按类别做额度管理，
+/// 不是为了决定消息类型 —— 消息类型依旧由发送入口 `ContentMessageType` 决定。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileType {
     Image,
     Video,
-    Audio,
+    Voice,
     File,
     Other,
 }
@@ -34,7 +39,7 @@ impl FileType {
         match self {
             FileType::Image => "image",
             FileType::Video => "video",
-            FileType::Audio => "audio",
+            FileType::Voice => "voice",
             FileType::File => "file",
             FileType::Other => "other",
         }
@@ -44,7 +49,7 @@ impl FileType {
         match s {
             "image" => Some(FileType::Image),
             "video" => Some(FileType::Video),
-            "audio" => Some(FileType::Audio),
+            "voice" => Some(FileType::Voice),
             "file" => Some(FileType::File),
             "other" => Some(FileType::Other),
             _ => None,

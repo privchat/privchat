@@ -97,7 +97,7 @@ fn get_max_size_for_type(file_type: &FileType) -> i64 {
     match file_type {
         FileType::Image => 10 * 1024 * 1024,  // 10 MB
         FileType::Video => 200 * 1024 * 1024, // 200 MB
-        FileType::Audio => 50 * 1024 * 1024,  // 50 MB
+        FileType::Voice => 20 * 1024 * 1024,  // 20 MB（录音远小于视频，单独限额）
         FileType::File => 100 * 1024 * 1024,  // 100 MB
         FileType::Other => 50 * 1024 * 1024,  // 50 MB
     }

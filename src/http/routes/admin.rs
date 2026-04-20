@@ -2237,15 +2237,16 @@ fn parse_content_message_type(s: Option<&str>) -> privchat_protocol::ContentMess
     use privchat_protocol::ContentMessageType;
     match s {
         Some("image") => ContentMessageType::Image,
-        Some("file") => ContentMessageType::File,
+        // 普通音频文件作为 File 消息发送，不再有独立 Audio 消息类型
+        Some("file") | Some("audio") => ContentMessageType::File,
         Some("voice") => ContentMessageType::Voice,
         Some("video") => ContentMessageType::Video,
         Some("system") => ContentMessageType::System,
-        Some("audio") => ContentMessageType::Audio,
         Some("location") => ContentMessageType::Location,
         Some("contact_card") => ContentMessageType::ContactCard,
         Some("sticker") => ContentMessageType::Sticker,
         Some("forward") => ContentMessageType::Forward,
+        Some("link") => ContentMessageType::Link,
         _ => ContentMessageType::Text,
     }
 }

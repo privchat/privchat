@@ -1606,10 +1606,6 @@ impl SendMessageHandler {
                 self.validate_file_metadata(&metadata, "voice", sender_id)
                     .await
             }
-            privchat_protocol::ContentMessageType::Audio => {
-                self.validate_file_metadata(&metadata, "audio", sender_id)
-                    .await
-            }
             privchat_protocol::ContentMessageType::File => {
                 self.validate_file_metadata(&metadata, "file", sender_id)
                     .await
@@ -1625,6 +1621,9 @@ impl SendMessageHandler {
             }
             privchat_protocol::ContentMessageType::Forward => {
                 self.validate_forward_metadata(&metadata).await
+            }
+            privchat_protocol::ContentMessageType::Link => {
+                self.validate_link_metadata(&metadata).await
             }
         }
     }
@@ -1738,6 +1737,29 @@ impl SendMessageHandler {
                     "sticker 消息缺少 metadata.image_url".to_string(),
                 )
             })?;
+
+        Ok(())
+    }
+
+    /// 验证网址预览消息 metadata
+    ///
+    /// 仅强制 `url` 必填；`title` / `description` / `thumbnail_file_id` 由 SDK 应用层预览
+    /// 回调填充，服务端不参与抓取，缺失时按空白预览渲染。
+    async fn validate_link_metadata(&self, metadata: &Value) -> crate::Result<()> {
+        let url = metadata
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                crate::error::ServerError::Validation(
+                    "link 消息缺少 metadata.url".to_string(),
+                )
+            })?;
+
+        if url.trim().is_empty() {
+            return Err(crate::error::ServerError::Validation(
+                "link 消息的 metadata.url 不能为空".to_string(),
+            ));
+        }
 
         Ok(())
     }

@@ -331,12 +331,12 @@ impl FileService {
     }
 
     fn detect_file_type(&self, mime_type: &str) -> Result<FileType> {
+        // 注：这里只按 MIME 服务端兜底分类。Voice 消息的分类由 SDK 明确传入 "voice"，
+        // 不靠 MIME 推导——否则任何 audio/* 的普通文件会被误分到 Voice。
         if mime_type.starts_with("image/") {
             Ok(FileType::Image)
         } else if mime_type.starts_with("video/") {
             Ok(FileType::Video)
-        } else if mime_type.starts_with("audio/") {
-            Ok(FileType::Audio)
         } else {
             Ok(FileType::File)
         }
@@ -346,7 +346,7 @@ impl FileService {
         let max_size = match file_type {
             FileType::Image => 10 * 1024 * 1024,
             FileType::Video => 100 * 1024 * 1024,
-            FileType::Audio => 10 * 1024 * 1024,
+            FileType::Voice => 10 * 1024 * 1024,
             FileType::File => 50 * 1024 * 1024,
             FileType::Other => 10 * 1024 * 1024,
         };
@@ -365,7 +365,7 @@ impl FileService {
         let subdir = match file_type {
             FileType::Image => "images",
             FileType::Video => "videos",
-            FileType::Audio => "audios",
+            FileType::Voice => "voices",
             FileType::File => "files",
             FileType::Other => "others",
         };
