@@ -1005,89 +1005,24 @@ impl MessageHandler for SendMessageHandler {
             }
         }
 
-        // 4.5. ✨ 验证引用消息（如果存在）
-        let reply_to_message_preview = if let Some(ref reply_to_id) = reply_to_message_id {
-            // 尝试解析 reply_to_id 是否为数字（seq）
-            let replied_msg = if let Ok(seq) = reply_to_id.parse::<u64>() {
-                // 如果是数字，通过 seq 查找
-                match self
-                    .message_history_service
-                    .get_message_by_seq(&send_message_request.channel_id, seq)
-                    .await
-                {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        warn!(
-                            "❌ SendMessageHandler: 引用的消息 (seq={}) 不存在: {}",
-                            seq, e
-                        );
-                        return self
-                            .create_error_response(
-                                &send_message_request,
-                                ErrorCode::MessageNotFound,
-                                "引用的消息不存在",
-                            )
-                            .await;
-                    }
-                }
-            } else {
-                // 如果不是数字，尝试解析为 u64 作为 message_id 查找
-                match reply_to_id.parse::<u64>() {
-                    Ok(msg_id) => match self.message_history_service.get_message(&msg_id).await {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            warn!(
-                                "❌ SendMessageHandler: 引用的消息 {} 不存在: {}",
-                                reply_to_id, e
-                            );
-                            return self
-                                .create_error_response(
-                                    &send_message_request,
-                                    ErrorCode::MessageNotFound,
-                                    "引用的消息不存在",
-                                )
-                                .await;
-                        }
-                    },
-                    Err(_) => {
-                        warn!(
-                            "❌ SendMessageHandler: 无效的 reply_to_message_id 格式: {}",
-                            reply_to_id
-                        );
-                        return self
-                            .create_error_response(
-                                &send_message_request,
-                                ErrorCode::InvalidParams,
-                                "无效的引用消息ID格式",
-                            )
-                            .await;
-                    }
-                }
-            };
-
-            // 验证引用的消息是否在同一个频道
-            if replied_msg.channel_id != send_message_request.channel_id {
+        // 4.5. reply_to_message_id 只做格式校验，不校验存在性/归属频道
+        // 按 REPLY_SPEC / local-first 语义：服务端仅转发引用的 server_message_id；
+        // 接收端 UI 在本地查不到原消息时自行渲染「已删除的消息」。
+        let reply_to_id_str: Option<String> = if let Some(ref reply_to_id) = reply_to_message_id {
+            if reply_to_id.parse::<u64>().is_err() {
                 warn!(
-                    "❌ SendMessageHandler: 引用的消息 {} 不在频道 {} 中",
-                    reply_to_id, send_message_request.channel_id
+                    "❌ SendMessageHandler: 无效的 reply_to_message_id 格式: {}",
+                    reply_to_id
                 );
                 return self
                     .create_error_response(
                         &send_message_request,
                         ErrorCode::InvalidParams,
-                        "引用的消息不在当前频道中",
+                        "无效的引用消息ID格式",
                     )
                     .await;
             }
-
-            // 创建引用消息预览（最多50字符）
-            let preview_content = replied_msg.content.chars().take(50).collect::<String>();
-            Some(crate::service::ReplyMessagePreview {
-                message_id: replied_msg.message_id.clone(),
-                sender_id: replied_msg.sender_id.clone(),
-                content: preview_content,
-                message_type: replied_msg.message_type,
-            })
+            Some(reply_to_id.clone())
         } else {
             None
         };
@@ -1459,7 +1394,7 @@ impl MessageHandler for SendMessageHandler {
         let this = self.clone();
         let channel_clone = channel.clone();
         let message_record_clone = message_record.clone();
-        let reply_preview = reply_to_message_preview.map(|r| r.clone());
+        let reply_preview = reply_to_id_str.clone();
         let mentioned = mentioned_user_ids.to_vec();
         tokio::spawn(async move {
             if let Err(e) = this
@@ -1468,7 +1403,7 @@ impl MessageHandler for SendMessageHandler {
                     &from_uid,
                     send_message_request.local_message_id,
                     &message_record_clone,
-                    reply_preview.as_ref(),
+                    reply_preview.as_deref(),
                     &mentioned,
                     is_mention_all,
                     pts as u64,
@@ -1840,7 +1775,7 @@ impl SendMessageHandler {
         sender_id: &UserId,
         original_local_message_id: u64,
         message_record: &crate::service::message_history_service::MessageHistoryRecord,
-        reply_to_message_preview: Option<&crate::service::ReplyMessagePreview>,
+        reply_to_message_id: Option<&str>,
         mentioned_user_ids: &[u64],
         is_mention_all: bool,
         pts: u64,
@@ -1872,7 +1807,7 @@ impl SendMessageHandler {
                 channel,
                 original_local_message_id,
                 message_record,
-                reply_to_message_preview,
+                reply_to_message_id,
                 mentioned_user_ids,
                 is_mention_all,
                 pts,
@@ -2053,7 +1988,7 @@ impl SendMessageHandler {
         channel: &crate::model::channel::Channel,
         original_local_message_id: u64,
         message_record: &crate::service::message_history_service::MessageHistoryRecord,
-        reply_to_message_preview: Option<&crate::service::ReplyMessagePreview>,
+        reply_to_message_id: Option<&str>,
         mentioned_user_ids: &[u64], // ✨ @提及的用户ID列表
         is_mention_all: bool,       // ✨ 是否@全体成员
         pts: u64,                   // ✨ 真实 pts（来自 SyncService/DB）
@@ -2083,16 +2018,11 @@ impl SendMessageHandler {
             }
         }
 
-        // ✨ 添加引用消息预览（如果存在）
-        if let Some(ref reply_preview) = reply_to_message_preview {
+        // 保留 reply_to_message_id（与 MessagePayloadEnvelope 对齐；接收端本地查找渲染）
+        if let Some(reply_id) = reply_to_message_id {
             payload_json.insert(
-                "reply_to".to_string(),
-                serde_json::json!({
-                    "message_id": reply_preview.message_id,
-                    "sender_id": reply_preview.sender_id,
-                    "content": reply_preview.content,
-                    "message_type": reply_preview.message_type
-                }),
+                "reply_to_message_id".to_string(),
+                serde_json::Value::String(reply_id.to_string()),
             );
         }
 
