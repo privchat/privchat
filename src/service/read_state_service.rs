@@ -164,18 +164,23 @@ impl ReadStateService {
         read_pts: u64,
         client_visible_pts: Option<u64>,
     ) -> Result<ReadPtsUpdateResult> {
-        let max_pts_row = sqlx::query(
-            "SELECT COALESCE(MAX(pts), 0) AS max_pts FROM privchat_messages WHERE channel_id = $1",
+        // 以 privchat_channel_pts.current_pts 为 pts 的唯一权威来源（与 sync/get_channel_pts、
+        // sync/submit 的分配器一致），privchat_messages 只是下游投影，允许异步落地。
+        // 用投影表校验会出现 current_pts 先行、MAX(pts) 尚未落库的瞬时越界，从而误拒合法的 markRead。
+        let channel_pts_row = sqlx::query(
+            "SELECT COALESCE(current_pts, 0) AS current_pts FROM privchat_channel_pts WHERE channel_id = $1",
         )
         .bind(channel_id as i64)
-        .fetch_one(self.pool.as_ref())
+        .fetch_optional(self.pool.as_ref())
         .await
-        .map_err(|e| ServerError::Database(format!("查询频道最大 pts 失败: {}", e)))?;
-        let max_pts = max_pts_row.get::<i64, _>("max_pts") as u64;
-        if read_pts > max_pts {
+        .map_err(|e| ServerError::Database(format!("查询频道 current_pts 失败: {}", e)))?;
+        let current_pts = channel_pts_row
+            .map(|row| row.get::<i64, _>("current_pts") as u64)
+            .unwrap_or(0);
+        if read_pts > current_pts {
             return Err(ServerError::Validation(format!(
-                "read_pts 超出频道最大 pts: read_pts={}, max_pts={}",
-                read_pts, max_pts
+                "read_pts 超出频道 current_pts: read_pts={}, current_pts={}",
+                read_pts, current_pts
             )));
         }
 
