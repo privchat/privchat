@@ -480,6 +480,36 @@ impl ConnectionManager {
         Ok(devices_to_disconnect)
     }
 
+    /// 强制关闭指定 session（按 session_id 精确断开）。
+    ///
+    /// 与 `disconnect_device` 的区别：此方法不需要 user_id/device_id，
+    /// 用于「会话未完成鉴权却尝试访问受保护资源」等安全场景 —— 这类 session
+    /// 根本不在 index_a 里，所以不做用户级清理，直接调 transport.close_session
+    /// 让对端收到 TCP 断开、重连时重新走完整 ConnAuth。
+    pub async fn force_close_session(&self, session_id: SessionId) {
+        // 如果该 session 在 index_b 里仍被视为 Authenticated（不该发生，但保险），
+        // 标为 Closing 让其它调用链路提前放弃使用。
+        if let Some(mut b_entry) = self.index_b.get_mut(&session_id) {
+            if b_entry.state == SessionState::Authenticated {
+                b_entry.state = SessionState::Closing;
+            }
+        }
+
+        let transport = self.transport_server.read().await;
+        if let Some(server) = transport.as_ref() {
+            if let Err(e) = server.close_session(session_id).await {
+                warn!(
+                    "⚠️ ConnectionManager: force_close_session 失败 sid={} err={}",
+                    session_id, e
+                );
+            } else {
+                info!("🔌 ConnectionManager: 强制断开未认证 session sid={}", session_id);
+            }
+        } else {
+            warn!("⚠️ ConnectionManager: TransportServer 未设置，无法强制断开 sid={}", session_id);
+        }
+    }
+
     // ---------------------------------------------------------------------
     // 查询接口（只读快照）
     // ---------------------------------------------------------------------

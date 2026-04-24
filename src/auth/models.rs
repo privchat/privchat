@@ -45,10 +45,20 @@ pub struct ImTokenClaims {
     /// 只在安全事件时递增（登出、改密、被踢等）
     #[serde(default = "default_session_version")]
     pub session_version: i64,
+
+    /// Token 类型：`"access"`（默认）或 `"refresh"`。
+    /// B1 引入以区分 refresh token 与 access token；存量 access token 无此字段，
+    /// 反序列化时默认为 `"access"`，保证向后兼容。
+    #[serde(default = "default_token_type")]
+    pub typ: String,
 }
 
 fn default_session_version() -> i64 {
     1
+}
+
+fn default_token_type() -> String {
+    "access".to_string()
 }
 
 /// 设备信息

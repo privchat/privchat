@@ -264,6 +264,7 @@ mod tests {
             business_system_id: "test-business".to_string(),
             app_id: "test-app".to_string(),
             session_version: 1,
+            typ: "access".to_string(),
         }
     }
 

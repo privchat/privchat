@@ -523,7 +523,10 @@ impl ChatServer {
 
         message_dispatcher.register_handler(
             MessageType::RpcRequest,
-            Box::new(RPCMessageHandler::new(auth_middleware.clone())),
+            Box::new(RPCMessageHandler::new(
+                auth_middleware.clone(),
+                connection_manager.clone(),
+            )),
         );
 
         // 创建上传 token 服务

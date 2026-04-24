@@ -17,22 +17,31 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::context::RequestContext;
 use crate::error::Result;
 use crate::handler::MessageHandler;
+use crate::infra::ConnectionManager;
 use crate::middleware::AuthMiddleware;
 use crate::rpc::{handle_rpc_request, types::RPCMessageRequest};
 
 /// RPC 消息处理器
 pub struct RPCMessageHandler {
     auth_middleware: Arc<AuthMiddleware>,
+    connection_manager: Arc<ConnectionManager>,
 }
 
 impl RPCMessageHandler {
-    pub fn new(auth_middleware: Arc<AuthMiddleware>) -> Self {
-        Self { auth_middleware }
+    pub fn new(
+        auth_middleware: Arc<AuthMiddleware>,
+        connection_manager: Arc<ConnectionManager>,
+    ) -> Self {
+        Self {
+            auth_middleware,
+            connection_manager,
+        }
     }
 }
 
@@ -83,17 +92,32 @@ impl MessageHandler for RPCMessageHandler {
                 crate::rpc::RpcContext::new().with_session_id(context.session_id.to_string())
             }
             Err(error_code) => {
-                // 认证失败，返回错误码
+                // 认证失败：先把错误码回给客户端，再主动断开这条 session。
+                //
+                // 未认证 session 继续存活只会让客户端误以为通道可用，把队列里的
+                // 消息/文件 token 重复投递过来打满日志；主动断开能让客户端走
+                // reconnect + re-authenticate 通道恢复，与 SDK 的 auto-reconnect
+                // 形成闭环。
                 warn!(
-                    "❌ RPC 认证失败: route={}, error={}",
-                    rpc_request.route, error_code
+                    "❌ RPC 认证失败，将断开 session: route={}, session={}, error={}",
+                    rpc_request.route, context.session_id, error_code
                 );
                 let error_response = serde_json::json!({
                     "code": error_code.code(),
                     "message": error_code.message(),
                     "data": null
                 });
-                return Ok(Some(serde_json::to_vec(&error_response)?));
+                let response_bytes = serde_json::to_vec(&error_response)?;
+
+                // 等错误响应发出后再断开（~50ms 足够 transport 把帧刷到网络）。
+                let cm = self.connection_manager.clone();
+                let sid = context.session_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    cm.force_close_session(sid).await;
+                });
+
+                return Ok(Some(response_bytes));
             }
         };
 

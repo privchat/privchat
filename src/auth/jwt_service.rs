@@ -18,7 +18,7 @@
 use crate::auth::models::ImTokenClaims;
 use crate::error::{Result, ServerError};
 use chrono::Utc;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use uuid::Uuid;
 
 /// JWT 签发和验证服务
@@ -28,17 +28,29 @@ pub struct JwtService {
     issuer: String,
     audience: String,
     token_ttl: i64,
+    refresh_token_ttl: i64,
 }
 
+/// Access token 的 `typ` 值。
+pub const TOKEN_TYPE_ACCESS: &str = "access";
+/// Refresh token 的 `typ` 值。
+pub const TOKEN_TYPE_REFRESH: &str = "refresh";
+
 impl JwtService {
-    /// 创建 JWT 服务 (HS256 对称加密)
+    /// 创建 JWT 服务 (HS256 对称加密)。`refresh_token_ttl` 默认取 `token_ttl * 4`。
     pub fn new(secret: String, token_ttl: i64) -> Self {
+        Self::new_with_ttls(secret, token_ttl, token_ttl.saturating_mul(4))
+    }
+
+    /// 创建 JWT 服务并显式指定 access / refresh 的 TTL（秒）。
+    pub fn new_with_ttls(secret: String, token_ttl: i64, refresh_token_ttl: i64) -> Self {
         Self {
             encoding_key: EncodingKey::from_secret(secret.as_bytes()),
             decoding_key: DecodingKey::from_secret(secret.as_bytes()),
             issuer: "privchat-im".to_string(),
             audience: "privchat-client".to_string(),
             token_ttl,
+            refresh_token_ttl,
         }
     }
 
@@ -71,8 +83,48 @@ impl JwtService {
         session_version: i64,
         custom_ttl: Option<i64>,
     ) -> Result<String> {
+        self.issue_token_inner(
+            user_id,
+            device_id,
+            business_system_id,
+            app_id,
+            session_version,
+            custom_ttl.unwrap_or(self.token_ttl),
+            TOKEN_TYPE_ACCESS,
+        )
+    }
+
+    /// 签发 refresh token（Phase B1：不做 rotation，直接长 TTL）。
+    pub fn issue_refresh_token(
+        &self,
+        user_id: u64,
+        device_id: &str,
+        business_system_id: &str,
+        app_id: &str,
+        session_version: i64,
+    ) -> Result<String> {
+        self.issue_token_inner(
+            user_id,
+            device_id,
+            business_system_id,
+            app_id,
+            session_version,
+            self.refresh_token_ttl,
+            TOKEN_TYPE_REFRESH,
+        )
+    }
+
+    fn issue_token_inner(
+        &self,
+        user_id: u64,
+        device_id: &str,
+        business_system_id: &str,
+        app_id: &str,
+        session_version: i64,
+        ttl: i64,
+        typ: &str,
+    ) -> Result<String> {
         let now = Utc::now().timestamp();
-        let ttl = custom_ttl.unwrap_or(self.token_ttl);
         let jti = Uuid::new_v4().to_string();
 
         let claims = ImTokenClaims {
@@ -86,6 +138,7 @@ impl JwtService {
             business_system_id: business_system_id.to_string(),
             app_id: app_id.to_string(),
             session_version,
+            typ: typ.to_string(),
         };
 
         let header = Header::new(Algorithm::HS256);
@@ -95,16 +148,50 @@ impl JwtService {
         Ok(token)
     }
 
-    /// 验证 token
-    pub fn verify_token(&self, token: &str) -> Result<ImTokenClaims> {
+    /// 解码 token（不做 typ 校验，内部共用）。
+    fn decode_token(&self, token: &str) -> Result<ImTokenClaims> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[&self.audience]);
 
         let token_data = decode::<ImTokenClaims>(token, &self.decoding_key, &validation)
-            .map_err(|_e| ServerError::InvalidToken)?;
+            .map_err(|e| match e.kind() {
+                ErrorKind::ExpiredSignature => ServerError::TokenExpired,
+                _ => ServerError::InvalidToken,
+            })?;
 
         Ok(token_data.claims)
+    }
+
+    /// 验证 access token。refresh token 会被拒绝为 `InvalidToken`，防止跨用途。
+    pub fn verify_token(&self, token: &str) -> Result<ImTokenClaims> {
+        let claims = self.decode_token(token)?;
+        if claims.typ == TOKEN_TYPE_REFRESH {
+            tracing::warn!(
+                "❌ refresh token 被用于 access 路径: jti={}, user={}, device={}",
+                claims.jti,
+                claims.sub,
+                claims.device_id
+            );
+            return Err(ServerError::InvalidToken);
+        }
+        Ok(claims)
+    }
+
+    /// 验证 refresh token。仅接受 `typ == "refresh"`。
+    pub fn verify_refresh_token(&self, token: &str) -> Result<ImTokenClaims> {
+        let claims = self.decode_token(token)?;
+        if claims.typ != TOKEN_TYPE_REFRESH {
+            tracing::warn!(
+                "❌ access token 被用于 refresh 路径: jti={}, user={}, device={}, typ={}",
+                claims.jti,
+                claims.sub,
+                claims.device_id,
+                claims.typ
+            );
+            return Err(ServerError::InvalidToken);
+        }
+        Ok(claims)
     }
 
     /// 验证 token 并检查 device_id 匹配

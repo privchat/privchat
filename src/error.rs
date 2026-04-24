@@ -74,6 +74,10 @@ pub enum ServerError {
     Unknown(String),
     /// 无效令牌
     InvalidToken,
+    /// 令牌已过期
+    TokenExpired,
+    /// 令牌已被撤销
+    TokenRevoked,
     /// 未授权
     Unauthorized(String),
     /// 协议错误
@@ -125,6 +129,8 @@ impl fmt::Display for ServerError {
             ServerError::VersionMismatch(msg) => write!(f, "Version mismatch: {}", msg),
             ServerError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
             ServerError::InvalidToken => write!(f, "Invalid token"),
+            ServerError::TokenExpired => write!(f, "Token expired"),
+            ServerError::TokenRevoked => write!(f, "Token revoked"),
             ServerError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
             ServerError::Protocol(msg) => write!(f, "Protocol error: {}", msg),
             ServerError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
@@ -151,6 +157,8 @@ impl IntoResponse for ServerError {
         let status_code = match &self {
             ServerError::Authentication(_)
             | ServerError::InvalidToken
+            | ServerError::TokenExpired
+            | ServerError::TokenRevoked
             | ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::Authorization(_)
             | ServerError::PermissionDenied(_)
@@ -255,6 +263,10 @@ pub enum ErrorCode {
     VersionMismatch = 5001,
     /// 无效令牌
     InvalidToken = 5002,
+    /// 令牌已过期
+    TokenExpired = 5010,
+    /// 令牌已被撤销
+    TokenRevoked = 5011,
     /// 协议错误
     Protocol = 5003,
     /// 错误请求
@@ -300,6 +312,8 @@ impl From<&ServerError> for ErrorCode {
             ServerError::VersionMismatch(_) => ErrorCode::VersionMismatch,
             ServerError::Unknown(_) => ErrorCode::Unknown,
             ServerError::InvalidToken => ErrorCode::InvalidToken,
+            ServerError::TokenExpired => ErrorCode::TokenExpired,
+            ServerError::TokenRevoked => ErrorCode::TokenRevoked,
             ServerError::Unauthorized(_) => ErrorCode::Authentication,
             ServerError::Protocol(_) => ErrorCode::Protocol,
             ServerError::BadRequest(_) => ErrorCode::BadRequest,

@@ -175,8 +175,17 @@ pub async fn handle(
     let token_ttl = services.jwt_service.default_ttl();
     let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(token_ttl)).timestamp_millis();
 
-    // TODO: 生成 refresh_token（目前暂时使用相同的 token）
-    let refresh_token = token.clone();
+    // 8.1 签发 refresh token（B1 non-rotation，typ=refresh，长 TTL）
+    let refresh_token = services
+        .jwt_service
+        .issue_refresh_token(
+            user_id,
+            device_id,
+            "privchat-internal",
+            &app_id,
+            1,
+        )
+        .map_err(|e| RpcError::internal(format!("生成 refresh token 失败: {}", e)))?;
 
     tracing::debug!(
         "✅ 用户注册成功: username={}, user_id={}, device_id={}, device_type={}, app_id={}",

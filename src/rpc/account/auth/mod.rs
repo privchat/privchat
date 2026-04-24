@@ -17,13 +17,14 @@
 
 pub mod login;
 pub mod logout;
+pub mod refresh;
 
 use super::super::router::GLOBAL_RPC_ROUTER;
 use super::super::RpcServiceContext;
 use privchat_protocol::rpc::routes;
 
 /// 注册 auth 模块的所有路由
-/// 注意：这些接口主要用于本地测试，生产环境应该使用 AuthorizationRequest 中的认证机制
+/// 注意：login/logout 主要用于本地测试；refresh 是生产路径（Phase B1）。
 pub async fn register_routes(services: RpcServiceContext) {
     let services_login = services.clone();
     GLOBAL_RPC_ROUTER
@@ -41,5 +42,13 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    tracing::debug!("🔧 Auth 模块路由注册完成（测试用）");
+    let services_refresh = services.clone();
+    GLOBAL_RPC_ROUTER
+        .register(routes::auth::REFRESH, move |body, ctx| {
+            let services = services_refresh.clone();
+            Box::pin(async move { refresh::handle(body, services, ctx).await })
+        })
+        .await;
+
+    tracing::debug!("🔧 Auth 模块路由注册完成（login/logout/refresh）");
 }

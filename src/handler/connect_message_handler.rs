@@ -28,7 +28,7 @@ use crate::service::{
 use crate::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use privchat_protocol::ContentMessageType;
+use privchat_protocol::{ContentMessageType, ErrorCode};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -151,9 +151,13 @@ impl MessageHandler for ConnectMessageHandler {
                 );
                 claims
             }
+            Err(crate::error::ServerError::TokenExpired) => {
+                warn!("❌ ConnectMessageHandler: Token 已过期");
+                return self.create_error_response(ErrorCode::TokenExpired, "Token 已过期");
+            }
             Err(e) => {
                 warn!("❌ ConnectMessageHandler: Token 验证失败: {}", e);
-                return self.create_error_response("INVALID_TOKEN", "Token 验证失败");
+                return self.create_error_response(ErrorCode::InvalidToken, "Token 验证失败");
             }
         };
 
@@ -163,7 +167,7 @@ impl MessageHandler for ConnectMessageHandler {
                 "❌ ConnectMessageHandler: Token 已被撤销 (jti: {})",
                 claims.jti
             );
-            return self.create_error_response("TOKEN_REVOKED", "Token 已被撤销，请重新登录");
+            return self.create_error_response(ErrorCode::TokenRevoked, "Token 已被撤销，请重新登录");
         }
 
         // 4. 提取用户信息
@@ -183,7 +187,7 @@ impl MessageHandler for ConnectMessageHandler {
                 device_id, connect_request.device_info.device_id
             );
             return self.create_error_response(
-                "DEVICE_ID_MISMATCH",
+                ErrorCode::InvalidToken,
                 "请求的设备ID与 token 绑定的设备ID不匹配，请使用注册/登录时的设备ID",
             );
         }
@@ -206,14 +210,15 @@ impl MessageHandler for ConnectMessageHandler {
                     "❌ ConnectMessageHandler: 设备不存在: user={}, device={}",
                     user_id, device_id
                 );
-                return self.create_error_response("DEVICE_NOT_FOUND", "设备不存在，请重新登录");
+                return self
+                    .create_error_response(ErrorCode::DeviceNotFound, "设备不存在，请重新登录");
             }
             Ok(SessionVerifyResult::SessionInactive { state, message }) => {
                 warn!(
                     "❌ ConnectMessageHandler: 设备会话状态不可用: user={}, device={}, state={:?}",
                     user_id, device_id, state
                 );
-                return self.create_error_response("SESSION_INACTIVE", &message);
+                return self.create_error_response(ErrorCode::SessionExpired, &message);
             }
             Ok(SessionVerifyResult::VersionMismatch {
                 token_version,
@@ -222,7 +227,7 @@ impl MessageHandler for ConnectMessageHandler {
                 warn!("❌ ConnectMessageHandler: Token 版本过期: user={}, device={}, token_v={}, current_v={}",
                       user_id, device_id, token_version, current_version);
                 return self.create_error_response(
-                    "TOKEN_VERSION_MISMATCH",
+                    ErrorCode::SessionExpired,
                     &format!(
                         "Token 已失效（版本：{} < {}），请重新登录",
                         token_version, current_version
@@ -231,7 +236,7 @@ impl MessageHandler for ConnectMessageHandler {
             }
             Err(e) => {
                 warn!("❌ ConnectMessageHandler: 设备会话验证失败: {}", e);
-                return self.create_error_response("SESSION_VERIFY_ERROR", "设备会话验证失败");
+                return self.create_error_response(ErrorCode::InternalError, "设备会话验证失败");
             }
         }
 
@@ -417,12 +422,12 @@ impl ConnectMessageHandler {
     /// 创建错误响应
     fn create_error_response(
         &self,
-        error_code: &str,
+        error_code: ErrorCode,
         error_message: &str,
     ) -> Result<Option<Vec<u8>>> {
         let connect_response = privchat_protocol::protocol::AuthorizationResponse {
             success: false,
-            error_code: Some(error_code.to_string()),
+            error_code: Some(error_code.code()),
             error_message: Some(error_message.to_string()),
             session_id: None,
             user_id: None,
