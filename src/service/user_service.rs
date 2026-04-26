@@ -214,15 +214,16 @@ impl UserService {
             .map_err(|e| ServerError::Database(format!("检查用户失败: {}", e)))
     }
 
-    /// v1.2 service API 创建用户：多键幂等 + E.164 phone 校验 + 字段全可选。
+    /// v1.2 service API 创建用户：多键幂等 + identity-required + identity-conflict 防护。
     ///
-    /// 行为：
+    /// 行为（USER_API §3）：
     /// - normalize: username/email trim + lowercase；phone trim；E.164 格式校验
-    /// - 幂等优先级：phone → email → username。任一命中已有用户即返回 `Existing(user)`，
-    ///   不覆盖任何字段
-    /// - 全空（phone/email/username 都 None）合法，创建占位 uid
-    /// - INSERT UNIQUE 冲突兜底：catch 后按 phone/email/username 顺序 re-find，
-    ///   返回 existing；找不到对应 row 才返回错误（极端竞态）
+    /// - identity-required：phone / email / username 必须至少一个非空，全空 → 400
+    ///   `INVALID_USER_IDENTITY`
+    /// - 多键幂等：三个 key 各自查 existing；命中**同一** uid → `Existing`；命中**不同**
+    ///   uid → 409 `IDENTITY_CONFLICT`
+    /// - existing 命中**不**覆盖任何字段
+    /// - INSERT UNIQUE 冲突兜底：catch 后再走一次完整 identity-check，避免并发裂脑
     pub async fn create_user_admin(
         &self,
         params: CreateUserAdminParams,
@@ -251,7 +252,18 @@ impl UserService {
             .map(|val| val.trim().to_lowercase())
             .filter(|val| !val.is_empty());
 
-        // 2. phone 强制 E.164
+        // 2. identity-required：三者必须至少一个非空
+        if normalized_phone.is_none()
+            && normalized_email.is_none()
+            && normalized_username.is_none()
+        {
+            return Err(ServerError::Validation(
+                "INVALID_USER_IDENTITY: at least one of phone / email / username must be provided"
+                    .to_string(),
+            ));
+        }
+
+        // 3. phone 强制 E.164
         if let Some(ref phone_val) = normalized_phone {
             if !validate_phone_e164(phone_val) {
                 return Err(ServerError::Validation(format!(
@@ -261,36 +273,19 @@ impl UserService {
             }
         }
 
-        // 3. 幂等预检：phone → email → username
-        if let Some(ref phone_val) = normalized_phone {
-            if let Some(existing) = self.find_by_phone(phone_val).await? {
-                info!(
-                    "ℹ️ 幂等命中（phone）: user_id={}, phone={}",
-                    existing.id, phone_val
-                );
-                return Ok(CreateUserOutcome::Existing(existing));
-            }
-        }
-        if let Some(ref email_val) = normalized_email {
-            if let Some(existing) = self.find_by_email(email_val).await? {
-                info!(
-                    "ℹ️ 幂等命中（email）: user_id={}, email={}",
-                    existing.id, email_val
-                );
-                return Ok(CreateUserOutcome::Existing(existing));
-            }
-        }
-        if let Some(ref username_val) = normalized_username {
-            if let Some(existing) = self.find_by_username(username_val).await? {
-                info!(
-                    "ℹ️ 幂等命中（username）: user_id={}, username={}",
-                    existing.id, username_val
-                );
-                return Ok(CreateUserOutcome::Existing(existing));
-            }
+        // 4. 多键幂等检测 + 跨键冲突检测
+        if let Some(outcome) = self
+            .resolve_identity_match(
+                normalized_phone.as_deref(),
+                normalized_email.as_deref(),
+                normalized_username.as_deref(),
+            )
+            .await?
+        {
+            return Ok(outcome);
         }
 
-        // 4. 构造新 user 并持久化
+        // 5. 构造新 user 并持久化
         let user = User::new_admin(
             0,
             normalized_username.clone(),
@@ -313,38 +308,84 @@ impl UserService {
                 Ok(CreateUserOutcome::Created(created))
             }
             Err(DatabaseError::DuplicateEntry(msg)) => {
-                // 并发兜底：另一个请求在我们 pre-check 后抢先 INSERT，按相同优先级 re-find
-                if let Some(ref phone_val) = normalized_phone {
-                    if let Some(existing) = self.find_by_phone(phone_val).await? {
-                        info!(
-                            "ℹ️ 并发幂等命中（phone）: user_id={}, phone={}",
-                            existing.id, phone_val
-                        );
-                        return Ok(CreateUserOutcome::Existing(existing));
-                    }
-                }
-                if let Some(ref email_val) = normalized_email {
-                    if let Some(existing) = self.find_by_email(email_val).await? {
-                        info!(
-                            "ℹ️ 并发幂等命中（email）: user_id={}, email={}",
-                            existing.id, email_val
-                        );
-                        return Ok(CreateUserOutcome::Existing(existing));
-                    }
-                }
-                if let Some(ref username_val) = normalized_username {
-                    if let Some(existing) = self.find_by_username(username_val).await? {
-                        info!(
-                            "ℹ️ 并发幂等命中（username）: user_id={}, username={}",
-                            existing.id, username_val
-                        );
-                        return Ok(CreateUserOutcome::Existing(existing));
-                    }
+                // 并发兜底：另一个请求在 pre-check 后抢先 INSERT。
+                // 重跑完整 identity-check（含跨键冲突检测），避免并发裂脑。
+                if let Some(outcome) = self
+                    .resolve_identity_match(
+                        normalized_phone.as_deref(),
+                        normalized_email.as_deref(),
+                        normalized_username.as_deref(),
+                    )
+                    .await?
+                {
+                    info!(
+                        "ℹ️ 并发兜底命中: user_id={}",
+                        outcome.user().id
+                    );
+                    return Ok(CreateUserOutcome::Existing(outcome.into_user()));
                 }
                 Err(ServerError::Validation(msg))
             }
             Err(other) => Err(ServerError::Database(format!("创建用户失败: {}", other))),
         }
+    }
+
+    /// 多键幂等检测 + 跨键冲突检测的统一入口。
+    ///
+    /// 返回值：
+    /// - `Ok(None)` — 三个字段都未命中，调用方应继续 INSERT
+    /// - `Ok(Some(Existing(user)))` — 至少一个字段命中且全部命中同一 uid
+    /// - `Err(DuplicateEntry("IDENTITY_CONFLICT: ..."))` — 命中多个不同 uid
+    async fn resolve_identity_match(
+        &self,
+        phone: Option<&str>,
+        email: Option<&str>,
+        username: Option<&str>,
+    ) -> Result<Option<CreateUserOutcome>, ServerError> {
+        let phone_match = match phone {
+            Some(p) => self.find_by_phone(p).await?,
+            None => None,
+        };
+        let email_match = match email {
+            Some(e) => self.find_by_email(e).await?,
+            None => None,
+        };
+        let username_match = match username {
+            Some(u) => self.find_by_username(u).await?,
+            None => None,
+        };
+
+        let matches: Vec<&User> = [&phone_match, &email_match, &username_match]
+            .iter()
+            .filter_map(|m| m.as_ref())
+            .collect();
+
+        if matches.is_empty() {
+            return Ok(None);
+        }
+
+        let first_uid = matches[0].id;
+        if matches.iter().any(|u| u.id != first_uid) {
+            let mut keys: Vec<&str> = Vec::new();
+            if phone_match.is_some() {
+                keys.push("phone");
+            }
+            if email_match.is_some() {
+                keys.push("email");
+            }
+            if username_match.is_some() {
+                keys.push("username");
+            }
+            let conflicting_uids: Vec<String> = matches.iter().map(|u| u.id.to_string()).collect();
+            return Err(ServerError::DuplicateEntry(format!(
+                "IDENTITY_CONFLICT: keys ({}) match different existing users (uids: {})",
+                keys.join(", "),
+                conflicting_uids.join(", ")
+            )));
+        }
+
+        // 全命中同一 uid
+        Ok(Some(CreateUserOutcome::Existing(matches[0].clone())))
     }
 
     /// admin 更新用户：拉取现有用户 -> 按 patch 语义 merge -> 持久化。
