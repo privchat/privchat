@@ -184,20 +184,19 @@ impl ReadStateService {
             )));
         }
 
-        // 双重水位裁剪：accepted = min(requested, client_visible, server_delivered)
+        // 单一水位裁剪：accepted = min(requested, client_visible)
+        //
+        // 为何不再用 server_delivered 裁剪：delivery_tracker.try_advance 仅在严格连续
+        // (pts == current+1) 时推进，任一条消息因 TCP 路由瞬时失败而漏 ack 都会让水位卡死，
+        // 导致后续合法 markRead 被误压低到旧水位，私聊 `peer_read_pts_updated` 广播闸门
+        // 因 advanced=false 而静默丢弃，最终发送方看不到「已读」。
+        // 客户端调用 markRead(N) 在因果上意味着客户端已经看到 pts<=N（无论走 push 还是
+        // sync 路径），应以客户端声明为权威。delivery_tracker 退化为本地 telemetry，
+        // 由本函数末尾按 effective_read_pts 反向修复对齐。
         let mut effective_read_pts = read_pts;
 
         if let Some(visible) = client_visible_pts {
             effective_read_pts = effective_read_pts.min(visible);
-        }
-
-        if let Some(tracker) = &self.delivery_tracker {
-            let delivered = tracker.get_delivered_pts(reader_id, channel_id).await;
-            if delivered > 0 {
-                effective_read_pts = effective_read_pts.min(delivered);
-            }
-            // delivered == 0 表示 DeliveryTracker 尚未初始化该用户/频道的数据，
-            // 此时不裁剪（兼容历史数据 / 旧客户端）
         }
 
         if effective_read_pts < read_pts {
@@ -212,6 +211,17 @@ impl ReadStateService {
                 channel_id,
                 last_read_pts: 0,
             });
+        }
+
+        // 因果对齐：客户端已读 effective_read_pts ⇒ 已收到 effective_read_pts。
+        // 若 tracker 因 try_advance gap 落后于真实送达，这里强制对齐。
+        if let Some(tracker) = &self.delivery_tracker {
+            let current_delivered = tracker.get_delivered_pts(reader_id, channel_id).await;
+            if effective_read_pts > current_delivered {
+                tracker
+                    .force_set(reader_id, channel_id, effective_read_pts)
+                    .await;
+            }
         }
 
         let new_last_read_pts = self
