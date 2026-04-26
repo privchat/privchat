@@ -22,7 +22,8 @@
 //!   - `/api/app/files/upload` - 文件上传
 //!   - `/metrics` - Prometheus 指标
 //! - 管理 API（端口 9090，仅内网）：
-//!   - `/api/admin/*` - 管理接口（业务系统调用，使用 X-Service-Key 认证）
+//!   - `/api/admin/*` - 管理接口 legacy 前缀（向后兼容）
+//!   - `/api/service/*` - 管理接口 v1.2 前缀（与 legacy 完全等价）
 
 pub mod admin;
 pub mod metrics;
@@ -39,6 +40,11 @@ pub fn create_file_routes() -> Router<FileServerState> {
 }
 
 /// 创建管理 API 路由
+///
+/// 同 handler 同时挂载到 `/api/admin` 和 `/api/service` 两个前缀下，行为完全一致。
+/// `/api/admin` 是 v1.0/v1.1 兼容前缀；`/api/service` 是 v1.2 推荐前缀。
 pub fn create_admin_routes() -> Router<AdminServerState> {
-    admin::create_route()
+    Router::new()
+        .nest("/api/admin", admin::create_route())
+        .nest("/api/service", admin::create_route())
 }

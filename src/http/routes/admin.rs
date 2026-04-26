@@ -19,6 +19,11 @@
 //!
 //! 统一的管理接口，使用 X-Service-Key 进行安全认证
 //!
+//! 路径前缀：本模块返回相对路径（如 `/users`），由 `routes::create_admin_routes`
+//! 通过 axum `nest()` 同时挂载到 `/api/admin/*`（legacy）和 `/api/service/*`（v1.2）
+//! 两个前缀下，行为完全一致。下方 handler 文档里 `/api/admin/...` 的示例同样适用
+//! `/api/service/...`。
+//!
 //! 包含以下管理功能：
 //! - Token 管理：签发 token
 //! - 用户管理：查询、更新、删除、封禁/解封用户
@@ -49,111 +54,111 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
-/// 创建管理 API 路由
+/// 创建管理 API 路由（返回相对路径 router，由 caller 决定前缀挂载点）
 pub fn create_route() -> Router<AdminServerState> {
     Router::new()
         // Token 管理（三方对接接口）
-        .route("/api/admin/token/issue", post(issue_token))
+        .route("/token/issue", post(issue_token))
         // 用户管理
-        .route("/api/admin/users", post(create_user)) // 创建用户
-        .route("/api/admin/users", get(list_users))
-        .route("/api/admin/users/{user_id}", get(get_user))
-        .route("/api/admin/users/{user_id}", put(update_user))
-        .route("/api/admin/users/{user_id}", delete(delete_user))
+        .route("/users", post(create_user)) // 创建用户
+        .route("/users", get(list_users))
+        .route("/users/{user_id}", get(get_user))
+        .route("/users/{user_id}", put(update_user))
+        .route("/users/{user_id}", delete(delete_user))
         // 群组管理
-        .route("/api/admin/groups", get(list_groups))
-        .route("/api/admin/groups/{group_id}", get(get_group))
-        .route("/api/admin/groups/{group_id}", delete(dissolve_group))
+        .route("/groups", get(list_groups))
+        .route("/groups/{group_id}", get(get_group))
+        .route("/groups/{group_id}", delete(dissolve_group))
         // Room 频道管理
-        .route("/api/admin/room", post(create_room_channel))
-        .route("/api/admin/room", get(list_room_channels))
-        .route("/api/admin/room/{channel_id}", get(get_room_channel))
+        .route("/room", post(create_room_channel))
+        .route("/room", get(list_room_channels))
+        .route("/room/{channel_id}", get(get_room_channel))
         .route(
-            "/api/admin/room/{channel_id}/broadcast",
+            "/room/{channel_id}/broadcast",
             post(room_broadcast),
         )
         // 好友管理
-        .route("/api/admin/friendships", post(create_friendship)) // 创建好友关系
-        .route("/api/admin/friendships", get(list_friendships))
+        .route("/friendships", post(create_friendship)) // 创建好友关系
+        .route("/friendships", get(list_friendships))
         // 登录日志
-        .route("/api/admin/login-logs", get(list_login_logs))
-        .route("/api/admin/login-logs/{log_id}", get(get_login_log))
+        .route("/login-logs", get(list_login_logs))
+        .route("/login-logs/{log_id}", get(get_login_log))
         // 设备管理
-        .route("/api/admin/devices", get(list_devices))
-        .route("/api/admin/devices/{device_id}", get(get_device))
+        .route("/devices", get(list_devices))
+        .route("/devices/{device_id}", get(get_device))
         // 统计报表
-        .route("/api/admin/stats", get(get_stats))
-        .route("/api/admin/stats/users", get(get_user_stats))
-        .route("/api/admin/stats/groups", get(get_group_stats))
-        .route("/api/admin/stats/messages", get(get_message_stats))
+        .route("/stats", get(get_stats))
+        .route("/stats/users", get(get_user_stats))
+        .route("/stats/groups", get(get_group_stats))
+        .route("/stats/messages", get(get_message_stats))
         // 聊天记录
-        .route("/api/admin/messages", get(list_messages))
-        .route("/api/admin/messages/{message_id}", get(get_message))
+        .route("/messages", get(list_messages))
+        .route("/messages/{message_id}", get(get_message))
         // === P0: 用户封禁/解封 ===
-        .route("/api/admin/users/{user_id}/suspend", post(suspend_user))
-        .route("/api/admin/users/{user_id}/unsuspend", post(unsuspend_user))
+        .route("/users/{user_id}/suspend", post(suspend_user))
+        .route("/users/{user_id}/unsuspend", post(unsuspend_user))
         // === P0: 设备强制踢出 ===
-        .route("/api/admin/devices/{device_id}/revoke", post(revoke_device))
+        .route("/devices/{device_id}/revoke", post(revoke_device))
         .route(
-            "/api/admin/users/{user_id}/revoke-all-devices",
+            "/users/{user_id}/revoke-all-devices",
             post(revoke_all_user_devices),
         )
         // === P0: 群组成员管理 ===
         .route(
-            "/api/admin/groups/{group_id}/members",
+            "/groups/{group_id}/members",
             get(list_group_members).post(add_group_member),
         )
         .route(
-            "/api/admin/groups/{group_id}/members/{user_id}",
+            "/groups/{group_id}/members/{user_id}",
             delete(remove_group_member),
         )
         // === P0: 消息撤回 + 系统消息 ===
         .route(
-            "/api/admin/messages/{message_id}/revoke",
+            "/messages/{message_id}/revoke",
             post(revoke_message),
         )
-        .route("/api/admin/messages/send-system", post(send_system_message))
-        .route("/api/admin/messages/send", post(send_message))
+        .route("/messages/send-system", post(send_system_message))
+        .route("/messages/send", post(send_message))
         // === P0: 安全管控 ===
-        .route("/api/admin/security/shadow-banned", get(list_shadow_banned))
+        .route("/security/shadow-banned", get(list_shadow_banned))
         .route(
-            "/api/admin/security/shadow-ban/{user_id}",
+            "/security/shadow-ban/{user_id}",
             delete(unshadow_ban_user),
         )
         .route(
-            "/api/admin/security/users/{user_id}/state",
+            "/security/users/{user_id}/state",
             get(get_user_security_state),
         )
         .route(
-            "/api/admin/security/users/{user_id}/reset",
+            "/security/users/{user_id}/reset",
             post(reset_user_security_state),
         )
         // === P0: 在线状态 ===
-        .route("/api/admin/presence/online-count", get(get_online_count))
-        .route("/api/admin/presence/users", get(list_online_users))
+        .route("/presence/online-count", get(get_online_count))
+        .route("/presence/users", get(list_online_users))
         .route(
-            "/api/admin/presence/user/{user_id}",
+            "/presence/user/{user_id}",
             get(get_user_connection),
         )
         // === P1: 用户资源 ===
-        .route("/api/admin/users/{user_id}/friends", get(get_user_friends))
-        .route("/api/admin/users/{user_id}/devices", get(get_user_devices))
-        .route("/api/admin/users/{user_id}/groups", get(get_user_groups))
+        .route("/users/{user_id}/friends", get(get_user_friends))
+        .route("/users/{user_id}/devices", get(get_user_devices))
+        .route("/users/{user_id}/groups", get(get_user_groups))
         // === P1: 会话管理 ===
         .route(
-            "/api/admin/users/{user_id}/channels",
+            "/users/{user_id}/channels",
             get(list_user_channels),
         )
-        .route("/api/admin/channels/{channel_id}", get(get_channel))
+        .route("/channels/{channel_id}", get(get_channel))
         .route(
-            "/api/admin/channels/{channel_id}/participants",
+            "/channels/{channel_id}/participants",
             get(list_channel_participants),
         )
         // === P1: 消息广播与搜索 ===
-        .route("/api/admin/messages/broadcast", post(broadcast_message))
-        .route("/api/admin/messages/search", get(search_messages))
+        .route("/messages/broadcast", post(broadcast_message))
+        .route("/messages/search", get(search_messages))
         // === P0: 系统运维 ===
-        .route("/api/admin/system/health", get(health_check))
+        .route("/system/health", get(health_check))
 }
 
 // =====================================================
