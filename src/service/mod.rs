@@ -99,5 +99,8 @@ pub use room_history_service::RoomHistoryService;
 pub use sticker_service::{Sticker, StickerPackage, StickerService};
 pub use unread_count_service::UnreadCountService;
 pub use upload_token_service::{UploadToken, UploadTokenService};
-pub use user_service::{CreateUserAdminParams, UpdateUserAdminParams, UserService};
+pub use user_service::{
+    validate_phone_e164, CreateUserAdminParams, CreateUserOutcome, UpdateUserAdminParams,
+    UserService,
+};
 pub use delivery_tracker::DeliveryTracker;

@@ -44,7 +44,7 @@ impl UserRepository {
         #[derive(sqlx::FromRow)]
         struct UserRow {
             user_id: i64,
-            username: String,
+            username: Option<String>,
             password_hash: Option<String>,
             phone: Option<String>,
             email: Option<String>,
@@ -56,6 +56,7 @@ impl UserRepository {
             created_at: i64,
             updated_at: i64,
             last_active_at: Option<i64>,
+            business_system_id: Option<String>,
         }
 
         let row = sqlx::query_as::<_, UserRow>(
@@ -73,7 +74,8 @@ impl UserRepository {
                 privacy_settings,
                 created_at,
                 updated_at,
-                last_active_at
+                last_active_at,
+                business_system_id
             FROM privchat_users
             WHERE user_id = $1
             "#,
@@ -99,6 +101,7 @@ impl UserRepository {
                 r.created_at,
                 r.updated_at,
                 r.last_active_at,
+                r.business_system_id,
             ))),
             None => Ok(None),
         }
@@ -109,7 +112,7 @@ impl UserRepository {
         #[derive(sqlx::FromRow)]
         struct UserRow {
             user_id: i64,
-            username: String,
+            username: Option<String>,
             password_hash: Option<String>,
             phone: Option<String>,
             email: Option<String>,
@@ -121,6 +124,7 @@ impl UserRepository {
             created_at: i64,
             updated_at: i64,
             last_active_at: Option<i64>,
+            business_system_id: Option<String>,
         }
 
         let row = sqlx::query_as::<_, UserRow>(
@@ -138,7 +142,8 @@ impl UserRepository {
                 privacy_settings,
                 created_at,
                 updated_at,
-                last_active_at
+                last_active_at,
+                business_system_id
             FROM privchat_users
             WHERE LOWER(username) = LOWER($1)
             "#,
@@ -164,17 +169,20 @@ impl UserRepository {
                 r.created_at,
                 r.updated_at,
                 r.last_active_at,
+                r.business_system_id,
             ))),
             None => Ok(None),
         }
     }
 
-    /// 根据邮箱查找用户
-    pub async fn find_by_email(&self, email: &str) -> Result<Option<User>, DatabaseError> {
+    /// 根据手机号查找用户（v1.2 service API 幂等检测用）。
+    ///
+    /// `phone` 必须是已规范化（trim）后的字符串；不做大小写折叠（手机号本身是数字）。
+    pub async fn find_by_phone(&self, phone: &str) -> Result<Option<User>, DatabaseError> {
         #[derive(sqlx::FromRow)]
         struct UserRow {
             user_id: i64,
-            username: String,
+            username: Option<String>,
             password_hash: Option<String>,
             phone: Option<String>,
             email: Option<String>,
@@ -186,6 +194,75 @@ impl UserRepository {
             created_at: i64,
             updated_at: i64,
             last_active_at: Option<i64>,
+            business_system_id: Option<String>,
+        }
+
+        let row = sqlx::query_as::<_, UserRow>(
+            r#"
+            SELECT
+                user_id,
+                username,
+                password_hash,
+                phone,
+                email,
+                display_name,
+                avatar_url,
+                user_type,
+                status,
+                privacy_settings,
+                created_at,
+                updated_at,
+                last_active_at,
+                business_system_id
+            FROM privchat_users
+            WHERE phone = $1
+            "#,
+        )
+        .bind(phone)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to query user by phone: {}", e)))?;
+
+        match row {
+            Some(r) => Ok(Some(User::from_db_row(
+                r.user_id,
+                r.username,
+                r.password_hash,
+                r.phone,
+                r.email,
+                r.display_name,
+                r.avatar_url,
+                r.user_type.unwrap_or(0),
+                r.status.unwrap_or(0),
+                r.privacy_settings
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                r.created_at,
+                r.updated_at,
+                r.last_active_at,
+                r.business_system_id,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// 根据邮箱查找用户
+    pub async fn find_by_email(&self, email: &str) -> Result<Option<User>, DatabaseError> {
+        #[derive(sqlx::FromRow)]
+        struct UserRow {
+            user_id: i64,
+            username: Option<String>,
+            password_hash: Option<String>,
+            phone: Option<String>,
+            email: Option<String>,
+            display_name: Option<String>,
+            avatar_url: Option<String>,
+            user_type: Option<i16>,
+            status: Option<i16>,
+            privacy_settings: Option<serde_json::Value>,
+            created_at: i64,
+            updated_at: i64,
+            last_active_at: Option<i64>,
+            business_system_id: Option<String>,
         }
 
         let row = sqlx::query_as::<_, UserRow>(
@@ -203,7 +280,8 @@ impl UserRepository {
                 privacy_settings,
                 created_at,
                 updated_at,
-                last_active_at
+                last_active_at,
+                business_system_id
             FROM privchat_users
             WHERE LOWER(email) = LOWER($1)
             "#,
@@ -229,6 +307,7 @@ impl UserRepository {
                 r.created_at,
                 r.updated_at,
                 r.last_active_at,
+                r.business_system_id,
             ))),
             None => Ok(None),
         }
@@ -250,20 +329,25 @@ impl UserRepository {
             created_at,
             updated_at,
             last_active_at,
+            business_system_id,
         ) = user.to_db_values();
 
-        // 检查用户名是否已存在
-        let exists: Option<(i32,)> =
-            sqlx::query_as("SELECT 1 FROM privchat_users WHERE LOWER(username) = LOWER($1)")
-                .bind(&username)
-                .fetch_optional(self.pool.as_ref())
-                .await
-                .map_err(|e| DatabaseError::Database(format!("Failed to check username: {}", e)))?;
+        // 检查用户名是否已存在（仅当 username 给定时）
+        if let Some(ref username_val) = username {
+            let exists: Option<(i32,)> =
+                sqlx::query_as("SELECT 1 FROM privchat_users WHERE LOWER(username) = LOWER($1)")
+                    .bind(username_val)
+                    .fetch_optional(self.pool.as_ref())
+                    .await
+                    .map_err(|e| {
+                        DatabaseError::Database(format!("Failed to check username: {}", e))
+                    })?;
 
-        if exists.is_some() {
-            return Err(DatabaseError::DuplicateEntry(
-                "Username already exists".to_string(),
-            ));
+            if exists.is_some() {
+                return Err(DatabaseError::DuplicateEntry(
+                    "Username already exists".to_string(),
+                ));
+            }
         }
 
         // 检查邮箱是否已存在
@@ -288,9 +372,10 @@ impl UserRepository {
             r#"
             INSERT INTO privchat_users (
                 username, password_hash, phone, email, display_name, avatar_url,
-                user_type, status, privacy_settings, created_at, updated_at, last_active_at
+                user_type, status, privacy_settings, created_at, updated_at, last_active_at,
+                business_system_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING user_id
             "#,
             username,
@@ -305,11 +390,22 @@ impl UserRepository {
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
             created_at,
             updated_at,
-            last_active_at
+            last_active_at,
+            business_system_id,
         )
         .fetch_one(self.pool.as_ref())
         .await
-        .map_err(|e| DatabaseError::Database(format!("Failed to create user: {}", e)))?;
+        .map_err(|e| {
+            // PostgreSQL 23505 = unique_violation：转 DuplicateEntry，让 service 层走幂等兜底
+            if let sqlx::Error::Database(db_err) = &e {
+                if db_err.code().as_deref() == Some("23505") {
+                    return DatabaseError::DuplicateEntry(
+                        db_err.constraint().unwrap_or("unknown_unique").to_string(),
+                    );
+                }
+            }
+            DatabaseError::Database(format!("Failed to create user: {}", e))
+        })?;
 
         // 返回创建的用户（包含数据库生成的 user_id）
         let mut created_user = user.clone();
@@ -333,6 +429,7 @@ impl UserRepository {
             created_at,
             updated_at,
             last_active_at,
+            business_system_id,
         ) = user.to_db_values();
 
         // 检查 user_id 是否已存在
@@ -350,18 +447,22 @@ impl UserRepository {
             )));
         }
 
-        // 检查用户名是否已存在
-        let exists: Option<(i32,)> =
-            sqlx::query_as("SELECT 1 FROM privchat_users WHERE LOWER(username) = LOWER($1)")
-                .bind(&username)
-                .fetch_optional(self.pool.as_ref())
-                .await
-                .map_err(|e| DatabaseError::Database(format!("Failed to check username: {}", e)))?;
+        // 检查用户名是否已存在（仅当 username 给定时）
+        if let Some(ref username_val) = username {
+            let exists: Option<(i32,)> =
+                sqlx::query_as("SELECT 1 FROM privchat_users WHERE LOWER(username) = LOWER($1)")
+                    .bind(username_val)
+                    .fetch_optional(self.pool.as_ref())
+                    .await
+                    .map_err(|e| {
+                        DatabaseError::Database(format!("Failed to check username: {}", e))
+                    })?;
 
-        if exists.is_some() {
-            return Err(DatabaseError::DuplicateEntry(
-                "Username already exists".to_string(),
-            ));
+            if exists.is_some() {
+                return Err(DatabaseError::DuplicateEntry(
+                    "Username already exists".to_string(),
+                ));
+            }
         }
 
         // 检查邮箱是否已存在
@@ -386,9 +487,10 @@ impl UserRepository {
             r#"
             INSERT INTO privchat_users (
                 user_id, username, password_hash, phone, email, display_name, avatar_url,
-                user_type, status, privacy_settings, created_at, updated_at, last_active_at
+                user_type, status, privacy_settings, created_at, updated_at, last_active_at,
+                business_system_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING user_id
             "#,
             user_id as i64,
@@ -404,7 +506,8 @@ impl UserRepository {
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
             created_at,
             updated_at,
-            last_active_at
+            last_active_at,
+            business_system_id,
         )
         .fetch_one(self.pool.as_ref())
         .await
@@ -432,12 +535,13 @@ impl UserRepository {
             _created_at,
             updated_at,
             last_active_at,
+            business_system_id,
         ) = user.to_db_values();
 
         let rows_affected = sqlx::query!(
             r#"
             UPDATE privchat_users
-            SET 
+            SET
                 username = $2,
                 password_hash = $3,
                 phone = $4,
@@ -448,7 +552,8 @@ impl UserRepository {
                 status = $9,
                 privacy_settings = $10,
                 updated_at = $11,
-                last_active_at = $12
+                last_active_at = $12,
+                business_system_id = $13
             WHERE user_id = $1
             "#,
             user_id,
@@ -463,7 +568,8 @@ impl UserRepository {
             serde_json::to_value(&privacy_settings)
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
             updated_at,
-            last_active_at
+            last_active_at,
+            business_system_id,
         )
         .execute(self.pool.as_ref())
         .await
@@ -518,7 +624,7 @@ impl UserRepository {
         #[derive(sqlx::FromRow)]
         struct UserRow {
             user_id: i64,
-            username: String,
+            username: Option<String>,
             password_hash: Option<String>,
             phone: Option<String>,
             email: Option<String>,
@@ -531,6 +637,7 @@ impl UserRepository {
             updated_at: i64,
             sync_version: i64,
             last_active_at: Option<i64>,
+            business_system_id: Option<String>,
         }
 
         let ids: Vec<i64> = related_user_ids.iter().map(|id| *id as i64).collect();
@@ -550,7 +657,8 @@ impl UserRepository {
                 created_at,
                 updated_at,
                 sync_version,
-                last_active_at
+                last_active_at,
+                business_system_id
             FROM privchat_users
             WHERE user_id = ANY($1::BIGINT[])
               AND sync_version > $2
@@ -586,6 +694,7 @@ impl UserRepository {
                     r.created_at,
                     r.updated_at,
                     r.last_active_at,
+                    r.business_system_id,
                 ),
             })
             .collect())
@@ -602,7 +711,7 @@ impl UserRepository {
         #[derive(sqlx::FromRow)]
         struct UserRow {
             user_id: i64,
-            username: String,
+            username: Option<String>,
             password_hash: Option<String>,
             phone: Option<String>,
             email: Option<String>,
@@ -614,6 +723,7 @@ impl UserRepository {
             created_at: i64,
             updated_at: i64,
             last_active_at: Option<i64>,
+            business_system_id: Option<String>,
         }
 
         let rows = sqlx::query_as::<_, UserRow>(
@@ -631,7 +741,8 @@ impl UserRepository {
                 privacy_settings,
                 created_at,
                 updated_at,
-                last_active_at
+                last_active_at,
+                business_system_id
             FROM privchat_users
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
@@ -661,6 +772,7 @@ impl UserRepository {
                     r.created_at,
                     r.updated_at,
                     r.last_active_at,
+                    r.business_system_id,
                 )
             })
             .collect();
@@ -681,7 +793,7 @@ impl UserRepository {
         #[derive(sqlx::FromRow)]
         struct UserRow {
             user_id: i64,
-            username: String,
+            username: Option<String>,
             password_hash: Option<String>,
             phone: Option<String>,
             email: Option<String>,
@@ -693,6 +805,7 @@ impl UserRepository {
             created_at: i64,
             updated_at: i64,
             last_active_at: Option<i64>,
+            business_system_id: Option<String>,
         }
 
         let rows = sqlx::query_as::<_, UserRow>(
@@ -710,7 +823,8 @@ impl UserRepository {
                 privacy_settings,
                 created_at,
                 updated_at,
-                last_active_at
+                last_active_at,
+                business_system_id
             FROM privchat_users
             ORDER BY created_at DESC
             "#,
@@ -737,6 +851,7 @@ impl UserRepository {
                     r.created_at,
                     r.updated_at,
                     r.last_active_at,
+                    r.business_system_id,
                 )
             })
             .collect())
@@ -749,7 +864,7 @@ impl UserRepository {
         #[derive(sqlx::FromRow)]
         struct UserRow {
             user_id: i64,
-            username: String,
+            username: Option<String>,
             password_hash: Option<String>,
             phone: Option<String>,
             email: Option<String>,
@@ -761,6 +876,7 @@ impl UserRepository {
             created_at: i64,
             updated_at: i64,
             last_active_at: Option<i64>,
+            business_system_id: Option<String>,
         }
 
         let rows = sqlx::query_as::<_, UserRow>(
@@ -778,7 +894,8 @@ impl UserRepository {
                 privacy_settings,
                 created_at,
                 updated_at,
-                last_active_at
+                last_active_at,
+                business_system_id
             FROM privchat_users
             WHERE 
                 LOWER(username) LIKE LOWER($1)
@@ -810,6 +927,7 @@ impl UserRepository {
                     r.created_at,
                     r.updated_at,
                     r.last_active_at,
+                    r.business_system_id,
                 )
             })
             .collect())

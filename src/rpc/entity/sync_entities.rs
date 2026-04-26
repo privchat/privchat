@@ -166,7 +166,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
                         "user_id": user.id,
                         "uid": user.id,
                         "username": user.username,
-                        "nickname": user.display_name.clone().unwrap_or_else(|| user.username.clone()),
+                        "nickname": user.display_name.clone().unwrap_or_else(|| user.username_or_default()),
                         "avatar": user.avatar_url.clone().unwrap_or_default(),
                         "user_type": user.user_type,
                         "status": user.status,

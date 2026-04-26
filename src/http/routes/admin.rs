@@ -297,28 +297,34 @@ fn extract_service_key(headers: &HeaderMap) -> Result<String> {
 // 用户管理
 // =====================================================
 
-/// 创建用户请求
+/// 创建用户请求（v1.2 service API）
+///
+/// 所有标识字段（username / phone / email）均可选；三者全空也合法（创建占位 uid）。
+/// 详细语义见 `docs/spec/02-server/api/USER_API.md` §3。
 #[derive(Debug, Deserialize)]
 struct CreateUserRequest {
-    /// 用户名（必填，唯一）
-    username: String,
+    /// 用户名（可选；v1.2 起可空）
+    username: Option<String>,
     /// 显示名称（可选）
     display_name: Option<String>,
     /// 邮箱（可选）
     email: Option<String>,
-    /// 手机号（可选）
+    /// 手机号（可选；非空时必须 E.164 格式 `^\+[1-9]\d{1,14}$`）
     phone: Option<String>,
     /// 头像URL（可选）
     avatar_url: Option<String>,
-    /// 用户类型（可选，默认根据ID自动推断）
+    /// 用户类型（可选，默认 0=NORMAL）
     user_type: Option<i16>,
+    /// 业务系统标识（可选，仅落审计）
+    business_system_id: Option<String>,
 }
 
-/// 创建用户
+/// 创建用户（多键幂等）
 ///
-/// POST /api/admin/users
+/// `POST /api/service/users`（v1.2）/ `POST /api/admin/users`（兼容别名）
 ///
-/// 用于业务系统为已有用户创建IM账号
+/// 行为详见 USER_API §3：phone > email > username 顺序判幂等；命中已有用户返回
+/// `created=false` + 不覆盖任何字段；全空合法。
 async fn create_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -333,11 +339,15 @@ async fn create_user(
         phone,
         avatar_url,
         user_type,
+        business_system_id,
     } = request;
 
-    info!("创建用户: username={}", username);
+    info!(
+        "创建用户: phone={:?}, email={:?}, username={:?}, business_system_id={:?}",
+        phone, email, username, business_system_id
+    );
 
-    let created_user = state
+    let outcome = state
         .user_service
         .create_user_admin(crate::service::CreateUserAdminParams {
             username,
@@ -346,20 +356,24 @@ async fn create_user(
             phone,
             avatar_url,
             user_type,
+            business_system_id,
         })
         .await?;
 
+    let created_flag = outcome.was_created();
+    let user = outcome.into_user();
+
     Ok(Json(json!({
-        "success": true,
-        "user_id": created_user.id,
-        "username": created_user.username,
-        "display_name": created_user.display_name,
-        "email": created_user.email,
-        "phone": created_user.phone,
-        "avatar_url": created_user.avatar_url,
-        "user_type": created_user.user_type,
-        "created_at": created_user.created_at.timestamp_millis(),
-        "message": "用户创建成功"
+        "user_id": user.id,
+        "created": created_flag,
+        "username": user.username,
+        "display_name": user.display_name,
+        "email": user.email,
+        "phone": user.phone,
+        "avatar_url": user.avatar_url,
+        "user_type": user.user_type,
+        "business_system_id": user.business_system_id,
+        "created_at": user.created_at.timestamp_millis(),
     })))
 }
 
@@ -1999,7 +2013,7 @@ async fn get_user_connection(
 
     Ok(Json(dto::UserConnectionResponse {
         user_id,
-        username: user_info.as_ref().map(|u| u.username.clone()),
+        username: user_info.as_ref().and_then(|u| u.username.clone()),
         nickname: user_info.as_ref().and_then(|u| u.display_name.clone()),
         online: !connections.is_empty(),
         devices: connections

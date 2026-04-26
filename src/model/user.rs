@@ -27,8 +27,8 @@ use sqlx::Type;
 pub struct User {
     /// 用户ID
     pub id: u64, // 数据库中是 BIGINT
-    /// 用户名
-    pub username: String,
+    /// 用户名（v1.2 起可空：phone-only / email-only / 占位 uid 创建路径无 username）
+    pub username: Option<String>,
     /// 密码哈希（bcrypt）
     ///
     /// - 内置账号系统：必需（由服务器生成）
@@ -55,30 +55,33 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
     /// 最后活跃时间（数据库存储为 BIGINT 毫秒时间戳）
     pub last_active_at: Option<DateTime<Utc>>,
+    /// 业务系统标识（v1.2 service API 审计字段，仅落库，不参与 IM 业务逻辑）
+    pub business_system_id: Option<String>,
 }
 
 impl User {
-    /// 创建新用户
+    /// 创建新用户（兼容签名：内置账号系统传入 username 必非空，包成 Some）
     pub fn new(id: u64, username: String) -> Self {
         let now = Utc::now();
         Self {
             id,
-            username,
+            username: Some(username),
             password_hash: None,
             phone: None,
             display_name: None,
             email: None,
             avatar_url: None,
-            user_type: Self::infer_user_type(id), // 根据 ID 自动推断类型
+            user_type: Self::infer_user_type(id),
             status: UserStatus::Active,
             privacy_settings: Value::Object(serde_json::Map::new()),
             created_at: now,
             updated_at: now,
             last_active_at: Some(now),
+            business_system_id: None,
         }
     }
 
-    /// 创建完整用户信息
+    /// 创建完整用户信息（兼容签名：保留 String username 入参，调用方一律传非空）
     pub fn new_with_details(
         id: u64,
         username: String,
@@ -89,45 +92,63 @@ impl User {
         let now = Utc::now();
         Self {
             id,
-            username,
+            username: Some(username),
             password_hash: None,
             phone: None,
             display_name,
             email,
             avatar_url,
-            user_type: Self::infer_user_type(id), // 根据 ID 自动推断类型
+            user_type: Self::infer_user_type(id),
             status: UserStatus::Active,
             privacy_settings: Value::Object(serde_json::Map::new()),
             created_at: now,
             updated_at: now,
             last_active_at: Some(now),
+            business_system_id: None,
+        }
+    }
+
+    /// v1.2 service API 创建路径专用：username/phone/email 全可选，三者全空也合法（占位 uid）
+    pub fn new_admin(
+        id: u64,
+        username: Option<String>,
+        phone: Option<String>,
+        email: Option<String>,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+        user_type: i16,
+        business_system_id: Option<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id,
+            username,
+            password_hash: None,
+            phone,
+            display_name,
+            email,
+            avatar_url,
+            user_type,
+            status: UserStatus::Active,
+            privacy_settings: Value::Object(serde_json::Map::new()),
+            created_at: now,
+            updated_at: now,
+            last_active_at: Some(now),
+            business_system_id,
         }
     }
 
     /// 创建带密码的用户（用于内置账号系统）
     pub fn new_with_password(id: u64, username: String, password_hash: String) -> Self {
-        let now = Utc::now();
-        Self {
-            id,
-            username,
-            password_hash: Some(password_hash),
-            phone: None,
-            display_name: None,
-            email: None,
-            avatar_url: None,
-            user_type: Self::infer_user_type(id), // 根据 ID 自动推断类型
-            status: UserStatus::Active,
-            privacy_settings: Value::Object(serde_json::Map::new()),
-            created_at: now,
-            updated_at: now,
-            last_active_at: Some(now),
-        }
+        let mut user = Self::new(id, username);
+        user.password_hash = Some(password_hash);
+        user
     }
 
     /// 从数据库行创建（处理时间戳和类型转换）
     pub fn from_db_row(
         user_id: i64, // PostgreSQL BIGINT
-        username: String,
+        username: Option<String>,
         password_hash: Option<String>,
         phone: Option<String>,
         email: Option<String>,
@@ -139,6 +160,7 @@ impl User {
         created_at: i64,             // 毫秒时间戳
         updated_at: i64,             // 毫秒时间戳
         last_active_at: Option<i64>, // 毫秒时间戳
+        business_system_id: Option<String>,
     ) -> Self {
         let uid = user_id as u64;
         Self {
@@ -160,6 +182,7 @@ impl User {
             created_at: DateTime::from_timestamp_millis(created_at).unwrap_or_else(|| Utc::now()),
             updated_at: DateTime::from_timestamp_millis(updated_at).unwrap_or_else(|| Utc::now()),
             last_active_at: last_active_at.and_then(|ts| DateTime::from_timestamp_millis(ts)),
+            business_system_id,
         }
     }
 
@@ -168,7 +191,7 @@ impl User {
         &self,
     ) -> (
         i64,
-        String,
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -180,6 +203,7 @@ impl User {
         i64,
         i64,
         Option<i64>,
+        Option<String>,
     ) {
         (
             self.id as i64,
@@ -195,7 +219,23 @@ impl User {
             self.created_at.timestamp_millis(),
             self.updated_at.timestamp_millis(),
             self.last_active_at.map(|dt| dt.timestamp_millis()),
+            self.business_system_id.clone(),
         )
+    }
+
+    /// 显示用名（v1.2 起 username 可空）：display_name → username → "user_{uid}"
+    pub fn display_or_username(&self) -> String {
+        self.display_name
+            .clone()
+            .or_else(|| self.username.clone())
+            .unwrap_or_else(|| format!("user_{}", self.id))
+    }
+
+    /// 取 username（兼容旧调用方）：None 时回退到 "user_{uid}"
+    pub fn username_or_default(&self) -> String {
+        self.username
+            .clone()
+            .unwrap_or_else(|| format!("user_{}", self.id))
     }
 
     /// 更新最后活跃时间

@@ -22,13 +22,14 @@ use crate::model::user::User;
 
 /// 将 User 模型转换为 CachedUserProfile
 pub fn user_to_cached_profile(user: &User) -> CachedUserProfile {
+    let username = user.username_or_default();
     CachedUserProfile {
         user_id: user.id.to_string(),
-        username: user.username.clone(),
+        username: username.clone(),
         nickname: user
             .display_name
             .clone()
-            .unwrap_or_else(|| user.username.clone()),
+            .unwrap_or_else(|| username.clone()),
         avatar_url: user.avatar_url.clone(),
         user_type: user.user_type,
         phone: user.phone.clone(),

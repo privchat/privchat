@@ -207,7 +207,8 @@ impl AdminService {
             .map_err(|e| ServerError::Database(format!("查询用户失败: {}", e)))?
             .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
 
-        let display_name = user.display_name.as_deref().unwrap_or(&user.username);
+        let username_fallback = user.username_or_default();
+        let display_name = user.display_name.as_deref().unwrap_or(&username_fallback);
 
         // 2. 添加用户到群组
         self.channel_service

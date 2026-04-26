@@ -25,15 +25,107 @@ use crate::repository::UserRepository;
 
 /// admin 创建用户的参数集合
 ///
-/// service 内部会做用户名/邮箱的 normalize + 唯一性校验 + 记录持久化。
-#[derive(Debug, Clone)]
+/// v1.2 service API：所有标识字段（username / phone / email）均可选；
+/// 三者全空也合法（创建占位 uid，所有标识字段落 NULL）。
+/// service 内部会做 normalize + 多键幂等检测 + 记录持久化。
+#[derive(Debug, Clone, Default)]
 pub struct CreateUserAdminParams {
-    pub username: String,
+    pub username: Option<String>,
     pub display_name: Option<String>,
     pub email: Option<String>,
     pub phone: Option<String>,
     pub avatar_url: Option<String>,
     pub user_type: Option<i16>,
+    pub business_system_id: Option<String>,
+}
+
+/// `create_user_admin` 的执行结果。
+///
+/// `Created`：本次新建用户；`Existing`：因某个标识字段（phone/email/username）已存在，
+/// 直接返回已有用户，**不**对 existing 做任何字段覆盖。
+pub enum CreateUserOutcome {
+    Created(User),
+    Existing(User),
+}
+
+impl CreateUserOutcome {
+    pub fn into_user(self) -> User {
+        match self {
+            CreateUserOutcome::Created(u) | CreateUserOutcome::Existing(u) => u,
+        }
+    }
+
+    pub fn user(&self) -> &User {
+        match self {
+            CreateUserOutcome::Created(u) | CreateUserOutcome::Existing(u) => u,
+        }
+    }
+
+    pub fn was_created(&self) -> bool {
+        matches!(self, CreateUserOutcome::Created(_))
+    }
+}
+
+/// E.164 手机号格式校验：`+` 开头 + 首位非 0 + 1-14 位数字。
+///
+/// 不做猜测式规范化（如自动加 `+86`）；不合法直接拒绝。
+pub fn validate_phone_e164(phone: &str) -> bool {
+    let bytes = phone.as_bytes();
+    if bytes.len() < 3 || bytes.len() > 16 {
+        return false;
+    }
+    if bytes[0] != b'+' {
+        return false;
+    }
+    if !(b'1'..=b'9').contains(&bytes[1]) {
+        return false;
+    }
+    bytes[2..].iter().all(|b| b.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod phone_validator_tests {
+    use super::validate_phone_e164;
+
+    #[test]
+    fn accepts_valid_e164() {
+        assert!(validate_phone_e164("+8613800000000"));
+        assert!(validate_phone_e164("+14155552671"));
+        assert!(validate_phone_e164("+447911123456"));
+        assert!(validate_phone_e164("+1234567890123456".get(..16).unwrap()));
+    }
+
+    #[test]
+    fn rejects_missing_plus() {
+        assert!(!validate_phone_e164("8613800000000"));
+        assert!(!validate_phone_e164("13800000000"));
+    }
+
+    #[test]
+    fn rejects_leading_zero_country_code() {
+        assert!(!validate_phone_e164("+0613800000000"));
+    }
+
+    #[test]
+    fn rejects_non_digit_body() {
+        assert!(!validate_phone_e164("+86 138 0000 0000"));
+        assert!(!validate_phone_e164("+86-138-0000"));
+        assert!(!validate_phone_e164("+86abc"));
+    }
+
+    #[test]
+    fn rejects_too_short_or_too_long() {
+        assert!(!validate_phone_e164(""));
+        assert!(!validate_phone_e164("+"));
+        assert!(!validate_phone_e164("+1"));
+        // > 16 chars (E.164 max = + plus 15 digits)
+        assert!(!validate_phone_e164("+12345678901234567"));
+    }
+
+    #[test]
+    fn rejects_only_plus() {
+        assert!(!validate_phone_e164("+"));
+    }
 }
 
 /// admin 更新用户的参数集合
@@ -83,6 +175,13 @@ impl UserService {
             .map_err(map_db_error_query)
     }
 
+    pub async fn find_by_phone(&self, phone: &str) -> Result<Option<User>, ServerError> {
+        self.user_repository
+            .find_by_phone(phone)
+            .await
+            .map_err(map_db_error_query)
+    }
+
     pub async fn search(&self, query: &str) -> Result<Vec<User>, ServerError> {
         self.user_repository
             .search(query)
@@ -115,11 +214,19 @@ impl UserService {
             .map_err(|e| ServerError::Database(format!("检查用户失败: {}", e)))
     }
 
-    /// admin 创建用户：normalize + 唯一性预检 + 持久化。
+    /// v1.2 service API 创建用户：多键幂等 + E.164 phone 校验 + 字段全可选。
+    ///
+    /// 行为：
+    /// - normalize: username/email trim + lowercase；phone trim；E.164 格式校验
+    /// - 幂等优先级：phone → email → username。任一命中已有用户即返回 `Existing(user)`，
+    ///   不覆盖任何字段
+    /// - 全空（phone/email/username 都 None）合法，创建占位 uid
+    /// - INSERT UNIQUE 冲突兜底：catch 后按 phone/email/username 顺序 re-find，
+    ///   返回 existing；找不到对应 row 才返回错误（极端竞态）
     pub async fn create_user_admin(
         &self,
         params: CreateUserAdminParams,
-    ) -> Result<User, ServerError> {
+    ) -> Result<CreateUserOutcome, ServerError> {
         let CreateUserAdminParams {
             username,
             display_name,
@@ -127,60 +234,117 @@ impl UserService {
             phone,
             avatar_url,
             user_type,
+            business_system_id,
         } = params;
 
-        let normalized_username = username.trim().to_lowercase();
-        if normalized_username.is_empty() {
-            return Err(ServerError::Validation("用户名不能为空".to_string()));
-        }
-
+        // 1. normalize
+        let normalized_phone = phone
+            .as_ref()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
         let normalized_email = email
             .as_ref()
             .map(|val| val.trim().to_lowercase())
             .filter(|val| !val.is_empty());
+        let normalized_username = username
+            .as_ref()
+            .map(|val| val.trim().to_lowercase())
+            .filter(|val| !val.is_empty());
 
-        if self.find_by_username(&normalized_username).await?.is_some() {
-            return Err(ServerError::Validation(format!(
-                "用户名 {} 已存在",
-                normalized_username
-            )));
-        }
-
-        if let Some(ref email_val) = normalized_email {
-            if self.find_by_email(email_val).await?.is_some() {
-                return Err(ServerError::Validation(format!("邮箱 {} 已存在", email_val)));
+        // 2. phone 强制 E.164
+        if let Some(ref phone_val) = normalized_phone {
+            if !validate_phone_e164(phone_val) {
+                return Err(ServerError::Validation(format!(
+                    "INVALID_PHONE_FORMAT: phone must be E.164 (e.g. +8613800000000), got {}",
+                    phone_val
+                )));
             }
         }
 
-        let mut user = User::new_with_details(
+        // 3. 幂等预检：phone → email → username
+        if let Some(ref phone_val) = normalized_phone {
+            if let Some(existing) = self.find_by_phone(phone_val).await? {
+                info!(
+                    "ℹ️ 幂等命中（phone）: user_id={}, phone={}",
+                    existing.id, phone_val
+                );
+                return Ok(CreateUserOutcome::Existing(existing));
+            }
+        }
+        if let Some(ref email_val) = normalized_email {
+            if let Some(existing) = self.find_by_email(email_val).await? {
+                info!(
+                    "ℹ️ 幂等命中（email）: user_id={}, email={}",
+                    existing.id, email_val
+                );
+                return Ok(CreateUserOutcome::Existing(existing));
+            }
+        }
+        if let Some(ref username_val) = normalized_username {
+            if let Some(existing) = self.find_by_username(username_val).await? {
+                info!(
+                    "ℹ️ 幂等命中（username）: user_id={}, username={}",
+                    existing.id, username_val
+                );
+                return Ok(CreateUserOutcome::Existing(existing));
+            }
+        }
+
+        // 4. 构造新 user 并持久化
+        let user = User::new_admin(
             0,
-            normalized_username,
+            normalized_username.clone(),
+            normalized_phone.clone(),
+            normalized_email.clone(),
             display_name,
-            normalized_email,
             avatar_url,
-        );
-        if let Some(phone) = phone {
-            user.phone = Some(phone);
-        }
-        if let Some(user_type) = user_type {
-            user.user_type = user_type;
-        }
-
-        let created = self
-            .user_repository
-            .create(&user)
-            .await
-            .map_err(|e| match e {
-                DatabaseError::DuplicateEntry(msg) => ServerError::Validation(msg),
-                other => ServerError::Database(format!("创建用户失败: {}", other)),
-            })?;
-
-        info!(
-            "✅ 用户创建成功: user_id={}, username={}",
-            created.id, created.username
+            user_type.unwrap_or(0),
+            business_system_id,
         );
 
-        Ok(created)
+        match self.user_repository.create(&user).await {
+            Ok(created) => {
+                info!(
+                    "✅ 用户创建成功: user_id={}, username={}, phone={}",
+                    created.id,
+                    created.username.as_deref().unwrap_or("<none>"),
+                    created.phone.as_deref().unwrap_or("<none>")
+                );
+                Ok(CreateUserOutcome::Created(created))
+            }
+            Err(DatabaseError::DuplicateEntry(msg)) => {
+                // 并发兜底：另一个请求在我们 pre-check 后抢先 INSERT，按相同优先级 re-find
+                if let Some(ref phone_val) = normalized_phone {
+                    if let Some(existing) = self.find_by_phone(phone_val).await? {
+                        info!(
+                            "ℹ️ 并发幂等命中（phone）: user_id={}, phone={}",
+                            existing.id, phone_val
+                        );
+                        return Ok(CreateUserOutcome::Existing(existing));
+                    }
+                }
+                if let Some(ref email_val) = normalized_email {
+                    if let Some(existing) = self.find_by_email(email_val).await? {
+                        info!(
+                            "ℹ️ 并发幂等命中（email）: user_id={}, email={}",
+                            existing.id, email_val
+                        );
+                        return Ok(CreateUserOutcome::Existing(existing));
+                    }
+                }
+                if let Some(ref username_val) = normalized_username {
+                    if let Some(existing) = self.find_by_username(username_val).await? {
+                        info!(
+                            "ℹ️ 并发幂等命中（username）: user_id={}, username={}",
+                            existing.id, username_val
+                        );
+                        return Ok(CreateUserOutcome::Existing(existing));
+                    }
+                }
+                Err(ServerError::Validation(msg))
+            }
+            Err(other) => Err(ServerError::Database(format!("创建用户失败: {}", other))),
+        }
     }
 
     /// admin 更新用户：拉取现有用户 -> 按 patch 语义 merge -> 持久化。

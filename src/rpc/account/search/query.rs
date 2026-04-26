@@ -129,19 +129,20 @@ pub async fn handle(
                 .await
             {
                 Ok(search_record) => {
+                    let username = user.username_or_default();
                     tracing::debug!(
                         "✨ 创建搜索记录: username={}, user_id={}, search_session_id={}",
-                        user.username,
+                        username,
                         user_id,
                         search_record.search_session_id
                     );
                     results.push(SearchedUser {
                         user_id: user.id,
-                        username: user.username.clone(),
+                        username: username.clone(),
                         nickname: user
                             .display_name
                             .clone()
-                            .unwrap_or_else(|| user.username.clone()),
+                            .unwrap_or_else(|| username.clone()),
                         avatar_url: user.avatar_url.clone(),
                         user_type: user.user_type,
                         search_session_id: search_record.search_session_id,
@@ -151,14 +152,15 @@ pub async fn handle(
                 }
                 Err(e) => {
                     tracing::warn!("⚠️ 创建搜索记录失败: {} -> {}: {}", searcher_id, user_id, e);
+                    let username = user.username_or_default();
                     // 继续处理，但使用默认的 search_session_id
                     results.push(SearchedUser {
                         user_id: user.id,
-                        username: user.username.clone(),
+                        username: username.clone(),
                         nickname: user
                             .display_name
                             .clone()
-                            .unwrap_or_else(|| user.username.clone()),
+                            .unwrap_or_else(|| username.clone()),
                         avatar_url: user.avatar_url.clone(),
                         user_type: user.user_type,
                         search_session_id: 0, // 搜索记录创建失败时使用默认值
