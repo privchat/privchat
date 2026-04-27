@@ -57,14 +57,26 @@ use tracing::{debug, info, warn};
 /// 创建管理 API 路由（返回相对路径 router，由 caller 决定前缀挂载点）
 pub fn create_route() -> Router<AdminServerState> {
     Router::new()
-        // Token 管理（三方对接接口）
-        .route("/token/issue", post(issue_token))
+        // Token 管理
+        .route("/token/issue", post(issue_token)) // legacy 别名（v1.0/v1.1），保留向后兼容
+        .route(
+            "/users/{user_id}/tokens",
+            post(issue_token_for_user), // v1.2 新路径：uid-scoped IM token 签发
+        )
         // 用户管理
         .route("/users", post(create_user)) // 创建用户
         .route("/users", get(list_users))
+        .route(
+            "/users/by-mobile/{mobile}", // v1.2 新增：按手机号查询 uid（注册前判重）
+            get(get_user_by_mobile),
+        )
         .route("/users/{user_id}", get(get_user))
         .route("/users/{user_id}", put(update_user))
         .route("/users/{user_id}", delete(delete_user))
+        .route(
+            "/users/{user_id}/sessions/bump", // v1.2 新增：bump 全设备 session_version（不踢）
+            post(bump_user_sessions),
+        )
         // 群组管理
         .route("/groups", get(list_groups))
         .route("/groups/{group_id}", get(get_group))
@@ -279,6 +291,152 @@ async fn issue_token(
         .await?;
 
     Ok(Json(response))
+}
+
+/// v1.2 新增：uid-scoped IM Token 签发请求
+///
+/// 请求体不含 `user_id`（uid 来自 URL path）；其它字段与 [`IssueTokenRequest`] 一致。
+#[derive(Debug, Deserialize)]
+struct UidScopedIssueTokenRequest {
+    /// 设备ID（可选，UUID v4）
+    device_id: Option<String>,
+    /// 设备信息
+    device_info: crate::auth::models::DeviceInfo,
+    /// 自定义 TTL (秒)
+    ttl: Option<i64>,
+    /// 业务系统标识（v1.2 起可选；仅审计）
+    #[serde(default)]
+    business_system_id: Option<String>,
+}
+
+/// v1.2 新路径：按 uid 签发 IM Token
+///
+/// `POST /api/service/users/{user_id}/tokens`
+///
+/// 跟老的 `POST /api/admin/token/issue` 等价，但路径上把 uid 显式从 body 提到 path，
+/// 同时返回 `session_version` + `device_created`。老路径保留为 deprecated alias。
+async fn issue_token_for_user(
+    State(state): State<AdminServerState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+    Json(req): Json<UidScopedIssueTokenRequest>,
+) -> Result<Json<IssueTokenResponse>> {
+    verify_service_key(&headers, &state).await?;
+
+    // 校验 uid 存在（404 USER_NOT_FOUND）
+    if !state.user_service.exists(user_id).await? {
+        return Err(ServerError::NotFound(format!("USER_NOT_FOUND: uid {}", user_id)));
+    }
+
+    let request = IssueTokenRequest {
+        user_id,
+        business_system_id: req.business_system_id.unwrap_or_default(),
+        device_id: req.device_id,
+        device_info: req.device_info,
+        ttl: req.ttl,
+    };
+
+    debug!("收到 uid-scoped token 签发请求: user_id={}", user_id);
+
+    let response = state
+        .token_issue_service
+        .issue_token(
+            &extract_service_key(&headers)?,
+            request,
+            addr.ip().to_string(),
+        )
+        .await?;
+
+    Ok(Json(response))
+}
+
+/// v1.2 新路径：按手机号查询用户
+///
+/// `GET /api/service/users/by-mobile/{mobile}`
+///
+/// `mobile` 必须 E.164 格式（与 USER_API §3 创建路径一致）；命中返回最少必要字段，
+/// 未命中 404 USER_NOT_FOUND，非法格式 400 INVALID_PHONE_FORMAT。
+async fn get_user_by_mobile(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(mobile): Path<String>,
+) -> Result<Json<Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    let trimmed = mobile.trim();
+    if !crate::service::validate_phone_e164(trimmed) {
+        return Err(ServerError::Validation(format!(
+            "INVALID_PHONE_FORMAT: phone must be E.164 (e.g. +8613800000000), got {}",
+            trimmed
+        )));
+    }
+
+    let user = state
+        .user_service
+        .find_by_phone(trimmed)
+        .await?
+        .ok_or_else(|| {
+            ServerError::NotFound(format!("USER_NOT_FOUND: no user with phone {}", trimmed))
+        })?;
+
+    Ok(Json(json!({
+        "user_id": user.id,
+        "username": user.username,
+        "phone": user.phone,
+        "email": user.email,
+        "display_name": user.display_name,
+        "avatar_url": user.avatar_url,
+        "user_type": user.user_type,
+        "status": user.status as i16,
+        "business_system_id": user.business_system_id,
+        "created_at": user.created_at.timestamp_millis(),
+        "updated_at": user.updated_at.timestamp_millis(),
+    })))
+}
+
+/// v1.2 新增：bump 用户全设备 session_version（不踢、不改 state）
+///
+/// `POST /api/service/users/{user_id}/sessions/bump`
+///
+/// 与 `revoke-all-devices` 的差别：本接口仅推进 `session_version`，旧 IM token
+/// 因版本不匹配而失效，但用户可立即重新登录（不进入 Revoked 终态）。
+/// 改密、改手机号等场景使用。
+#[derive(Debug, Deserialize, Default)]
+struct BumpSessionsRequest {
+    /// 自由文本，落审计；可选
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn bump_user_sessions(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(user_id): Path<u64>,
+    body: Option<Json<BumpSessionsRequest>>,
+) -> Result<Json<Value>> {
+    verify_service_key(&headers, &state).await?;
+
+    if !state.user_service.exists(user_id).await? {
+        return Err(ServerError::NotFound(format!("USER_NOT_FOUND: uid {}", user_id)));
+    }
+
+    let reason = body
+        .and_then(|Json(req)| req.reason)
+        .unwrap_or_else(|| "service_bump".to_string());
+
+    let devices_affected = state.device_manager_db.bump_user_sessions(user_id).await?;
+
+    info!(
+        "✅ sessions bumped: user_id={}, devices_affected={}, reason={}",
+        user_id, devices_affected, reason
+    );
+
+    Ok(Json(json!({
+        "user_id": user_id,
+        "devices_affected": devices_affected,
+        "reason": reason,
+    })))
 }
 
 /// 从请求头中提取 Service Key（内部使用）

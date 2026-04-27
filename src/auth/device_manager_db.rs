@@ -319,6 +319,40 @@ impl DeviceManagerDb {
         Ok(result.session_version)
     }
 
+    /// v1.2 新增：bump 用户全部设备的 session_version（不改 session_state）。
+    ///
+    /// 用途：改密改手机后强制旧 IM token 失效，但用户可立即重新登录。
+    /// 与 [`revoke_all_devices`] 的差别：本接口**不**把 `session_state` 改成 Revoked，
+    /// 也**不**写 `kicked_at` / `kicked_reason`。
+    ///
+    /// 仅 bump `session_state = 0 (Active)` 的设备；已被 Kicked / Revoked 的设备不受影响。
+    pub async fn bump_user_sessions(&self, user_id: u64) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let result = sqlx::query!(
+            r#"
+            UPDATE privchat_devices
+            SET
+                session_version = session_version + 1,
+                updated_at = $1
+            WHERE user_id = $2 AND session_state = 0
+            "#,
+            now,
+            user_id as i64,
+        )
+        .execute(&*self.db_pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("bump session 失败: {}", e)))?;
+
+        let count = result.rows_affected() as usize;
+        info!(
+            "✅ user 全设备 session_version bumped: user_id={}, devices_affected={}",
+            user_id, count
+        );
+
+        Ok(count)
+    }
+
     /// 撤销所有设备（用于密码修改、账号注销等）
     pub async fn revoke_all_devices(&self, user_id: u64, reason: &str) -> Result<usize> {
         let now = chrono::Utc::now().timestamp_millis();
@@ -388,13 +422,20 @@ impl DeviceManagerDb {
     // =====================================================
 
     /// 注册新设备或更新现有设备
-    pub async fn register_or_update_device(&self, device: &Device) -> Result<()> {
+    ///
+    /// 返回 `(created, session_version)`：
+    /// - `created = true`  本次新建设备记录
+    /// - `created = false` 复用已有设备记录（仅更新 device_name / app_version 等元数据）
+    /// - `session_version` 为当前设备最新版本号（不会在此接口被 bump）
+    ///
+    /// `(xmax = 0)` 是 PostgreSQL `INSERT ... ON CONFLICT` 中区分新行和更新行的常用技巧。
+    pub async fn register_or_update_device(&self, device: &Device) -> Result<(bool, i64)> {
         let device_uuid = Uuid::parse_str(&device.device_id)
             .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
 
         let now = chrono::Utc::now();
 
-        sqlx::query!(
+        let row = sqlx::query!(
             r#"
             INSERT INTO privchat_devices (
                 device_id, user_id, device_type, device_name, device_model,
@@ -402,7 +443,7 @@ impl DeviceManagerDb {
                 last_active_at, last_ip, created_at
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, 0, $8, $9, $8)
-            ON CONFLICT (user_id, device_id) 
+            ON CONFLICT (user_id, device_id)
             DO UPDATE SET
                 device_name = EXCLUDED.device_name,
                 device_model = EXCLUDED.device_model,
@@ -410,6 +451,7 @@ impl DeviceManagerDb {
                 app_version = EXCLUDED.app_version,
                 last_active_at = EXCLUDED.last_active_at,
                 last_ip = EXCLUDED.last_ip
+            RETURNING (xmax = 0) AS created, session_version
             "#,
             device_uuid,
             device.user_id as i64,
@@ -421,13 +463,21 @@ impl DeviceManagerDb {
             now.timestamp_millis(),
             device.ip_address,
         )
-        .execute(&*self.db_pool)
+        .fetch_one(&*self.db_pool)
         .await
         .map_err(|e| ServerError::Database(format!("注册设备失败: {}", e)))?;
 
-        info!("✅ 设备已注册/更新: device_id={}", device.device_id);
+        let created = row.created.unwrap_or(false);
+        let session_version = row.session_version;
 
-        Ok(())
+        info!(
+            "✅ 设备已{}: device_id={}, session_version={}",
+            if created { "新建" } else { "更新" },
+            device.device_id,
+            session_version
+        );
+
+        Ok((created, session_version))
     }
 
     /// 获取设备信息和会话版本

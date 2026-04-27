@@ -86,49 +86,63 @@ impl TokenIssueService {
             Uuid::new_v4().to_string()
         };
 
-        // 4. 签发 IM token
-        let im_token = self.jwt_service.issue_token(
-            request.user_id,
-            &device_id,
-            &request.business_system_id,
-            &request.device_info.app_id,
-            request.ttl,
-        )?;
-
-        // 5. 解析 token 获取 claims (提取 jti)
-        let claims = self.jwt_service.verify_token(&im_token)?;
-
-        // 6. 注册设备
-        let device = Device {
+        // 4. 先 UPSERT 设备到 DB，拿到真实 session_version 与 device_created。
+        //    顺序很关键：必须在 jwt 签发之前完成，确保 token 内嵌的 session_version
+        //    与 DB 一致；新建设备 version=1，复用设备 version 不变（签发不 bump）。
+        let mut device_created = true;
+        let mut session_version: i64 = 1;
+        // 占位 device，先用版本 1 / 空 jti 进 DB upsert（jti 字段不持久化，由内存 manager 维护）
+        let mut device = Device {
             device_id: device_id.clone(),
             user_id: request.user_id,
             business_system_id: request.business_system_id.clone(),
             device_info: request.device_info.clone(),
             device_type: DeviceType::from_app_id(&request.device_info.app_id),
-            token_jti: claims.jti,
-            session_version: 1,                               // ✨ 新增
-            session_state: crate::auth::SessionState::Active, // ✨ 新增
-            kicked_at: None,                                  // ✨ 新增
-            kicked_reason: None,                              // ✨ 新增
+            token_jti: String::new(),
+            session_version: 1,
+            session_state: crate::auth::SessionState::Active,
+            kicked_at: None,
+            kicked_reason: None,
             last_active_at: Utc::now(),
             created_at: Utc::now(),
             ip_address: ip_address.clone(),
         };
-
-        // 同时注册到内存和数据库
-        self.device_manager.register_device(device.clone()).await?;
         if let Some(ref db) = self.device_manager_db {
-            if let Err(e) = db.register_or_update_device(&device).await {
-                warn!("⚠️ 设备写入数据库失败（内存已注册）: {}", e);
+            match db.register_or_update_device(&device).await {
+                Ok((created, version)) => {
+                    device_created = created;
+                    session_version = version;
+                }
+                Err(e) => {
+                    warn!("⚠️ 设备写入数据库失败（内存仍会注册）: {}", e);
+                }
             }
         }
+
+        // 5. 用真实 session_version 签 IM token，确保 token claim 与 DB 一致
+        let im_token = self.jwt_service.issue_token_with_version(
+            request.user_id,
+            &device_id,
+            &request.business_system_id,
+            &request.device_info.app_id,
+            session_version,
+            request.ttl,
+        )?;
+
+        // 6. 解析 token 获取 claims (提取 jti)
+        let claims = self.jwt_service.verify_token(&im_token)?;
+
+        // 7. 用真实 jti + version 注册到内存 manager
+        device.token_jti = claims.jti;
+        device.session_version = session_version;
+        self.device_manager.register_device(device.clone()).await?;
 
         let ttl = request.ttl.unwrap_or(self.jwt_service.default_ttl());
         let expires_at = Utc::now() + chrono::Duration::seconds(ttl);
 
         info!(
-            "✅ Token 签发成功: user_id={}, device_id={}, business_system={}",
-            request.user_id, device_id, request.business_system_id
+            "✅ Token 签发成功: user_id={}, device_id={}, business_system={}, created={}, session_version={}",
+            request.user_id, device_id, request.business_system_id, device_created, session_version
         );
 
         Ok(IssueTokenResponse {
@@ -136,6 +150,8 @@ impl TokenIssueService {
             device_id,
             expires_in: ttl,
             expires_at,
+            session_version,
+            device_created,
         })
     }
 
@@ -148,13 +164,7 @@ impl TokenIssueService {
 
         // device_id 的验证在 issue_token 中处理（需要解析 UUID）
 
-        // 验证 business_system_id
-        if request.business_system_id.is_empty() {
-            return Err(ServerError::Validation(
-                "business_system_id 不能为空".to_string(),
-            ));
-        }
-
+        // 验证 business_system_id（v1.2 起可选，仅审计；上限 255）
         if request.business_system_id.len() > 255 {
             return Err(ServerError::Validation(
                 "business_system_id 长度不能超过 255".to_string(),

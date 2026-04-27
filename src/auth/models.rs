@@ -202,6 +202,16 @@ pub struct IssueTokenResponse {
 
     /// 过期时间戳
     pub expires_at: DateTime<Utc>,
+
+    /// 当前设备的 session_version（v1.2 新增）
+    ///
+    /// 客户端不需要关心；application 用于审计或与 sessions/bump 对账。
+    pub session_version: i64,
+
+    /// 是否本次新建设备记录（v1.2 新增）
+    ///
+    /// `true` = 首次为该 (user_id, device_id) 创建记录；`false` = 复用已有设备。
+    pub device_created: bool,
 }
 
 /// 设备列表响应
