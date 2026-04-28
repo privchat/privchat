@@ -152,9 +152,63 @@ impl fmt::Display for ServerError {
 
 impl StdError for ServerError {}
 
-impl IntoResponse for ServerError {
-    fn into_response(self) -> Response {
-        let status_code = match &self {
+impl ServerError {
+    /// 映射到 `protocol::ErrorCode`（数字码，跨 HTTP/RPC/TCP 唯一来源）。
+    ///
+    /// 完整映射表见 `docs/spec/02-server/SERVICE_RESPONSE_ENVELOPE_SPEC.md` §4.1。
+    /// `Validation` / `DuplicateEntry` 会根据 message 前缀进一步分流（见 §4.2）。
+    pub fn protocol_code(&self) -> privchat_protocol::ErrorCode {
+        use privchat_protocol::ErrorCode as P;
+        match self {
+            ServerError::Internal(_) => P::InternalError,
+            ServerError::Authentication(_) => P::AuthRequired,
+            ServerError::Authorization(_) => P::PermissionDenied,
+            ServerError::Validation(msg) => {
+                subcode_from_message(msg).unwrap_or(P::InvalidParams)
+            }
+            ServerError::UserNotFound(_) => P::UserNotFound,
+            ServerError::ChannelNotFound(_) => P::ChannelNotFound,
+            ServerError::MessageNotFound(_) => P::MessageNotFound,
+            ServerError::NotInChannel(_) => P::OperationNotAllowed,
+            ServerError::Database(_) => P::DatabaseError,
+            ServerError::Network(_) => P::NetworkError,
+            ServerError::Serialization(_) => P::EncodingError,
+            ServerError::Configuration(_) => P::InternalError,
+            ServerError::Cache(_) => P::CacheError,
+            ServerError::RateLimit(_) => P::RateLimitExceeded,
+            ServerError::ResourceExhausted(_) => P::ConcurrentLimitExceeded,
+            ServerError::Timeout(_) => P::Timeout,
+            ServerError::Unsupported(_) => P::OperationNotAllowed,
+            ServerError::InvalidRequest(_) => P::InvalidParams,
+            ServerError::Duplicate(_) => P::OperationConflict,
+            ServerError::PermissionDenied(_) => P::PermissionDenied,
+            ServerError::ServiceUnavailable(_) => P::ServiceUnavailable,
+            ServerError::VersionMismatch(_) => P::VersionError,
+            ServerError::Unknown(_) => P::SystemError,
+            ServerError::InvalidToken => P::InvalidToken,
+            ServerError::TokenExpired => P::TokenExpired,
+            ServerError::TokenRevoked => P::TokenRevoked,
+            ServerError::Unauthorized(_) => P::AuthRequired,
+            ServerError::Protocol(_) => P::ProtocolError,
+            ServerError::BadRequest(_) => P::InvalidParams,
+            ServerError::NotFound(msg) => {
+                subcode_from_message(msg).unwrap_or(P::ResourceNotFound)
+            }
+            ServerError::Forbidden(_) => P::PermissionDenied,
+            ServerError::InvalidDeviceId => P::InvalidParams,
+            ServerError::InvalidDeviceType => P::InvalidParams,
+            ServerError::DuplicateEntry(msg) => {
+                subcode_from_message(msg).unwrap_or(P::OperationConflict)
+            }
+            ServerError::ChannelResyncRequired(_) => P::SyncChannelResyncRequired,
+            ServerError::EntityResyncRequired(_) => P::SyncEntityResyncRequired,
+            ServerError::FullRebuildRequired(_) => P::SyncFullRebuildRequired,
+        }
+    }
+
+    /// 选择合适的 HTTP status code（见 ENVELOPE_SPEC §3.1 / §4.1）。
+    pub fn http_status(&self) -> StatusCode {
+        match self {
             ServerError::Authentication(_)
             | ServerError::InvalidToken
             | ServerError::TokenExpired
@@ -162,10 +216,15 @@ impl IntoResponse for ServerError {
             | ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::Authorization(_)
             | ServerError::PermissionDenied(_)
-            | ServerError::Forbidden(_) => StatusCode::FORBIDDEN,
+            | ServerError::Forbidden(_)
+            | ServerError::NotInChannel(_)
+            | ServerError::Unsupported(_) => StatusCode::FORBIDDEN,
             ServerError::Validation(_)
             | ServerError::InvalidRequest(_)
-            | ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            | ServerError::BadRequest(_)
+            | ServerError::InvalidDeviceId
+            | ServerError::InvalidDeviceType
+            | ServerError::VersionMismatch(_) => StatusCode::BAD_REQUEST,
             ServerError::UserNotFound(_)
             | ServerError::ChannelNotFound(_)
             | ServerError::MessageNotFound(_)
@@ -175,13 +234,51 @@ impl IntoResponse for ServerError {
             | ServerError::ChannelResyncRequired(_)
             | ServerError::EntityResyncRequired(_)
             | ServerError::FullRebuildRequired(_) => StatusCode::CONFLICT,
-            ServerError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
+            ServerError::RateLimit(_) | ServerError::ResourceExhausted(_) => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             ServerError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ServerError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        }
+    }
+}
 
-        let error_response = ErrorResponse::new(&self);
-        (status_code, Json(error_response)).into_response()
+/// 从错误 message 前缀分流到具体 `protocol::ErrorCode`（见 ENVELOPE_SPEC §4.2）。
+///
+/// USER_API §3 / TOKEN_API 等约定调用方写 `<TAG>: <detail>` 形式的 message。
+/// 本函数识别这些 tag 并返对应精确码；不识别返 `None`，由调用 variant 走默认映射。
+fn subcode_from_message(msg: &str) -> Option<privchat_protocol::ErrorCode> {
+    use privchat_protocol::ErrorCode as P;
+    // 兼容 Display 加了 "<Variant Display>: " 前缀的情形
+    let trimmed = msg
+        .strip_prefix("Validation error: ")
+        .or_else(|| msg.strip_prefix("Not found: "))
+        .or_else(|| msg.strip_prefix("Duplicate entry: "))
+        .unwrap_or(msg);
+    if trimmed.starts_with("INVALID_USER_IDENTITY") {
+        Some(P::MissingRequiredParam)
+    } else if trimmed.starts_with("INVALID_PHONE_FORMAT") {
+        Some(P::InvalidFormat)
+    } else if trimmed.starts_with("USER_NOT_FOUND") {
+        Some(P::UserNotFound)
+    } else if trimmed.starts_with("IDENTITY_CONFLICT") {
+        Some(P::OperationConflict)
+    } else {
+        None
+    }
+}
+
+impl IntoResponse for ServerError {
+    fn into_response(self) -> Response {
+        let status_code = self.http_status();
+        let code = self.protocol_code() as u32;
+        let envelope = serde_json::json!({
+            "code": code,
+            "message": self.to_string(),
+            "data": null,
+        });
+        (status_code, Json(envelope)).into_response()
     }
 }
 

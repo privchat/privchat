@@ -22,8 +22,10 @@
 //! - 管理 API（仅内网）：用户管理、群组管理、统计等
 
 pub mod dto;
+pub mod envelope;
 pub mod middleware;
 pub mod routes;
 pub mod server;
 
+pub use envelope::{ApiEnvelope, ApiResult};
 pub use server::{AdminHttpServer, AdminServerState, FileHttpServer, FileServerState};

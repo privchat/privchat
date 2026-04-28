@@ -40,7 +40,7 @@
 use crate::auth::{IssueTokenRequest, IssueTokenResponse};
 use crate::error::{Result, ServerError};
 use crate::http::dto::admin as dto;
-use crate::http::AdminServerState;
+use crate::http::{ApiEnvelope, ApiResult, AdminServerState};
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::HeaderMap,
@@ -276,7 +276,7 @@ async fn issue_token(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<IssueTokenRequest>,
-) -> Result<Json<IssueTokenResponse>> {
+) -> ApiResult<IssueTokenResponse> {
     verify_service_key(&headers, &state).await?;
 
     debug!("收到 token 签发请求: user_id={}", request.user_id);
@@ -290,7 +290,7 @@ async fn issue_token(
         )
         .await?;
 
-    Ok(Json(response))
+    Ok(ApiEnvelope::ok(response))
 }
 
 /// v1.2 新增：uid-scoped IM Token 签发请求
@@ -321,7 +321,7 @@ async fn issue_token_for_user(
     headers: HeaderMap,
     Path(user_id): Path<u64>,
     Json(req): Json<UidScopedIssueTokenRequest>,
-) -> Result<Json<IssueTokenResponse>> {
+) -> ApiResult<IssueTokenResponse> {
     verify_service_key(&headers, &state).await?;
 
     // 校验 uid 存在（404 USER_NOT_FOUND）
@@ -348,7 +348,7 @@ async fn issue_token_for_user(
         )
         .await?;
 
-    Ok(Json(response))
+    Ok(ApiEnvelope::ok(response))
 }
 
 /// v1.2 新路径：按手机号查询用户
@@ -361,7 +361,7 @@ async fn get_user_by_mobile(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(mobile): Path<String>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let trimmed = mobile.trim();
@@ -380,7 +380,7 @@ async fn get_user_by_mobile(
             ServerError::NotFound(format!("USER_NOT_FOUND: no user with phone {}", trimmed))
         })?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "user_id": user.id,
         "username": user.username,
         "phone": user.phone,
@@ -414,7 +414,7 @@ async fn bump_user_sessions(
     headers: HeaderMap,
     Path(user_id): Path<u64>,
     body: Option<Json<BumpSessionsRequest>>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     if !state.user_service.exists(user_id).await? {
@@ -432,7 +432,7 @@ async fn bump_user_sessions(
         user_id, devices_affected, reason
     );
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "user_id": user_id,
         "devices_affected": devices_affected,
         "reason": reason,
@@ -487,7 +487,7 @@ async fn create_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Json(request): Json<CreateUserRequest>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let CreateUserRequest {
@@ -521,7 +521,7 @@ async fn create_user(
     let created_flag = outcome.was_created();
     let user = outcome.into_user();
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "user_id": user.id,
         "created": created_flag,
         "username": user.username,
@@ -551,7 +551,7 @@ async fn list_users(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<UserListQuery>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let page = params.page.unwrap_or(1);
@@ -586,7 +586,7 @@ async fn list_users(
         })
         .collect();
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "users": user_list,
         "total": total,
         "page": page,
@@ -601,7 +601,7 @@ async fn get_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let user = state
@@ -610,7 +610,7 @@ async fn get_user(
         .await?
         .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "user_id": user.id,
         "username": user.username,
         "display_name": user.display_name,
@@ -643,7 +643,7 @@ async fn update_user(
     headers: HeaderMap,
     Path(user_id): Path<u64>,
     Json(request): Json<UpdateUserRequest>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let UpdateUserRequest {
@@ -668,7 +668,7 @@ async fn update_user(
         )
         .await?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "success": true,
         "user_id": user_id,
         "message": "用户更新成功"
@@ -682,12 +682,12 @@ async fn delete_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     state.user_service.delete_user_admin(user_id).await?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "success": true,
         "user_id": user_id,
         "message": "用户已删除"
@@ -705,7 +705,7 @@ async fn list_groups(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let page = params
@@ -724,7 +724,7 @@ async fn list_groups(
         .await
         .map_err(|e| ServerError::Database(format!("查询群组列表失败: {}", e)))?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "groups": group_list,
         "total": total,
         "page": page,
@@ -739,7 +739,7 @@ async fn get_group(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(group_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let group = state
@@ -751,7 +751,7 @@ async fn get_group(
             _ => ServerError::Database(format!("查询群组详情失败: {}", e)),
         })?;
 
-    Ok(Json(group))
+    Ok(ApiEnvelope::ok(group))
 }
 
 /// 解散群组
@@ -761,7 +761,7 @@ async fn dissolve_group(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(group_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     state
@@ -773,7 +773,7 @@ async fn dissolve_group(
             _ => ServerError::Database(format!("解散群组失败: {}", e)),
         })?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "success": true,
         "group_id": group_id,
         "message": "群组已解散"
@@ -793,7 +793,7 @@ async fn create_room_channel(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Json(payload): Json<dto::CreateRoomChannelRequest>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let channel_id = next_channel_id();
@@ -806,7 +806,7 @@ async fn create_room_channel(
         channel_id, name
     );
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "success": true,
         "channel_id": channel_id,
         "name": name,
@@ -821,7 +821,7 @@ async fn list_room_channels(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let page = params
@@ -853,7 +853,7 @@ async fn list_room_channels(
         })
         .collect();
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "channels": channels,
         "total": total_channels,
         "total_sessions": total_sessions,
@@ -869,12 +869,12 @@ async fn get_room_channel(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(channel_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let online_count = state.subscribe_manager.get_channel_online_count(channel_id);
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "channel_id": channel_id,
         "online_count": online_count,
     })))
@@ -888,7 +888,7 @@ async fn room_broadcast(
     headers: HeaderMap,
     Path(channel_id): Path<u64>,
     Json(payload): Json<dto::RoomBroadcastRequest>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let sessions = state.subscribe_manager.get_channel_sessions(channel_id);
@@ -927,7 +927,7 @@ async fn room_broadcast(
             "📡 Room broadcast: channel_id={}, 无在线订阅者，仅写入历史",
             channel_id
         );
-        return Ok(Json(json!({
+        return Ok(ApiEnvelope::ok(json!({
             "success": true,
             "channel_id": channel_id,
             "online_count": 0,
@@ -981,7 +981,7 @@ async fn room_broadcast(
         channel_id, online_count, delivered
     );
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "success": true,
         "channel_id": channel_id,
         "online_count": online_count,
@@ -1003,7 +1003,7 @@ async fn create_friendship(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Json(request): Json<dto::CreateFriendshipRequest>,
-) -> Result<Json<dto::CreateFriendshipResponse>> {
+) -> ApiResult<dto::CreateFriendshipResponse> {
     verify_service_key(&headers, &state).await?;
 
     let user1_id = request.user1_id;
@@ -1027,7 +1027,7 @@ async fn create_friendship(
             _ => ServerError::Database(format!("创建好友关系失败: {}", e)),
         })?;
 
-    Ok(Json(dto::CreateFriendshipResponse {
+    Ok(ApiEnvelope::ok(dto::CreateFriendshipResponse {
         success: true,
         user1_id,
         user2_id,
@@ -1045,7 +1045,7 @@ async fn list_friendships(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let page = params
@@ -1064,7 +1064,7 @@ async fn list_friendships(
         .await
         .map_err(|e| ServerError::Database(format!("查询好友关系失败: {}", e)))?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "friendships": friendship_list,
         "total": total,
         "page": page,
@@ -1081,7 +1081,7 @@ async fn get_user_friends(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let friend_ids = state
@@ -1103,7 +1103,7 @@ async fn get_user_friends(
         }
     }
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "user_id": user_id,
         "friends": friends,
         "total": friends.len(),
@@ -1121,7 +1121,7 @@ async fn get_user_groups(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let groups = state
@@ -1130,7 +1130,7 @@ async fn get_user_groups(
         .await
         .map_err(|e| ServerError::Database(format!("查询用户群组列表失败: {}", e)))?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "user_id": user_id,
         "groups": groups,
     })))
@@ -1159,7 +1159,7 @@ async fn list_login_logs(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<LoginLogQuery>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let page = params.page.unwrap_or(1);
@@ -1202,7 +1202,7 @@ async fn list_login_logs(
         })
         .collect();
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "logs": log_list,
         "total": log_list.len(),
         "page": page,
@@ -1217,7 +1217,7 @@ async fn get_login_log(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(log_id): Path<i64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let log = state
@@ -1227,7 +1227,7 @@ async fn get_login_log(
         .map_err(|e| ServerError::Database(format!("查询登录日志详情失败: {}", e)))?
         .ok_or_else(|| ServerError::NotFound(format!("登录日志 {} 不存在", log_id)))?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "log_id": log.log_id,
         "user_id": log.user_id,
         "device_id": log.device_id.to_string(),
@@ -1268,7 +1268,7 @@ async fn list_devices(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let page = params
@@ -1315,7 +1315,7 @@ async fn list_devices(
         })
         .collect();
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "devices": device_list,
         "total": total,
         "page": page,
@@ -1330,7 +1330,7 @@ async fn get_device(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(device_id): Path<String>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let device = state
@@ -1354,7 +1354,7 @@ async fn get_device(
         crate::auth::models::DeviceType::Unknown => "unknown",
     };
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "device_id": device.device_id,
         "device_name": device.device_name,
         "device_model": device.device_model,
@@ -1373,7 +1373,7 @@ async fn get_user_devices(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let devices = state
@@ -1409,7 +1409,7 @@ async fn get_user_devices(
         })
         .collect();
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "user_id": user_id,
         "devices": device_list,
         "total": device_list.len(),
@@ -1426,7 +1426,7 @@ async fn get_user_devices(
 async fn get_stats(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     // 用户数
@@ -1451,7 +1451,7 @@ async fn get_stats(
         .await
         .map_err(|e| ServerError::Database(format!("获取设备统计失败: {}", e)))?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "users": {
             "total": user_count,
         },
@@ -1473,12 +1473,12 @@ async fn get_stats(
 async fn get_user_stats(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let total = state.user_service.count().await?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "total": total,
         "active": 0,  // TODO
         "inactive": 0,  // TODO
@@ -1491,7 +1491,7 @@ async fn get_user_stats(
 async fn get_group_stats(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let stats = state
@@ -1500,7 +1500,7 @@ async fn get_group_stats(
         .await
         .map_err(|e| ServerError::Database(format!("获取群组统计失败: {}", e)))?;
 
-    Ok(Json(stats))
+    Ok(ApiEnvelope::ok(stats))
 }
 
 /// 获取消息统计
@@ -1509,12 +1509,12 @@ async fn get_group_stats(
 async fn get_message_stats(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let stats = state.message_service.admin_stats().await?;
 
-    Ok(Json(stats))
+    Ok(ApiEnvelope::ok(stats))
 }
 
 // =====================================================
@@ -1539,7 +1539,7 @@ async fn list_messages(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<MessageQuery>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let page = params.page.unwrap_or(1);
@@ -1557,7 +1557,7 @@ async fn list_messages(
         )
         .await?;
 
-    Ok(Json(json!({
+    Ok(ApiEnvelope::ok(json!({
         "messages": message_list,
         "total": total,
         "page": page,
@@ -1572,7 +1572,7 @@ async fn get_message(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(message_id): Path<u64>,
-) -> Result<Json<Value>> {
+) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     let message = state
@@ -1581,7 +1581,7 @@ async fn get_message(
         .await?
         .ok_or_else(|| ServerError::NotFound(format!("消息 {} 不存在", message_id)))?;
 
-    Ok(Json(message))
+    Ok(ApiEnvelope::ok(message))
 }
 
 // =====================================================
@@ -1596,13 +1596,13 @@ async fn suspend_user(
     headers: HeaderMap,
     Path(user_id): Path<u64>,
     Json(request): Json<dto::SuspendUserRequest>,
-) -> Result<Json<dto::SuspendUserResponse>> {
+) -> ApiResult<dto::SuspendUserResponse> {
     verify_service_key(&headers, &state).await?;
 
     let reason = request.reason.as_deref().unwrap_or("admin_suspend");
     let result = state.admin_service.suspend_user(user_id, reason).await?;
 
-    Ok(Json(dto::SuspendUserResponse {
+    Ok(ApiEnvelope::ok(dto::SuspendUserResponse {
         success: true,
         user_id,
         previous_status: result.previous_status,
@@ -1620,12 +1620,12 @@ async fn unsuspend_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<dto::UnsuspendUserResponse>> {
+) -> ApiResult<dto::UnsuspendUserResponse> {
     verify_service_key(&headers, &state).await?;
 
     let result = state.admin_service.unsuspend_user(user_id).await?;
 
-    Ok(Json(dto::UnsuspendUserResponse {
+    Ok(ApiEnvelope::ok(dto::UnsuspendUserResponse {
         success: true,
         user_id,
         previous_status: result.previous_status,
@@ -1646,7 +1646,7 @@ async fn revoke_device(
     headers: HeaderMap,
     Path(device_id): Path<String>,
     Json(request): Json<dto::RevokeDeviceRequest>,
-) -> Result<Json<dto::RevokeDeviceResponse>> {
+) -> ApiResult<dto::RevokeDeviceResponse> {
     verify_service_key(&headers, &state).await?;
 
     let reason = request.reason.as_deref().unwrap_or("admin_revoke");
@@ -1655,7 +1655,7 @@ async fn revoke_device(
         .revoke_device(request.user_id, &device_id, reason)
         .await?;
 
-    Ok(Json(dto::RevokeDeviceResponse {
+    Ok(ApiEnvelope::ok(dto::RevokeDeviceResponse {
         success: true,
         device_id,
         user_id: request.user_id,
@@ -1671,7 +1671,7 @@ async fn revoke_all_user_devices(
     headers: HeaderMap,
     Path(user_id): Path<u64>,
     Json(request): Json<dto::RevokeAllDevicesRequest>,
-) -> Result<Json<dto::RevokeAllDevicesResponse>> {
+) -> ApiResult<dto::RevokeAllDevicesResponse> {
     verify_service_key(&headers, &state).await?;
 
     let reason = request.reason.as_deref().unwrap_or("admin_revoke_all");
@@ -1680,7 +1680,7 @@ async fn revoke_all_user_devices(
         .revoke_all_devices(user_id, reason)
         .await?;
 
-    Ok(Json(dto::RevokeAllDevicesResponse {
+    Ok(ApiEnvelope::ok(dto::RevokeAllDevicesResponse {
         success: true,
         user_id,
         revoked_count,
@@ -1699,7 +1699,7 @@ async fn list_group_members(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(group_id): Path<u64>,
-) -> Result<Json<dto::ListGroupMembersResponse>> {
+) -> ApiResult<dto::ListGroupMembersResponse> {
     verify_service_key(&headers, &state).await?;
 
     let members = state.channel_service.list_members_admin(group_id).await?;
@@ -1718,7 +1718,7 @@ async fn list_group_members(
 
     let total = member_list.len();
 
-    Ok(Json(dto::ListGroupMembersResponse {
+    Ok(ApiEnvelope::ok(dto::ListGroupMembersResponse {
         group_id,
         members: member_list,
         total,
@@ -1732,7 +1732,7 @@ async fn remove_group_member(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path((group_id, user_id)): Path<(u64, u64)>,
-) -> Result<Json<dto::RemoveGroupMemberResponse>> {
+) -> ApiResult<dto::RemoveGroupMemberResponse> {
     verify_service_key(&headers, &state).await?;
 
     state
@@ -1740,7 +1740,7 @@ async fn remove_group_member(
         .remove_member_admin(group_id, user_id)
         .await?;
 
-    Ok(Json(dto::RemoveGroupMemberResponse {
+    Ok(ApiEnvelope::ok(dto::RemoveGroupMemberResponse {
         success: true,
         group_id,
         user_id,
@@ -1764,7 +1764,7 @@ async fn revoke_message(
     headers: HeaderMap,
     Path(message_id): Path<u64>,
     Json(_request): Json<dto::RevokeMessageRequest>,
-) -> Result<Json<dto::RevokeMessageResponse>> {
+) -> ApiResult<dto::RevokeMessageResponse> {
     verify_service_key(&headers, &state).await?;
 
     let summary = state
@@ -1772,7 +1772,7 @@ async fn revoke_message(
         .revoke_message_admin(message_id, crate::config::SYSTEM_USER_ID)
         .await?;
 
-    Ok(Json(dto::RevokeMessageResponse {
+    Ok(ApiEnvelope::ok(dto::RevokeMessageResponse {
         success: true,
         message_id: summary.message_id,
         channel_id: summary.channel_id,
@@ -1788,7 +1788,7 @@ async fn send_system_message(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Json(request): Json<dto::SendSystemMessageRequest>,
-) -> Result<Json<dto::SendSystemMessageResponse>> {
+) -> ApiResult<dto::SendSystemMessageResponse> {
     verify_service_key(&headers, &state).await?;
 
     let message_type = parse_content_message_type(request.message_type.as_deref());
@@ -1814,7 +1814,7 @@ async fn send_system_message(
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
 
-    Ok(Json(dto::SendSystemMessageResponse {
+    Ok(ApiEnvelope::ok(dto::SendSystemMessageResponse {
         success: true,
         message_id: result.message_id,
         channel_id: request.channel_id,
@@ -1833,7 +1833,7 @@ async fn send_system_message(
 async fn list_shadow_banned(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
-) -> Result<Json<dto::ListShadowBannedResponse>> {
+) -> ApiResult<dto::ListShadowBannedResponse> {
     verify_service_key(&headers, &state).await?;
 
     let banned = state.security_service.list_shadow_banned().await;
@@ -1852,7 +1852,7 @@ async fn list_shadow_banned(
 
     let total = users.len();
 
-    Ok(Json(dto::ListShadowBannedResponse { users, total }))
+    Ok(ApiEnvelope::ok(dto::ListShadowBannedResponse { users, total }))
 }
 
 /// 解除用户的 Shadow Ban
@@ -1862,7 +1862,7 @@ async fn unshadow_ban_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<dto::UnshadowBanResponse>> {
+) -> ApiResult<dto::UnshadowBanResponse> {
     verify_service_key(&headers, &state).await?;
 
     let devices = state
@@ -1877,7 +1877,7 @@ async fn unshadow_ban_user(
         .unban_all_user_devices(user_id, &device_ids)
         .await;
 
-    Ok(Json(dto::UnshadowBanResponse {
+    Ok(ApiEnvelope::ok(dto::UnshadowBanResponse {
         success: true,
         user_id,
         affected_devices: affected,
@@ -1892,7 +1892,7 @@ async fn get_user_security_state(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<dto::UserSecurityStateResponse>> {
+) -> ApiResult<dto::UserSecurityStateResponse> {
     verify_service_key(&headers, &state).await?;
 
     let devices = state
@@ -1920,7 +1920,7 @@ async fn get_user_security_state(
         )
         .collect();
 
-    Ok(Json(dto::UserSecurityStateResponse {
+    Ok(ApiEnvelope::ok(dto::UserSecurityStateResponse {
         user_id,
         devices: devices_dto,
     }))
@@ -1933,7 +1933,7 @@ async fn reset_user_security_state(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<dto::ResetSecurityStateResponse>> {
+) -> ApiResult<dto::ResetSecurityStateResponse> {
     verify_service_key(&headers, &state).await?;
 
     let devices = state
@@ -1948,7 +1948,7 @@ async fn reset_user_security_state(
         .unban_all_user_devices(user_id, &device_ids)
         .await;
 
-    Ok(Json(dto::ResetSecurityStateResponse {
+    Ok(ApiEnvelope::ok(dto::ResetSecurityStateResponse {
         success: true,
         user_id,
         affected_devices: affected,
@@ -1966,12 +1966,12 @@ async fn reset_user_security_state(
 async fn get_online_count(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
-) -> Result<Json<dto::OnlineCountResponse>> {
+) -> ApiResult<dto::OnlineCountResponse> {
     verify_service_key(&headers, &state).await?;
 
     let count = state.connection_manager.get_connection_count().await;
 
-    Ok(Json(dto::OnlineCountResponse {
+    Ok(ApiEnvelope::ok(dto::OnlineCountResponse {
         online_count: count,
     }))
 }
@@ -1986,12 +1986,12 @@ async fn get_online_count(
 async fn health_check(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
-) -> Result<Json<dto::HealthCheckResponse>> {
+) -> ApiResult<dto::HealthCheckResponse> {
     verify_service_key(&headers, &state).await?;
 
     let connections = state.connection_manager.get_connection_count().await;
 
-    Ok(Json(dto::HealthCheckResponse {
+    Ok(ApiEnvelope::ok(dto::HealthCheckResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: 0,
@@ -2013,7 +2013,7 @@ async fn send_message(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Json(request): Json<dto::SendMessageRequest>,
-) -> Result<Json<dto::SendMessageResponse>> {
+) -> ApiResult<dto::SendMessageResponse> {
     verify_service_key(&headers, &state).await?;
 
     let message_type = parse_content_message_type(request.message_type.as_deref());
@@ -2059,7 +2059,7 @@ async fn send_message(
         request.channel_id, request.sender_id, result.message_id, result.pts
     );
 
-    Ok(Json(dto::SendMessageResponse {
+    Ok(ApiEnvelope::ok(dto::SendMessageResponse {
         success: true,
         message_id: result.message_id,
         channel_id: request.channel_id,
@@ -2083,7 +2083,7 @@ async fn add_group_member(
     headers: HeaderMap,
     Path(group_id): Path<u64>,
     Json(request): Json<dto::AddGroupMemberRequest>,
-) -> Result<Json<dto::AddGroupMemberResponse>> {
+) -> ApiResult<dto::AddGroupMemberResponse> {
     verify_service_key(&headers, &state).await?;
 
     let result = state
@@ -2091,7 +2091,7 @@ async fn add_group_member(
         .add_user_to_group_with_announcement(group_id, request.user_id)
         .await?;
 
-    Ok(Json(dto::AddGroupMemberResponse {
+    Ok(ApiEnvelope::ok(dto::AddGroupMemberResponse {
         success: true,
         group_id,
         user_id: request.user_id,
@@ -2113,7 +2113,7 @@ async fn list_online_users(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<dto::PageParams>,
-) -> Result<Json<dto::ListOnlineUsersResponse>> {
+) -> ApiResult<dto::ListOnlineUsersResponse> {
     verify_service_key(&headers, &state).await?;
 
     let page = params.page.unwrap_or(1);
@@ -2142,7 +2142,7 @@ async fn list_online_users(
         .take(page_size as usize)
         .collect();
 
-    Ok(Json(dto::ListOnlineUsersResponse {
+    Ok(ApiEnvelope::ok(dto::ListOnlineUsersResponse {
         users: vec![], // TODO: 聚合用户信息
         total: total_online,
         page,
@@ -2157,7 +2157,7 @@ async fn get_user_connection(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(user_id): Path<u64>,
-) -> Result<Json<dto::UserConnectionResponse>> {
+) -> ApiResult<dto::UserConnectionResponse> {
     verify_service_key(&headers, &state).await?;
 
     let connections = state.connection_manager.get_user_connections(user_id).await;
@@ -2169,7 +2169,7 @@ async fn get_user_connection(
         .ok()
         .flatten();
 
-    Ok(Json(dto::UserConnectionResponse {
+    Ok(ApiEnvelope::ok(dto::UserConnectionResponse {
         user_id,
         username: user_info.as_ref().and_then(|u| u.username.clone()),
         nickname: user_info.as_ref().and_then(|u| u.display_name.clone()),
@@ -2203,7 +2203,7 @@ async fn list_user_channels(
     headers: HeaderMap,
     Path(user_id): Path<u64>,
     Query(params): Query<dto::PageParams>,
-) -> Result<Json<dto::ListChannelsResponse>> {
+) -> ApiResult<dto::ListChannelsResponse> {
     verify_service_key(&headers, &state).await?;
 
     let page = params.page.unwrap_or(1);
@@ -2247,7 +2247,7 @@ async fn list_user_channels(
         })
         .collect();
 
-    Ok(Json(dto::ListChannelsResponse {
+    Ok(ApiEnvelope::ok(dto::ListChannelsResponse {
         channels,
         total: result.1 as usize,
         page,
@@ -2262,7 +2262,7 @@ async fn get_channel(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(channel_id): Path<u64>,
-) -> Result<Json<serde_json::Value>> {
+) -> ApiResult<serde_json::Value> {
     verify_service_key(&headers, &state).await?;
 
     let channel = state
@@ -2272,7 +2272,7 @@ async fn get_channel(
         .map_err(|e| ServerError::Database(format!("获取会话详情失败: {}", e)))?
         .ok_or_else(|| ServerError::NotFound(format!("会话 {} 不存在", channel_id)))?;
 
-    Ok(Json(channel))
+    Ok(ApiEnvelope::ok(channel))
 }
 
 /// 获取会话参与者列表
@@ -2283,7 +2283,7 @@ async fn list_channel_participants(
     headers: HeaderMap,
     Path(channel_id): Path<u64>,
     Query(params): Query<dto::PageParams>,
-) -> Result<Json<serde_json::Value>> {
+) -> ApiResult<serde_json::Value> {
     verify_service_key(&headers, &state).await?;
 
     let page = params.page.unwrap_or(1);
@@ -2295,7 +2295,7 @@ async fn list_channel_participants(
         .await
         .map_err(|e| ServerError::Database(format!("获取参与者列表失败: {}", e)))?;
 
-    Ok(Json(serde_json::json!({
+    Ok(ApiEnvelope::ok(serde_json::json!({
         "channel_id": channel_id,
         "participants": result.0,
         "total": result.1,
@@ -2313,7 +2313,7 @@ async fn broadcast_message(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Json(request): Json<dto::BroadcastRequest>,
-) -> Result<Json<dto::BroadcastResponse>> {
+) -> ApiResult<dto::BroadcastResponse> {
     verify_service_key(&headers, &state).await?;
 
     let target_scope = request.target_scope.unwrap_or_else(|| "all".to_string());
@@ -2326,7 +2326,7 @@ async fn broadcast_message(
         target_scope, online_count
     );
 
-    Ok(Json(dto::BroadcastResponse {
+    Ok(ApiEnvelope::ok(dto::BroadcastResponse {
         success: true,
         target_scope,
         online_recipients: online_count,
@@ -2345,7 +2345,7 @@ async fn search_messages(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Query(params): Query<dto::SearchMessagesRequest>,
-) -> Result<Json<dto::SearchMessagesResponse>> {
+) -> ApiResult<dto::SearchMessagesResponse> {
     verify_service_key(&headers, &state).await?;
 
     if params.keyword.trim().is_empty() {
@@ -2401,7 +2401,7 @@ async fn search_messages(
         })
         .collect();
 
-    Ok(Json(dto::SearchMessagesResponse {
+    Ok(ApiEnvelope::ok(dto::SearchMessagesResponse {
         messages,
         total: result.1 as usize,
         page,

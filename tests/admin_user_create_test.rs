@@ -66,11 +66,26 @@ fn unique_username() -> String {
     format!("test_user_{}", &unique_suffix()[..10])
 }
 
-async fn post_create_user(
-    client: &Client,
-    path: &str,
-    body: Value,
-) -> (StatusCode, Value) {
+/// 解包 envelope 后的响应：HTTP status + envelope.code + envelope.message + envelope.data
+///
+/// 成功响应：data = Some(业务对象)
+/// 错误响应：data = None
+struct EnvelopeResp {
+    status: StatusCode,
+    code: u32,
+    #[allow(dead_code)]
+    message: String,
+    data: Value,
+}
+
+impl EnvelopeResp {
+    fn ok_data(&self) -> &Value {
+        assert_eq!(self.code, 0, "expected envelope.code=0, got {} (msg: {})", self.code, self.message);
+        &self.data
+    }
+}
+
+async fn post_create_user(client: &Client, path: &str, body: Value) -> EnvelopeResp {
     let url = format!("{}{}", base_url(), path);
     let resp = client
         .post(&url)
@@ -81,14 +96,17 @@ async fn post_create_user(
         .expect("HTTP request failed");
     let status = resp.status();
     let json: Value = resp.json().await.expect("response JSON parse failed");
-    (status, json)
+    let code = json["code"].as_u64().expect("envelope.code missing or not number") as u32;
+    let message = json["message"].as_str().unwrap_or("").to_string();
+    let data = json.get("data").cloned().unwrap_or(Value::Null);
+    EnvelopeResp { status, code, message, data }
 }
 
-async fn post_admin(client: &Client, body: Value) -> (StatusCode, Value) {
+async fn post_admin(client: &Client, body: Value) -> EnvelopeResp {
     post_create_user(client, "/api/admin/users", body).await
 }
 
-async fn post_service(client: &Client, body: Value) -> (StatusCode, Value) {
+async fn post_service(client: &Client, body: Value) -> EnvelopeResp {
     post_create_user(client, "/api/service/users", body).await
 }
 
@@ -100,11 +118,13 @@ async fn post_service(client: &Client, body: Value) -> (StatusCode, Value) {
 async fn t1_phone_idempotent() {
     let client = Client::new();
     let phone = unique_phone("+8613");
-    let (s1, b1) = post_service(&client, json!({"phone": phone, "display_name": "alice"})).await;
-    let (s2, b2) = post_service(&client, json!({"phone": phone, "display_name": "bob"})).await;
+    let r1 = post_service(&client, json!({"phone": phone, "display_name": "alice"})).await;
+    let r2 = post_service(&client, json!({"phone": phone, "display_name": "bob"})).await;
 
-    assert_eq!(s1, StatusCode::OK);
-    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(r1.status, StatusCode::OK);
+    assert_eq!(r2.status, StatusCode::OK);
+    let b1 = r1.ok_data();
+    let b2 = r2.ok_data();
     assert_eq!(b1["created"], json!(true));
     assert_eq!(b2["created"], json!(false));
     assert_eq!(b1["user_id"], b2["user_id"], "重复 phone 必须返回相同 uid");
@@ -118,11 +138,13 @@ async fn t1_phone_idempotent() {
 async fn t2_email_idempotent() {
     let client = Client::new();
     let email = unique_email();
-    let (s1, b1) = post_service(&client, json!({"email": email})).await;
-    let (s2, b2) = post_service(&client, json!({"email": email})).await;
+    let r1 = post_service(&client, json!({"email": email})).await;
+    let r2 = post_service(&client, json!({"email": email})).await;
 
-    assert_eq!(s1, StatusCode::OK);
-    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(r1.status, StatusCode::OK);
+    assert_eq!(r2.status, StatusCode::OK);
+    let b1 = r1.ok_data();
+    let b2 = r2.ok_data();
     assert_eq!(b1["created"], json!(true));
     assert_eq!(b2["created"], json!(false));
     assert_eq!(b1["user_id"], b2["user_id"]);
@@ -136,30 +158,32 @@ async fn t2_email_idempotent() {
 async fn t3_username_idempotent() {
     let client = Client::new();
     let username = unique_username();
-    let (s1, b1) = post_service(&client, json!({"username": username})).await;
-    let (s2, b2) = post_service(&client, json!({"username": username})).await;
+    let r1 = post_service(&client, json!({"username": username})).await;
+    let r2 = post_service(&client, json!({"username": username})).await;
 
-    assert_eq!(s1, StatusCode::OK);
-    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(r1.status, StatusCode::OK);
+    assert_eq!(r2.status, StatusCode::OK);
+    let b1 = r1.ok_data();
+    let b2 = r2.ok_data();
     assert_eq!(b1["created"], json!(true));
     assert_eq!(b2["created"], json!(false));
     assert_eq!(b1["user_id"], b2["user_id"]);
 }
 
 // =====================================================
-// T4: 三者全空 → 400 INVALID_USER_IDENTITY
+// T4: 三者全空 → 400 + envelope.code=10101 (MissingRequiredParam)
 // =====================================================
 #[tokio::test]
 #[ignore]
 async fn t4_empty_identity_rejected() {
     let client = Client::new();
-    let (s, b) = post_service(&client, json!({})).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    let msg = b["message"].as_str().unwrap_or("");
+    let r = post_service(&client, json!({})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.code, 10101, "MissingRequiredParam = 10101");
     assert!(
-        msg.contains("INVALID_USER_IDENTITY"),
-        "expected INVALID_USER_IDENTITY, got: {}",
-        msg
+        r.message.contains("INVALID_USER_IDENTITY"),
+        "expected INVALID_USER_IDENTITY tag, got: {}",
+        r.message
     );
 }
 
@@ -167,39 +191,36 @@ async fn t4_empty_identity_rejected() {
 #[ignore]
 async fn t4b_only_display_name_rejected() {
     let client = Client::new();
-    let (s, b) = post_service(&client, json!({"display_name": "alice"})).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(b["message"]
-        .as_str()
-        .unwrap_or("")
-        .contains("INVALID_USER_IDENTITY"));
+    let r = post_service(&client, json!({"display_name": "alice"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.code, 10101);
+    assert!(r.message.contains("INVALID_USER_IDENTITY"));
 }
 
 // =====================================================
-// T5: phone 不带 + → 400 INVALID_PHONE_FORMAT
+// T5: phone 不带 + → 400 + envelope.code=10104 (InvalidFormat)
 // =====================================================
 #[tokio::test]
 #[ignore]
 async fn t5_phone_format_rejected() {
     let client = Client::new();
-    let (s, b) = post_service(&client, json!({"phone": "13800000000"})).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(b["message"]
-        .as_str()
-        .unwrap_or("")
-        .contains("INVALID_PHONE_FORMAT"));
+    let r = post_service(&client, json!({"phone": "13800000000"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.code, 10104, "InvalidFormat = 10104");
+    assert!(r.message.contains("INVALID_PHONE_FORMAT"));
 }
 
 // =====================================================
-// T6: phone E.164 合法 → 200
+// T6: phone E.164 合法 → 200 + envelope.code=0
 // =====================================================
 #[tokio::test]
 #[ignore]
 async fn t6_phone_e164_accepted() {
     let client = Client::new();
     let phone = unique_phone("+1415");
-    let (s, b) = post_service(&client, json!({"phone": phone})).await;
-    assert_eq!(s, StatusCode::OK);
+    let r = post_service(&client, json!({"phone": phone})).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let b = r.ok_data();
     assert_eq!(b["created"], json!(true));
     assert_eq!(b["phone"], json!(phone));
 }
@@ -212,8 +233,9 @@ async fn t6_phone_e164_accepted() {
 async fn t7_phone_only_username_null() {
     let client = Client::new();
     let phone = unique_phone("+8615");
-    let (s, b) = post_service(&client, json!({"phone": phone})).await;
-    assert_eq!(s, StatusCode::OK);
+    let r = post_service(&client, json!({"phone": phone})).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let b = r.ok_data();
     assert!(b["username"].is_null(), "phone-only 创建 username 应为 null");
 }
 
@@ -225,9 +247,9 @@ async fn t7_phone_only_username_null() {
 async fn t8_user_type_bot_persisted() {
     let client = Client::new();
     let username = unique_username();
-    let (s, b) = post_service(&client, json!({"username": username, "user_type": 2})).await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(b["user_type"], json!(2));
+    let r = post_service(&client, json!({"username": username, "user_type": 2})).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.ok_data()["user_type"], json!(2));
 }
 
 // =====================================================
@@ -238,13 +260,13 @@ async fn t8_user_type_bot_persisted() {
 async fn t9_business_system_id_persisted() {
     let client = Client::new();
     let email = unique_email();
-    let (s, b) = post_service(
+    let r = post_service(
         &client,
         json!({"email": email, "business_system_id": "shop_test"}),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(b["business_system_id"], json!("shop_test"));
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.ok_data()["business_system_id"], json!("shop_test"));
 }
 
 // =====================================================
@@ -267,8 +289,9 @@ async fn t10_concurrent_same_phone_single_uid() {
     let mut created_count = 0;
     let mut existing_count = 0;
     for h in handles {
-        let (status, body) = h.await.unwrap();
-        assert_eq!(status, StatusCode::OK, "并发请求都应该返回 200, body={body}");
+        let r = h.await.unwrap();
+        assert_eq!(r.status, StatusCode::OK, "并发请求都应该返回 200");
+        let body = r.ok_data();
         uids.push(body["user_id"].as_u64().unwrap());
         if body["created"] == json!(true) {
             created_count += 1;
@@ -291,10 +314,12 @@ async fn t10_concurrent_same_phone_single_uid() {
 async fn t11_dual_prefix_cross_idempotent() {
     let client = Client::new();
     let phone = unique_phone("+8617");
-    let (s1, b1) = post_admin(&client, json!({"phone": phone})).await;
-    let (s2, b2) = post_service(&client, json!({"phone": phone})).await;
-    assert_eq!(s1, StatusCode::OK);
-    assert_eq!(s2, StatusCode::OK);
+    let r1 = post_admin(&client, json!({"phone": phone})).await;
+    let r2 = post_service(&client, json!({"phone": phone})).await;
+    assert_eq!(r1.status, StatusCode::OK);
+    assert_eq!(r2.status, StatusCode::OK);
+    let b1 = r1.ok_data();
+    let b2 = r2.ok_data();
     assert_eq!(b1["created"], json!(true));
     assert_eq!(b2["created"], json!(false));
     assert_eq!(b1["user_id"], b2["user_id"]);
@@ -308,7 +333,7 @@ async fn t11_dual_prefix_cross_idempotent() {
 async fn t12_existing_hit_does_not_overwrite() {
     let client = Client::new();
     let phone = unique_phone("+8618");
-    let (_, b1) = post_service(
+    let r1 = post_service(
         &client,
         json!({
             "phone": phone,
@@ -317,7 +342,7 @@ async fn t12_existing_hit_does_not_overwrite() {
         }),
     )
     .await;
-    let (_, b2) = post_service(
+    let r2 = post_service(
         &client,
         json!({
             "phone": phone,
@@ -327,6 +352,8 @@ async fn t12_existing_hit_does_not_overwrite() {
     )
     .await;
 
+    let b1 = r1.ok_data();
+    let b2 = r2.ok_data();
     assert_eq!(b1["user_id"], b2["user_id"]);
     assert_eq!(b2["created"], json!(false));
     assert_eq!(b2["display_name"], json!("first"), "display_name 不应被覆盖");
@@ -338,7 +365,7 @@ async fn t12_existing_hit_does_not_overwrite() {
 }
 
 // =====================================================
-// T13: phone(A) + email(B) 命中不同 uid → 409 IDENTITY_CONFLICT
+// T13: phone(A) + email(B) 命中不同 uid → 409 + envelope.code=10205
 // =====================================================
 #[tokio::test]
 #[ignore]
@@ -346,31 +373,32 @@ async fn t13_identity_conflict_phone_vs_email() {
     let client = Client::new();
     let phone_a = unique_phone("+8613");
     let email_b = unique_email();
-    let (_, ba) = post_service(&client, json!({"phone": phone_a})).await;
-    let (_, bb) = post_service(&client, json!({"email": email_b})).await;
-    let uid_a = ba["user_id"].as_u64().unwrap();
-    let uid_b = bb["user_id"].as_u64().unwrap();
+    let ra = post_service(&client, json!({"phone": phone_a})).await;
+    let rb = post_service(&client, json!({"email": email_b})).await;
+    let uid_a = ra.ok_data()["user_id"].as_u64().unwrap();
+    let uid_b = rb.ok_data()["user_id"].as_u64().unwrap();
     assert_ne!(uid_a, uid_b, "setup: A 和 B 必须是不同的 uid");
 
-    let (s, b) = post_service(
+    let r = post_service(
         &client,
         json!({"phone": phone_a, "email": email_b}),
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT);
-    let msg = b["message"].as_str().unwrap_or("");
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert_eq!(r.code, 10205, "OperationConflict = 10205");
     assert!(
-        msg.contains("IDENTITY_CONFLICT"),
-        "expected IDENTITY_CONFLICT, got: {}",
-        msg
+        r.message.contains("IDENTITY_CONFLICT"),
+        "expected IDENTITY_CONFLICT tag, got: {}",
+        r.message
     );
     // message 里应能看到两个冲突的 uid
     assert!(
-        msg.contains(&uid_a.to_string()) && msg.contains(&uid_b.to_string()),
+        r.message.contains(&uid_a.to_string())
+            && r.message.contains(&uid_b.to_string()),
         "message 应列出冲突的 uid {} 和 {}, got: {}",
         uid_a,
         uid_b,
-        msg
+        r.message
     );
 }
 
@@ -382,13 +410,14 @@ async fn t13_identity_conflict_phone_vs_email() {
 async fn t14_partial_match_returns_existing() {
     let client = Client::new();
     let phone = unique_phone("+8616");
-    let (_, b1) = post_service(&client, json!({"phone": phone})).await;
-    let uid_a = b1["user_id"].as_u64().unwrap();
+    let r1 = post_service(&client, json!({"phone": phone})).await;
+    let uid_a = r1.ok_data()["user_id"].as_u64().unwrap();
 
     let new_username = unique_username();
-    let (s, b) =
+    let r =
         post_service(&client, json!({"phone": phone, "username": new_username})).await;
-    assert_eq!(s, StatusCode::OK);
+    assert_eq!(r.status, StatusCode::OK);
+    let b = r.ok_data();
     assert_eq!(b["created"], json!(false));
     assert_eq!(b["user_id"].as_u64().unwrap(), uid_a);
     // existing 不覆盖：username 仍然是 NULL（因为 user A 创建时 username 没传）
