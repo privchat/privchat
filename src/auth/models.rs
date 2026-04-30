@@ -212,6 +212,14 @@ pub struct IssueTokenResponse {
     ///
     /// `true` = 首次为该 (user_id, device_id) 创建记录；`false` = 复用已有设备。
     pub device_created: bool,
+
+    /// IM refresh token（v1.3 新增）
+    ///
+    /// 客户端持有，用于通过 server 内置 refresh RPC 续签 `im_token`，无需再请求 application。
+    pub im_refresh_token: String,
+
+    /// refresh token 过期时间（秒，v1.3 新增）
+    pub im_refresh_expires_in: i64,
 }
 
 /// 设备列表响应

@@ -129,6 +129,15 @@ impl TokenIssueService {
             request.ttl,
         )?;
 
+        // 5.1 同时签发 refresh token（与 access 同 session_version；客户端走 server 刷 RPC，无需再回 application）
+        let im_refresh_token = self.jwt_service.issue_refresh_token(
+            request.user_id,
+            &device_id,
+            &request.business_system_id,
+            &request.device_info.app_id,
+            session_version,
+        )?;
+
         // 6. 解析 token 获取 claims (提取 jti)
         let claims = self.jwt_service.verify_token(&im_token)?;
 
@@ -139,6 +148,7 @@ impl TokenIssueService {
 
         let ttl = request.ttl.unwrap_or(self.jwt_service.default_ttl());
         let expires_at = Utc::now() + chrono::Duration::seconds(ttl);
+        let refresh_ttl = self.jwt_service.default_refresh_ttl();
 
         info!(
             "✅ Token 签发成功: user_id={}, device_id={}, business_system={}, created={}, session_version={}",
@@ -152,6 +162,8 @@ impl TokenIssueService {
             expires_at,
             session_version,
             device_created,
+            im_refresh_token,
+            im_refresh_expires_in: refresh_ttl,
         })
     }
 
@@ -240,6 +252,9 @@ mod tests {
             .unwrap();
 
         assert!(!response.im_token.is_empty());
+        assert!(!response.im_refresh_token.is_empty());
+        assert_ne!(response.im_token, response.im_refresh_token);
+        assert!(response.im_refresh_expires_in >= response.expires_in);
         assert!(!response.device_id.is_empty());
         assert_eq!(response.expires_in, 3600);
 

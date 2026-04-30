@@ -223,9 +223,14 @@ impl JwtService {
         Ok(claims)
     }
 
-    /// 获取默认 TTL
+    /// 获取默认 access TTL
     pub fn default_ttl(&self) -> i64 {
         self.token_ttl
+    }
+
+    /// 获取默认 refresh TTL
+    pub fn default_refresh_ttl(&self) -> i64 {
+        self.refresh_token_ttl
     }
 }
 
