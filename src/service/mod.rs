@@ -49,6 +49,8 @@ pub mod sticker_service;
 pub mod blacklist_service;
 // 新增二维码服务
 pub mod qrcode_service;
+// Web 扫码登录场景服务（spec QR_API §4）
+pub mod qr_login_service;
 // 新增审批服务
 pub mod approval_service;
 // 新增离线消息队列服务

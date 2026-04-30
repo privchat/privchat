@@ -40,6 +40,7 @@
 use crate::auth::{IssueTokenRequest, IssueTokenResponse};
 use crate::error::{Result, ServerError};
 use crate::http::dto::admin as dto;
+use crate::http::dto::qr_login as qr_dto;
 use crate::http::{ApiEnvelope, ApiResult, AdminServerState};
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
@@ -171,6 +172,12 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/messages/search", get(search_messages))
         // === P0: 系统运维 ===
         .route("/system/health", get(health_check))
+        // === QR Login（spec QR_API §4）===
+        .route("/qr-login/scenes", post(create_qr_scene))
+        .route("/qr-login/scenes/{scene_id}", get(get_qr_scene))
+        .route("/qr-login/scenes/{scene_id}/scan", post(scan_qr_scene))
+        .route("/qr-login/scenes/{scene_id}/confirm", post(confirm_qr_scene))
+        .route("/qr-login/scenes/{scene_id}/reject", post(reject_qr_scene))
 }
 
 // =====================================================
@@ -2475,5 +2482,120 @@ async fn resolve_channel_type_and_members(
     // 无法从参与者列表推断类型，保守按群组处理
     let channel_type: u8 = if members.len() <= 2 { 1 } else { 2 };
     Ok((channel_type, members))
+}
+
+// =====================================================
+// QR Login（spec QR_API §4）
+// =====================================================
+
+/// `POST /qr-login/scenes` —— Web 申请创建二维码场景。
+async fn create_qr_scene(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(request): Json<qr_dto::CreateQrSceneRequest>,
+) -> ApiResult<qr_dto::QrSceneResponse> {
+    verify_service_key(&headers, &state).await?;
+    if request.device_id.trim().is_empty() {
+        return Err(ServerError::Validation(
+            "device_id 不能为空".to_string(),
+        ));
+    }
+    let scene = state.qr_login_service.create_scene(
+        request.purpose,
+        request.device_id,
+        request.device_info.into_snapshot(),
+        request.ttl,
+    );
+    Ok(ApiEnvelope::ok(qr_dto::QrSceneResponse {
+        rpc_topic: scene.rpc_topic(),
+        scene_id: scene.scene_id,
+        qr_token: scene.qr_token,
+        expires_at: scene.expires_at,
+    }))
+}
+
+/// `GET /qr-login/scenes/{scene_id}` —— 兜底查询当前状态（正常路径走 RPC 推送）。
+async fn get_qr_scene(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(scene_id): Path<String>,
+) -> ApiResult<qr_dto::QrSceneStatusResponse> {
+    verify_service_key(&headers, &state).await?;
+    let scene = state.qr_login_service.get_scene(&scene_id)?;
+    Ok(ApiEnvelope::ok(qr_dto::QrSceneStatusResponse {
+        scene_id: scene.scene_id,
+        state: scene.state,
+        expires_at: scene.expires_at,
+        scanned_at: scene.scanned_at,
+        scanner_uid: scene.scanner_uid,
+        scanner_avatar: scene.scanner_avatar,
+        scanner_display_name: scene.scanner_display_name,
+    }))
+}
+
+/// `POST /qr-login/scenes/{scene_id}/scan` —— App 扫码（state=created → scanned）。
+async fn scan_qr_scene(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(scene_id): Path<String>,
+    Json(request): Json<qr_dto::ScanQrSceneRequest>,
+) -> ApiResult<qr_dto::ScanQrSceneResponse> {
+    verify_service_key(&headers, &state).await?;
+    let result = state.qr_login_service.scan_scene(
+        &scene_id,
+        request.scanner_uid,
+        request.scanner_device_id,
+        &request.qr_token,
+        request.scanner_avatar,
+        request.scanner_display_name,
+    )?;
+    Ok(ApiEnvelope::ok(qr_dto::ScanQrSceneResponse {
+        scene_id: result.scene.scene_id,
+        state: result.scene.state,
+        confirm_token: result.confirm_token,
+        purpose: result.scene.purpose,
+        web_device_info: result.scene.web_device_info,
+    }))
+}
+
+/// `POST /qr-login/scenes/{scene_id}/confirm` —— App 确认（state=scanned → authorized）。
+async fn confirm_qr_scene(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(scene_id): Path<String>,
+    Json(request): Json<qr_dto::ConfirmQrSceneRequest>,
+) -> ApiResult<qr_dto::ConfirmQrSceneResponse> {
+    verify_service_key(&headers, &state).await?;
+    let scene = state.qr_login_service.confirm_scene(
+        &scene_id,
+        request.scanner_uid,
+        &request.scanner_device_id,
+        &request.confirm_token,
+    )?;
+    let uid = scene.scanner_uid.unwrap_or_default();
+    Ok(ApiEnvelope::ok(qr_dto::ConfirmQrSceneResponse {
+        scene_id: scene.scene_id,
+        state: scene.state,
+        uid,
+    }))
+}
+
+/// `POST /qr-login/scenes/{scene_id}/reject` —— App 拒绝（state=scanned → rejected）。
+async fn reject_qr_scene(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(scene_id): Path<String>,
+    Json(request): Json<qr_dto::RejectQrSceneRequest>,
+) -> ApiResult<qr_dto::RejectQrSceneResponse> {
+    verify_service_key(&headers, &state).await?;
+    let scene = state.qr_login_service.reject_scene(
+        &scene_id,
+        request.scanner_uid,
+        &request.confirm_token,
+    )?;
+    Ok(ApiEnvelope::ok(qr_dto::RejectQrSceneResponse {
+        scene_id: scene.scene_id,
+        state: scene.state,
+    }))
 }
 

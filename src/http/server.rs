@@ -58,6 +58,8 @@ pub struct AdminServerState {
     pub room_history_service: Arc<RoomHistoryService>,
     pub message_service: Arc<MessageService>,
     pub user_service: Arc<UserService>,
+    /// Web 扫码登录场景服务（spec QR_API §4）。
+    pub qr_login_service: Arc<crate::service::qr_login_service::QrLoginService>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -128,6 +130,9 @@ impl AdminHttpServer {
             message_repository.clone(),
         ));
 
+        let qr_login_service =
+            Arc::new(crate::service::qr_login_service::QrLoginService::new());
+
         Self {
             state: AdminServerState {
                 service_key_manager,
@@ -142,6 +147,7 @@ impl AdminHttpServer {
                 room_history_service,
                 message_service,
                 user_service,
+                qr_login_service,
             },
             port,
         }

@@ -21,3 +21,4 @@
 //! 使用 `#[derive(Serialize, Deserialize)]` 保证类型安全。
 
 pub mod admin;
+pub mod qr_login;
