@@ -20,13 +20,29 @@
 //! 路由：POST /api/app/files/upload
 //! 认证：需要 X-Upload-Token header
 
-use axum::{extract::DefaultBodyLimit, extract::State, response::Json, routing::post, Router};
+use axum::{extract::DefaultBodyLimit, extract::State, routing::post, Router};
 use axum_extra::extract::Multipart;
-use serde_json::{json, Value};
+use serde::Serialize;
 use tracing::info;
 
-use crate::error::{Result, ServerError};
-use crate::http::FileServerState;
+use crate::error::ServerError;
+use crate::http::{ApiEnvelope, ApiResult, FileServerState};
+
+/// 文件上传响应（spec SERVICE_RESPONSE_ENVELOPE_SPEC §0：所有 HTTP 接口走统一信封）。
+#[derive(Debug, Serialize)]
+pub struct UploadResponse {
+    pub file_id: u64,
+    pub file_url: String,
+    /// P1 缩略图 URL；当前未生成时为 null。
+    pub thumbnail_url: Option<String>,
+    pub file_size: u64,
+    pub original_size: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub mime_type: String,
+    pub uploaded_at: u64,
+    pub storage_source_id: u32,
+}
 
 /// 从请求头提取客户端 IP（兼容反向代理：X-Forwarded-For 取第一个，否则 X-Real-IP）
 fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -65,7 +81,7 @@ async fn upload_file(
     State(state): State<FileServerState>,
     headers: axum::http::HeaderMap,
     mut multipart: Multipart,
-) -> Result<Json<Value>> {
+) -> ApiResult<UploadResponse> {
     // 提取 X-Upload-Token header
     let upload_token = headers
         .get("X-Upload-Token")
@@ -170,16 +186,16 @@ async fn upload_file(
     info!("✅ 文件上传成功: {}", metadata.file_id);
 
     // 返回响应（含 storage_source_id，便于客户端写入消息 content，未来多存储源）
-    Ok(Json(json!({
-        "file_id": metadata.file_id,
-        "file_url": file_service.build_access_url(&metadata.file_path, metadata.storage_source_id),
-        "thumbnail_url": serde_json::Value::Null,
-        "file_size": metadata.file_size,
-        "original_size": metadata.original_size,
-        "width": metadata.width,
-        "height": metadata.height,
-        "mime_type": metadata.mime_type,
-        "uploaded_at": metadata.uploaded_at,
-        "storage_source_id": metadata.storage_source_id,
-    })))
+    Ok(ApiEnvelope::ok(UploadResponse {
+        file_id: metadata.file_id,
+        file_url: file_service.build_access_url(&metadata.file_path, metadata.storage_source_id),
+        thumbnail_url: None,
+        file_size: metadata.file_size,
+        original_size: metadata.original_size,
+        width: metadata.width,
+        height: metadata.height,
+        mime_type: metadata.mime_type,
+        uploaded_at: metadata.uploaded_at,
+        storage_source_id: metadata.storage_source_id,
+    }))
 }
