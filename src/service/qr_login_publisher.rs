@@ -189,3 +189,146 @@ impl QrLoginPublisher {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sid(n: u64) -> SessionId {
+        SessionId::new(n)
+    }
+
+    /// #2 spec QR_API §5：同一 unauth session 重复 create_scene，旧 scene binding
+    /// 必须被替换，并且双向 registry 都不残留旧条目。
+    #[test]
+    fn bind_replaces_existing_session_binding() {
+        let pub_ = QrLoginPublisher::new();
+        pub_.bind("scene_old".to_string(), sid(1));
+        assert_eq!(pub_.binding_count(), 1);
+        assert_eq!(pub_.lookup_session("scene_old"), Some(sid(1)));
+
+        // 同一 session 重新绑定到新 scene
+        pub_.bind("scene_new".to_string(), sid(1));
+
+        assert_eq!(
+            pub_.binding_count(),
+            1,
+            "重复 bind 应替换不应累计"
+        );
+        assert_eq!(
+            pub_.lookup_session("scene_old"),
+            None,
+            "scene_to_session 残留旧 scene"
+        );
+        assert_eq!(
+            pub_.lookup_session("scene_new"),
+            Some(sid(1)),
+            "新 scene 必须存在"
+        );
+        assert_eq!(
+            pub_.unbind_by_session(&sid(1)),
+            Some("scene_new".to_string()),
+            "session_to_scene 必须只指向新 scene"
+        );
+    }
+
+    /// 多个不同 session 各自绑定不同 scene，互不影响。
+    #[test]
+    fn bind_independent_sessions_coexist() {
+        let pub_ = QrLoginPublisher::new();
+        pub_.bind("scene_a".to_string(), sid(1));
+        pub_.bind("scene_b".to_string(), sid(2));
+        pub_.bind("scene_c".to_string(), sid(3));
+
+        assert_eq!(pub_.binding_count(), 3);
+        assert_eq!(pub_.lookup_session("scene_a"), Some(sid(1)));
+        assert_eq!(pub_.lookup_session("scene_b"), Some(sid(2)));
+        assert_eq!(pub_.lookup_session("scene_c"), Some(sid(3)));
+    }
+
+    /// `unbind_by_scene` 必须双向清理（authorized / rejected / expired 推送后）。
+    #[test]
+    fn unbind_by_scene_clears_both_directions() {
+        let pub_ = QrLoginPublisher::new();
+        pub_.bind("scene_x".to_string(), sid(42));
+
+        pub_.unbind_by_scene("scene_x");
+
+        assert_eq!(pub_.binding_count(), 0);
+        assert_eq!(pub_.lookup_session("scene_x"), None);
+        assert_eq!(
+            pub_.unbind_by_session(&sid(42)),
+            None,
+            "session_to_scene 不能残留"
+        );
+    }
+
+    /// #7 spec QR_API §5：连接关闭时 `unbind_by_session` 双向清理 +
+    /// 返回原 scene_id（让调用方 logging）。
+    #[test]
+    fn unbind_by_session_clears_both_and_returns_scene() {
+        let pub_ = QrLoginPublisher::new();
+        pub_.bind("scene_y".to_string(), sid(99));
+
+        let scene = pub_.unbind_by_session(&sid(99));
+
+        assert_eq!(scene, Some("scene_y".to_string()));
+        assert_eq!(pub_.binding_count(), 0);
+        assert_eq!(
+            pub_.lookup_session("scene_y"),
+            None,
+            "scene_to_session 不能残留"
+        );
+    }
+
+    /// 没有 binding 时 `unbind_by_session` 返回 None，不报错。
+    #[test]
+    fn unbind_by_session_returns_none_when_unbound() {
+        let pub_ = QrLoginPublisher::new();
+        assert_eq!(pub_.unbind_by_session(&sid(7)), None);
+    }
+
+    /// 没有 binding 时 `unbind_by_scene` 是 no-op，不 panic。
+    #[test]
+    fn unbind_by_scene_unknown_is_noop() {
+        let pub_ = QrLoginPublisher::new();
+        pub_.unbind_by_scene("scene_does_not_exist");
+        assert_eq!(pub_.binding_count(), 0);
+    }
+
+    /// #8 spec QR_API §5：未绑定时 `push_event` 返回 `NoSubscriber`，
+    /// 不报错（让上层不要回滚 confirm）。
+    #[tokio::test]
+    async fn push_event_returns_no_subscriber_when_unbound() {
+        let pub_ = QrLoginPublisher::new();
+        let cm = crate::infra::ConnectionManager::new();
+
+        let event = QrLoginPushEvent {
+            event: "qr_login.authorized".to_string(),
+            scene_id: "scene_missing".to_string(),
+            state: "authorized".to_string(),
+            data: None,
+        };
+
+        let outcome = pub_.push_event(&cm, event, true).await;
+        assert_eq!(outcome, PushOutcome::NoSubscriber);
+        assert_eq!(pub_.binding_count(), 0);
+    }
+
+    /// `push_event(terminal=true)` 即便 NoSubscriber 也是安全的：不会 panic、
+    /// 不会留下半清理状态。
+    #[tokio::test]
+    async fn push_event_terminal_no_subscriber_idempotent() {
+        let pub_ = QrLoginPublisher::new();
+        let cm = crate::infra::ConnectionManager::new();
+        let event = QrLoginPushEvent {
+            event: "qr_login.expired".to_string(),
+            scene_id: "ghost".to_string(),
+            state: "expired".to_string(),
+            data: None,
+        };
+        // 连续推两次相同事件，行为应一致。
+        assert_eq!(pub_.push_event(&cm, event.clone(), true).await, PushOutcome::NoSubscriber);
+        assert_eq!(pub_.push_event(&cm, event, true).await, PushOutcome::NoSubscriber);
+    }
+}
