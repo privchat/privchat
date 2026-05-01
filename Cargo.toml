@@ -75,6 +75,10 @@ fastrand = "2.3.0"
 # 认证
 jsonwebtoken = "9.3"
 bcrypt = "0.15"  # 密码加密
+sha2 = "0.10"    # token_hash for privchat_refresh_tokens
+hex = "0.4"      # 十六进制编码 (token_hash)
+rsa = { version = "0.9", features = ["pem"] }  # JWKS modulus 提取
+base64 = "0.22"  # JWKS n/e 字段（base64url-no-pad）
 
 # 离线消息系统依赖
 bytes = { version = "1.5", features = ["serde"] }

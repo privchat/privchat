@@ -7,3 +7,11 @@ config.toml
 .DS_Store
 
 /storage
+
+# RS256 unified token keys (spec TOKEN_UNIFICATION_SPEC v1.3 §4.4 / §11.1)
+# 私钥永远不进 repo。仅提交 keys/README.md 说明生成命令。
+/.local/
+/keys/*
+!/keys/README.md
+*.pem
+*.key

@@ -46,6 +46,18 @@ cleanup_interval_seconds = 60
 port = 9090
 # master_key = "your-secret-key"  # 也可通过环境变量 SERVICE_MASTER_KEY 设置
 
+# Unified token (spec TOKEN_UNIFICATION_SPEC v1.3 Phase A).
+# 留空 = 关闭 unified token 路径，server 仍按 v1.2 HS256 IM token 工作。
+# 路径下必须存在对应 RSA PEM 文件；private/public key 永远不进 repo（见 keys/README.md）。
+# [auth.rsa_jwt]
+# private_key_path = "./.local/keys/jwt/v1.pem"        # 生产: /etc/privchat/keys/jwt/v1.pem
+# public_key_path  = "./.local/keys/jwt/v1.pub.pem"    # 生产: /etc/privchat/keys/jwt/v1.pub.pem
+# kid              = "v1"
+# access_ttl_secs  = 3600       # 1h
+# refresh_ttl_secs = 604800     # 7d
+# 也可通过 env 覆盖：JWT_RS256_PRIVATE_KEY_PATH / JWT_RS256_PUBLIC_KEY_PATH /
+#                  JWT_RS256_KID / JWT_RS256_ACCESS_TTL_SECS / JWT_RS256_REFRESH_TTL_SECS
+
 [room]
 subscribe_history = true
 subscribe_history_limit = 30
