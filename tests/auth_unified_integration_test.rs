@@ -42,14 +42,31 @@ fn service_key() -> String {
         .unwrap_or_else(|_| "your_service_master_key_here".to_string())
 }
 
-fn unique_uid() -> u64 {
-    // 用纳秒时间 + 偏移；测试相互不冲突即可
+fn unique_phone(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    // 限制到 i64 安全区
-    100_000_000_000u64 + (nanos as u64 % 1_000_000_000_000u64)
+    // E.164: prefix 含 `+` 与国家码，再补 9 位号码
+    format!("{}{}", prefix, format!("{:012}", nanos % 1_000_000_000_000)[..9].to_string())
+}
+
+/// 先调 `/api/service/users` 创建一个测试 user，返回 server 分配的 uid。
+/// `/auth/issue` 会在 `privchat_devices` 上做 upsert，FK 指向 `privchat_users.id`，
+/// 所以 user 必须先存在。
+async fn create_test_user(client: &Client) -> u64 {
+    let phone = unique_phone("+8613");
+    let resp = post_json(
+        client,
+        "/api/service/users",
+        json!({ "phone": phone, "display_name": "auth_unified_test" }),
+        true,
+    )
+    .await;
+    let data = resp.ok_data();
+    data["user_id"]
+        .as_u64()
+        .expect("create user response missing user_id")
 }
 
 struct EnvelopeResp {
@@ -130,10 +147,11 @@ fn issue_body(uid: u64, device_id: Option<&str>) -> Value {
 #[ignore]
 async fn issue_without_service_key_returns_unauthorized() {
     let client = Client::new();
+    // service-key gate 在 DB 之前；用一个任意 uid 即可（请求不会到 device upsert）
     let resp = post_json(
         &client,
         "/api/service/auth/issue",
-        issue_body(unique_uid(), None),
+        issue_body(1, None),
         false, // 故意不带 service key
     )
     .await;
@@ -167,7 +185,7 @@ async fn jwks_is_public_and_well_formed() {
 #[ignore]
 async fn issue_introspect_refresh_round_trip() {
     let client = Client::new();
-    let uid = unique_uid();
+    let uid = create_test_user(&client).await;
 
     // issue
     let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
@@ -224,7 +242,7 @@ async fn issue_introspect_refresh_round_trip() {
 #[ignore]
 async fn revoke_by_jti_invalidates_refresh() {
     let client = Client::new();
-    let uid = unique_uid();
+    let uid = create_test_user(&client).await;
 
     let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
     let data = r.ok_data();
@@ -273,7 +291,7 @@ async fn revoke_by_jti_invalidates_refresh() {
 #[ignore]
 async fn bump_sessions_invalidates_old_access() {
     let client = Client::new();
-    let uid = unique_uid();
+    let uid = create_test_user(&client).await;
 
     let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
     let data = r.ok_data();
@@ -312,7 +330,7 @@ async fn bump_sessions_invalidates_old_access() {
 #[ignore]
 async fn introspect_tampered_token_returns_signature_invalid() {
     let client = Client::new();
-    let uid = unique_uid();
+    let uid = create_test_user(&client).await;
     let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
     let access = r.ok_data()["access_token"].as_str().unwrap().to_string();
 
@@ -364,7 +382,7 @@ async fn revoke_requires_exactly_one_of_jti_or_refresh_token() {
 #[ignore]
 async fn refresh_with_wrong_device_id_fails() {
     let client = Client::new();
-    let uid = unique_uid();
+    let uid = create_test_user(&client).await;
     let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
     let refresh = r.ok_data()["refresh_token"].as_str().unwrap().to_string();
 
