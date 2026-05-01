@@ -119,3 +119,21 @@ pub struct RejectQrSceneResponse {
     pub scene_id: String,
     pub state: QrSceneState,
 }
+
+// ────────── 5.x Push Authorized（spec QR_API §5） ──────────
+
+/// 由 application 调用：把 application 端组装好的登录返回对象（透明 JSON）
+/// 通过 server 的 unauth publisher 推回给 Web 端。
+///
+/// `data` 直接是 `MemberLoginResponse` 的 JSON 形态；server 不解析 schema，避免
+/// 协议层和 application 强耦合（spec QR_API §5）。
+#[derive(Debug, Deserialize)]
+pub struct PushQrAuthorizedRequest {
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PushQrAuthorizedResponse {
+    pub scene_id: String,
+    pub delivered: bool,
+}

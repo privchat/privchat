@@ -51,6 +51,8 @@ pub mod blacklist_service;
 pub mod qrcode_service;
 // Web 扫码登录场景服务（spec QR_API §4）
 pub mod qr_login_service;
+// Web 扫码登录的实时推送通道（spec QR_API §5）
+pub mod qr_login_publisher;
 // 新增审批服务
 pub mod approval_service;
 // 新增离线消息队列服务
@@ -93,6 +95,7 @@ pub use offline_queue_service::OfflineQueueService;
 pub use presence_service::PresenceService;
 pub use privacy_service::{PrivacyService, PrivacySettingsUpdate};
 pub use push_service::PushService;
+pub use qr_login_publisher::{PushOutcome, QrLoginPublisher};
 pub use qrcode_service::QRCodeService;
 pub use reaction_service::{Reaction, ReactionService, ReactionStats};
 pub use read_receipt_service::{GroupReadStats, ReadReceipt, ReadReceiptService};

@@ -125,6 +125,10 @@ pub struct ChatServer {
     message_service: Arc<crate::service::MessageService>,
     /// 用户服务（admin / RPC / job 统一入口，见 ADMIN_API_SPEC §1.4）
     user_service: Arc<crate::service::UserService>,
+    /// 扫码登录场景服务（spec QR_API §4–§5；admin HTTP + RPC 共享）
+    qr_login_service: Arc<crate::service::qr_login_service::QrLoginService>,
+    /// 扫码登录的 unauth 推送 publisher（spec QR_API §5）
+    qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
 }
 
 impl ChatServer {
@@ -498,6 +502,15 @@ impl ChatServer {
         // 用户服务：admin / RPC / job 对 User 领域对象的唯一入口
         let user_service = Arc::new(crate::service::UserService::new(user_repository.clone()));
         info!("✅ UserService 创建完成");
+
+        // 扫码登录（spec QR_API §4–§5）：service 持有内存状态机，publisher 维护
+        // scene_id ↔ session_id 双向映射，让 scan/reject/expired 自动回推 unauth 连接。
+        let qr_login_publisher = Arc::new(crate::service::QrLoginPublisher::new());
+        let qr_login_service = Arc::new(
+            crate::service::qr_login_service::QrLoginService::new()
+                .with_publisher(qr_login_publisher.clone(), connection_manager.clone()),
+        );
+        info!("✅ QrLoginService + Publisher 创建完成");
 
         // 5. 将 EventBus 传递给 SendMessageHandler
         // 注意：SendMessageHandler 需要支持设置 event_bus
@@ -1227,6 +1240,8 @@ impl ChatServer {
             typing_rate_limiter.clone(),
             message_service.clone(),
             user_service.clone(),
+            qr_login_service.clone(),
+            qr_login_publisher.clone(),
         );
         crate::rpc::init_rpc_system(rpc_services).await;
         info!("✅ RPC 系统初始化完成");
@@ -1303,6 +1318,8 @@ impl ChatServer {
             room_history_service,
             message_service,
             user_service,
+            qr_login_service,
+            qr_login_publisher,
         })
     }
 
@@ -1455,6 +1472,7 @@ impl ChatServer {
         let handler_limiter = self.handler_limiter.clone();
         let subscribe_manager = self.subscribe_manager.clone();
         let presence_service = self.presence_service.clone();
+        let qr_login_publisher = self.qr_login_publisher.clone();
 
         tokio::spawn(async move {
             info!("📡 事件处理器开始监听...");
@@ -1492,6 +1510,14 @@ impl ChatServer {
 
                         // 清理认证会话
                         auth_session_manager.unbind_session(&session_id).await;
+
+                        // 清理 QR 登录 publisher binding（spec QR_API §5）
+                        if let Some(scene_id) = qr_login_publisher.unbind_by_session(&session_id) {
+                            info!(
+                                "🪪 QR Login: 连接关闭释放 scene_id={} (session={})",
+                                scene_id, session_id
+                            );
+                        }
 
                         // 清理频道订阅（防止幽灵 session 堆积）
                         let left_channels = subscribe_manager.on_session_disconnect(&session_id);
@@ -1677,6 +1703,17 @@ impl ChatServer {
         let database = self.database.clone();
         let offline_worker = self.offline_worker.clone();
         let connection_manager = self.connection_manager.clone();
+
+        // 扫码登录 scene 到期扫描（spec QR_API §5）：每 5 秒推一次 expired
+        // 给仍然在线的 unauth 连接，并解绑 publisher。比 lazy 检查更及时。
+        let qr_login_service_tick = self.qr_login_service.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                qr_login_service_tick.tick_expired().await;
+            }
+        });
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -2048,6 +2085,8 @@ impl ChatServer {
             self.room_history_service.clone(),
             self.message_service.clone(),
             self.user_service.clone(),
+            self.qr_login_service.clone(),
+            self.qr_login_publisher.clone(),
             self.config.admin_api_port,
         );
 

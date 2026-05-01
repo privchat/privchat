@@ -178,6 +178,10 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/qr-login/scenes/{scene_id}/scan", post(scan_qr_scene))
         .route("/qr-login/scenes/{scene_id}/confirm", post(confirm_qr_scene))
         .route("/qr-login/scenes/{scene_id}/reject", post(reject_qr_scene))
+        .route(
+            "/qr-login/scenes/{scene_id}/push-authorized",
+            post(push_qr_authorized),
+        )
 }
 
 // =====================================================
@@ -2596,6 +2600,39 @@ async fn reject_qr_scene(
     Ok(ApiEnvelope::ok(qr_dto::RejectQrSceneResponse {
         scene_id: scene.scene_id,
         state: scene.state,
+    }))
+}
+
+/// `POST /qr-login/scenes/{scene_id}/push-authorized` —— application 显式推送
+/// `qr_login.authorized` 事件给创建该 scene 的 unauth 连接（spec QR_API §5）。
+///
+/// `data` 字段会原样塞进推送 payload 的 `data`，server **不**解析其 schema —
+/// application 通常把自己 `MemberLoginResponse` 的 JSON 直接塞进来。
+///
+/// `delivered=false` 表示 publisher 找不到 binding（Web 已断开）；调用方应
+/// **不**回滚 confirm 业务状态，只记录日志即可（spec §5）。
+async fn push_qr_authorized(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(scene_id): Path<String>,
+    Json(request): Json<qr_dto::PushQrAuthorizedRequest>,
+) -> ApiResult<qr_dto::PushQrAuthorizedResponse> {
+    verify_service_key(&headers, &state).await?;
+    // 把状态机标记为 authorized（兜底；正常 confirm 已经切过去了）
+    let _ = state.qr_login_service.mark_authorized(&scene_id).ok();
+    let event = privchat_protocol::rpc::qr_login::QrLoginPushEvent {
+        event: "qr_login.authorized".to_string(),
+        scene_id: scene_id.clone(),
+        state: "authorized".to_string(),
+        data: Some(request.data),
+    };
+    let outcome = state
+        .qr_login_publisher
+        .push_event(state.connection_manager.as_ref(), event, true)
+        .await;
+    Ok(ApiEnvelope::ok(qr_dto::PushQrAuthorizedResponse {
+        scene_id,
+        delivered: matches!(outcome, crate::service::PushOutcome::Delivered),
     }))
 }
 

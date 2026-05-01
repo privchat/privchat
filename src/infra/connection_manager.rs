@@ -816,6 +816,23 @@ impl ConnectionManager {
         }
     }
 
+    /// 把控制事件推到指定 session，**不**校验 Authenticated 状态、不查 index_b。
+    ///
+    /// 用途：扫码登录的 unauth 连接（spec QR_API §5）。这条 session 刻意未鉴权，
+    /// 通常也没有进入 `index_a/index_b`（注册口仅 `register_connecting`/`authenticate`
+    /// 调用时写入），但 transport 层仍持有它，所以直接走 transport 的 `send_to_session`。
+    /// 走 [`Self::send_push_to_session`] 会被 Authenticated 闸门挡掉。
+    ///
+    /// 返回 `Ok(0)` 表示 transport 没找到该 session（已断开），调用方按 `NoSubscriber`
+    /// 处理即可，**不要**当作错误。
+    pub async fn send_unauth_event_to_session(
+        &self,
+        session_id: SessionId,
+        message: &privchat_protocol::protocol::PushMessageRequest,
+    ) -> Result<usize> {
+        self.send_push_on_session(session_id, message).await
+    }
+
     /// 用户是否至少有一个 Authenticated 连接（离线判定用）。
     pub fn has_authenticated_connection(&self, user_id: u64) -> bool {
         let Some(a_entry) = self.index_a.get(&user_id) else {

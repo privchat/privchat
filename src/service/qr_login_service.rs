@@ -18,12 +18,18 @@
 //! - 不持久化，DashMap 内存存储 + lazy expire（每次访问检查 `expires_at`）
 //! - 默认 TTL：created 90s、scanned 60s、总寿命 ≤ 180s
 
+use std::sync::Arc;
+
 use chrono::Utc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::{Result, ServerError};
+use crate::infra::ConnectionManager;
+use crate::service::qr_login_publisher::QrLoginPublisher;
+use privchat_protocol::rpc::qr_login::QrLoginPushEvent;
 
 const DEFAULT_CREATED_TTL_SECS: i64 = 90;
 const SCANNED_TTL_SECS: i64 = 60;
@@ -76,12 +82,16 @@ pub struct ScanResult {
     pub confirm_token: String,
 }
 
-/// Web 扫码登录服务（spec QR_API）。
+/// Web 扫码登录服务（spec QR_API §4–§5）。
 ///
-/// 当前阶段（v1.2）只实现 HTTP 状态机；spec §5 unauth RPC 推送通道留待 protocol crate 扩展后再接。
+/// 状态机内存存储 + lazy expire；通过可选注入的 [`QrLoginPublisher`] 把 scan/reject/expire
+/// transition 实时推回创建该 scene 的 unauth 连接（spec §5）。`authorized` 不在本 service
+/// 推送 —— 那条事件需要 application 拼装好登录返回再显式 push（见 admin HTTP 路由）。
 #[derive(Clone)]
 pub struct QrLoginService {
-    scenes: std::sync::Arc<DashMap<String, QrScene>>,
+    scenes: Arc<DashMap<String, QrScene>>,
+    publisher: Option<Arc<QrLoginPublisher>>,
+    connection_manager: Option<Arc<ConnectionManager>>,
 }
 
 impl Default for QrLoginService {
@@ -93,8 +103,22 @@ impl Default for QrLoginService {
 impl QrLoginService {
     pub fn new() -> Self {
         Self {
-            scenes: std::sync::Arc::new(DashMap::new()),
+            scenes: Arc::new(DashMap::new()),
+            publisher: None,
+            connection_manager: None,
         }
+    }
+
+    /// 注入 publisher + connection_manager，让状态转换自动推送事件给 unauth 连接。
+    /// 没注入也能跑（HTTP 状态机仍正确），只是 Web 端拿不到实时事件。
+    pub fn with_publisher(
+        mut self,
+        publisher: Arc<QrLoginPublisher>,
+        connection_manager: Arc<ConnectionManager>,
+    ) -> Self {
+        self.publisher = Some(publisher);
+        self.connection_manager = Some(connection_manager);
+        self
     }
 
     /// 创建场景（state=created）。
@@ -184,9 +208,25 @@ impl QrLoginService {
         // scanned 阶段重新计 expires_at（spec §3.3）
         entry.expires_at = now_ms + SCANNED_TTL_SECS * 1000;
 
+        let scene_snapshot = entry.clone();
+        let confirm_token_owned = confirm_token.clone();
+        // 释放 DashMap 行锁后再异步 push，避免 Send + 死锁
+        drop(entry);
+        self.spawn_push(
+            scene_snapshot.clone(),
+            "qr_login.scanned",
+            Some(json!({
+                "scanner_uid": scene_snapshot.scanner_uid.unwrap_or_default(),
+                "scanner_avatar": scene_snapshot.scanner_avatar,
+                "scanner_display_name": scene_snapshot.scanner_display_name,
+                "scanned_at": scene_snapshot.scanned_at.unwrap_or_default(),
+            })),
+            false,
+        );
+
         Ok(ScanResult {
-            scene: entry.clone(),
-            confirm_token,
+            scene: scene_snapshot,
+            confirm_token: confirm_token_owned,
         })
     }
 
@@ -247,7 +287,10 @@ impl QrLoginService {
 
         entry.state = QrSceneState::Rejected;
         entry.confirm_token_consumed = true;
-        Ok(entry.clone())
+        let snapshot = entry.clone();
+        drop(entry);
+        self.spawn_push(snapshot.clone(), "qr_login.rejected", None, true);
+        Ok(snapshot)
     }
 
     fn ensure_scanned_with_token(
@@ -297,6 +340,99 @@ impl QrLoginService {
             scene.state = QrSceneState::Expired;
         }
     }
+
+    /// 标记 scene 为 authorized 并清掉 confirm_token，供 admin HTTP push 路径调用。
+    /// 通常 confirm 已经把状态切为 authorized；这是 application 显式 push 之前的兜底，
+    /// 用于 publisher 找不到状态时不至于推一个错误状态。
+    pub fn mark_authorized(&self, scene_id: &str) -> Result<QrScene> {
+        let mut entry = self
+            .scenes
+            .get_mut(scene_id)
+            .ok_or_else(|| ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id)))?;
+        entry.state = QrSceneState::Authorized;
+        entry.confirm_token_consumed = true;
+        Ok(entry.clone())
+    }
+
+    /// 主动扫一遍内存里的 scene，把已经过期但状态仍是 created/scanned 的转成 expired，
+    /// 顺手把 `qr_login.expired` 推回 unauth 连接（spec §5）。
+    /// 调用方应该周期性触发（如每 5s）。
+    pub async fn tick_expired(&self) {
+        let now = Utc::now().timestamp_millis();
+        let mut to_publish: Vec<QrScene> = Vec::new();
+        for mut entry in self.scenes.iter_mut() {
+            if matches!(
+                entry.state,
+                QrSceneState::Authorized | QrSceneState::Rejected | QrSceneState::Expired
+            ) {
+                continue;
+            }
+            if now >= entry.expires_at {
+                entry.state = QrSceneState::Expired;
+                to_publish.push(entry.clone());
+            }
+        }
+        for scene in to_publish {
+            self.publish_now(scene, "qr_login.expired", None, true).await;
+        }
+    }
+
+    fn spawn_push(
+        &self,
+        scene: QrScene,
+        event: &'static str,
+        data: Option<serde_json::Value>,
+        terminal: bool,
+    ) {
+        let Some(publisher) = self.publisher.clone() else {
+            return;
+        };
+        let Some(cm) = self.connection_manager.clone() else {
+            return;
+        };
+        let push = QrLoginPushEvent {
+            event: event.to_string(),
+            scene_id: scene.scene_id.clone(),
+            state: state_label(scene.state),
+            data,
+        };
+        tokio::spawn(async move {
+            let _ = publisher.push_event(&cm, push, terminal).await;
+        });
+    }
+
+    async fn publish_now(
+        &self,
+        scene: QrScene,
+        event: &'static str,
+        data: Option<serde_json::Value>,
+        terminal: bool,
+    ) {
+        let Some(publisher) = self.publisher.as_ref() else {
+            return;
+        };
+        let Some(cm) = self.connection_manager.as_ref() else {
+            return;
+        };
+        let push = QrLoginPushEvent {
+            event: event.to_string(),
+            scene_id: scene.scene_id.clone(),
+            state: state_label(scene.state),
+            data,
+        };
+        let _ = publisher.push_event(cm.as_ref(), push, terminal).await;
+    }
+}
+
+fn state_label(state: QrSceneState) -> String {
+    match state {
+        QrSceneState::Created => "created",
+        QrSceneState::Scanned => "scanned",
+        QrSceneState::Authorized => "authorized",
+        QrSceneState::Rejected => "rejected",
+        QrSceneState::Expired => "expired",
+    }
+    .to_string()
 }
 
 #[cfg(test)]

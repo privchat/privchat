@@ -31,6 +31,7 @@ pub mod file;
 pub mod group;
 pub mod message;
 pub mod presence;
+pub mod qr_login;
 pub mod qrcode;
 pub mod sticker;
 pub mod sync;
@@ -44,11 +45,12 @@ use crate::infra::{
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::UserRepository;
 use crate::service::sync::SyncService;
+use crate::service::qr_login_service::QrLoginService;
 use crate::service::{
     ApprovalService, BlacklistService, ChannelService, FileService, FriendService,
     MessageHistoryService, MessageService, OfflineQueueService, PresenceService, PrivacyService,
-    QRCodeService, ReactionService, ReadReceiptService, ReadStateService, StickerService,
-    UnreadCountService, UploadTokenService, UserService,
+    QRCodeService, QrLoginPublisher, ReactionService, ReadReceiptService, ReadStateService,
+    StickerService, UnreadCountService, UploadTokenService, UserService,
 };
 use router::GLOBAL_RPC_ROUTER;
 use std::sync::Arc;
@@ -155,6 +157,10 @@ pub struct RpcServiceContext {
     pub message_service: Arc<MessageService>,
     /// 用户服务 - 用户 CRUD / 查询的唯一入口（与 admin 共享同一 Arc 实例）
     pub user_service: Arc<UserService>,
+    /// 扫码登录场景服务（spec QR_API §4，与 admin 共享同一实例）
+    pub qr_login_service: Arc<QrLoginService>,
+    /// 扫码登录的 unauth 推送 publisher（spec QR_API §5）
+    pub qr_login_publisher: Arc<QrLoginPublisher>,
 }
 
 impl RpcServiceContext {
@@ -196,6 +202,8 @@ impl RpcServiceContext {
         typing_rate_limiter: Arc<TypingRateLimiter>,
         message_service: Arc<MessageService>,
         user_service: Arc<UserService>,
+        qr_login_service: Arc<QrLoginService>,
+        qr_login_publisher: Arc<QrLoginPublisher>,
     ) -> Self {
         Self {
             // channel_service 已合并到 channel_service
@@ -235,6 +243,8 @@ impl RpcServiceContext {
             typing_rate_limiter,
             message_service,
             user_service,
+            qr_login_service,
+            qr_login_publisher,
         }
     }
 }
@@ -253,6 +263,7 @@ pub async fn init_rpc_system(services: RpcServiceContext) {
     file::register_routes(services.clone()).await;
     sticker::register_routes(services.clone()).await;
     qrcode::register_routes(services.clone()).await;
+    qr_login::register_routes(services.clone()).await;
     user::register_routes(services.clone()).await;
     presence::register_routes(services.clone()).await;
 
