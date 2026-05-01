@@ -131,6 +131,8 @@ pub struct ChatServer {
     qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
     /// RS256 unified token 服务（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A，可选）
     rsa_jwt_service: Option<Arc<crate::auth::RsaJwtService>>,
+    /// Unified token 编排服务（issue / refresh / introspect / revoke）
+    unified_token_service: Option<Arc<crate::auth::UnifiedTokenService>>,
 }
 
 impl ChatServer {
@@ -539,6 +541,25 @@ impl ChatServer {
             info!("ℹ️ RsaJwtService 未配置；unified token 路径关闭（v1.2 HS256 行为不变）");
             None
         };
+
+        // Unified token 编排服务：与 RsaJwtService 同启停。
+        let refresh_token_repository =
+            Arc::new(crate::repository::RefreshTokenRepository::new(pool.clone()));
+        let unified_token_service: Option<Arc<crate::auth::UnifiedTokenService>> =
+            rsa_jwt_service.as_ref().map(|rsa| {
+                Arc::new(crate::auth::UnifiedTokenService::new(
+                    rsa.clone(),
+                    device_manager_db.clone(),
+                    refresh_token_repository.clone(),
+                    config.rsa_jwt.default_audience.clone(),
+                    config.rsa_jwt.issuer.clone(),
+                    config.rsa_jwt.access_ttl_secs,
+                    config.rsa_jwt.refresh_ttl_secs,
+                ))
+            });
+        if unified_token_service.is_some() {
+            info!("✅ UnifiedTokenService 创建完成（issue/refresh/introspect/revoke 端点已生效）");
+        }
 
         // 5. 将 EventBus 传递给 SendMessageHandler
         // 注意：SendMessageHandler 需要支持设置 event_bus
@@ -1349,6 +1370,7 @@ impl ChatServer {
             qr_login_service,
             qr_login_publisher,
             rsa_jwt_service,
+            unified_token_service,
         })
     }
 
@@ -2117,6 +2139,7 @@ impl ChatServer {
             self.qr_login_service.clone(),
             self.qr_login_publisher.clone(),
             self.rsa_jwt_service.clone(),
+            self.unified_token_service.clone(),
             self.config.admin_api_port,
         );
 

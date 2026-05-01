@@ -26,6 +26,7 @@
 //!   - `/api/service/*` - 管理接口 v1.2 前缀（与 legacy 完全等价）
 
 pub mod admin;
+pub mod auth;
 pub mod auth_jwks;
 pub mod metrics;
 pub mod upload;
@@ -45,11 +46,13 @@ pub fn create_file_routes() -> Router<FileServerState> {
 /// 同 handler 同时挂载到 `/api/admin` 和 `/api/service` 两个前缀下，行为完全一致。
 /// `/api/admin` 是 v1.0/v1.1 兼容前缀；`/api/service` 是 v1.2 推荐前缀。
 ///
-/// `/api/service/auth/jwks` 是 spec TOKEN_UNIFICATION_SPEC v1.3 §6.1 公开端点
-/// （**不**走 service master key），与 admin 路由独立挂载。
+/// `/api/service/auth/*` 是 spec TOKEN_UNIFICATION_SPEC v1.3 §6.1 unified token API：
+/// - `/auth/issue|refresh|introspect|revoke` 走 service-key（在 handler 里 `verify_service_key`）
+/// - `/auth/jwks` **不**走 service master key（公钥发布，安全边界在私钥）
 pub fn create_admin_routes() -> Router<AdminServerState> {
     Router::new()
         .nest("/api/admin", admin::create_route())
         .nest("/api/service", admin::create_route())
+        .nest("/api/service/auth", auth::create_route())
         .route("/api/service/auth/jwks", get(auth_jwks::handler))
 }

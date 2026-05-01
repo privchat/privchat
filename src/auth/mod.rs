@@ -24,6 +24,7 @@ pub mod models;
 pub mod password;
 pub mod rsa_jwt_service;
 pub mod service_key_manager;
+pub mod unified_token_service;
 pub mod session_state;
 pub mod token;
 pub mod token_issue_service;
@@ -43,6 +44,9 @@ pub use rsa_jwt_service::{
     RsaJwtService, UnifiedTokenClaims, VerifyError as UnifiedVerifyError,
 };
 pub use service_key_manager::{ServiceKeyManager, ServiceKeyStrategy};
+pub use unified_token_service::{
+    IntrospectResult, IssueParams, IssueResult, RevokeRequest, UnifiedTokenService,
+};
 pub use session_state::{KickReason, KickedDevice, SessionState, SessionVerifyResult};
 pub use token::TokenAuth;
 pub use token_issue_service::TokenIssueService;

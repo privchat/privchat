@@ -98,6 +98,7 @@ pub mod file_upload_repo;
 pub mod login_log_repository;
 pub mod message_repo;
 pub mod presence_repository;
+pub mod refresh_token_repository; // v1.3 unified refresh token store
 pub mod user_device_repo; // ✨ 新增：用户设备 Repository
 pub mod user_repo;
 
@@ -108,5 +109,8 @@ pub use file_upload_repo::FileUploadRepository;
 pub use login_log_repository::{CreateLoginLogRequest, LoginLogQuery, LoginLogRepository};
 pub use message_repo::{MessageRepository, PgMessageRepository};
 pub use presence_repository::PresenceRepository;
+pub use refresh_token_repository::{
+    hash_refresh_token, RefreshTokenRecord, RefreshTokenRepository,
+};
 pub use user_device_repo::{UserDevice, UserDeviceRepository}; // ✨ 新增
 pub use user_repo::UserRepository;
