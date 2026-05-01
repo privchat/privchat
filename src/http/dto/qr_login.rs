@@ -104,6 +104,10 @@ pub struct ConfirmQrSceneResponse {
     pub scene_id: String,
     pub state: QrSceneState,
     pub uid: u64,
+    /// 创建 scene 时由 Web 端提供的 device_id；application 用它给 Web 签发登录 token。
+    pub web_device_id: String,
+    /// Web 设备快照（spec QR_API §5）；application 用它构造 issueImToken 的 DeviceInfo。
+    pub web_device_info: WebDeviceSnapshot,
 }
 
 // ────────── 4.5 Reject ──────────

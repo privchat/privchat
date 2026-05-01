@@ -2581,6 +2581,8 @@ async fn confirm_qr_scene(
         scene_id: scene.scene_id,
         state: scene.state,
         uid,
+        web_device_id: scene.web_device_id,
+        web_device_info: scene.web_device_info,
     }))
 }
 
