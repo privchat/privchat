@@ -95,6 +95,61 @@ pub struct ServerConfig {
     pub redis_url: String,
     /// 推送配置
     pub push: PushConfig,
+    /// RS256 unified token 配置（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）
+    /// 缺省（路径不填或文件不存在）时不启用 RsaJwtService，server 仍按 v1.2 HS256 IM token 工作。
+    pub rsa_jwt: RsaJwtConfig,
+}
+
+/// RS256 unified token 配置。
+///
+/// 私钥 / 公钥 PEM 文件路径走环境变量或配置文件，**绝不**入 repo。
+/// 本地默认 `./.local/keys/jwt/v1.pem`；生产 `/etc/privchat/keys/jwt/v1.pem`。
+///
+/// 见 spec TOKEN_UNIFICATION_SPEC §4.4 / §11.1：
+/// - 算法锁 RS256
+/// - 每个 token 必须含 kid header
+/// - 公钥从 jwks endpoint 暴露，私钥永远不出进程
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RsaJwtConfig {
+    /// 私钥 PEM 文件路径；空字符串视为未配置（关闭 unified token 路径）
+    pub private_key_path: String,
+    /// 公钥 PEM 文件路径
+    pub public_key_path: String,
+    /// 当前签名 key 的 kid（JWT header `kid` claim 用）
+    pub kid: String,
+    /// access token TTL 秒；spec 锁定 1h
+    pub access_ttl_secs: i64,
+    /// refresh token TTL 秒；spec 锁定 7d
+    pub refresh_ttl_secs: i64,
+    /// 颁发方 issuer claim；锁定 "privchat-server"
+    pub issuer: String,
+    /// 默认 audience 列表；application + IM 都接受
+    pub default_audience: Vec<String>,
+}
+
+impl Default for RsaJwtConfig {
+    fn default() -> Self {
+        Self {
+            private_key_path: String::new(),
+            public_key_path: String::new(),
+            kid: "v1".to_string(),
+            access_ttl_secs: 3600,         // 1h
+            refresh_ttl_secs: 604800,      // 7d
+            issuer: "privchat-server".to_string(),
+            default_audience: vec![
+                "privchat-application".to_string(),
+                "privchat-server".to_string(),
+            ],
+        }
+    }
+}
+
+impl RsaJwtConfig {
+    /// 是否配置了可用的 RS256 key 路径。
+    pub fn is_enabled(&self) -> bool {
+        !self.private_key_path.trim().is_empty()
+            && !self.public_key_path.trim().is_empty()
+    }
 }
 
 impl Default for ServerConfig {
@@ -134,6 +189,7 @@ impl Default for ServerConfig {
             service_master_key: String::new(),
             redis_url: String::new(),
             push: PushConfig::default(),
+            rsa_jwt: RsaJwtConfig::default(),
         }
     }
 }
@@ -239,6 +295,33 @@ impl ServerConfig {
         // Service Master Key
         if let Ok(key) = env::var("SERVICE_MASTER_KEY") {
             self.service_master_key = key;
+        }
+
+        // RS256 unified token (spec TOKEN_UNIFICATION_SPEC v1.3)
+        if let Ok(p) = env::var("JWT_RS256_PRIVATE_KEY_PATH") {
+            self.rsa_jwt.private_key_path = p;
+        }
+        if let Ok(p) = env::var("JWT_RS256_PUBLIC_KEY_PATH") {
+            self.rsa_jwt.public_key_path = p;
+        }
+        if let Ok(kid) = env::var("JWT_RS256_KID") {
+            if !kid.trim().is_empty() {
+                self.rsa_jwt.kid = kid;
+            }
+        }
+        if let Ok(ttl) = env::var("JWT_RS256_ACCESS_TTL_SECS") {
+            if let Ok(v) = ttl.parse::<i64>() {
+                if v > 0 {
+                    self.rsa_jwt.access_ttl_secs = v;
+                }
+            }
+        }
+        if let Ok(ttl) = env::var("JWT_RS256_REFRESH_TTL_SECS") {
+            if let Ok(v) = ttl.parse::<i64>() {
+                if v > 0 {
+                    self.rsa_jwt.refresh_ttl_secs = v;
+                }
+            }
         }
 
         // Redis 配置
@@ -583,9 +666,28 @@ struct TomlConfig {
     room: Option<TomlRoomConfig>,
     file: Option<TomlFileConfig>,
     admin: Option<TomlAdminConfig>,
+    auth: Option<TomlAuthConfig>,
     logging: Option<TomlLoggingConfig>,
     system_message: Option<TomlSystemMessageConfig>,
     push: Option<TomlPushConfig>,
+}
+
+/// TOML [auth] 段（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）
+#[derive(Debug, Deserialize)]
+struct TomlAuthConfig {
+    rsa_jwt: Option<TomlRsaJwtConfig>,
+}
+
+/// TOML [auth.rsa_jwt] 段
+#[derive(Debug, Deserialize)]
+struct TomlRsaJwtConfig {
+    private_key_path: Option<String>,
+    public_key_path: Option<String>,
+    kid: Option<String>,
+    access_ttl_secs: Option<i64>,
+    refresh_ttl_secs: Option<i64>,
+    issuer: Option<String>,
+    default_audience: Option<Vec<String>>,
 }
 
 /// TOML [admin] 段
@@ -1071,6 +1173,42 @@ impl From<TomlConfig> for ServerConfig {
             }
             if let Some(key) = admin.master_key {
                 config.service_master_key = key;
+            }
+        }
+
+        if let Some(auth) = toml.auth {
+            if let Some(rsa) = auth.rsa_jwt {
+                if let Some(p) = rsa.private_key_path {
+                    config.rsa_jwt.private_key_path = p;
+                }
+                if let Some(p) = rsa.public_key_path {
+                    config.rsa_jwt.public_key_path = p;
+                }
+                if let Some(kid) = rsa.kid {
+                    if !kid.trim().is_empty() {
+                        config.rsa_jwt.kid = kid;
+                    }
+                }
+                if let Some(ttl) = rsa.access_ttl_secs {
+                    if ttl > 0 {
+                        config.rsa_jwt.access_ttl_secs = ttl;
+                    }
+                }
+                if let Some(ttl) = rsa.refresh_ttl_secs {
+                    if ttl > 0 {
+                        config.rsa_jwt.refresh_ttl_secs = ttl;
+                    }
+                }
+                if let Some(iss) = rsa.issuer {
+                    if !iss.trim().is_empty() {
+                        config.rsa_jwt.issuer = iss;
+                    }
+                }
+                if let Some(aud) = rsa.default_audience {
+                    if !aud.is_empty() {
+                        config.rsa_jwt.default_audience = aud;
+                    }
+                }
             }
         }
 

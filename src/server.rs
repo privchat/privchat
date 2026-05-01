@@ -129,6 +129,8 @@ pub struct ChatServer {
     qr_login_service: Arc<crate::service::qr_login_service::QrLoginService>,
     /// 扫码登录的 unauth 推送 publisher（spec QR_API §5）
     qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
+    /// RS256 unified token 服务（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A，可选）
+    rsa_jwt_service: Option<Arc<crate::auth::RsaJwtService>>,
 }
 
 impl ChatServer {
@@ -511,6 +513,32 @@ impl ChatServer {
                 .with_publisher(qr_login_publisher.clone(), connection_manager.clone()),
         );
         info!("✅ QrLoginService + Publisher 创建完成");
+
+        // RS256 unified token（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）：
+        // 仅在 [auth.rsa_jwt] 配置完整时启用；缺省 None，server 仍按 v1.2 HS256 IM token 工作。
+        let rsa_jwt_service = if config.rsa_jwt.is_enabled() {
+            match crate::auth::RsaJwtService::from_config(config.rsa_jwt.clone()) {
+                Ok(svc) => {
+                    info!(
+                        "✅ RsaJwtService 创建完成 kid={} access_ttl={}s refresh_ttl={}s",
+                        config.rsa_jwt.kid,
+                        config.rsa_jwt.access_ttl_secs,
+                        config.rsa_jwt.refresh_ttl_secs
+                    );
+                    Some(Arc::new(svc))
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ RsaJwtService 加载失败（unified token 路径将关闭）: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ RsaJwtService 未配置；unified token 路径关闭（v1.2 HS256 行为不变）");
+            None
+        };
 
         // 5. 将 EventBus 传递给 SendMessageHandler
         // 注意：SendMessageHandler 需要支持设置 event_bus
@@ -1320,6 +1348,7 @@ impl ChatServer {
             user_service,
             qr_login_service,
             qr_login_publisher,
+            rsa_jwt_service,
         })
     }
 
@@ -2087,6 +2116,7 @@ impl ChatServer {
             self.user_service.clone(),
             self.qr_login_service.clone(),
             self.qr_login_publisher.clone(),
+            self.rsa_jwt_service.clone(),
             self.config.admin_api_port,
         );
 

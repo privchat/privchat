@@ -62,6 +62,10 @@ pub struct AdminServerState {
     pub qr_login_service: Arc<crate::service::qr_login_service::QrLoginService>,
     /// Web 扫码登录的 unauth 推送 publisher（spec QR_API §5）。
     pub qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
+    /// RS256 unified token 服务（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）。
+    /// 未配置 `[auth.rsa_jwt]` 时为 `None`，server 仍按 v1.2 HS256 IM token 工作；
+    /// `/auth/jwks` 此时返回 503。
+    pub rsa_jwt_service: Option<Arc<crate::auth::RsaJwtService>>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -124,6 +128,7 @@ impl AdminHttpServer {
         user_service: Arc<UserService>,
         qr_login_service: Arc<crate::service::qr_login_service::QrLoginService>,
         qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
+        rsa_jwt_service: Option<Arc<crate::auth::RsaJwtService>>,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -150,6 +155,7 @@ impl AdminHttpServer {
                 user_service,
                 qr_login_service,
                 qr_login_publisher,
+                rsa_jwt_service,
             },
             port,
         }
