@@ -189,7 +189,7 @@ pub fn create_route() -> Router<AdminServerState> {
 // =====================================================
 
 /// 从请求头中提取并验证 Service Key
-async fn verify_service_key(headers: &HeaderMap, state: &AdminServerState) -> Result<()> {
+pub(crate) async fn verify_service_key(headers: &HeaderMap, state: &AdminServerState) -> Result<()> {
     let key = headers
         .get("X-Service-Key")
         .or_else(|| headers.get("x-service-key"))
@@ -451,7 +451,7 @@ async fn bump_user_sessions(
 }
 
 /// 从请求头中提取 Service Key（内部使用）
-fn extract_service_key(headers: &HeaderMap) -> Result<String> {
+pub(crate) fn extract_service_key(headers: &HeaderMap) -> Result<String> {
     let key = headers
         .get("X-Service-Key")
         .or_else(|| headers.get("x-service-key"))
