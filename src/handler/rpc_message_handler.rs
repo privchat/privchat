@@ -50,18 +50,34 @@ impl MessageHandler for RPCMessageHandler {
     async fn handle(&self, context: RequestContext) -> Result<Option<Vec<u8>>> {
         debug!("🔧 处理 RPC 请求: session_id={}", context.session_id);
 
-        // 解析 RPC 请求
-        let rpc_request: RPCMessageRequest = match serde_json::from_slice(&context.data) {
-            Ok(req) => req,
-            Err(e) => {
-                tracing::error!("❌ RPC 请求解析失败: {}", e);
-                let error_response = serde_json::json!({
-                    "code": 400,
-                    "message": "Invalid RPC request format",
-                    "data": null
-                });
-                return Ok(Some(serde_json::to_vec(&error_response)?));
+        // Wire format is FlatBuffers privchat_protocol::RpcRequest. The
+        // protocol envelope carries `route` plus opaque body bytes (currently
+        // JSON UTF-8 of the RPC params); we parse the body into a
+        // serde_json::Value for the existing handler dispatcher.
+        let fb_request: privchat_protocol::RpcRequest =
+            match privchat_protocol::decode_message(&context.data) {
+                Ok(req) => req,
+                Err(e) => {
+                    tracing::error!("❌ RPC 请求解析失败 (flatbuffers): {}", e);
+                    return Ok(Some(encode_rpc_error(400, "Invalid RPC request format")?));
+                }
+            };
+
+        let body_value: serde_json::Value = if fb_request.body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            match serde_json::from_slice(&fb_request.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("❌ RPC body JSON 解析失败: {}", e);
+                    return Ok(Some(encode_rpc_error(400, "Invalid RPC body JSON")?));
+                }
             }
+        };
+
+        let rpc_request = RPCMessageRequest {
+            route: fb_request.route,
+            body: body_value,
         };
 
         info!(
@@ -102,12 +118,7 @@ impl MessageHandler for RPCMessageHandler {
                     "❌ RPC 认证失败，将断开 session: route={}, session={}, error={}",
                     rpc_request.route, context.session_id, error_code
                 );
-                let error_response = serde_json::json!({
-                    "code": error_code.code(),
-                    "message": error_code.message(),
-                    "data": null
-                });
-                let response_bytes = serde_json::to_vec(&error_response)?;
+                let response_bytes = encode_rpc_error(error_code.code() as i32, error_code.message())?;
 
                 // 等错误响应发出后再断开（~50ms 足够 transport 把帧刷到网络）。
                 let cm = self.connection_manager.clone();
@@ -132,12 +143,38 @@ impl MessageHandler for RPCMessageHandler {
             rpc_request.route, rpc_response.code, rpc_response.message
         );
 
-        // 序列化响应
-        let response_data = serde_json::to_vec(&rpc_response)?;
-        Ok(Some(response_data))
+        // Encode response as FlatBuffers privchat_protocol::RpcResponse.
+        // The original RpcResponse.data is serde_json::Value — wrap it as
+        // JSON UTF-8 bytes inside the FB envelope's `data: [ubyte]` slot.
+        let data_bytes = match &rpc_response.data {
+            Some(v) => {
+                let bytes = serde_json::to_vec(v)?;
+                if bytes.is_empty() { None } else { Some(bytes) }
+            }
+            None => None,
+        };
+        let fb_response = privchat_protocol::RpcResponse {
+            code: rpc_response.code,
+            message: rpc_response.message.clone(),
+            data: data_bytes,
+        };
+        let response_bytes = privchat_protocol::encode_message(&fb_response)
+            .map_err(|e| crate::error::ServerError::Internal(format!("encode rpc response: {e}")))?;
+        Ok(Some(response_bytes))
     }
 
     fn name(&self) -> &'static str {
         "RPCMessageHandler"
     }
+}
+
+/// Encode an RPC-layer error into a FlatBuffers `RpcResponse`.
+fn encode_rpc_error(code: i32, message: &str) -> Result<Vec<u8>> {
+    let resp = privchat_protocol::RpcResponse {
+        code,
+        message: message.to_string(),
+        data: None,
+    };
+    privchat_protocol::encode_message(&resp)
+        .map_err(|e| crate::error::ServerError::Internal(format!("encode rpc error: {e}")).into())
 }
