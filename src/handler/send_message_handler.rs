@@ -1435,22 +1435,27 @@ impl SendMessageHandler {
         Vec<u64>,
         Option<crate::model::privacy::FriendRequestSource>,
     )> {
-        // 复用 privchat-protocol 定义的 MessagePayloadEnvelope，单次 serde 解析
-        use privchat_protocol::message::{MessagePayloadEnvelope, MessageSource};
+        // Wire format is FlatBuffers MessagePayloadEnvelope (zero-copy
+        // typed metadata union). Downstream code still wants metadata as
+        // an opaque JSON string (validation re-parses per content type),
+        // so we serialize the typed inner metadata back to JSON without
+        // the discriminator tag — matching the legacy on-disk shape.
+        use privchat_protocol::{MessagePayloadEnvelope, MessageSource};
 
-        let parsed: MessagePayloadEnvelope = match serde_json::from_slice(payload) {
-            Ok(v) => v,
-            Err(_) => {
-                // fallback: 纯文本模式
-                return Ok((
-                    String::from_utf8_lossy(payload).to_string(),
-                    None,
-                    None,
-                    Vec::new(),
-                    None,
-                ));
-            }
-        };
+        let parsed: MessagePayloadEnvelope =
+            match privchat_protocol::decode_message::<MessagePayloadEnvelope>(payload) {
+                Ok(v) => v,
+                Err(_) => {
+                    // fallback: 纯文本模式（旧客户端 / 测试可能直接传 utf-8）
+                    return Ok((
+                        String::from_utf8_lossy(payload).to_string(),
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            };
 
         // content: 如果为空，用整个 payload 作为字符串
         let content = if parsed.content.is_empty() {
@@ -1459,10 +1464,14 @@ impl SendMessageHandler {
             parsed.content
         };
 
-        // metadata: 序列化回 JSON 字符串
-        let metadata = parsed
-            .metadata
-            .map(|m| serde_json::to_string(&m).unwrap_or_else(|_| "{}".to_string()));
+        // metadata: 把 typed 枚举转回 inner JSON shape（不带 type 标签）
+        let metadata = parsed.metadata.as_ref().map(|m| {
+            serde_json::to_string(&m.to_inner_json_value())
+                .unwrap_or_else(|_| "{}".to_string())
+        });
+
+        // reply_to_message_id: u64 → Option<String> for downstream API contract
+        let reply_to_message_id = parsed.reply_to_message_id.map(|n| n.to_string());
 
         // message_source: 从 MessageSource 转为 FriendRequestSource 枚举
         let message_source =
@@ -1492,8 +1501,8 @@ impl SendMessageHandler {
         Ok((
             content,
             metadata,
-            parsed.reply_to_message_id,
-            parsed.mentioned_user_ids.unwrap_or_default(),
+            reply_to_message_id,
+            parsed.mentioned_user_ids,
             message_source,
         ))
     }
