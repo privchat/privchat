@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::auth::ImTokenClaims;
+use crate::auth::UnifiedTokenClaims;
 use chrono::{DateTime, Duration, Utc};
 use msgtrans::SessionId;
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ pub struct SessionInfo {
     /// 最后活跃时间
     pub last_active_at: DateTime<Utc>,
     /// JWT 声明
-    pub jwt_claims: ImTokenClaims,
+    pub jwt_claims: UnifiedTokenClaims,
     /// 客户端 pts（服务器维护，推送离线消息后更新）
     pub client_pts: u64,
     /// 是否已准备好接收补差和实时推送
@@ -73,7 +73,7 @@ impl SessionManager {
         session_id: SessionId,
         user_id: String,
         device_id: String,
-        jwt_claims: ImTokenClaims,
+        jwt_claims: UnifiedTokenClaims,
     ) {
         let info = SessionInfo {
             user_id: user_id.clone(),
@@ -250,10 +250,10 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::ImTokenClaims;
+    use crate::auth::UnifiedTokenClaims;
 
-    fn create_test_claims(user_id: u64, device_id: &str) -> ImTokenClaims {
-        ImTokenClaims {
+    fn create_test_claims(user_id: u64, device_id: &str) -> UnifiedTokenClaims {
+        UnifiedTokenClaims {
             sub: user_id.to_string(),
             device_id: device_id.to_string(),
             exp: (Utc::now() + Duration::hours(24)).timestamp(),

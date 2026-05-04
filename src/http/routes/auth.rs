@@ -278,9 +278,5 @@ async fn revoke_handler(
 fn require_unified_token_service(
     state: &AdminServerState,
 ) -> Result<&std::sync::Arc<crate::auth::UnifiedTokenService>, ServerError> {
-    state.unified_token_service.as_ref().ok_or_else(|| {
-        ServerError::Internal(
-            "unified token service is not configured (set [auth.rsa_jwt] in config)".to_string(),
-        )
-    })
+    Ok(&state.unified_token_service)
 }

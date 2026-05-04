@@ -19,11 +19,10 @@
 
 pub mod device_manager;
 pub mod device_manager_db;
-pub mod jwt_service;
 pub mod models;
 pub mod password;
-pub mod rsa_jwt_service;
 pub mod service_key_manager;
+pub mod token_service;
 pub mod unified_token_service;
 pub mod session_state;
 pub mod token;
@@ -33,17 +32,15 @@ pub mod token_revocation;
 // 重新导出主要类型
 pub use device_manager::{DeviceManager, DeviceStats};
 pub use device_manager_db::DeviceManagerDb;
-pub use jwt_service::JwtService;
 pub use models::{
-    Device, DeviceInfo, DeviceItem, DeviceListResponse, DeviceType, ImTokenClaims,
-    IssueTokenRequest, IssueTokenResponse, ServiceKeyConfig,
+    Device, DeviceInfo, DeviceItem, DeviceListResponse, DeviceType, IssueTokenRequest,
+    IssueTokenResponse, ServiceKeyConfig,
 };
 pub use password::{hash_password, verify_password, PASSWORD_COST};
-pub use rsa_jwt_service::{
-    IssueClaims as UnifiedIssueClaims, IssuedToken as UnifiedIssuedToken, JwkRsa, JwkSet,
-    RsaJwtService, UnifiedTokenClaims, VerifyError as UnifiedVerifyError,
-};
 pub use service_key_manager::{ServiceKeyManager, ServiceKeyStrategy};
+pub use token_service::{
+    IssueClaims, IssuedToken, JwkRsa, JwkSet, TokenService, UnifiedTokenClaims, VerifyError,
+};
 pub use unified_token_service::{
     IntrospectResult, IssueParams, IssueResult, RevokeRequest, UnifiedTokenService,
 };

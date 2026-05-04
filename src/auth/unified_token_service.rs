@@ -8,7 +8,7 @@
 //! Unified token 编排服务（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）。
 //!
 //! 串起：
-//! - [`crate::auth::RsaJwtService`]：RS256 签发 / 验签
+//! - [`crate::auth::TokenService`]：RS256 签发 / 验签
 //! - [`crate::auth::DeviceManagerDb`]：设备 upsert + `session_version` 真值
 //! - [`crate::repository::RefreshTokenRepository`]：refresh token 落库
 //!
@@ -26,8 +26,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::auth::rsa_jwt_service::{
-    IssueClaims, RsaJwtService, VerifyError, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH,
+use crate::auth::token_service::{
+    IssueClaims, TokenService, VerifyError, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH,
 };
 use crate::auth::{Device, DeviceInfo, DeviceManagerDb, DeviceType, SessionState, SessionVerifyResult};
 use crate::error::{Result, ServerError};
@@ -109,7 +109,7 @@ pub enum RevokeRequest {
 
 #[derive(Clone)]
 pub struct UnifiedTokenService {
-    rsa: Arc<RsaJwtService>,
+    rsa: Arc<TokenService>,
     devices: Arc<DeviceManagerDb>,
     refresh_repo: Arc<RefreshTokenRepository>,
     /// 默认 audience；issue 未传 audience 时 fallback
@@ -122,7 +122,7 @@ pub struct UnifiedTokenService {
 
 impl UnifiedTokenService {
     pub fn new(
-        rsa: Arc<RsaJwtService>,
+        rsa: Arc<TokenService>,
         devices: Arc<DeviceManagerDb>,
         refresh_repo: Arc<RefreshTokenRepository>,
         default_audience: Vec<String>,
@@ -139,6 +139,11 @@ impl UnifiedTokenService {
             access_ttl_secs,
             refresh_ttl_secs,
         }
+    }
+
+    /// 暴露底层 [`TokenService`]：HTTP `/auth/jwks` 端点直接拿它返 JWKS。
+    pub fn token_service(&self) -> &Arc<TokenService> {
+        &self.rsa
     }
 
     /// `/api/service/auth/issue`。spec §6.1 service-only。
@@ -204,10 +209,10 @@ impl UnifiedTokenService {
         // 5) 签 access + refresh
         // Phase A：access TTL 走 config 默认；params.access_ttl_secs 仅日后扩展用，这里保留接口不消费
         let access = self.rsa.issue_access(issue_claims.clone()).map_err(|e| {
-            ServerError::Internal(format!("RsaJwtService access 签发失败: {}", e))
+            ServerError::Internal(format!("TokenService access 签发失败: {}", e))
         })?;
         let refresh = self.rsa.issue_refresh(issue_claims).map_err(|e| {
-            ServerError::Internal(format!("RsaJwtService refresh 签发失败: {}", e))
+            ServerError::Internal(format!("TokenService refresh 签发失败: {}", e))
         })?;
 
         // 6) refresh 落库（永不存明文，spec §11.2）
@@ -316,7 +321,7 @@ impl UnifiedTokenService {
                     app_id: claims.app_id.clone(),
                 };
                 let access = self.rsa.issue_access(issue_claims).map_err(|e| {
-                    ServerError::Internal(format!("RsaJwtService access 签发失败: {}", e))
+                    ServerError::Internal(format!("TokenService access 签发失败: {}", e))
                 })?;
 
                 // 8) Phase A：refresh 不 rotate；touch last_used_at
@@ -464,7 +469,7 @@ impl UnifiedTokenService {
     }
 }
 
-/// 把 RsaJwtService 的 [`VerifyError`] 转 [`ServerError`]，统一交给 HTTP 层映射 envelope code。
+/// 把 TokenService 的 [`VerifyError`] 转 [`ServerError`]，统一交给 HTTP 层映射 envelope code。
 fn verify_to_error(e: VerifyError) -> ServerError {
     match e {
         VerifyError::Expired => ServerError::Unauthorized("token 已过期".to_string()),

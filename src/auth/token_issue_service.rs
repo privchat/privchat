@@ -17,7 +17,7 @@
 
 use crate::auth::device_manager::DeviceManager;
 use crate::auth::device_manager_db::DeviceManagerDb;
-use crate::auth::jwt_service::JwtService;
+use crate::auth::TokenService;
 use crate::auth::models::{Device, DeviceType, IssueTokenRequest, IssueTokenResponse};
 use crate::auth::service_key_manager::ServiceKeyManager;
 use crate::error::{Result, ServerError};
@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 /// Token 签发服务（整合所有认证服务）
 pub struct TokenIssueService {
-    jwt_service: Arc<JwtService>,
+    jwt_service: Arc<TokenService>,
     service_key_manager: Arc<ServiceKeyManager>,
     device_manager: Arc<DeviceManager>,
     device_manager_db: Option<Arc<DeviceManagerDb>>,
@@ -37,7 +37,7 @@ pub struct TokenIssueService {
 impl TokenIssueService {
     /// 创建新的 Token 签发服务
     pub fn new(
-        jwt_service: Arc<JwtService>,
+        jwt_service: Arc<TokenService>,
         service_key_manager: Arc<ServiceKeyManager>,
         device_manager: Arc<DeviceManager>,
         device_manager_db: Option<Arc<DeviceManagerDb>>,
@@ -215,7 +215,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_issue_token() {
-        let jwt_service = Arc::new(JwtService::new(
+        let jwt_service = Arc::new(TokenService::new(
             "test-secret-key-at-least-32-chars".to_string(),
             3600,
         ));
@@ -265,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_issue_token_invalid_service_key() {
-        let jwt_service = Arc::new(JwtService::new(
+        let jwt_service = Arc::new(TokenService::new(
             "test-secret-key-at-least-32-chars".to_string(),
             3600,
         ));

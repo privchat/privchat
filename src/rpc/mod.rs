@@ -132,7 +132,7 @@ pub struct RpcServiceContext {
     pub offline_queue_service: Arc<OfflineQueueService>,
     pub user_message_index: Arc<UserMessageIndex>,
     /// JWT 服务 - 用于签发和验证 JWT token
-    pub jwt_service: Arc<crate::auth::JwtService>,
+    pub jwt_service: Arc<crate::auth::TokenService>,
     /// 用户仓库 - 用于从数据库读取用户数据
     pub user_repository: Arc<UserRepository>,
     /// 消息仓库 - 用于从数据库读取消息数据
@@ -189,7 +189,7 @@ impl RpcServiceContext {
         pts_generator: Arc<PtsGenerator>,
         offline_queue_service: Arc<OfflineQueueService>,
         user_message_index: Arc<UserMessageIndex>,
-        jwt_service: Arc<crate::auth::JwtService>,
+        jwt_service: Arc<crate::auth::TokenService>,
         user_repository: Arc<UserRepository>,
         message_repository: Arc<crate::repository::PgMessageRepository>,
         connection_manager: Arc<ConnectionManager>, // ✨ 新增参数

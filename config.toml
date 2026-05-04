@@ -6,8 +6,14 @@
 max_connections = 2000
 connection_timeout = 300
 heartbeat_interval = 60
-use_internal_auth = true
 handler_max_inflight = 2000
+
+# 账号体系归属。BUILTIN = server 内置注册/登录/refresh；
+# PLATFORM = 账号托管于 privchat platform（如 privchat-application），
+# server 端用户面 RPC（account/auth/login | account/user/register | account/auth/refresh）一律 forbidden。
+# 也可通过 env 覆盖：PRIVCHAT_ACCOUNT_MODE=BUILTIN | PLATFORM
+[account]
+mode = "BUILTIN"
 
 [[gateway.listeners]]
 protocol = "tcp"
@@ -46,17 +52,23 @@ cleanup_interval_seconds = 60
 port = 9090
 # master_key = "your-secret-key"  # 也可通过环境变量 SERVICE_MASTER_KEY 设置
 
-# Unified token (spec TOKEN_UNIFICATION_SPEC v1.3 Phase A).
-# 留空 = 关闭 unified token 路径，server 仍按 v1.2 HS256 IM token 工作。
-# 路径下必须存在对应 RSA PEM 文件；private/public key 永远不进 repo（见 keys/README.md）。
-# [auth.rsa_jwt]
-# private_key_path = "./.local/keys/jwt/v1.pem"        # 生产: /etc/privchat/keys/jwt/v1.pem
-# public_key_path  = "./.local/keys/jwt/v1.pub.pem"    # 生产: /etc/privchat/keys/jwt/v1.pub.pem
-# kid              = "v1"
-# access_ttl_secs  = 3600       # 1h
-# refresh_ttl_secs = 604800     # 7d
-# 也可通过 env 覆盖：JWT_RS256_PRIVATE_KEY_PATH / JWT_RS256_PUBLIC_KEY_PATH /
-#                  JWT_RS256_KID / JWT_RS256_ACCESS_TTL_SECS / JWT_RS256_REFRESH_TTL_SECS
+# 统一 token 配置（HTTP API + IM RPC 同一签发/验证路径）。
+# algorithm: "RS256" 或 "HS256"
+#   - RS256: 需配 private_key_path / public_key_path（PEM）；JWKS 端点暴露公钥
+#   - HS256: 需配 secret（对称密钥）；JWKS 端点返 503
+# kid 在两种算法下都写，便于轮换审计；RS256 还会写到 JWT header.
+# 也可通过 env 覆盖：PRIVCHAT_JWT_ALGORITHM / PRIVCHAT_JWT_SECRET /
+#   PRIVCHAT_JWT_PRIVATE_KEY_PATH / PRIVCHAT_JWT_PUBLIC_KEY_PATH / PRIVCHAT_JWT_KID /
+#   PRIVCHAT_JWT_ACCESS_TTL_SECS / PRIVCHAT_JWT_REFRESH_TTL_SECS
+[auth.jwt]
+algorithm        = "RS256"
+private_key_path = "./.local/keys/jwt/v1.pem"
+public_key_path  = "./.local/keys/jwt/v1.pub.pem"
+kid              = "v1"
+access_ttl_secs  = 3600
+refresh_ttl_secs = 604800
+issuer           = "privchat-server"
+default_audience = ["privchat-application", "privchat-server"]
 
 [room]
 subscribe_history = true

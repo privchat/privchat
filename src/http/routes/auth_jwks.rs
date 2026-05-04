@@ -17,21 +17,21 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
 
+use crate::config::JwtAlgorithm;
 use crate::http::AdminServerState;
 
-/// 返回 server 当前签名公钥集（Phase A 单 key）。
+/// 返回 server 当前签名公钥集。
 ///
-/// 未配置 `[auth.rsa_jwt]`（生产部署关闭 unified token 时）返回 503，
-/// 避免误导 application 以为 server 支持但没数据。
+/// 仅 RS256 模式下有 keys；HS256 模式下返回 503（HS256 没有公钥可发布）。
 pub async fn handler(State(state): State<AdminServerState>) -> impl IntoResponse {
-    match state.rsa_jwt_service.as_ref() {
-        Some(svc) => (StatusCode::OK, Json(svc.jwks())).into_response(),
-        None => (
+    let token_service = state.unified_token_service.token_service();
+    match token_service.algorithm() {
+        JwtAlgorithm::Rs256 => (StatusCode::OK, Json(token_service.jwks())).into_response(),
+        JwtAlgorithm::Hs256 => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "rsa_jwt_not_configured",
-                "message": "Unified token (RS256) is not configured on this server. \
-                            Set [auth.rsa_jwt] in config or JWT_RS256_* env vars."
+                "error": "jwks_unavailable_for_hs256",
+                "message": "[auth.jwt] algorithm=HS256；HS256 不暴露公钥。改 RS256 后此端点会返回 JWKS。"
             })),
         )
             .into_response(),
