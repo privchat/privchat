@@ -27,9 +27,9 @@ use uuid::Uuid;
 
 /// 处理用户注册请求
 ///
-/// 根据服务器配置 `use_internal_auth` 决定是否启用：
-/// - true: 使用服务器内置的注册功能，返回 JWT token（适合独立部署）
-/// - false: 返回错误，提示使用外部认证系统（适合企业集成）
+/// 根据服务器配置 `account.mode` 决定是否启用：
+/// - [`AccountMode::Builtin`](crate::config::AccountMode::Builtin)：使用 server 内置注册，返回 JWT token（独立部署）
+/// - [`AccountMode::Platform`](crate::config::AccountMode::Platform)：返回 forbidden，引导客户端走 platform 注册
 ///
 /// 注册成功后返回 JWT token，客户端可直接用于 AuthorizationRequest
 pub async fn handle(
@@ -39,11 +39,11 @@ pub async fn handle(
 ) -> RpcResult<Value> {
     tracing::debug!("🔧 处理用户注册请求: {:?}", body);
 
-    // 检查是否启用内置账号系统
-    if !services.config.use_internal_auth {
-        tracing::warn!("❌ 内置账号系统已禁用，请使用外部认证系统");
+    // PLATFORM 模式下用户面 RPC 一律拒绝
+    if !services.config.account.is_builtin() {
+        tracing::warn!("❌ account.mode=PLATFORM，server 内置注册已禁用");
         return Err(RpcError::forbidden(
-            "内置账号系统已禁用。请使用外部认证系统进行用户注册。".to_string(),
+            "account.mode=PLATFORM：server 内置注册已禁用，请通过 platform 完成注册。".to_string(),
         ));
     }
 

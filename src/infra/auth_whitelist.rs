@@ -36,11 +36,12 @@ lazy_static! {
     ///
     /// 这些 RPC 接口可以在未认证的情况下访问
     ///
-    /// 注意：本 IM 系统支持两种账号体系模式：
-    /// 1. 内置账号系统：使用服务器内置的注册/登录功能（适合独立部署）
-    /// 2. 外部账号系统：认证 token 由外部业务系统签发（适合企业集成）
+    /// 注意：本 IM 系统支持两种账号体系模式（见配置 `[account] mode`）：
+    /// 1. BUILTIN：使用服务器内置的注册/登录功能（适合独立部署）
+    /// 2. PLATFORM：认证 token 由 privchat platform（外部）签发（适合企业集成）
     ///
-    /// 通过配置 `use_internal_auth` 可以控制是否启用内置账号系统
+    /// `account/auth/login` 与 `account/user/register` 仍出现在白名单（路由可达），
+    /// PLATFORM 模式下由 handler 返 forbidden；spec 接受这种语义（避免动态白名单复杂度）。
     pub static ref ANONYMOUS_RPC_ROUTES: HashSet<String> = {
         let mut set = HashSet::new();
 

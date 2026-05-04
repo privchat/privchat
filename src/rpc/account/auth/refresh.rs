@@ -39,6 +39,14 @@ pub async fn handle(
 ) -> RpcResult<Value> {
     tracing::debug!("🔧 处理 refresh token 请求");
 
+    // PLATFORM 模式下用户面 RPC 一律拒绝（refresh token 由 platform 持有签发）
+    if !services.config.account.is_builtin() {
+        tracing::warn!("❌ account.mode=PLATFORM，server 内置 refresh 已禁用");
+        return Err(RpcError::forbidden(
+            "account.mode=PLATFORM：server 内置 refresh 已禁用，请向 platform 申请新 token。".to_string(),
+        ));
+    }
+
     let request: AuthRefreshRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 

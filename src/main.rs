@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
         tracing::info!("  - Log File: {}", f);
     }
     tracing::info!("  - Protocols: {:?}", config.enabled_protocols);
+    tracing::info!("  - Account Mode: {:?}", config.account.mode);
 
     // 创建服务器（如果数据库连接或目录创建等失败，会打印错误并退出）
     let server = match ChatServer::new(config).await {
@@ -132,8 +133,13 @@ fn generate_config(path: &str) -> Result<()> {
 max_connections = 100000
 connection_timeout = 300
 heartbeat_interval = 60
-use_internal_auth = true
 handler_max_inflight = 2000
+
+# 账号体系归属。BUILTIN = server 内置注册/登录/refresh；
+# PLATFORM = 账号托管于 privchat platform（如 privchat-application），
+# server 端用户面 RPC 一律 forbidden。也可通过 PRIVCHAT_ACCOUNT_MODE 覆盖。
+[account]
+mode = "BUILTIN"
 
 [[gateway.listeners]]
 protocol = "tcp"

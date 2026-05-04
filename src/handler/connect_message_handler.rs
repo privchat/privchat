@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use crate::auth::{
-    DeviceManager, DeviceManagerDb, JwtService, SessionVerifyResult, TokenRevocationService,
+    DeviceManager, DeviceManagerDb, TokenService, SessionVerifyResult, TokenRevocationService,
 };
 use crate::context::RequestContext;
 use crate::handler::MessageHandler;
@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 
 /// 连接消息处理器
 pub struct ConnectMessageHandler {
-    jwt_service: Arc<JwtService>,
+    jwt_service: Arc<TokenService>,
     token_revocation_service: Arc<TokenRevocationService>,
     device_manager: Arc<DeviceManager>,
     device_manager_db: Arc<DeviceManagerDb>, // ✨ 新增：数据库版设备管理器
@@ -65,7 +65,7 @@ pub struct ConnectMessageHandler {
 
 impl ConnectMessageHandler {
     pub fn new(
-        jwt_service: Arc<JwtService>,
+        jwt_service: Arc<TokenService>,
         token_revocation_service: Arc<TokenRevocationService>,
         device_manager: Arc<DeviceManager>,
         device_manager_db: Arc<DeviceManagerDb>, // ✨ 新增参数
@@ -449,7 +449,7 @@ impl ConnectMessageHandler {
         &self,
         user_id: u64,
         device_id: &str,
-        claims: &crate::auth::ImTokenClaims,
+        claims: &crate::auth::UnifiedTokenClaims,
         connect_request: &privchat_protocol::protocol::AuthorizationRequest,
         context: &RequestContext,
     ) -> anyhow::Result<bool> {

@@ -32,8 +32,6 @@ pub struct ServerConfig {
     pub port: u16,
     /// 数据库连接字符串
     pub database_url: String,
-    /// JWT密钥
-    pub jwt_secret: String,
     /// 最大连接数
     pub max_connections: u32,
     /// 连接超时时间（秒）
@@ -77,11 +75,13 @@ pub struct ServerConfig {
     ///
     /// 注意：此 URL 不包含端口号，生产环境通常通过域名访问（80/443 端口）
     pub file_api_base_url: Option<String>,
-    /// 是否启用内置账号系统
+    /// 账号体系归属（spec ACCOUNT_MODE）。
     ///
-    /// - true: 使用服务器内置的注册/登录功能（适合独立部署）
-    /// - false: 使用外部账号系统（适合企业集成，token 由外部系统签发）
-    pub use_internal_auth: bool,
+    /// - [`AccountMode::Builtin`]：使用 server 内置账号系统（注册 / 登录 / refresh 全在本进程）
+    /// - [`AccountMode::Platform`]：使用 privchat platform（外部）账号系统；server 仅负责 IM 通道
+    ///   认证 token 由 platform 签发，server 端用户面 RPC（`account/auth/login`、
+    ///   `account/user/register`、`account/auth/refresh`）一律 forbidden。
+    pub account: AccountConfig,
     /// 系统消息配置
     pub system_message: SystemMessageConfig,
     /// 安全防护配置
@@ -95,27 +95,50 @@ pub struct ServerConfig {
     pub redis_url: String,
     /// 推送配置
     pub push: PushConfig,
-    /// RS256 unified token 配置（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）
-    /// 缺省（路径不填或文件不存在）时不启用 RsaJwtService，server 仍按 v1.2 HS256 IM token 工作。
-    pub rsa_jwt: RsaJwtConfig,
+    /// 统一 token 配置（HTTP API + IM RPC 共用，单一签发/验证路径）。
+    pub jwt: JwtConfig,
 }
 
-/// RS256 unified token 配置。
+/// JWT 算法（配置 `[auth.jwt] algorithm`）。
 ///
-/// 私钥 / 公钥 PEM 文件路径走环境变量或配置文件，**绝不**入 repo。
-/// 本地默认 `./.local/keys/jwt/v1.pem`；生产 `/etc/privchat/keys/jwt/v1.pem`。
+/// - [`Hs256`](JwtAlgorithm::Hs256)：对称 secret，简单部署
+/// - [`Rs256`](JwtAlgorithm::Rs256)：非对称 PEM key + JWKS 暴露公钥，跨服务验签更安全
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum JwtAlgorithm {
+    Hs256,
+    Rs256,
+}
+
+impl Default for JwtAlgorithm {
+    fn default() -> Self {
+        JwtAlgorithm::Rs256
+    }
+}
+
+/// 统一 token 配置（spec TOKEN_UNIFICATION_SPEC v1.3 §4 / §6）。
 ///
-/// 见 spec TOKEN_UNIFICATION_SPEC §4.4 / §11.1：
-/// - 算法锁 RS256
-/// - 每个 token 必须含 kid header
-/// - 公钥从 jwks endpoint 暴露，私钥永远不出进程
+/// HTTP API（/api/service/auth/issue 等）与 IM RPC（AuthorizationRequest）使用
+/// **同一** `TokenService` 实例签发与验证；算法由 [`algorithm`](JwtConfig::algorithm) 决定。
+///
+/// 字段语义按算法分组：
+/// - [`JwtAlgorithm::Hs256`]：仅用 [`secret`](JwtConfig::secret)；其它密钥字段忽略
+/// - [`JwtAlgorithm::Rs256`]：用 [`private_key_path`](JwtConfig::private_key_path)、
+///   [`public_key_path`](JwtConfig::public_key_path)、[`kid`](JwtConfig::kid)；JWKS 端点暴露公钥
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RsaJwtConfig {
-    /// 私钥 PEM 文件路径；空字符串视为未配置（关闭 unified token 路径）
+pub struct JwtConfig {
+    /// 签名/验签算法；fail-fast 启动校验（缺密钥则报错）
+    pub algorithm: JwtAlgorithm,
+    /// HS256 共享密钥（仅 [`JwtAlgorithm::Hs256`] 使用）
+    #[serde(default)]
+    pub secret: String,
+    /// RS256 私钥 PEM 文件路径（仅 [`JwtAlgorithm::Rs256`] 使用）
+    #[serde(default)]
     pub private_key_path: String,
-    /// 公钥 PEM 文件路径
+    /// RS256 公钥 PEM 文件路径（仅 [`JwtAlgorithm::Rs256`] 使用）
+    #[serde(default)]
     pub public_key_path: String,
-    /// 当前签名 key 的 kid（JWT header `kid` claim 用）
+    /// 当前签名 key 的 kid（JWT header `kid` claim；HS256 也写，便于轮换审计）
     pub kid: String,
     /// access token TTL 秒；spec 锁定 1h
     pub access_ttl_secs: i64,
@@ -127,14 +150,16 @@ pub struct RsaJwtConfig {
     pub default_audience: Vec<String>,
 }
 
-impl Default for RsaJwtConfig {
+impl Default for JwtConfig {
     fn default() -> Self {
         Self {
+            algorithm: JwtAlgorithm::default(),
+            secret: String::new(),
             private_key_path: String::new(),
             public_key_path: String::new(),
             kid: "v1".to_string(),
-            access_ttl_secs: 3600,         // 1h
-            refresh_ttl_secs: 604800,      // 7d
+            access_ttl_secs: 3600,
+            refresh_ttl_secs: 604800,
             issuer: "privchat-server".to_string(),
             default_audience: vec![
                 "privchat-application".to_string(),
@@ -144,11 +169,75 @@ impl Default for RsaJwtConfig {
     }
 }
 
-impl RsaJwtConfig {
-    /// 是否配置了可用的 RS256 key 路径。
-    pub fn is_enabled(&self) -> bool {
-        !self.private_key_path.trim().is_empty()
-            && !self.public_key_path.trim().is_empty()
+impl JwtConfig {
+    /// 启动期校验：算法对应的密钥必须配齐，否则 fail-fast。
+    pub fn validate(&self) -> Result<(), String> {
+        match self.algorithm {
+            JwtAlgorithm::Hs256 => {
+                if self.secret.trim().is_empty() {
+                    return Err(
+                        "[auth.jwt] algorithm=HS256 但 secret 未配置（NETON_JWT_SECRET 可覆盖）"
+                            .to_string(),
+                    );
+                }
+            }
+            JwtAlgorithm::Rs256 => {
+                if self.private_key_path.trim().is_empty()
+                    || self.public_key_path.trim().is_empty()
+                {
+                    return Err(
+                        "[auth.jwt] algorithm=RS256 但 private_key_path 或 public_key_path 未配置"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if self.kid.trim().is_empty() {
+            return Err("[auth.jwt] kid 不能为空".to_string());
+        }
+        if self.access_ttl_secs <= 0 || self.refresh_ttl_secs <= 0 {
+            return Err("[auth.jwt] access_ttl_secs / refresh_ttl_secs 必须 > 0".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// 账号体系归属。
+///
+/// - [`Builtin`](AccountMode::Builtin)：privchat-server 内置账号系统（独立部署 / 测试默认）
+/// - [`Platform`](AccountMode::Platform)：账号体系托管于 privchat platform（如 privchat-application）；
+///   server 端只承担 IM 通道职责，用户面 RPC 一律 forbidden。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum AccountMode {
+    Builtin,
+    Platform,
+}
+
+impl Default for AccountMode {
+    fn default() -> Self {
+        AccountMode::Builtin
+    }
+}
+
+/// `[account]` 配置块。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountConfig {
+    pub mode: AccountMode,
+}
+
+impl Default for AccountConfig {
+    fn default() -> Self {
+        Self {
+            mode: AccountMode::Builtin,
+        }
+    }
+}
+
+impl AccountConfig {
+    /// PLATFORM 模式下，server 端用户面 RPC（login/register/refresh）必须拒绝。
+    pub fn is_builtin(&self) -> bool {
+        self.mode == AccountMode::Builtin
     }
 }
 
@@ -158,7 +247,6 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 9001,
             database_url: String::new(),
-            jwt_secret: String::new(),
             max_connections: 1000,
             connection_timeout: 300,
             heartbeat_interval: 60,
@@ -182,14 +270,14 @@ impl Default for ServerConfig {
             http_file_server_port: 9083,
             admin_api_port: 9090,
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
-            use_internal_auth: true, // 默认启用内置账号系统（方便独立部署和测试）
+            account: AccountConfig::default(), // 默认 BUILTIN（独立部署 / 测试）
             system_message: SystemMessageConfig::default(),
             security: SecurityProtectionConfig::default(),
             handler_max_inflight: 2000,
             service_master_key: String::new(),
             redis_url: String::new(),
             push: PushConfig::default(),
-            rsa_jwt: RsaJwtConfig::default(),
+            jwt: JwtConfig::default(),
         }
     }
 }
@@ -276,9 +364,6 @@ impl ServerConfig {
         if let Ok(db_url) = env::var("DATABASE_URL") {
             self.database_url = db_url;
         }
-        if let Ok(jwt_secret) = env::var("PRIVCHAT_JWT_SECRET") {
-            self.jwt_secret = jwt_secret;
-        }
         if let Ok(max_conn) = env::var("PRIVCHAT_MAX_CONNECTIONS") {
             self.max_connections = max_conn.parse().unwrap_or(self.max_connections);
         }
@@ -297,29 +382,43 @@ impl ServerConfig {
             self.service_master_key = key;
         }
 
-        // RS256 unified token (spec TOKEN_UNIFICATION_SPEC v1.3)
-        if let Ok(p) = env::var("JWT_RS256_PRIVATE_KEY_PATH") {
-            self.rsa_jwt.private_key_path = p;
-        }
-        if let Ok(p) = env::var("JWT_RS256_PUBLIC_KEY_PATH") {
-            self.rsa_jwt.public_key_path = p;
-        }
-        if let Ok(kid) = env::var("JWT_RS256_KID") {
-            if !kid.trim().is_empty() {
-                self.rsa_jwt.kid = kid;
+        // 统一 JWT 配置（spec TOKEN_UNIFICATION_SPEC v1.3 §4 / §6）
+        if let Ok(algo) = env::var("PRIVCHAT_JWT_ALGORITHM") {
+            match algo.trim().to_ascii_uppercase().as_str() {
+                "HS256" => self.jwt.algorithm = JwtAlgorithm::Hs256,
+                "RS256" => self.jwt.algorithm = JwtAlgorithm::Rs256,
+                other => tracing::warn!(
+                    "PRIVCHAT_JWT_ALGORITHM 非法值 '{}'（仅 HS256 / RS256），保留默认 {:?}",
+                    other,
+                    self.jwt.algorithm
+                ),
             }
         }
-        if let Ok(ttl) = env::var("JWT_RS256_ACCESS_TTL_SECS") {
+        if let Ok(secret) = env::var("PRIVCHAT_JWT_SECRET") {
+            self.jwt.secret = secret;
+        }
+        if let Ok(p) = env::var("PRIVCHAT_JWT_PRIVATE_KEY_PATH") {
+            self.jwt.private_key_path = p;
+        }
+        if let Ok(p) = env::var("PRIVCHAT_JWT_PUBLIC_KEY_PATH") {
+            self.jwt.public_key_path = p;
+        }
+        if let Ok(kid) = env::var("PRIVCHAT_JWT_KID") {
+            if !kid.trim().is_empty() {
+                self.jwt.kid = kid;
+            }
+        }
+        if let Ok(ttl) = env::var("PRIVCHAT_JWT_ACCESS_TTL_SECS") {
             if let Ok(v) = ttl.parse::<i64>() {
                 if v > 0 {
-                    self.rsa_jwt.access_ttl_secs = v;
+                    self.jwt.access_ttl_secs = v;
                 }
             }
         }
-        if let Ok(ttl) = env::var("JWT_RS256_REFRESH_TTL_SECS") {
+        if let Ok(ttl) = env::var("PRIVCHAT_JWT_REFRESH_TTL_SECS") {
             if let Ok(v) = ttl.parse::<i64>() {
                 if v > 0 {
-                    self.rsa_jwt.refresh_ttl_secs = v;
+                    self.jwt.refresh_ttl_secs = v;
                 }
             }
         }
@@ -341,6 +440,19 @@ impl ServerConfig {
         // 管理 API 端口
         if let Ok(admin_port) = env::var("PRIVCHAT_ADMIN_API_PORT") {
             self.admin_api_port = admin_port.parse().unwrap_or(self.admin_api_port);
+        }
+
+        // 账号体系归属（BUILTIN | PLATFORM）
+        if let Ok(mode) = env::var("PRIVCHAT_ACCOUNT_MODE") {
+            match mode.trim().to_ascii_uppercase().as_str() {
+                "BUILTIN" => self.account.mode = AccountMode::Builtin,
+                "PLATFORM" => self.account.mode = AccountMode::Platform,
+                other => tracing::warn!(
+                    "PRIVCHAT_ACCOUNT_MODE 非法值 '{}'（仅支持 BUILTIN / PLATFORM），保留默认 {:?}",
+                    other,
+                    self.account.mode
+                ),
+            }
         }
 
         // 文件配置
@@ -560,7 +672,7 @@ impl ServerConfig {
             });
         }
         if let Some(jwt_secret) = &cli.jwt_secret {
-            self.jwt_secret = jwt_secret.clone();
+            self.jwt.secret = jwt_secret.clone();
         }
         if let Some(log_level) = cli.get_log_level() {
             self.log_level = log_level;
@@ -637,9 +749,6 @@ impl ServerConfig {
         if self.database_url.is_empty() {
             missing.push("DATABASE_URL");
         }
-        if self.jwt_secret.is_empty() {
-            missing.push("PRIVCHAT_JWT_SECRET");
-        }
         if self.service_master_key.is_empty() {
             missing.push("SERVICE_MASTER_KEY");
         }
@@ -654,6 +763,11 @@ impl ServerConfig {
             );
         }
 
+        // [auth.jwt] fail-fast 校验（算法 + 对应密钥）
+        self.jwt
+            .validate()
+            .map_err(|e| anyhow::anyhow!("[auth.jwt] 配置错误: {}", e))?;
+
         Ok(())
     }
 }
@@ -667,6 +781,7 @@ struct TomlConfig {
     file: Option<TomlFileConfig>,
     admin: Option<TomlAdminConfig>,
     auth: Option<TomlAuthConfig>,
+    account: Option<TomlAccountConfig>,
     logging: Option<TomlLoggingConfig>,
     system_message: Option<TomlSystemMessageConfig>,
     push: Option<TomlPushConfig>,
@@ -675,12 +790,14 @@ struct TomlConfig {
 /// TOML [auth] 段（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）
 #[derive(Debug, Deserialize)]
 struct TomlAuthConfig {
-    rsa_jwt: Option<TomlRsaJwtConfig>,
+    jwt: Option<TomlJwtConfig>,
 }
 
-/// TOML [auth.rsa_jwt] 段
+/// TOML `[auth.jwt]` 段（统一 token 配置）
 #[derive(Debug, Deserialize)]
-struct TomlRsaJwtConfig {
+struct TomlJwtConfig {
+    algorithm: Option<JwtAlgorithm>,
+    secret: Option<String>,
     private_key_path: Option<String>,
     public_key_path: Option<String>,
     kid: Option<String>,
@@ -898,8 +1015,13 @@ struct TomlGatewayConfig {
     max_connections: Option<u32>,
     connection_timeout: Option<u64>,
     heartbeat_interval: Option<u64>,
-    use_internal_auth: Option<bool>,
     handler_max_inflight: Option<usize>,
+}
+
+/// TOML `[account]` 段。
+#[derive(Debug, Deserialize)]
+struct TomlAccountConfig {
+    mode: Option<AccountMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1053,9 +1175,6 @@ impl From<TomlConfig> for ServerConfig {
             if let Some(interval) = gw.heartbeat_interval {
                 config.heartbeat_interval = interval;
             }
-            if let Some(use_internal) = gw.use_internal_auth {
-                config.use_internal_auth = use_internal;
-            }
             if let Some(max_inflight) = gw.handler_max_inflight {
                 config.handler_max_inflight = max_inflight;
             }
@@ -1177,38 +1296,50 @@ impl From<TomlConfig> for ServerConfig {
         }
 
         if let Some(auth) = toml.auth {
-            if let Some(rsa) = auth.rsa_jwt {
-                if let Some(p) = rsa.private_key_path {
-                    config.rsa_jwt.private_key_path = p;
+            if let Some(jwt) = auth.jwt {
+                if let Some(algo) = jwt.algorithm {
+                    config.jwt.algorithm = algo;
                 }
-                if let Some(p) = rsa.public_key_path {
-                    config.rsa_jwt.public_key_path = p;
+                if let Some(s) = jwt.secret {
+                    config.jwt.secret = s;
                 }
-                if let Some(kid) = rsa.kid {
+                if let Some(p) = jwt.private_key_path {
+                    config.jwt.private_key_path = p;
+                }
+                if let Some(p) = jwt.public_key_path {
+                    config.jwt.public_key_path = p;
+                }
+                if let Some(kid) = jwt.kid {
                     if !kid.trim().is_empty() {
-                        config.rsa_jwt.kid = kid;
+                        config.jwt.kid = kid;
                     }
                 }
-                if let Some(ttl) = rsa.access_ttl_secs {
+                if let Some(ttl) = jwt.access_ttl_secs {
                     if ttl > 0 {
-                        config.rsa_jwt.access_ttl_secs = ttl;
+                        config.jwt.access_ttl_secs = ttl;
                     }
                 }
-                if let Some(ttl) = rsa.refresh_ttl_secs {
+                if let Some(ttl) = jwt.refresh_ttl_secs {
                     if ttl > 0 {
-                        config.rsa_jwt.refresh_ttl_secs = ttl;
+                        config.jwt.refresh_ttl_secs = ttl;
                     }
                 }
-                if let Some(iss) = rsa.issuer {
+                if let Some(iss) = jwt.issuer {
                     if !iss.trim().is_empty() {
-                        config.rsa_jwt.issuer = iss;
+                        config.jwt.issuer = iss;
                     }
                 }
-                if let Some(aud) = rsa.default_audience {
+                if let Some(aud) = jwt.default_audience {
                     if !aud.is_empty() {
-                        config.rsa_jwt.default_audience = aud;
+                        config.jwt.default_audience = aud;
                     }
                 }
+            }
+        }
+
+        if let Some(account) = toml.account {
+            if let Some(mode) = account.mode {
+                config.account.mode = mode;
             }
         }
 

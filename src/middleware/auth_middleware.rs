@@ -152,12 +152,12 @@ impl AuthMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::ImTokenClaims;
+    use crate::auth::UnifiedTokenClaims;
     use crate::infra::SessionManager;
     use chrono::{Duration, Utc};
 
-    fn create_test_claims(user_id: u64, device_id: &str) -> ImTokenClaims {
-        ImTokenClaims {
+    fn create_test_claims(user_id: u64, device_id: &str) -> UnifiedTokenClaims {
+        UnifiedTokenClaims {
             sub: user_id.to_string(),
             device_id: device_id.to_string(),
             exp: (Utc::now() + Duration::hours(24)).timestamp(),

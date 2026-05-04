@@ -129,10 +129,8 @@ pub struct ChatServer {
     qr_login_service: Arc<crate::service::qr_login_service::QrLoginService>,
     /// 扫码登录的 unauth 推送 publisher（spec QR_API §5）
     qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
-    /// RS256 unified token 服务（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A，可选）
-    rsa_jwt_service: Option<Arc<crate::auth::RsaJwtService>>,
     /// Unified token 编排服务（issue / refresh / introspect / revoke）
-    unified_token_service: Option<Arc<crate::auth::UnifiedTokenService>>,
+    unified_token_service: Arc<crate::auth::UnifiedTokenService>,
 }
 
 impl ChatServer {
@@ -242,13 +240,15 @@ impl ChatServer {
         // 🔧 初始化认证服务
         info!("🔧 初始化认证服务...");
 
-        // 1. 创建 JWT 服务（使用配置系统中的 jwt_secret）
-        let token_ttl = 604800; // 7天
-        let jwt_service = Arc::new(crate::auth::JwtService::new(
-            config.jwt_secret.clone(),
-            token_ttl,
-        ));
-        info!("✅ JWT 服务初始化完成");
+        // 1. 创建统一 Token 服务（HTTP API + IM RPC 共用同一实例）
+        let jwt_service = Arc::new(crate::auth::TokenService::from_config(config.jwt.clone())?);
+        info!(
+            "✅ Token 服务初始化完成 algorithm={:?} kid={} access_ttl={}s refresh_ttl={}s",
+            config.jwt.algorithm,
+            config.jwt.kid,
+            config.jwt.access_ttl_secs,
+            config.jwt.refresh_ttl_secs,
+        );
 
         // 2. 创建 Service Key 管理器（使用主密钥模式）
         let service_key_manager = Arc::new(crate::auth::ServiceKeyManager::new_master_key(
@@ -516,50 +516,22 @@ impl ChatServer {
         );
         info!("✅ QrLoginService + Publisher 创建完成");
 
-        // RS256 unified token（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）：
-        // 仅在 [auth.rsa_jwt] 配置完整时启用；缺省 None，server 仍按 v1.2 HS256 IM token 工作。
-        let rsa_jwt_service = if config.rsa_jwt.is_enabled() {
-            match crate::auth::RsaJwtService::from_config(config.rsa_jwt.clone()) {
-                Ok(svc) => {
-                    info!(
-                        "✅ RsaJwtService 创建完成 kid={} access_ttl={}s refresh_ttl={}s",
-                        config.rsa_jwt.kid,
-                        config.rsa_jwt.access_ttl_secs,
-                        config.rsa_jwt.refresh_ttl_secs
-                    );
-                    Some(Arc::new(svc))
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ RsaJwtService 加载失败（unified token 路径将关闭）: {}",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            info!("ℹ️ RsaJwtService 未配置；unified token 路径关闭（v1.2 HS256 行为不变）");
-            None
-        };
-
-        // Unified token 编排服务：与 RsaJwtService 同启停。
+        // Unified token 编排服务（spec TOKEN_UNIFICATION_SPEC v1.3）：
+        // 复用前面已经创建的 jwt_service（同一 TokenService 实例既给 IM RPC 用，
+        // 也给 HTTP /api/service/auth/* 用）。
         let refresh_token_repository =
             Arc::new(crate::repository::RefreshTokenRepository::new(pool.clone()));
-        let unified_token_service: Option<Arc<crate::auth::UnifiedTokenService>> =
-            rsa_jwt_service.as_ref().map(|rsa| {
-                Arc::new(crate::auth::UnifiedTokenService::new(
-                    rsa.clone(),
-                    device_manager_db.clone(),
-                    refresh_token_repository.clone(),
-                    config.rsa_jwt.default_audience.clone(),
-                    config.rsa_jwt.issuer.clone(),
-                    config.rsa_jwt.access_ttl_secs,
-                    config.rsa_jwt.refresh_ttl_secs,
-                ))
-            });
-        if unified_token_service.is_some() {
-            info!("✅ UnifiedTokenService 创建完成（issue/refresh/introspect/revoke 端点已生效）");
-        }
+        let unified_token_service: Arc<crate::auth::UnifiedTokenService> =
+            Arc::new(crate::auth::UnifiedTokenService::new(
+                jwt_service.clone(),
+                device_manager_db.clone(),
+                refresh_token_repository.clone(),
+                config.jwt.default_audience.clone(),
+                config.jwt.issuer.clone(),
+                config.jwt.access_ttl_secs,
+                config.jwt.refresh_ttl_secs,
+            ));
+        info!("✅ UnifiedTokenService 创建完成（issue/refresh/introspect/revoke 端点已生效）");
 
         // 5. 将 EventBus 传递给 SendMessageHandler
         // 注意：SendMessageHandler 需要支持设置 event_bus
@@ -1369,7 +1341,6 @@ impl ChatServer {
             user_service,
             qr_login_service,
             qr_login_publisher,
-            rsa_jwt_service,
             unified_token_service,
         })
     }
@@ -2138,7 +2109,6 @@ impl ChatServer {
             self.user_service.clone(),
             self.qr_login_service.clone(),
             self.qr_login_publisher.clone(),
-            self.rsa_jwt_service.clone(),
             self.unified_token_service.clone(),
             self.config.admin_api_port,
         );
