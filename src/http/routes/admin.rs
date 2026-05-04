@@ -640,8 +640,13 @@ async fn get_user(
 /// 更新用户信息
 ///
 /// PUT /api/admin/users/:user_id
+///
+/// `username` 是 application member 改名的镜像通道（spec
+/// MODULE_MEMBER_PROFILE_SPEC §7.1）：server 不做格式校验、保留词、频控；
+/// 仅依靠 DB UNIQUE 兜底，冲突 → 409 `OperationConflict`。
 #[derive(Debug, Deserialize)]
 struct UpdateUserRequest {
+    username: Option<String>,
     display_name: Option<String>,
     email: Option<String>,
     phone: Option<String>,
@@ -658,6 +663,7 @@ async fn update_user(
     verify_service_key(&headers, &state).await?;
 
     let UpdateUserRequest {
+        username,
         display_name,
         email,
         phone,
@@ -670,6 +676,7 @@ async fn update_user(
         .update_user_admin(
             user_id,
             crate::service::UpdateUserAdminParams {
+                username,
                 display_name,
                 email,
                 phone,

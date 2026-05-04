@@ -573,7 +573,18 @@ impl UserRepository {
         )
         .execute(self.pool.as_ref())
         .await
-        .map_err(|e| DatabaseError::Database(format!("Failed to update user: {}", e)))?;
+        .map_err(|e| {
+            // PostgreSQL 23505 = unique_violation：转 DuplicateEntry，让 service 层透传成 409
+            // 主要触发字段：username / phone / email 的 UNIQUE 约束
+            if let sqlx::Error::Database(db_err) = &e {
+                if db_err.code().as_deref() == Some("23505") {
+                    return DatabaseError::DuplicateEntry(
+                        db_err.constraint().unwrap_or("unknown_unique").to_string(),
+                    );
+                }
+            }
+            DatabaseError::Database(format!("Failed to update user: {}", e))
+        })?;
 
         if rows_affected.rows_affected() == 0 {
             return Err(DatabaseError::NotFound("User not found".to_string()));
