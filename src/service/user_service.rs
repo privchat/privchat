@@ -132,8 +132,13 @@ mod phone_validator_tests {
 ///
 /// 字段均为可选：`None` 表示不改动；`Some(value)` 表示落库。
 /// `email: Some("".to_string())` 在 normalize 后会变成 `None` 并清空邮箱。
+///
+/// `username` 走纯镜像语义：server 不做格式校验、保留词、频控（spec
+/// MODULE_MEMBER_PROFILE_SPEC §7.1）；只靠 DB UNIQUE 兜底，冲突回 409
+/// `OperationConflict`。application 层是真正的守门人。
 #[derive(Debug, Clone, Default)]
 pub struct UpdateUserAdminParams {
+    pub username: Option<String>,
     pub display_name: Option<String>,
     pub email: Option<String>,
     pub phone: Option<String>,
@@ -391,6 +396,8 @@ impl UserService {
     /// admin 更新用户：拉取现有用户 -> 按 patch 语义 merge -> 持久化。
     ///
     /// 邮箱变更会检查除本人外是否存在冲突占用；空字符串视为清空。
+    /// `username` 不做业务校验（spec MODULE_MEMBER_PROFILE_SPEC §7.1）；
+    /// DB UNIQUE 23505 → `ServerError::DuplicateEntry` → 409。
     pub async fn update_user_admin(
         &self,
         user_id: u64,
@@ -402,12 +409,22 @@ impl UserService {
             .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
 
         let UpdateUserAdminParams {
+            username,
             display_name,
             email,
             phone,
             avatar_url,
             status,
         } = params;
+
+        if let Some(username) = username {
+            let trimmed = username.trim();
+            user.username = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
 
         if let Some(display_name) = display_name {
             user.display_name = Some(display_name);
@@ -440,12 +457,13 @@ impl UserService {
             user.status = UserStatus::from_i16(status);
         }
 
-        self.user_repository
-            .update(&user)
-            .await
-            .map_err(|e| ServerError::Database(format!("更新用户失败: {}", e)))?;
-
-        Ok(user)
+        match self.user_repository.update(&user).await {
+            Ok(_) => Ok(user),
+            Err(DatabaseError::DuplicateEntry(constraint)) => Err(ServerError::DuplicateEntry(
+                format!("UNIQUE 约束冲突: {}", constraint),
+            )),
+            Err(other) => Err(ServerError::Database(format!("更新用户失败: {}", other))),
+        }
     }
 
     /// admin 软删除用户：exists 前置校验 + 调 repository.delete。
