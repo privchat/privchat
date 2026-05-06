@@ -202,6 +202,27 @@ impl LoginLogRepository {
         Ok(record)
     }
 
+    /// 同一 user × device 是否已经登录过其他 token（用于判定是否首次设备登录）。
+    ///
+    /// refresh access token 时新 token 的 jti 是新的，但 device_id 不变。如果发现该
+    /// (user_id, device_id) 已经有任意 login_log 记录（含正在记录的当前条），就视为
+    /// 非首次登录——不发"您的账号在 xxx 设备登录了"系统提醒。
+    pub async fn has_prior_device_login(&self, user_id: i64, device_id: uuid::Uuid) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM privchat_login_logs
+                WHERE user_id = $1 AND device_id = $2
+            ) as "exists!"
+            "#,
+            user_id,
+            device_id
+        )
+        .fetch_one(&*self.db_pool)
+        .await?;
+        Ok(result.exists)
+    }
+
     /// 检查 token 是否已被记录（防止重复记录）
     /// 带本地缓存（L1-only, TTL 30s），减少 DB 查询
     pub async fn is_token_logged(&self, token_jti: &str) -> Result<bool> {
