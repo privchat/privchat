@@ -59,6 +59,11 @@ lazy_static! {
         // 用户注册 - 注册成功后返回 JWT token，可直接用于 AuthorizationRequest
         set.insert("account/user/register".to_string());
 
+        // 刷新 access token - refresh_token 自带 JWT 签名校验，不需要已认证 IM session
+        // （spec TOKEN_REFRESH_SPEC §8.1：白名单接口；由 client 在 access token 过期、
+        // ConnAuth 拿到 10002 后调用，回到 IM 通道继续 authenticate）
+        set.insert("account/auth/refresh".to_string());
+
         // ==================== 扫码登录（spec QR_API §5） ====================
         // Web/PC unauth 连接创建二维码 scene；server 内部把 scene_id ↔ session_id
         // 绑定到 QrLoginPublisher，后续 scanned/authorized/rejected/expired 推回这条连接。
@@ -127,6 +132,7 @@ mod tests {
         assert!(is_anonymous_rpc_route("system/info"));
         assert!(is_anonymous_rpc_route("account/auth/login"));
         assert!(is_anonymous_rpc_route("account/user/register"));
+        assert!(is_anonymous_rpc_route("account/auth/refresh"));
         assert!(is_anonymous_rpc_route("qr_login/create_scene"));
 
         // 其他所有 RPC 都不应该在白名单中

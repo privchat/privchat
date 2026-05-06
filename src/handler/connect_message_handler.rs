@@ -341,20 +341,23 @@ impl MessageHandler for ConnectMessageHandler {
 
         // 7. ✨ 记录登录日志（仅首次 token 认证时记录）
         // 这将记录：token 首次使用时间、设备信息、IP、风险评分等
-        let first_token_auth = match self
+        let (first_token_auth, first_device_login) = match self
             .record_login_log(user_id, &device_id, &claims, &connect_request, &context)
             .await
         {
             Ok(v) => v,
             Err(e) => {
                 warn!("⚠️ ConnectMessageHandler: 记录登录日志失败: {}", e);
-                false
+                (false, false)
             }
         };
 
-        // 仅在 token 首次被认证使用且 token 为“新签发”时发送登录提醒，避免重启/重连反复提示。
+        // 仅在「首次 token 认证 + token 为新签发 + 该设备首次登录」时发送登录提醒。
+        // refresh access_token 时 token jti 变了（first_token_auth=true）但 device_id
+        // 不变（first_device_login=false），所以走 refresh 的 ConnectAuth 不会再次提示
+        // "您的账号在 xxx 设备登录了。"，避免每次 refresh 后重复打扰。
         let token_age_secs = Utc::now().timestamp().saturating_sub(claims.iat);
-        if first_token_auth && token_age_secs <= 120 {
+        if first_token_auth && first_device_login && token_age_secs <= 120 {
             // spawn 到后台，不阻塞认证响应
             let channel_service = self.channel_service.clone();
             let message_service = self.message_service.clone();
@@ -377,8 +380,8 @@ impl MessageHandler for ConnectMessageHandler {
             });
         } else {
             debug!(
-                "📝 跳过登录提醒: user_id={}, first_token_auth={}, token_age_secs={}",
-                user_id, first_token_auth, token_age_secs
+                "📝 跳过登录提醒: user_id={}, first_token_auth={}, first_device_login={}, token_age_secs={}",
+                user_id, first_token_auth, first_device_login, token_age_secs
             );
         }
 
@@ -445,6 +448,11 @@ impl ConnectMessageHandler {
     /// 记录登录日志
     ///
     /// 只在 token 首次使用时记录，避免日志爆炸
+    ///
+    /// 返回 `(first_token_auth, first_device_login)`：
+    /// - `first_token_auth`：当前 token jti 第一次被认证（refresh 后新 token 也算 true）
+    /// - `first_device_login`：(user_id, device_id) 在 login_log 里之前**没有**任何记录，
+    ///   即该设备首次登录该账号。refresh 路径会得到 `(true, false)`，用于跳过登录提醒。
     async fn record_login_log(
         &self,
         user_id: u64,
@@ -452,7 +460,7 @@ impl ConnectMessageHandler {
         claims: &crate::auth::UnifiedTokenClaims,
         connect_request: &privchat_protocol::protocol::AuthorizationRequest,
         context: &RequestContext,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<(bool, bool)> {
         use crate::repository::CreateLoginLogRequest;
         use uuid::Uuid;
 
@@ -460,7 +468,7 @@ impl ConnectMessageHandler {
         let token_jti = &claims.jti;
         if self.login_log_repository.is_token_logged(token_jti).await? {
             debug!("📝 Token {} 已记录，跳过", token_jti);
-            return Ok(false);
+            return Ok((false, false));
         }
 
         info!(
@@ -471,6 +479,15 @@ impl ConnectMessageHandler {
         // 2. 解析设备 ID
         let device_uuid =
             Uuid::parse_str(device_id).map_err(|e| anyhow::anyhow!("Invalid device_id: {}", e))?;
+
+        // 2.1 在写入当前条目之前先查 (user, device) 是否有过历史记录——这样查询
+        // 不会算上即将写入的这一条。refresh 时该值为 true（已存在），用于跳过提醒。
+        let device_already_logged = self
+            .login_log_repository
+            .has_prior_device_login(user_id as i64, device_uuid)
+            .await
+            .unwrap_or(false);
+        let first_device_login = !device_already_logged;
 
         // 3. 提取设备信息
         let device_info = &connect_request.device_info;
@@ -505,7 +522,7 @@ impl ConnectMessageHandler {
             auth_source: Some("privchat-internal".to_string()),
             status,
             risk_score: risk_score as i16,
-            is_new_device: false,   // TODO: 查询设备是否首次登录
+            is_new_device: first_device_login,
             is_new_location: false, // TODO: 检查是否为新 IP 地址
             risk_factors: if risk_score > 50 {
                 Some(vec!["high_risk_ip".to_string()]) // TODO: 实现风险因素收集
@@ -538,7 +555,7 @@ impl ConnectMessageHandler {
             }
         });
 
-        Ok(true)
+        Ok((true, first_device_login))
     }
 
     /// 计算登录风险评分 (0-100)
