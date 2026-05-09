@@ -97,6 +97,14 @@ pub struct ServerConfig {
     pub push: PushConfig,
     /// 统一 token 配置（HTTP API + IM RPC 共用，单一签发/验证路径）。
     pub jwt: JwtConfig,
+    /// Channel Transfer 出站配置（spec 02-server/CHANNEL_TRANSFER_SPEC v2.0）。
+    ///
+    /// `None` 表示 transfer 未启用：wire `TransferRequest` handler 不注册，
+    /// `/api/service/transfer/send` endpoint 仍可挂载但会返回 `ServiceUnavailable`。
+    /// 配 `[channel_transfer]` 表（含 `application_url` + `application_master_key`）
+    /// 才启用。
+    #[serde(default)]
+    pub channel_transfer: Option<ChannelTransferConfig>,
 }
 
 /// JWT 算法（配置 `[auth.jwt] algorithm`）。
@@ -278,6 +286,7 @@ impl Default for ServerConfig {
             redis_url: String::new(),
             push: PushConfig::default(),
             jwt: JwtConfig::default(),
+            channel_transfer: None,
         }
     }
 }
@@ -785,6 +794,18 @@ struct TomlConfig {
     logging: Option<TomlLoggingConfig>,
     system_message: Option<TomlSystemMessageConfig>,
     push: Option<TomlPushConfig>,
+    channel_transfer: Option<TomlChannelTransferConfig>,
+}
+
+/// TOML `[channel_transfer]` 段（spec 02-server/CHANNEL_TRANSFER_SPEC v2.0）
+#[derive(Debug, Deserialize)]
+struct TomlChannelTransferConfig {
+    /// privchat-application 基址，例如 `http://privchat-application:9100`
+    application_url: Option<String>,
+    /// application 端的 master key（与 server 自身的 service_master_key 不复用）
+    application_master_key: Option<String>,
+    /// server → application HTTP 调用超时，毫秒；缺省 3000
+    timeout_ms: Option<u64>,
 }
 
 /// TOML [auth] 段（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）
@@ -1507,6 +1528,22 @@ impl From<TomlConfig> for ServerConfig {
             }
         }
 
+        // [channel_transfer]：require both URL and master key to enable.
+        // Missing or partial config keeps `channel_transfer = None`, which
+        // disables wire ingress and makes /api/service/transfer/send report
+        // ServiceUnavailable.
+        if let Some(ct) = toml.channel_transfer {
+            if let (Some(url), Some(key)) = (ct.application_url, ct.application_master_key) {
+                if !url.is_empty() && !key.is_empty() {
+                    config.channel_transfer = Some(ChannelTransferConfig {
+                        application_url: url,
+                        application_master_key: key,
+                        timeout_ms: ct.timeout_ms.unwrap_or(3000),
+                    });
+                }
+            }
+        }
+
         config
     }
 }
@@ -1545,6 +1582,22 @@ impl CacheConfig {
     pub fn has_redis(&self) -> bool {
         self.redis.is_some()
     }
+}
+
+/// Channel Transfer 出站配置（spec 02-server/CHANNEL_TRANSFER_SPEC v2.0 §5.1 / §13）。
+///
+/// 本配置只描述 server 调 application 的出站方向。
+/// `/api/service/transfer/send`（app→server 入站）复用 server 现有的
+/// `service_master_key` + `verify_service_key` 中间件，不在此结构中。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelTransferConfig {
+    /// privchat-application 基址（不含路径），例如 `http://privchat-application:9100`。
+    pub application_url: String,
+    /// application 端的 master key；server 调 application 时放入 `X-Service-Key` header。
+    /// 与 server 自身的 `service_master_key` 不复用。
+    pub application_master_key: String,
+    /// HTTP 调用超时（毫秒）。spec §8.2 推荐默认 3000。
+    pub timeout_ms: u64,
 }
 
 /// Room 订阅配置
