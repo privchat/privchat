@@ -291,7 +291,7 @@ async fn spawn_mock_app(
     let canned = Arc::new(canned);
     let app = Router::new()
         .route(
-            "/service/privchat/transfer",
+            "/service/privchat/transfer/dispatch",
             post(
                 move |State((cap, canned)): State<(
                     Arc<Mutex<Capture>>,
@@ -339,7 +339,7 @@ async fn relay_sends_x_service_key_and_maps_response() {
     };
     let client = TransferRelayClient::new(&cfg).expect("relay client builds");
     assert!(
-        client.endpoint().ends_with("/service/privchat/transfer"),
+        client.endpoint().ends_with("/service/privchat/transfer/dispatch"),
         "endpoint must include relay path, got {}",
         client.endpoint()
     );
@@ -375,7 +375,7 @@ async fn relay_sends_x_service_key_and_maps_response() {
 #[tokio::test]
 async fn relay_maps_app_http_error() {
     let app = Router::new().route(
-        "/service/privchat/transfer",
+        "/service/privchat/transfer/dispatch",
         post(|| async {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
