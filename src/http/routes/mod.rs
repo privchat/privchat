@@ -29,6 +29,7 @@ pub mod admin;
 pub mod auth;
 pub mod auth_jwks;
 pub mod metrics;
+pub mod transfer;
 pub mod upload;
 
 use crate::http::{AdminServerState, FileServerState};
@@ -55,4 +56,10 @@ pub fn create_admin_routes() -> Router<AdminServerState> {
         .nest("/api/service", admin::create_route())
         .nest("/api/service/auth", auth::create_route())
         .route("/api/service/auth/jwks", get(auth_jwks::handler))
+        // Channel Transfer push endpoint (server spec §5.2). Inherits the
+        // existing X-Service-Key check from `/api/service/*` via the route
+        // handler's explicit `verify_service_key` call. NOT a business
+        // dispatch — pure packet-delivery extension of channel pub/sub
+        // (server spec §1.4).
+        .nest("/api/service/transfer", transfer::create_route())
 }
