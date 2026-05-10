@@ -27,6 +27,7 @@ pub trait MessageHandler: Send + Sync {
 }
 
 // 导出所有处理器
+pub mod channel_transfer_handler;
 pub mod connect_message_handler;
 pub mod disconnect_message_handler;
 pub mod ping_message_handler;
@@ -34,6 +35,9 @@ pub mod rpc_message_handler;
 pub mod send_message_handler;
 pub mod subscribe_message_handler;
 
+pub use channel_transfer_handler::{
+    ChannelTransferHandler, ChannelTransferLookups, DefaultChannelTransferLookups,
+};
 pub use connect_message_handler::ConnectMessageHandler;
 pub use disconnect_message_handler::DisconnectMessageHandler;
 pub use ping_message_handler::PingMessageHandler;
