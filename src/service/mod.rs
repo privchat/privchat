@@ -69,8 +69,8 @@ pub mod mention_service;
 pub mod room_history_service;
 // 送达水位追踪服务
 pub mod delivery_tracker;
-// Channel Transfer (spec 02-server/CHANNEL_TRANSFER_SPEC v2.0)
-pub mod transfer;
+// Note: Channel Transfer is *not* a business service (server spec §1.4).
+// See `crate::channel_transfer` for the relay utilities.
 
 pub use admin_service::AdminService;
 pub use approval_service::{ApprovalService, JoinMethod, JoinRequest, JoinRequestStatus};
@@ -111,9 +111,3 @@ pub use user_service::{
     UserService,
 };
 pub use delivery_tracker::DeliveryTracker;
-pub use transfer::{
-    validate_transfer_body_size, validate_transfer_request_id, validate_transfer_route,
-    ForwardTransferRequest, ForwardTransferResponse, RelayError, TransferRelayClient,
-    TransferValidationError, MAX_TRANSFER_BODY_BYTES, MAX_TRANSFER_REQUEST_ID_LEN,
-    MAX_TRANSFER_ROUTE_LEN, SERVICE_KEY_HEADER,
-};

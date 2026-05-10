@@ -3,20 +3,20 @@
 //
 // Author: zoujiaqing <zoujiaqing@gmail.com>
 //
-// Integration tests for `privchat::service::transfer` (Channel Transfer
+// Integration tests for `privchat::channel_transfer` (Channel Transfer
 // Bite 1: validators + outbound HTTP relay client).
 //
 // Lives in `tests/` rather than inline `#[cfg(test)]` so it bypasses
 // pre-existing test-mode compile breakage in unrelated `infra::session_manager`
 // and `middleware::auth_middleware` modules.
 
-use privchat::config::ChannelTransferConfig;
-use privchat::service::transfer::{
+use privchat::channel_transfer::{
     validate_transfer_body_size, validate_transfer_request_id, validate_transfer_route,
-    ForwardTransferRequest, ForwardTransferResponse, RelayError, TransferRelayClient,
-    TransferValidationError, MAX_TRANSFER_BODY_BYTES, MAX_TRANSFER_REQUEST_ID_LEN,
-    SERVICE_KEY_HEADER,
+    ChannelTransferRelayClient, ChannelTransferRelayError, ChannelTransferValidationError,
+    ForwardTransferRequest, ForwardTransferResponse, MAX_TRANSFER_BODY_BYTES,
+    MAX_TRANSFER_REQUEST_ID_LEN, SERVICE_KEY_HEADER,
 };
+use privchat::config::ChannelTransferConfig;
 
 // =====================================================================
 // validate_transfer_request_id
@@ -43,15 +43,15 @@ fn request_id_short_rejected() {
     // 15 alnum bytes → rejected for low entropy.
     assert_eq!(
         validate_transfer_request_id("aaaaaaaaaaaaaaa"),
-        Err(TransferValidationError::RequestIdLowEntropy)
+        Err(ChannelTransferValidationError::RequestIdLowEntropy)
     );
     assert_eq!(
         validate_transfer_request_id("42"),
-        Err(TransferValidationError::RequestIdLowEntropy)
+        Err(ChannelTransferValidationError::RequestIdLowEntropy)
     );
     assert_eq!(
         validate_transfer_request_id("req_42"),
-        Err(TransferValidationError::RequestIdLowEntropy)
+        Err(ChannelTransferValidationError::RequestIdLowEntropy)
     );
 }
 
@@ -59,7 +59,7 @@ fn request_id_short_rejected() {
 fn request_id_empty_rejected() {
     assert_eq!(
         validate_transfer_request_id(""),
-        Err(TransferValidationError::RequestIdEmpty)
+        Err(ChannelTransferValidationError::RequestIdEmpty)
     );
 }
 
@@ -68,7 +68,7 @@ fn request_id_too_long_rejected() {
     let s = "a".repeat(MAX_TRANSFER_REQUEST_ID_LEN + 1);
     assert!(matches!(
         validate_transfer_request_id(&s),
-        Err(TransferValidationError::RequestIdTooLong { .. })
+        Err(ChannelTransferValidationError::RequestIdTooLong { .. })
     ));
 }
 
@@ -77,11 +77,11 @@ fn request_id_bad_char_rejected() {
     // Spaces and slashes are not URL/log safe.
     assert_eq!(
         validate_transfer_request_id("not safe id 1234567890"),
-        Err(TransferValidationError::RequestIdBadChar)
+        Err(ChannelTransferValidationError::RequestIdBadChar)
     );
     assert_eq!(
         validate_transfer_request_id("path/like/id/123456"),
-        Err(TransferValidationError::RequestIdBadChar)
+        Err(ChannelTransferValidationError::RequestIdBadChar)
     );
 }
 
@@ -101,7 +101,7 @@ fn route_canonical_accepted() {
 fn route_leading_slash_rejected() {
     assert_eq!(
         validate_transfer_route("/game/poker/raise"),
-        Err(TransferValidationError::RouteLeadingSlash)
+        Err(ChannelTransferValidationError::RouteLeadingSlash)
     );
 }
 
@@ -109,11 +109,11 @@ fn route_leading_slash_rejected() {
 fn route_wrong_segment_count_rejected() {
     assert_eq!(
         validate_transfer_route("game/poker"),
-        Err(TransferValidationError::RouteShape)
+        Err(ChannelTransferValidationError::RouteShape)
     );
     assert_eq!(
         validate_transfer_route("game/poker/raise/extra"),
-        Err(TransferValidationError::RouteShape)
+        Err(ChannelTransferValidationError::RouteShape)
     );
 }
 
@@ -121,7 +121,7 @@ fn route_wrong_segment_count_rejected() {
 fn route_uppercase_rejected() {
     assert_eq!(
         validate_transfer_route("Game/Poker/Raise"),
-        Err(TransferValidationError::RouteSegmentBadChar)
+        Err(ChannelTransferValidationError::RouteSegmentBadChar)
     );
 }
 
@@ -129,11 +129,11 @@ fn route_uppercase_rejected() {
 fn route_underscore_or_dot_rejected() {
     assert_eq!(
         validate_transfer_route("game/poker/raise_now"),
-        Err(TransferValidationError::RouteSegmentBadChar)
+        Err(ChannelTransferValidationError::RouteSegmentBadChar)
     );
     assert_eq!(
         validate_transfer_route("game/poker/raise.now"),
-        Err(TransferValidationError::RouteSegmentBadChar)
+        Err(ChannelTransferValidationError::RouteSegmentBadChar)
     );
 }
 
@@ -141,7 +141,7 @@ fn route_underscore_or_dot_rejected() {
 fn route_empty_segment_rejected() {
     assert_eq!(
         validate_transfer_route("game//raise"),
-        Err(TransferValidationError::RouteEmptySegment)
+        Err(ChannelTransferValidationError::RouteEmptySegment)
     );
 }
 
@@ -149,11 +149,11 @@ fn route_empty_segment_rejected() {
 fn route_dash_at_segment_boundary_rejected() {
     assert_eq!(
         validate_transfer_route("game/-poker/raise"),
-        Err(TransferValidationError::RouteSegmentBadChar)
+        Err(ChannelTransferValidationError::RouteSegmentBadChar)
     );
     assert_eq!(
         validate_transfer_route("game/poker-/raise"),
-        Err(TransferValidationError::RouteSegmentBadChar)
+        Err(ChannelTransferValidationError::RouteSegmentBadChar)
     );
 }
 
@@ -163,7 +163,7 @@ fn route_too_long_rejected() {
     let route = format!("svc/{mid}/act");
     assert!(matches!(
         validate_transfer_route(&route),
-        Err(TransferValidationError::RouteTooLong { .. })
+        Err(ChannelTransferValidationError::RouteTooLong { .. })
     ));
 }
 
@@ -183,7 +183,7 @@ fn body_over_limit_rejected() {
     let body = vec![0u8; MAX_TRANSFER_BODY_BYTES + 1];
     let err = validate_transfer_body_size(&body).unwrap_err();
     match err {
-        TransferValidationError::BodyTooLarge { len, limit } => {
+        ChannelTransferValidationError::BodyTooLarge { len, limit } => {
             assert_eq!(len, MAX_TRANSFER_BODY_BYTES + 1);
             assert_eq!(limit, MAX_TRANSFER_BODY_BYTES);
         }
@@ -267,7 +267,7 @@ fn forward_response_missing_data_is_none() {
 }
 
 // =====================================================================
-// TransferRelayClient: real HTTP via tiny axum server
+// ChannelTransferRelayClient: real HTTP via tiny axum server
 // =====================================================================
 
 use axum::extract::State;
@@ -337,7 +337,7 @@ async fn relay_sends_x_service_key_and_maps_response() {
         application_master_key: "test-master-key".to_string(),
         timeout_ms: 3000,
     };
-    let client = TransferRelayClient::new(&cfg).expect("relay client builds");
+    let client = ChannelTransferRelayClient::new(&cfg).expect("relay client builds");
     assert!(
         client.endpoint().ends_with("/service/privchat/transfer/dispatch"),
         "endpoint must include relay path, got {}",
@@ -401,7 +401,7 @@ async fn relay_maps_app_http_error() {
         application_master_key: "k".to_string(),
         timeout_ms: 3000,
     };
-    let client = TransferRelayClient::new(&cfg).unwrap();
+    let client = ChannelTransferRelayClient::new(&cfg).unwrap();
     let req = ForwardTransferRequest {
         internal_request_id: "i".to_string(),
         client_request_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
@@ -414,7 +414,7 @@ async fn relay_maps_app_http_error() {
     };
     let err = client.forward(&req).await.expect_err("expected error");
     match err {
-        RelayError::AppHttpError { status, body, .. } => {
+        ChannelTransferRelayError::AppHttpError { status, body, .. } => {
             assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
             let body = body.expect("error body parsed");
             assert_eq!(body.code, 4);
