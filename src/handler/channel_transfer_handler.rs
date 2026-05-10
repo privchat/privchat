@@ -36,13 +36,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use privchat_protocol::protocol::MessageType;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::channel_transfer::{
     validate_transfer_body_size, validate_transfer_request_id, validate_transfer_route,
     ChannelTransferRelayClient, ChannelTransferRelayError, ForwardTransferRequest,
 };
+use crate::config::ChannelTransferConfig;
 use crate::context::RequestContext;
+use crate::dispatcher::MessageDispatcher;
 use crate::error::{Result, ServerError};
 use crate::handler::MessageHandler;
 use crate::infra::{ConnectionManager, SubscribeManager};
@@ -382,4 +386,51 @@ fn encode_response(
     };
     privchat_protocol::encode_message(&resp)
         .map_err(|e| ServerError::Internal(format!("encode TransferResponse: {e}")).into())
+}
+
+// =====================================================================
+// Registration entry point — keeps the wiring conditional on
+// `[channel_transfer]` config being present, and keeps the construction
+// chain (relay → lookups → handler → register) in one auditable place
+// so server.rs / tests share the same path.
+// =====================================================================
+
+/// Register [`ChannelTransferHandler`] against `MessageType::TransferRequest`
+/// iff Channel Transfer is enabled in config (i.e. `cfg.is_some()`).
+///
+/// Returns `Ok(true)` if the handler was registered, `Ok(false)` if
+/// registration was skipped because no config is present.
+///
+/// Server boundary (server spec §1.4) is preserved: this function only
+/// constructs and registers the wire ingress relay. It does NOT touch
+/// `service_id`, business registry, `callback_url`, route prefix
+/// validation, idempotency, audit, or any HTTP routes.
+pub fn try_register_channel_transfer_handler(
+    dispatcher: &mut MessageDispatcher,
+    cfg: Option<&ChannelTransferConfig>,
+    connection_manager: Arc<ConnectionManager>,
+    subscribe_manager: Arc<SubscribeManager>,
+) -> Result<bool> {
+    let Some(cfg) = cfg else {
+        info!("📡 Channel Transfer: 未启用 ([channel_transfer] 缺省)，跳过 wire ingress 注册");
+        return Ok(false);
+    };
+
+    let relay = ChannelTransferRelayClient::new(cfg).map_err(|e| {
+        ServerError::Internal(format!("ChannelTransferRelayClient init failed: {e}"))
+    })?;
+    let lookups: Arc<dyn ChannelTransferLookups> =
+        Arc::new(DefaultChannelTransferLookups::new(
+            connection_manager,
+            subscribe_manager,
+        ));
+    dispatcher.register_handler(
+        MessageType::TransferRequest,
+        Box::new(ChannelTransferHandler::new(lookups, Arc::new(relay))),
+    );
+    info!(
+        "✅ Channel Transfer: wire ingress handler 已注册 (target={}, timeout={}ms)",
+        cfg.application_url, cfg.timeout_ms
+    );
+    Ok(true)
 }

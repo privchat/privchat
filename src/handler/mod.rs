@@ -36,7 +36,8 @@ pub mod send_message_handler;
 pub mod subscribe_message_handler;
 
 pub use channel_transfer_handler::{
-    ChannelTransferHandler, ChannelTransferLookups, DefaultChannelTransferLookups,
+    try_register_channel_transfer_handler, ChannelTransferHandler, ChannelTransferLookups,
+    DefaultChannelTransferLookups,
 };
 pub use connect_message_handler::ConnectMessageHandler;
 pub use disconnect_message_handler::DisconnectMessageHandler;

@@ -27,10 +27,14 @@ use privchat::channel_transfer::{
     SERVICE_KEY_HEADER, MAX_TRANSFER_BODY_BYTES,
 };
 use privchat::config::ChannelTransferConfig;
+use privchat::dispatcher::MessageDispatcher;
 use privchat::handler::channel_transfer_handler::{
-    process_transfer_request, ChannelTransferLookups, CODE_AUTH_REQUIRED,
-    CODE_CHANNEL_NOT_SUBSCRIBED, CODE_INVALID_PARAMS, CODE_PAYLOAD_TOO_LARGE, CODE_TIMEOUT,
+    process_transfer_request, try_register_channel_transfer_handler, ChannelTransferLookups,
+    CODE_AUTH_REQUIRED, CODE_CHANNEL_NOT_SUBSCRIBED, CODE_INVALID_PARAMS, CODE_PAYLOAD_TOO_LARGE,
+    CODE_TIMEOUT,
 };
+use privchat::infra::{ConnectionManager, SubscribeManager};
+use privchat_protocol::protocol::MessageType;
 
 // =====================================================================
 // Helpers — wire encode + canned axum mock app + canned lookups
@@ -348,4 +352,46 @@ async fn forward_request_carries_user_id_room_id_internal_request_id_and_trace_i
 
     // X-Service-Key header was on the wire
     assert_eq!(cap.service_key.as_deref(), Some("test-master-key"));
+}
+
+// =====================================================================
+// Bite 2 wiring: try_register_channel_transfer_handler
+// =====================================================================
+
+#[test]
+fn registration_skipped_when_config_absent() {
+    let mut dispatcher = MessageDispatcher::new();
+    let cm = Arc::new(ConnectionManager::new());
+    let sm = Arc::new(SubscribeManager::new());
+
+    let registered = try_register_channel_transfer_handler(&mut dispatcher, None, cm, sm)
+        .expect("registration is allowed to skip cleanly");
+
+    assert!(!registered, "Ok(false) means no handler installed");
+    assert!(
+        !dispatcher.is_registered(MessageType::TransferRequest),
+        "MessageType::TransferRequest must NOT have a handler when config is absent"
+    );
+}
+
+#[test]
+fn registration_succeeds_when_config_enabled() {
+    let mut dispatcher = MessageDispatcher::new();
+    let cm = Arc::new(ConnectionManager::new());
+    let sm = Arc::new(SubscribeManager::new());
+    let cfg = ChannelTransferConfig {
+        application_url: "http://127.0.0.1:65535".to_string(), // never reached
+        application_master_key: "test-master-key".to_string(),
+        timeout_ms: 3_000,
+    };
+
+    let registered =
+        try_register_channel_transfer_handler(&mut dispatcher, Some(&cfg), cm, sm)
+            .expect("registration succeeds with valid config");
+
+    assert!(registered, "Ok(true) means handler installed");
+    assert!(
+        dispatcher.is_registered(MessageType::TransferRequest),
+        "MessageType::TransferRequest MUST have a handler after enabled registration"
+    );
 }
