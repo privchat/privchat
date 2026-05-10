@@ -58,6 +58,12 @@ impl MessageDispatcher {
             Ok(None)
         }
     }
+
+    /// Test/diagnostic accessor — whether a handler is registered for the
+    /// given `MessageType`.
+    pub fn is_registered(&self, message_type: MessageType) -> bool {
+        self.handlers.contains_key(&message_type)
+    }
 }
 
 /// 消息分发器构建器

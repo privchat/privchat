@@ -640,6 +640,20 @@ impl ChatServer {
             )),
         );
 
+        // Channel Transfer wire ingress (spec 02-server/CHANNEL_TRANSFER_SPEC v2.0).
+        // Conditional on [channel_transfer] in config — when absent the handler
+        // is intentionally not registered, so `MessageType::TransferRequest`
+        // packets fall through the dispatcher's "no handler" warn path.
+        // Server boundary (§1.4): relay only — no service_id, no business
+        // dispatch, no idempotency, no audit. Application-side dispatch lives
+        // in neton-application-module-privchat (dispatch spec §1.4).
+        crate::handler::try_register_channel_transfer_handler(
+            &mut message_dispatcher,
+            config.channel_transfer.as_ref(),
+            connection_manager.clone(),
+            subscribe_manager.clone(),
+        )?;
+
         // ✨ 初始化 Push 系统（Phase 2：带 Redis 和设备查询）
         info!("🔧 初始化 Push 系统...");
 
