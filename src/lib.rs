@@ -18,6 +18,7 @@
 #![allow(unused_variables, dead_code, async_fn_in_trait, static_mut_refs)]
 
 pub mod auth;
+pub mod channel_transfer; // Channel Transfer relay utilities (spec 02-server/CHANNEL_TRANSFER_SPEC v2.0).
 pub mod cli;
 pub mod config;
 pub mod context;
