@@ -229,11 +229,11 @@ pub fn validate_transfer_body_size(body: &[u8]) -> Result<(), TransferValidation
 
 // =====================================================================
 // Outbound relay: server → application
-//   POST {application_url}/service/privchat/transfer
+//   POST {application_url}/service/privchat/transfer/dispatch
 //   X-Service-Key: <application_master_key>
 // =====================================================================
 
-/// Server-side payload for `POST /service/privchat/transfer` (spec §5.1).
+/// Server-side payload for `POST /service/privchat/transfer/dispatch` (spec §5.1).
 ///
 /// `body` and `data` cross HTTP as base64; this struct uses `Vec<u8>` and
 /// serializes via the `base64_bytes` adapter so call-sites stay
@@ -310,7 +310,7 @@ mod base64_bytes_opt {
     }
 }
 
-/// Outbound HTTP client for `POST /service/privchat/transfer`.
+/// Outbound HTTP client for `POST /service/privchat/transfer/dispatch`.
 ///
 /// Owns nothing application-specific: takes a [`ChannelTransferConfig`] up
 /// front, builds a reqwest client with the configured timeout, and exposes
@@ -367,7 +367,7 @@ impl TransferRelayClient {
     /// unrepresentable header value.
     pub fn new(cfg: &ChannelTransferConfig) -> Result<Self, RelayError> {
         let endpoint = format!(
-            "{}/service/privchat/transfer",
+            "{}/service/privchat/transfer/dispatch",
             cfg.application_url.trim_end_matches('/')
         );
         let master_key = HeaderValue::from_str(&cfg.application_master_key).map_err(|e| {
