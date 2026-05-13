@@ -169,21 +169,40 @@ impl ChannelService {
         self.channel_repository.pool()
     }
 
-    /// **临时 accessor，待移除**。
-    ///
-    /// 为了让 admin route `send_system_message_to_user` 直接调
-    /// `create_or_get_direct_channel` 而开放，绕过了 ChannelService 的业务封装。
-    ///
-    /// FOLLOW-UP（spec SYSTEM_MESSAGE_ADMIN_SPEC §5.2）：
-    /// - 在 `ChannelService` 上提供显式业务方法（如 `ensure_direct_channel_for_admin`
-    ///   或更高层 `send_system_message_to_user`）
-    /// - 把 admin handler 改成调那个业务方法
-    /// - 把本 accessor 改回 `pub(crate)` 或私有
-    ///
-    /// 在那之前禁止新增对它的调用。
-    #[doc(hidden)]
-    pub fn channel_repository(&self) -> Arc<PgChannelRepository> {
+    pub(crate) fn channel_repository(&self) -> Arc<PgChannelRepository> {
         self.channel_repository.clone()
+    }
+
+    /// admin 场景下确保两个用户之间的私聊频道存在（不存在则新建），返回 `channel_id`。
+    ///
+    /// 业务封装：admin handler 不再直接持有 `PgChannelRepository`，由 ChannelService
+    /// 集中保管 source/source_id 等 admin-context 信息。
+    ///
+    /// - `sender_id == target_user_id` → 拒绝（拒接系统账号给自身写消息这类场景）
+    /// - 频道已存在 → 复用，不重复创建
+    /// - 已实现一并触发 `update_user_channel_index` 等 ChannelService 的副作用——
+    ///   完全由 service 决定，handler 看不到 repository。
+    pub async fn ensure_direct_channel_for_admin(
+        &self,
+        sender_id: u64,
+        target_user_id: u64,
+    ) -> Result<u64> {
+        if sender_id == target_user_id {
+            return Err(ServerError::Validation(
+                "不能给自己创建/取得私聊频道".to_string(),
+            ));
+        }
+        let (channel, _created) = self
+            .channel_repository
+            .create_or_get_direct_channel(sender_id, target_user_id, Some("admin"), None)
+            .await
+            .map_err(|e| {
+                ServerError::Database(format!(
+                    "ensure direct channel {} ⇄ {} 失败: {}",
+                    sender_id, target_user_id, e
+                ))
+            })?;
+        Ok(channel.id)
     }
 
     fn sync_channel_type(channel_type: ChannelType) -> i32 {

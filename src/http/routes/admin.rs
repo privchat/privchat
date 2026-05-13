@@ -1933,8 +1933,6 @@ async fn send_system_message_to_user(
     headers: HeaderMap,
     Json(request): Json<SendSystemMessageToUserRequest>,
 ) -> ApiResult<serde_json::Value> {
-    use crate::repository::ChannelRepository;
-
     verify_service_key(&headers, &state).await?;
 
     // sender_id 缺省 SYSTEM_USER_ID；非缺省时强校验 user_type ∈ {System, Bot}。
@@ -1943,28 +1941,12 @@ async fn send_system_message_to_user(
         ensure_system_sender(&state, sender_id).await?;
     }
 
-    if request.user_id == sender_id {
-        return Err(ServerError::Validation(
-            "不能给 sender 自身发系统消息".to_string(),
-        ));
-    }
+    // ChannelService.ensure_direct_channel_for_admin 内部已校验 sender_id != target_user_id。
+    let channel_id = state
+        .channel_service
+        .ensure_direct_channel_for_admin(sender_id, request.user_id)
+        .await?;
 
-    // FOLLOW-UP（SYSTEM_MESSAGE_ADMIN_SPEC §5.2）: 这里直接拿 channel_repository 是临时
-    // 方案。后续应在 ChannelService 上提供显式 `ensure_direct_channel_for_admin(peer_id)` /
-    // `send_system_message_to_user(...)` 业务方法，handler 改调那个，避免 admin route 持
-    // 续绕过 service 封装。
-    let repo = state.channel_service.channel_repository();
-    let (channel, _created) = repo
-        .create_or_get_direct_channel(sender_id, request.user_id, Some("admin"), None)
-        .await
-        .map_err(|e| {
-            ServerError::Database(format!(
-                "ensure sender {} ⇄ 用户 {} 私聊频道失败: {}",
-                sender_id, request.user_id, e
-            ))
-        })?;
-
-    let channel_id = channel.id;
     let message_type = parse_content_message_type(request.message_type.as_deref());
     let metadata = request
         .metadata
