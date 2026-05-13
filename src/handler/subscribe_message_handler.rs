@@ -15,9 +15,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::config::RoomTicketConfig;
 use crate::context::RequestContext;
 use crate::handler::MessageHandler;
 use crate::infra::{ConnectionManager, SubscribeManager};
+use crate::security::room_ticket::{self, VerifyError as TicketErr};
 use crate::Result;
 use async_trait::async_trait;
 use msgtrans::SessionId;
@@ -27,11 +29,29 @@ use tracing::{info, warn};
 const ACTION_SUBSCRIBE: u8 = 1;
 const ACTION_UNSUBSCRIBE: u8 = 2;
 
+// reason_code (spec ROOM_CHANNEL_SPEC §4.7). Constants are local to this
+// handler — wire is `ubyte`. 0..=8 已有语义; 9-12 是 Room ticket 校验失败
+// 的细分，便于 ops/debug 定位（spec §4.7 留了 7 = NOT_ALLOWED 作"通用授权
+// 失败"作为兜底，本 handler 用具体码以提供更精确诊断）。
+const REASON_OK: u8 = 0;
+const REASON_NOT_MEMBER: u8 = 4;
+const REASON_QUERY_FAILED: u8 = 5;
+const REASON_NOT_AUTHENTICATED: u8 = 6;
+const REASON_TOO_MANY: u8 = 8;
+const REASON_TICKET_MISSING: u8 = 9;
+const REASON_TICKET_INVALID: u8 = 10;
+const REASON_TICKET_EXPIRED: u8 = 11;
+const REASON_ROOM_CLOSED: u8 = 12;
+
 pub struct SubscribeMessageHandler {
     subscribe_manager: Arc<SubscribeManager>,
     channel_service: Arc<crate::service::ChannelService>,
     connection_manager: Arc<ConnectionManager>,
     room_history_service: Arc<crate::service::RoomHistoryService>,
+    /// Room subscribe ticket 配置。`None` = 进入 v1 兼容模式（"已认证即放行"
+    /// 无 ticket 校验，与 spec §4 不一致；仅过渡用）。配上 secret 才走完整
+    /// ticket 校验。
+    room_ticket: Option<Arc<RoomTicketConfig>>,
 }
 
 impl SubscribeMessageHandler {
@@ -40,12 +60,14 @@ impl SubscribeMessageHandler {
         channel_service: Arc<crate::service::ChannelService>,
         connection_manager: Arc<ConnectionManager>,
         room_history_service: Arc<crate::service::RoomHistoryService>,
+        room_ticket: Option<Arc<RoomTicketConfig>>,
     ) -> Self {
         Self {
             subscribe_manager,
             channel_service,
             connection_manager,
             room_history_service,
+            room_ticket,
         }
     }
 
@@ -177,22 +199,62 @@ impl MessageHandler for SubscribeMessageHandler {
                         }
                     }
                 }
-                // Room(2)：最小 gate — 必须已认证
-                // TODO 后续迭代实现完整 ticket 校验：
-                // 1. 从 subscribe_request.param 提取 ticket（JWT）
-                // 2. 验证签名（HMAC-SHA256）、过期时间
-                // 3. 校验 channel_id 匹配、device_id 匹配
-                // 4. 校验 Room 状态（OPEN/CLOSED）
-                // reason_code: 4=TICKET_EXPIRED, 5=TICKET_INVALID, 6=ROOM_CLOSED, 7=NOT_ALLOWED
+                // Room(2)：完整 ticket 校验（spec ROOM_CHANNEL_SPEC §4.6）。
+                // 1) authenticated（拿到 user_id / device_id 才能比对 ticket.did）
+                // 2) `[room_ticket]` 配过：解码 + 校验签名 + exp + cid + ct + did + scope
+                // 3) 未配 `[room_ticket]`：v1 兼容模式 — "已认证即放行"，warn 告警
                 2 => {
                     if context.user_id.is_none() {
                         warn!(
                             "📡 SubscribeMessageHandler: 未认证的会话 {} 尝试订阅 Room {}",
                             context.session_id, channel_id
                         );
-                        6 // 未认证
+                        REASON_NOT_AUTHENTICATED
                     } else {
-                        0 // 已认证即放行（ticket 校验后续迭代）
+                        match self.room_ticket.as_deref() {
+                            Some(cfg) => {
+                                let token = subscribe_request.param.as_str();
+                                // 当前连接的 device_id（spec §4.3 ticket.did 必须匹配）
+                                let dev = context.device_id.as_deref().unwrap_or("");
+                                match room_ticket::verify(cfg, token, channel_id, dev) {
+                                    Ok(claims) => {
+                                        info!(
+                                            "📡 SubscribeMessageHandler: Room {} ticket verified user={} dev={}",
+                                            channel_id, claims.sub, claims.did
+                                        );
+                                        REASON_OK
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "📡 SubscribeMessageHandler: Room {} ticket rejected: {} (session={}, dev='{}')",
+                                            channel_id, e, context.session_id, dev
+                                        );
+                                        match e {
+                                            TicketErr::Missing => REASON_TICKET_MISSING,
+                                            TicketErr::Expired => REASON_TICKET_EXPIRED,
+                                            TicketErr::MalformedHeader
+                                            | TicketErr::InvalidSignature
+                                            | TicketErr::BadScope
+                                            | TicketErr::BadChannelType
+                                            | TicketErr::ChannelMismatch
+                                            | TicketErr::DeviceMismatch
+                                            | TicketErr::UnknownKid
+                                            | TicketErr::Other => REASON_TICKET_INVALID,
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                // v1 兼容模式：spec §4 要求 ticket，但未配 secret 时退化
+                                // 为"已认证即放行"。直播 / 游戏开启 ticket 校验前必须配
+                                // `[room_ticket]`，否则 Room 实际无访问控制。
+                                warn!(
+                                    "📡 SubscribeMessageHandler: [room_ticket] not configured; Room {} subscribe is open to any authenticated user (spec §4 ticket gate disabled — v1 compat mode)",
+                                    channel_id
+                                );
+                                REASON_OK
+                            }
+                        }
                     }
                 }
                 // 未知 channel_type

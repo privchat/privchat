@@ -32,9 +32,15 @@
 /// - `EnforceFull`: 全部特性
 pub mod client_state;
 pub mod rate_limiter;
+pub mod room_ticket;
 pub mod security_service;
 
 pub use client_state::{ClientState, ClientStateManager, TrustScore, ViolationType};
+pub use room_ticket::{
+    sign as sign_room_ticket, sign_default as sign_room_ticket_default,
+    verify as verify_room_ticket, RoomTicketClaims, VerifyError as RoomTicketVerifyError,
+    CT_ROOM, SCOPE_SUBSCRIBE,
+};
 pub use rate_limiter::{
     FanoutCostCalculator, MultiDimensionRateLimiter, RateLimitConfig, RateLimitKey, RpcCost,
     RpcCostTable,

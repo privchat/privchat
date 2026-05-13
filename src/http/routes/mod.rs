@@ -29,6 +29,7 @@ pub mod admin;
 pub mod auth;
 pub mod auth_jwks;
 pub mod metrics;
+pub mod room_tickets;
 pub mod transfer;
 pub mod upload;
 
@@ -62,4 +63,8 @@ pub fn create_admin_routes() -> Router<AdminServerState> {
         // dispatch — pure packet-delivery extension of channel pub/sub
         // (server spec §1.4).
         .nest("/api/service/transfer", transfer::create_route())
+        // Room subscribe ticket issuer (spec ROOM_CHANNEL_SPEC §4.5). Same
+        // X-Service-Key gate; business APIs call this after deciding the
+        // requesting user should be admitted to a Room channel.
+        .nest("/api/service/room-tickets", room_tickets::create_route())
 }

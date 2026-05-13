@@ -175,6 +175,14 @@ application_url = "http://localhost:8080"
 application_master_key = "your_service_master_key_here"
 timeout_ms = 3000
 
+# Room subscribe ticket（spec 02-server/ROOM_CHANNEL_SPEC §4）
+# secret 是 HMAC-SHA256 key。生产环境通过 env 覆盖。
+# default_kid: 签发用的 key id；和 keys 多 key 一起用做轮换。
+[room_ticket]
+secret = "dev-room-ticket-secret-please-rotate-in-prod"
+default_kid = "v1"
+leeway_secs = 30
+
 [logging]
 level = "info"
 format = "compact"
