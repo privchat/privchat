@@ -223,21 +223,6 @@ impl User {
         )
     }
 
-    /// 显示用名（v1.2 起 username 可空）：display_name → username → "user_{uid}"
-    pub fn display_or_username(&self) -> String {
-        self.display_name
-            .clone()
-            .or_else(|| self.username.clone())
-            .unwrap_or_else(|| format!("user_{}", self.id))
-    }
-
-    /// 取 username（兼容旧调用方）：None 时回退到 "user_{uid}"
-    pub fn username_or_default(&self) -> String {
-        self.username
-            .clone()
-            .unwrap_or_else(|| format!("user_{}", self.id))
-    }
-
     /// 更新最后活跃时间
     pub fn update_last_active(&mut self) {
         self.last_active_at = Some(Utc::now());

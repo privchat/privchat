@@ -165,8 +165,9 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
                     payload: Some(json!({
                         "user_id": user.id,
                         "uid": user.id,
+                        // username / nickname 未设置则透传 null/空——不再 fallback 为 user_<uid>
                         "username": user.username,
-                        "nickname": user.display_name.clone().unwrap_or_else(|| user.username_or_default()),
+                        "nickname": user.display_name,
                         "avatar": user.avatar_url.clone().unwrap_or_default(),
                         "user_type": user.user_type,
                         "status": user.status,
