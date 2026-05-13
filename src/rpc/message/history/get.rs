@@ -92,6 +92,7 @@ pub async fn handle(
                         "content": content,
                         "message_type": msg.message_type.as_str(),
                         "timestamp": msg.created_at.timestamp_millis(),
+                        "message_seq": msg.pts,  // per-channel pts; clients project read-by-peer (sent vs ✓✓) by comparing this to ChannelRecord.peer_read_pts. Field name mirrors SendMessageResponse.message_seq for cross-RPC consistency.
                         "reply_to_message_id": msg.reply_to_message_id,
                         "metadata": msg.metadata,
                         "revoked": msg.revoked,  // 客户端根据此字段和语言设置显示占位符

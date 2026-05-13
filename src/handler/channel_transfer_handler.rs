@@ -272,16 +272,22 @@ pub async fn process_transfer_request(
         );
     }
 
-    // 4. Subscription
-    if !lookups.is_subscribed(user_id, req.channel_id).await {
-        return encode_response(
-            &req.request_id,
-            req.channel_id,
-            CODE_CHANNEL_NOT_SUBSCRIBED,
-            "channel not subscribed",
-            &[],
-        );
-    }
+    // 4. Subscription — **不**校验。
+    //
+    // Spec: CHANNEL_TRANSFER_SPEC §1.5 Transfer Access Policy。Transfer 通用层
+    // 只做 auth / channel access / room membership / route / business_channel
+    // binding / dispatch_flag。`is_subscribed(user_id, channel_id)` 是实时
+    // 事件订阅状态，不是 RPC 调用的通用前置条件——bot / official / system /
+    // wallet / 等普通 service 拿到 channel_id 就该能调。
+    //
+    // 需要"必须订阅"的强实时业务（如 game room 下注、live room 操作），由对应
+    // PrivChatTransferHandler 在 service handler 内自行校验（结合 seat token /
+    // room ticket / action_seq 一并审计）。详见 spec §1.5 中 game 校验链示例。
+    //
+    // 20900 `ChannelNotSubscribed` 段位仍然保留，但仅在两种语义下产生：
+    //   - app→user 推送时目标 online 但未订阅（投递路由，§12.2）
+    //   - service handler 自身声明 REQUIRE_SUBSCRIPTION 时业务返回
+    // 通用层**不**返。Room membership 在第 6 步保留——那才是真正的 channel access。
 
     // 5. channel_id → room_id
     let Some(room_id) = lookups.resolve_room(req.channel_id).await else {

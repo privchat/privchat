@@ -269,18 +269,51 @@ impl ReadStateService {
         limit: u32,
     ) -> Result<(Vec<ChannelReadCursorRow>, u64, bool)> {
         let limit = limit.clamp(1, 200);
+        // Returns two row classes in one page:
+        //   1. self rows  — caller's own cursor for every channel
+        //   2. peer rows  — for direct channels (channel_type=0), the
+        //      OTHER party's cursor on the same channel. Lets clients
+        //      hydrate `peer_read_pts` baseline at bootstrap so "已读"
+        //      survives re-login (otherwise read state only flows via
+        //      live `peer_read_pts_updated` push). See client-side
+        //      `absorbPeerReadCursor`.
+        //
+        // Both classes share `sync_version` as the monotonic page
+        // cursor — peer rows are real channel_read_cursor rows with
+        // their own sync_version, so increasing-since scans work
+        // unchanged. Caller distinguishes self/peer via `user_id` in
+        // the payload.
+        //
+        // Group channels (channel_type=1 by channels-table convention)
+        // are excluded from the peer branch because group "已读"
+        // semantics need per-member cursors and a different surface.
         let db_rows = sqlx::query(
             r#"
-            SELECT
-                channel_id,
-                user_id,
-                last_read_pts,
-                sync_version
-            FROM privchat_channel_read_cursor
-            WHERE user_id = $1
-              AND sync_version > $2
-              AND ($3::BIGINT IS NULL OR channel_id = $3)
-            ORDER BY sync_version ASC, channel_id ASC
+            WITH self_rows AS (
+                SELECT channel_id, user_id, last_read_pts, sync_version
+                FROM privchat_channel_read_cursor
+                WHERE user_id = $1
+                  AND sync_version > $2
+                  AND ($3::BIGINT IS NULL OR channel_id = $3)
+            ),
+            peer_rows AS (
+                SELECT cur.channel_id, cur.user_id, cur.last_read_pts, cur.sync_version
+                FROM privchat_channel_read_cursor cur
+                JOIN privchat_channels ch ON ch.channel_id = cur.channel_id
+                WHERE ch.channel_type = 0
+                  AND cur.sync_version > $2
+                  AND ($3::BIGINT IS NULL OR cur.channel_id = $3)
+                  AND cur.user_id <> $1
+                  AND (
+                    (ch.direct_user1_id = $1 AND cur.user_id = ch.direct_user2_id)
+                    OR
+                    (ch.direct_user2_id = $1 AND cur.user_id = ch.direct_user1_id)
+                  )
+            )
+            SELECT channel_id, user_id, last_read_pts, sync_version FROM self_rows
+            UNION ALL
+            SELECT channel_id, user_id, last_read_pts, sync_version FROM peer_rows
+            ORDER BY sync_version ASC, channel_id ASC, user_id ASC
             LIMIT $4
             "#,
         )

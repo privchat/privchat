@@ -162,6 +162,19 @@ app_id = ""
 access_token = ""
 endpoint = "https://server-api-push.meizu.com"
 
+# server → application 出站配置
+# spec: 02-server/CHANNEL_TRANSFER_SPEC §5 + SERVICE_ACCOUNT_FOLLOW_SPEC §5
+# v1 复用同一把 application master key（即 application 端 privchat.conf 的 service_master_key）
+[channel_transfer]
+application_url = "http://localhost:8080"
+application_master_key = "your_service_master_key_here"
+timeout_ms = 3000
+
+[service_account_event]
+application_url = "http://localhost:8080"
+application_master_key = "your_service_master_key_here"
+timeout_ms = 3000
+
 [logging]
 level = "info"
 format = "compact"

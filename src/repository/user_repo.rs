@@ -711,11 +711,12 @@ impl UserRepository {
             .collect())
     }
 
-    /// 获取所有用户（分页，管理 API）
+    /// 获取所有用户（分页，管理 API）。`user_type=Some(n)` 时按 user_type 过滤。
     pub async fn find_all_paginated(
         &self,
         page: u32,
         page_size: u32,
+        user_type: Option<i16>,
     ) -> Result<(Vec<User>, u32), DatabaseError> {
         let offset = (page - 1) * page_size;
 
@@ -737,9 +738,10 @@ impl UserRepository {
             business_system_id: Option<String>,
         }
 
+        // user_type 可选过滤；不传时返回所有 type。SQL 用 ($3::int2 IS NULL OR user_type = $3) 简化分支。
         let rows = sqlx::query_as::<_, UserRow>(
             r#"
-            SELECT 
+            SELECT
                 user_id,
                 username,
                 password_hash,
@@ -755,12 +757,14 @@ impl UserRepository {
                 last_active_at,
                 business_system_id
             FROM privchat_users
+            WHERE ($3::int2 IS NULL OR user_type = $3)
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
         )
         .bind(page_size as i64)
         .bind(offset as i64)
+        .bind(user_type)
         .fetch_all(self.pool.as_ref())
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to query users: {}", e)))?;
@@ -788,11 +792,14 @@ impl UserRepository {
             })
             .collect();
 
-        // 统计总数
-        let total_result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM privchat_users")
-            .fetch_one(self.pool.as_ref())
-            .await
-            .map_err(|e| DatabaseError::Database(format!("Failed to count users: {}", e)))?;
+        // 统计总数（与过滤条件一致）
+        let total_result: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM privchat_users WHERE ($1::int2 IS NULL OR user_type = $1)",
+        )
+        .bind(user_type)
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to count users: {}", e)))?;
 
         let total = total_result.0 as u32;
 

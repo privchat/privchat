@@ -161,6 +161,12 @@ pub struct RpcServiceContext {
     pub qr_login_service: Arc<QrLoginService>,
     /// 扫码登录的 unauth 推送 publisher（spec QR_API §5）
     pub qr_login_publisher: Arc<QrLoginPublisher>,
+    /// Bot follow 关系仓库 (spec SERVICE_ACCOUNT_FOLLOW_SPEC §4)
+    pub bot_follow_repository: Arc<crate::repository::BotFollowRepository>,
+    /// service-account event webhook caller (server → application)；
+    /// `None` = 未配 `[service_account_event]` 表，handler 会跳过 best-effort 通知
+    pub service_account_event_client:
+        Option<Arc<crate::service_account_event::ServiceAccountEventClient>>,
 }
 
 impl RpcServiceContext {
@@ -204,6 +210,10 @@ impl RpcServiceContext {
         user_service: Arc<UserService>,
         qr_login_service: Arc<QrLoginService>,
         qr_login_publisher: Arc<QrLoginPublisher>,
+        bot_follow_repository: Arc<crate::repository::BotFollowRepository>,
+        service_account_event_client: Option<
+            Arc<crate::service_account_event::ServiceAccountEventClient>,
+        >,
     ) -> Self {
         Self {
             // channel_service 已合并到 channel_service
@@ -245,6 +255,8 @@ impl RpcServiceContext {
             user_service,
             qr_login_service,
             qr_login_publisher,
+            bot_follow_repository,
+            service_account_event_client,
         }
     }
 }

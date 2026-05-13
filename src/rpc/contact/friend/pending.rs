@@ -53,6 +53,7 @@ pub async fn handle(
                         search_session_id: 0,
                         is_friend: false,
                         can_send_message: false,
+                        is_follow: false,
                     },
                     _ => SearchedUser {
                         user_id: req.from_user_id,
@@ -63,6 +64,7 @@ pub async fn handle(
                         search_session_id: 0,
                         is_friend: false,
                         can_send_message: false,
+                        is_follow: false,
                     },
                 };
 

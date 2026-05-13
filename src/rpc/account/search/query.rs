@@ -44,7 +44,10 @@ pub async fn handle(
     request.from_user_id = crate::rpc::get_current_user_id(&ctx)?;
 
     let searcher_id = request.from_user_id;
-    let query = request.query.trim().to_lowercase();
+    let raw_query = request.query.trim().to_string();
+    // username + email 走 case-insensitive；phone 是 E.164 数字串，
+    // 不应小写化（虽然 ASCII 数字小写化是 no-op，但保持语义清晰）。
+    let query = raw_query.to_lowercase();
 
     if query.is_empty() {
         return Err(RpcError::validation("query cannot be empty".to_string()));
@@ -52,7 +55,10 @@ pub async fn handle(
 
     let mut results = Vec::new();
 
-    // ✨ 关键字精确搜索：统一小写后按用户名/邮箱查找
+    // ✨ 关键字精确搜索：username → phone → email 三步级联，与 doc
+    // 注释一致（"支持搜索 username、phone、email"）。phone 的 query
+    // 用未小写化的原文：privchat_users.phone 存储为 E.164（含 `+`），
+    // 大小写不敏感但前缀字符必须保留。
     let (user_opt, search_type) = match services
         .user_repository
         .find_by_username(&query)
@@ -61,15 +67,24 @@ pub async fn handle(
         .flatten()
     {
         Some(user) => (Some(user), SearchType::Username),
-        None => (
-            services
-                .user_repository
-                .find_by_email(&query)
-                .await
-                .ok()
-                .flatten(),
-            SearchType::Email,
-        ),
+        None => match services
+            .user_repository
+            .find_by_phone(&raw_query)
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(user) => (Some(user), SearchType::Phone),
+            None => (
+                services
+                    .user_repository
+                    .find_by_email(&query)
+                    .await
+                    .ok()
+                    .flatten(),
+                SearchType::Email,
+            ),
+        },
     };
 
     // 处理找到的用户
@@ -89,6 +104,21 @@ pub async fn handle(
                 .friend_service
                 .is_friend(searcher_id, user_id)
                 .await;
+
+            // 2b. 检查 bot 关注关系（仅 user_type=2 有意义；非 bot 直接 false）
+            // spec: 02-server/SERVICE_ACCOUNT_FOLLOW_SPEC §4
+            let is_follow = if user.user_type == 2 {
+                services
+                    .bot_follow_repository
+                    .find(searcher_id, user_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|rec| rec.is_followed())
+                    .unwrap_or(false)
+            } else {
+                false
+            };
 
             // 检查是否可以发消息
             let can_send_message = {
@@ -148,6 +178,7 @@ pub async fn handle(
                         search_session_id: search_record.search_session_id,
                         is_friend,
                         can_send_message,
+                        is_follow,
                     });
                 }
                 Err(e) => {
@@ -166,6 +197,7 @@ pub async fn handle(
                         search_session_id: 0, // 搜索记录创建失败时使用默认值
                         is_friend,
                         can_send_message,
+                        is_follow,
                     });
                 }
             }
