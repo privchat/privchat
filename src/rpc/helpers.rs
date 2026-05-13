@@ -21,15 +21,14 @@ use crate::infra::cache_manager::CachedUserProfile;
 use crate::model::user::User;
 
 /// 将 User 模型转换为 CachedUserProfile
+///
+/// username / display_name 未设置时**透传空串**，不再 fallback 为 `user_<uid>`——
+/// 让 client 端按自己的 UX 决定如何显示空值（"未设置" / 隐藏 / 显示 uid 等）。
 pub fn user_to_cached_profile(user: &User) -> CachedUserProfile {
-    let username = user.username_or_default();
     CachedUserProfile {
         user_id: user.id.to_string(),
-        username: username.clone(),
-        nickname: user
-            .display_name
-            .clone()
-            .unwrap_or_else(|| username.clone()),
+        username: user.username.clone().unwrap_or_default(),
+        nickname: user.display_name.clone().unwrap_or_default(),
         avatar_url: user.avatar_url.clone(),
         user_type: user.user_type,
         phone: user.phone.clone(),

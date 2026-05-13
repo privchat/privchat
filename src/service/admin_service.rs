@@ -207,8 +207,14 @@ impl AdminService {
             .map_err(|e| ServerError::Database(format!("查询用户失败: {}", e)))?
             .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
 
-        let username_fallback = user.username_or_default();
-        let display_name = user.display_name.as_deref().unwrap_or(&username_fallback);
+        // 群公告里需要一个可读名字；display_name → username → "用户{uid}"。
+        // 这里只用于**公告文案**（不是 wire username 字段），所以保留兜底是 OK 的。
+        let id_fallback = format!("用户{}", user.id);
+        let display_name: &str = user
+            .display_name
+            .as_deref()
+            .or(user.username.as_deref())
+            .unwrap_or(&id_fallback);
 
         // 2. 添加用户到群组
         self.channel_service
