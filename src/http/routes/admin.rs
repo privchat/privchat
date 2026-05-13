@@ -125,6 +125,10 @@ pub fn create_route() -> Router<AdminServerState> {
             "/groups/{group_id}/members/{user_id}",
             delete(remove_group_member),
         )
+        .route(
+            "/groups/{group_id}/members/{user_id}/role",
+            put(set_group_member_role),
+        )
         // === P0: 消息撤回 + 系统消息 ===
         .route(
             "/messages/{message_id}/revoke",
@@ -132,6 +136,11 @@ pub fn create_route() -> Router<AdminServerState> {
         )
         .route("/messages/send-system", post(send_system_message))
         .route("/messages/send", post(send_message))
+        .route(
+            "/system-messages/send-to-user",
+            post(send_system_message_to_user),
+        )
+        .route("/system-messages/senders", get(list_system_senders))
         // === P0: 安全管控 ===
         .route("/security/shadow-banned", get(list_shadow_banned))
         .route(
@@ -167,6 +176,7 @@ pub fn create_route() -> Router<AdminServerState> {
             "/channels/{channel_id}/participants",
             get(list_channel_participants),
         )
+        .route("/direct-channels/lookup", get(lookup_direct_channel))
         // === P1: 消息广播与搜索 ===
         .route("/messages/broadcast", post(broadcast_message))
         .route("/messages/search", get(search_messages))
@@ -553,6 +563,8 @@ struct UserListQuery {
     page_size: Option<u32>,
     search: Option<String>,
     status: Option<i16>,
+    /// 按 user_type 过滤（0=Normal, 1=System, 2=Bot）。
+    user_type: Option<i16>,
 }
 
 /// 获取用户列表
@@ -569,13 +581,17 @@ async fn list_users(
     let page_size = params.page_size.unwrap_or(20).min(100); // 最大 100
 
     let (users, total) = if let Some(ref search) = params.search {
-        let users = state.user_service.search(search).await?;
+        // 搜索路径：先按关键字搜，再在内存里按 user_type 过滤（v1 简化；后续可下沉 SQL）。
+        let mut users = state.user_service.search(search).await?;
+        if let Some(ut) = params.user_type {
+            users.retain(|u| u.user_type == ut);
+        }
         let total = users.len() as u32;
         (users, total)
     } else {
         state
             .user_service
-            .find_all_paginated(page, page_size)
+            .find_all_paginated(page, page_size, params.user_type)
             .await?
     };
 
@@ -1766,6 +1782,53 @@ async fn remove_group_member(
     }))
 }
 
+/// 更新群成员角色（管理 API，仅 Admin / Member 互切；Owner 不允许通过此接口设置）
+///
+/// PUT /api/admin/groups/:group_id/members/:user_id/role
+/// body: { "role": "admin" | "member" }
+#[derive(Debug, serde::Deserialize)]
+struct SetMemberRoleRequest {
+    role: String,
+}
+
+async fn set_group_member_role(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path((group_id, user_id)): Path<(u64, u64)>,
+    Json(req): Json<SetMemberRoleRequest>,
+) -> ApiResult<serde_json::Value> {
+    verify_service_key(&headers, &state).await?;
+
+    let role = match req.role.to_lowercase().as_str() {
+        "admin" => crate::model::channel::MemberRole::Admin,
+        "member" => crate::model::channel::MemberRole::Member,
+        "owner" => {
+            return Err(ServerError::Validation(
+                "禁止通过此接口设置 Owner 角色".to_string(),
+            ));
+        }
+        other => {
+            return Err(ServerError::Validation(format!(
+                "不支持的角色: {}（仅支持 admin / member）",
+                other
+            )));
+        }
+    };
+
+    state
+        .channel_service
+        .set_member_role_admin(group_id, user_id, role)
+        .await?;
+
+    Ok(ApiEnvelope::ok(serde_json::json!({
+        "success": true,
+        "group_id": group_id,
+        "user_id": user_id,
+        "role": req.role.to_lowercase(),
+        "message": "角色已更新",
+    })))
+}
+
 // =====================================================
 // P0: 消息撤回 + 系统消息
 // =====================================================
@@ -1815,6 +1878,12 @@ async fn send_system_message(
         .metadata
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
+    // sender_id 缺省 SYSTEM_USER_ID；非缺省时强校验 user_type ∈ {System, Bot}。
+    let sender_id = request.sender_id.unwrap_or(crate::config::SYSTEM_USER_ID);
+    if sender_id != crate::config::SYSTEM_USER_ID {
+        ensure_system_sender(&state, sender_id).await?;
+    }
+
     let (channel_type, recipients) =
         resolve_channel_type_and_members(&state, request.channel_id).await?;
 
@@ -1822,7 +1891,7 @@ async fn send_system_message(
         .message_service
         .send_message(crate::service::ServerSendMessageRequest {
             channel_id: request.channel_id,
-            sender_id: crate::config::SYSTEM_USER_ID,
+            sender_id,
             content: request.content.clone(),
             message_type,
             metadata,
@@ -1839,6 +1908,90 @@ async fn send_system_message(
         created_at: result.created_at,
         message: "系统消息已发送".to_string(),
     }))
+}
+
+/// 发送系统消息到指定用户（私聊形式）
+///
+/// POST /api/admin/system-messages/send-to-user
+///
+/// body: { "user_id": <u64>, "content": <string>, "message_type": "text"?, "metadata": {}? }
+///
+/// 使用 SYSTEM_USER_ID 作为发送者，自动 ensure 系统账号与目标用户之间的私聊频道，然后写消息。
+/// 返回 { channel_id, message_id, created_at }。
+#[derive(Debug, serde::Deserialize)]
+struct SendSystemMessageToUserRequest {
+    user_id: u64,
+    content: String,
+    message_type: Option<String>,
+    metadata: Option<serde_json::Value>,
+    /// 发送者 user_id（可选，缺省 SYSTEM_USER_ID）。**必须** user_type ∈ {1,2}。
+    sender_id: Option<u64>,
+}
+
+async fn send_system_message_to_user(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(request): Json<SendSystemMessageToUserRequest>,
+) -> ApiResult<serde_json::Value> {
+    use crate::repository::ChannelRepository;
+
+    verify_service_key(&headers, &state).await?;
+
+    // sender_id 缺省 SYSTEM_USER_ID；非缺省时强校验 user_type ∈ {System, Bot}。
+    let sender_id = request.sender_id.unwrap_or(crate::config::SYSTEM_USER_ID);
+    if sender_id != crate::config::SYSTEM_USER_ID {
+        ensure_system_sender(&state, sender_id).await?;
+    }
+
+    if request.user_id == sender_id {
+        return Err(ServerError::Validation(
+            "不能给 sender 自身发系统消息".to_string(),
+        ));
+    }
+
+    // FOLLOW-UP（SYSTEM_MESSAGE_ADMIN_SPEC §5.2）: 这里直接拿 channel_repository 是临时
+    // 方案。后续应在 ChannelService 上提供显式 `ensure_direct_channel_for_admin(peer_id)` /
+    // `send_system_message_to_user(...)` 业务方法，handler 改调那个，避免 admin route 持
+    // 续绕过 service 封装。
+    let repo = state.channel_service.channel_repository();
+    let (channel, _created) = repo
+        .create_or_get_direct_channel(sender_id, request.user_id, Some("admin"), None)
+        .await
+        .map_err(|e| {
+            ServerError::Database(format!(
+                "ensure sender {} ⇄ 用户 {} 私聊频道失败: {}",
+                sender_id, request.user_id, e
+            ))
+        })?;
+
+    let channel_id = channel.id;
+    let message_type = parse_content_message_type(request.message_type.as_deref());
+    let metadata = request
+        .metadata
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+    let result = state
+        .message_service
+        .send_message(crate::service::ServerSendMessageRequest {
+            channel_id,
+            sender_id,
+            content: request.content.clone(),
+            message_type,
+            metadata,
+            channel_type: 1, // 1 = Direct
+            recipient_user_ids: vec![sender_id, request.user_id],
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
+
+    Ok(ApiEnvelope::ok(serde_json::json!({
+        "success": true,
+        "user_id": request.user_id,
+        "sender_id": sender_id,
+        "channel_id": channel_id,
+        "message_id": result.message_id,
+        "created_at": result.created_at,
+    })))
 }
 
 // =====================================================
@@ -2293,6 +2446,63 @@ async fn get_channel(
     Ok(ApiEnvelope::ok(channel))
 }
 
+/// 按两个用户 ID 查找他们之间的私聊频道。
+///
+/// GET /api/admin/direct-channels/lookup?user_a=&user_b=
+///
+/// 返回 `{ "channel_id": <u64> }` 或 404。供 admin 端"查 A 与 B 的聊天记录"
+/// 这条 UX 用：先 lookup 拿 channel_id，再走 list_messages 取消息。
+#[derive(Debug, serde::Deserialize)]
+struct DirectChannelLookupQuery {
+    user_a: u64,
+    user_b: u64,
+}
+
+async fn lookup_direct_channel(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Query(params): Query<DirectChannelLookupQuery>,
+) -> ApiResult<serde_json::Value> {
+    verify_service_key(&headers, &state).await?;
+
+    if params.user_a == params.user_b {
+        return Err(ServerError::Validation(
+            "user_a 与 user_b 不能相同".to_string(),
+        ));
+    }
+
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT channel_id
+        FROM privchat_channels
+        WHERE channel_type = 0
+          AND (
+                (direct_user1_id = $1 AND direct_user2_id = $2)
+             OR (direct_user1_id = $2 AND direct_user2_id = $1)
+          )
+        LIMIT 1
+        "#,
+    )
+    .bind(params.user_a as i64)
+    .bind(params.user_b as i64)
+    .fetch_optional(state.channel_service.pool())
+    .await
+    .map_err(|e| ServerError::Database(format!("查找私聊频道失败: {}", e)))?;
+
+    let channel_id = row.ok_or_else(|| {
+        ServerError::NotFound(format!(
+            "用户 {} 与 {} 之间不存在私聊频道",
+            params.user_a, params.user_b
+        ))
+    })?;
+
+    Ok(ApiEnvelope::ok(serde_json::json!({
+        "channel_id": channel_id.0 as u64,
+        "user_a": params.user_a,
+        "user_b": params.user_b,
+    })))
+}
+
 /// 获取会话参与者列表
 ///
 /// GET /api/admin/channels/:channel_id/participants
@@ -2425,6 +2635,74 @@ async fn search_messages(
         page,
         page_size,
     }))
+}
+
+/// 列出 user_type ∈ {System, Bot} 的所有用户，作为 admin 系统消息可用 sender 列表。
+///
+/// GET /api/admin/system-messages/senders
+async fn list_system_senders(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+) -> ApiResult<serde_json::Value> {
+    verify_service_key(&headers, &state).await?;
+
+    let rows: Vec<(i64, String, Option<String>, Option<String>, i16)> = sqlx::query_as(
+        r#"
+        SELECT user_id, username, display_name, avatar_url, user_type
+        FROM privchat_users
+        WHERE user_type IN (1, 2)
+        ORDER BY user_type ASC, user_id ASC
+        "#,
+    )
+    .fetch_all(state.channel_service.pool())
+    .await
+    .map_err(|e| ServerError::Database(format!("查询系统消息发送者失败: {}", e)))?;
+
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(user_id, username, display_name, avatar_url, user_type)| {
+            serde_json::json!({
+                "user_id": user_id as u64,
+                "username": username,
+                "display_name": display_name,
+                "avatar_url": avatar_url,
+                "user_type": user_type,
+            })
+        })
+        .collect();
+
+    Ok(ApiEnvelope::ok(serde_json::json!({ "items": items })))
+}
+
+/// 校验 sender_id 是合法的系统消息发送者：
+///   - 必须存在于 privchat_users
+///   - user_type ∈ {1=System, 2=Bot}
+///
+/// **底线**：普通用户（user_type=0）禁止作为系统消息 sender，否则后台可以伪造任意
+/// 用户身份发消息。spec SYSTEM_MESSAGE_ADMIN_SPEC §5（v1.5 sender 多元化）。
+async fn ensure_system_sender(
+    state: &AdminServerState,
+    sender_id: u64,
+) -> Result<i16> {
+    let user_type: Option<i16> = sqlx::query_scalar(
+        r#"SELECT user_type FROM privchat_users WHERE user_id = $1"#,
+    )
+    .bind(sender_id as i64)
+    .fetch_optional(state.channel_service.pool())
+    .await
+    .map_err(|e| ServerError::Database(format!("查询 sender 失败: {}", e)))?;
+
+    let user_type = user_type.ok_or_else(|| {
+        ServerError::NotFound(format!("sender_id {} 不存在", sender_id))
+    })?;
+
+    if !matches!(user_type, 1 | 2) {
+        return Err(ServerError::Validation(format!(
+            "sender_id {} 不是系统/机器人账号（user_type={}），禁止作为系统消息 sender",
+            sender_id, user_type
+        )));
+    }
+    Ok(user_type)
 }
 
 /// 解析消息类型字符串为 ContentMessageType

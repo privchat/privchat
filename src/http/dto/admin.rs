@@ -196,6 +196,9 @@ pub struct SendSystemMessageRequest {
     pub message_type: Option<String>,
     /// 附加元数据（可选）
     pub metadata: Option<serde_json::Value>,
+    /// 发送者 user_id（可选，缺省 SYSTEM_USER_ID）。
+    /// **强校验**：必须存在且 user_type ∈ {1=System, 2=Bot}。普通用户被拒。
+    pub sender_id: Option<u64>,
 }
 
 /// 发送系统消息响应
