@@ -169,6 +169,23 @@ impl ChannelService {
         self.channel_repository.pool()
     }
 
+    /// **临时 accessor，待移除**。
+    ///
+    /// 为了让 admin route `send_system_message_to_user` 直接调
+    /// `create_or_get_direct_channel` 而开放，绕过了 ChannelService 的业务封装。
+    ///
+    /// FOLLOW-UP（spec SYSTEM_MESSAGE_ADMIN_SPEC §5.2）：
+    /// - 在 `ChannelService` 上提供显式业务方法（如 `ensure_direct_channel_for_admin`
+    ///   或更高层 `send_system_message_to_user`）
+    /// - 把 admin handler 改成调那个业务方法
+    /// - 把本 accessor 改回 `pub(crate)` 或私有
+    ///
+    /// 在那之前禁止新增对它的调用。
+    #[doc(hidden)]
+    pub fn channel_repository(&self) -> Arc<PgChannelRepository> {
+        self.channel_repository.clone()
+    }
+
     fn sync_channel_type(channel_type: ChannelType) -> i32 {
         match channel_type {
             ChannelType::Direct => 1,
@@ -399,6 +416,8 @@ impl ChannelService {
 
     /// 获取群组详情（管理 API）
     pub async fn get_group_admin(&self, group_id: u64) -> Result<serde_json::Value> {
+        // JOIN privchat_users 把群主的 username/display_name/avatar 一并带回，admin
+        // 不需要额外再调一次 user 详情。
         let group = sqlx::query!(
             r#"
             SELECT
@@ -407,6 +426,9 @@ impl ChannelService {
                 g.name as group_name,
                 g.description,
                 g.owner_id as owner_id,
+                ou.username as owner_username,
+                ou.display_name as owner_display_name,
+                ou.avatar_url as owner_avatar_url,
                 g.member_count,
                 COALESCE(g.created_at, 0) as group_created_at,
                 COALESCE(g.updated_at, 0) as group_updated_at,
@@ -417,6 +439,7 @@ impl ChannelService {
                 c.updated_at as channel_updated_at
             FROM privchat_channels c
             LEFT JOIN privchat_groups g ON c.group_id = g.group_id
+            LEFT JOIN privchat_users ou ON ou.user_id = g.owner_id
             WHERE c.channel_type = 1 AND c.group_id = $1
             LIMIT 1
             "#,
@@ -429,17 +452,22 @@ impl ChannelService {
         let group =
             group.ok_or_else(|| ServerError::NotFound(format!("群组 {} 不存在", group_id)))?;
 
-        // 查询群组成员
+        // 群成员：JOIN users 拿全局 username/display_name/avatar；只返活跃成员
+        // （left_at IS NULL）。已离开的不在 admin 列表里露出。
         let members = sqlx::query!(
             r#"
             SELECT
-                user_id,
-                role,
-                joined_at,
-                nickname
-            FROM privchat_group_members
-            WHERE group_id = $1
-            ORDER BY joined_at ASC
+                m.user_id,
+                m.role,
+                m.joined_at,
+                m.nickname,
+                u.username,
+                u.display_name,
+                u.avatar_url
+            FROM privchat_group_members m
+            LEFT JOIN privchat_users u ON u.user_id = m.user_id
+            WHERE m.group_id = $1 AND m.left_at IS NULL
+            ORDER BY m.role ASC, m.joined_at ASC
             "#,
             group_id as i64,
         )
@@ -455,6 +483,9 @@ impl ChannelService {
                     "role": m.role,
                     "joined_at": m.joined_at,
                     "nickname": m.nickname,
+                    "username": m.username,
+                    "display_name": m.display_name,
+                    "avatar_url": m.avatar_url,
                 })
             })
             .collect();
@@ -466,6 +497,9 @@ impl ChannelService {
             "name": group.group_name,
             "description": group.description,
             "owner_id": owner_id,
+            "owner_username": group.owner_username,
+            "owner_display_name": group.owner_display_name,
+            "owner_avatar_url": group.owner_avatar_url,
             "member_count": group.member_count.unwrap_or(0) as u32,
             "members": member_list,
             "last_message_id": group.last_message_id.map(|id| id as u64),
@@ -474,6 +508,126 @@ impl ChannelService {
             "created_at": group.group_created_at,
             "updated_at": group.group_updated_at,
         }))
+    }
+
+    // =====================================================
+    // 群成员事实源一致性 helper
+    //
+    // 群成员的权威表是 `privchat_group_members`；`privchat_groups.member_count`
+    // 仅是它的派生缓存。所有改动都走以下三个 helper（全部接 tx），并在结尾
+    // 用 [recompute_group_member_count] 把 cache 刷一遍 —— 用 COUNT(*) 重算
+    // 而不是 +/- 1，避免历史上 increment/decrement 导致的脱节。
+    //
+    // 调用方负责 begin/commit。
+    // =====================================================
+
+    /// 把若干用户登记为群成员（owner 用 Owner 角色，其他用 Member）。已存在的活跃成员
+    /// 不做改动；曾经离开的复活（left_at = NULL）。`extra_member_ids` 中与 owner 相同
+    /// 的或重复出现的会被去重。
+    async fn upsert_group_members_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        group_id: u64,
+        owner_id: u64,
+        extra_member_ids: &[u64],
+        now_ms: i64,
+    ) -> Result<()> {
+        // owner 优先以 Owner 角色入表
+        Self::upsert_one_member_in_tx(tx, group_id, owner_id, MemberRole::Owner, now_ms).await?;
+
+        let mut seen: HashSet<u64> = HashSet::new();
+        seen.insert(owner_id);
+        for uid in extra_member_ids {
+            if !seen.insert(*uid) {
+                continue;
+            }
+            Self::upsert_one_member_in_tx(tx, group_id, *uid, MemberRole::Member, now_ms).await?;
+        }
+
+        Self::recompute_group_member_count_in_tx(tx, group_id, now_ms).await
+    }
+
+    /// 把单个用户加入群（INSERT 或复活）；不重算 member_count。
+    /// 想要立刻反映在 `privchat_groups.member_count` 上，调用方需配合 [recompute_group_member_count_in_tx]。
+    async fn upsert_one_member_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        group_id: u64,
+        user_id: u64,
+        role: MemberRole,
+        now_ms: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_group_members (
+                group_id, user_id, role, joined_at, nickname, left_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, NULL, NULL, $4)
+            ON CONFLICT (group_id, user_id) DO UPDATE SET
+                role = EXCLUDED.role,
+                joined_at = CASE
+                    WHEN privchat_group_members.left_at IS NOT NULL THEN EXCLUDED.joined_at
+                    ELSE privchat_group_members.joined_at
+                END,
+                left_at = NULL,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(group_id as i64)
+        .bind(user_id as i64)
+        .bind(role.to_i16())
+        .bind(now_ms)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("插入/复活群成员失败: {}", e)))?;
+        Ok(())
+    }
+
+    /// 标记一个活跃成员为已离开（left_at = now）。如果该成员已不活跃则什么都不做。
+    /// 不重算 member_count，调用方负责。
+    async fn mark_one_member_left_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        group_id: u64,
+        user_id: u64,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE privchat_group_members
+            SET left_at = $3, updated_at = $3
+            WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
+            "#,
+        )
+        .bind(group_id as i64)
+        .bind(user_id as i64)
+        .bind(now_ms)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("标记群成员离开失败: {}", e)))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 把 `privchat_groups.member_count` 重新刷成 `group_members WHERE left_at IS NULL` 的真实数量。
+    async fn recompute_group_member_count_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        group_id: u64,
+        now_ms: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE privchat_groups
+            SET member_count = (
+                SELECT COUNT(*)::int FROM privchat_group_members
+                WHERE group_id = $1 AND left_at IS NULL
+            ),
+            updated_at = $2
+            WHERE group_id = $1
+            "#,
+        )
+        .bind(group_id as i64)
+        .bind(now_ms)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("重算群成员数失败: {}", e)))?;
+        Ok(())
     }
 
     /// 解散群组（管理 API）
@@ -1040,43 +1194,27 @@ impl ChannelService {
     /// 移除群组成员（管理 API）
     pub async fn remove_member_admin(&self, group_id: u64, user_id: u64) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        let result = sqlx::query(
-            r#"
-            UPDATE privchat_group_members
-            SET left_at = $3,
-                updated_at = $3
-            WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
-            RETURNING user_id
-            "#,
-        )
-        .bind(group_id as i64)
-        .bind(user_id as i64)
-        .bind(now)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(|e| ServerError::Database(format!("移除群组成员失败: {}", e)))?;
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启事务失败: {}", e)))?;
 
-        if result.is_none() {
+        let actually_left =
+            Self::mark_one_member_left_in_tx(&mut tx, group_id, user_id, now).await?;
+        if !actually_left {
+            tx.rollback().await.ok();
             return Err(ServerError::NotFound(format!(
-                "群组 {} 中不存在成员 {}",
+                "群组 {} 中不存在活跃成员 {}",
                 group_id, user_id
             )));
         }
 
-        // 更新群组成员数
-        sqlx::query!(
-            r#"
-            UPDATE privchat_groups
-            SET member_count = GREATEST(COALESCE(member_count, 1) - 1, 0),
-                updated_at = $1
-            WHERE group_id = $2
-            "#,
-            chrono::Utc::now().timestamp_millis(),
-            group_id as i64,
-        )
-        .execute(self.pool())
-        .await
-        .map_err(|e| ServerError::Database(format!("更新群组成员数失败: {}", e)))?;
+        Self::recompute_group_member_count_in_tx(&mut tx, group_id, now).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交事务失败: {}", e)))?;
 
         info!(
             "✅ 群组成员已移除: group_id={}, user_id={}",
@@ -1088,73 +1226,45 @@ impl ChannelService {
 
     /// 添加群成员（管理 API）
     ///
-    /// 1. 数据库层面插入成员记录
-    /// 2. 更新群组成员数
-    /// 3. 更新内存状态
+    /// 1. 在事务里 upsert `privchat_group_members` + 重算 `privchat_groups.member_count`
+    /// 2. 同步内存 cache（仅当 channel 已 load 进 cache）
     pub async fn add_member_admin(&self, group_id: u64, user_id: u64) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启事务失败: {}", e)))?;
 
-        // 1. 检查是否已是成员
-        let existing = sqlx::query(
+        // 已经是活跃成员 → 直接拒。曾经离开 / 不存在 → upsert 进去。
+        let was_active: Option<bool> = sqlx::query_scalar(
             r#"
-            SELECT user_id, left_at FROM privchat_group_members
+            SELECT (left_at IS NULL) FROM privchat_group_members
             WHERE group_id = $1 AND user_id = $2
             "#,
         )
         .bind(group_id as i64)
         .bind(user_id as i64)
-        .fetch_optional(self.pool())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ServerError::Database(format!("查询群组成员失败: {}", e)))?;
 
-        if existing
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<i64>, _>("left_at").ok().flatten())
-            .is_none()
-            && existing.is_some()
-        {
+        if was_active == Some(true) {
+            tx.rollback().await.ok();
             return Err(ServerError::Validation(format!(
                 "用户 {} 已是群组 {} 的成员",
                 user_id, group_id
             )));
         }
 
-        // 2. 插入成员记录
-        sqlx::query(
-            r#"
-            INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, nickname, left_at, updated_at)
-            VALUES ($1, $2, 0, $3, NULL, NULL, $3)
-            ON CONFLICT (group_id, user_id) DO UPDATE SET
-                role = EXCLUDED.role,
-                joined_at = EXCLUDED.joined_at,
-                nickname = EXCLUDED.nickname,
-                left_at = NULL,
-                updated_at = EXCLUDED.updated_at
-            "#,
-        )
-        .bind(group_id as i64)
-        .bind(user_id as i64)
-        .bind(now)
-        .execute(self.pool())
-        .await
-        .map_err(|e| ServerError::Database(format!("添加群组成员失败: {}", e)))?;
+        Self::upsert_one_member_in_tx(&mut tx, group_id, user_id, MemberRole::Member, now).await?;
+        Self::recompute_group_member_count_in_tx(&mut tx, group_id, now).await?;
 
-        // 3. 更新群组成员数
-        sqlx::query!(
-            r#"
-            UPDATE privchat_groups
-            SET member_count = COALESCE(member_count, 0) + 1,
-                updated_at = $1
-            WHERE group_id = $2
-            "#,
-            now,
-            group_id as i64,
-        )
-        .execute(self.pool())
-        .await
-        .map_err(|e| ServerError::Database(format!("更新群组成员数失败: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交事务失败: {}", e)))?;
 
-        // 4. 更新内存状态（如果 channel 已加载）
+        // 同步内存 cache：忽略 join_channel 的 DB 写（upsert 幂等，重写一次代价低且不影响一致性）。
         let _ = self.join_channel(group_id, user_id, None).await;
 
         info!(
@@ -1162,6 +1272,91 @@ impl ChannelService {
             group_id, user_id
         );
 
+        Ok(())
+    }
+
+    /// 设置群成员角色（管理 API）
+    ///
+    /// 只支持 Admin / Member 互切。Owner 角色禁止通过本接口设置 / 取消 ——
+    /// owner 转让走独立流程（v1 不实现）。如果目标用户当前已是 Owner 或目标
+    /// 角色是 Owner，直接返 Validation。
+    ///
+    /// 不存在该成员（或已离开）→ NotFound。
+    pub async fn set_member_role_admin(
+        &self,
+        group_id: u64,
+        user_id: u64,
+        role: MemberRole,
+    ) -> Result<()> {
+        if role == MemberRole::Owner {
+            return Err(ServerError::Validation(
+                "禁止通过此接口将成员设为 Owner（请走转让群主流程）".to_string(),
+            ));
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启事务失败: {}", e)))?;
+
+        let current_role: Option<i16> = sqlx::query_scalar(
+            r#"
+            SELECT role FROM privchat_group_members
+            WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
+            "#,
+        )
+        .bind(group_id as i64)
+        .bind(user_id as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询成员当前角色失败: {}", e)))?;
+
+        let current = match current_role {
+            Some(r) => MemberRole::from_i16(r),
+            None => {
+                tx.rollback().await.ok();
+                return Err(ServerError::NotFound(format!(
+                    "群组 {} 中不存在活跃成员 {}",
+                    group_id, user_id
+                )));
+            }
+        };
+
+        if current == MemberRole::Owner {
+            tx.rollback().await.ok();
+            return Err(ServerError::Validation(
+                "禁止修改群主角色（请走转让群主流程）".to_string(),
+            ));
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE privchat_group_members
+            SET role = $3, updated_at = $4
+            WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
+            "#,
+        )
+        .bind(group_id as i64)
+        .bind(user_id as i64)
+        .bind(role.to_i16())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("更新群成员角色失败: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交事务失败: {}", e)))?;
+
+        // 内存缓存（如果 channel 已 load）
+        let _ = self.set_member_role(&group_id, &user_id, role).await;
+
+        info!(
+            "✅ 群成员角色已更新: group_id={}, user_id={}, role={:?}",
+            group_id, user_id, role
+        );
         Ok(())
     }
 
@@ -1269,17 +1464,32 @@ impl ChannelService {
                     });
                 }
 
-                // ✨ 先创建 privchat_groups 记录，获取 group_id
                 let now = chrono::Utc::now().timestamp_millis();
                 let group_name = request.name.clone().unwrap();
                 let group_description = request.description.clone();
+                let initial_members = request.member_ids.clone();
+
+                // 一个事务里完成：INSERT privchat_groups + INSERT owner / 初始成员
+                // 到 privchat_group_members + 重算 member_count。任何一步失败都回滚，
+                // 保证 groups 行不会出现没成员的孤儿状态。
+                let mut tx = match self.pool().begin().await {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        error!("❌ 开启群组创建事务失败: {}", e);
+                        return Ok(ChannelResponse {
+                            channel: Channel::new_direct(0, 0, 0),
+                            success: false,
+                            error: Some(format!("创建群组失败: {}", e)),
+                        });
+                    }
+                };
 
                 let group_id = match sqlx::query_as::<_, (i64,)>(
                     r#"
                     INSERT INTO privchat_groups (
                         name, description, owner_id, member_count, created_at, updated_at
                     )
-                    VALUES ($1, $2, $3, 1, $4, $4)
+                    VALUES ($1, $2, $3, 0, $4, $4)
                     RETURNING group_id
                     "#,
                 )
@@ -1287,12 +1497,13 @@ impl ChannelService {
                 .bind(group_description.as_deref())
                 .bind(creator_id as i64)
                 .bind(now)
-                .fetch_one(self.channel_repository.pool())
+                .fetch_one(&mut *tx)
                 .await
                 {
                     Ok(row) => row.0 as u64,
                     Err(e) => {
                         error!("❌ 创建群组记录失败: {}", e);
+                        let _ = tx.rollback().await;
                         return Ok(ChannelResponse {
                             channel: Channel::new_direct(0, 0, 0),
                             success: false,
@@ -1301,21 +1512,49 @@ impl ChannelService {
                     }
                 };
 
-                info!("✅ 群组记录已创建: group_id={}", group_id);
+                if let Err(e) = Self::upsert_group_members_in_tx(
+                    &mut tx,
+                    group_id,
+                    creator_id,
+                    &initial_members,
+                    now,
+                )
+                .await
+                {
+                    error!("❌ 群成员落库失败: {}", e);
+                    let _ = tx.rollback().await;
+                    return Ok(ChannelResponse {
+                        channel: Channel::new_direct(0, 0, 0),
+                        success: false,
+                        error: Some(format!("群成员落库失败: {}", e)),
+                    });
+                }
 
-                // 使用 group_id 作为 channel_id 创建会话
+                if let Err(e) = tx.commit().await {
+                    error!("❌ 提交群组创建事务失败: {}", e);
+                    return Ok(ChannelResponse {
+                        channel: Channel::new_direct(0, 0, 0),
+                        success: false,
+                        error: Some(format!("提交群组事务失败: {}", e)),
+                    });
+                }
+
+                info!(
+                    "✅ 群组记录已创建: group_id={}, owner={}, extra_members={}",
+                    group_id,
+                    creator_id,
+                    initial_members.len()
+                );
+
                 let mut conv = Channel::new_group(group_id, creator_id, request.name.clone());
-
-                // 设置群聊属性
                 conv.metadata.description = request.description;
                 conv.metadata.is_public = request.is_public.unwrap_or(false);
                 conv.metadata.max_members =
                     request.max_members.or(Some(self.config.max_group_members));
 
-                // 添加初始成员
-                for member_id in request.member_ids {
+                for member_id in initial_members {
                     if let Err(error) = conv.add_member(member_id, None) {
-                        warn!("Failed to add member to group: {}", error);
+                        warn!("Failed to add member to group cache: {}", error);
                     }
                 }
 
@@ -1513,64 +1752,105 @@ impl ChannelService {
             }
             ChannelType::Group => {
                 let mut conv = Channel::new_group(channel_id, creator_id, request.name.clone());
-
-                // ✨ 先在 privchat_groups 表中创建群组记录，然后设置 group_id
-                // 注意：现在使用 u64 类型，直接使用 channel_id 作为 group_id
                 let now = chrono::Utc::now().timestamp_millis();
+                let initial_members = request.member_ids.clone();
 
-                // 在 privchat_groups 表中创建群组记录
+                // 同 create_channel：用事务串起 INSERT privchat_groups +
+                // upsert privchat_group_members + 重算 member_count。
+                let mut tx = match self.pool().begin().await {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        warn!("⚠️ 开启群组创建事务失败: {}", e);
+                        return Ok(ChannelResponse {
+                            channel: conv,
+                            success: false,
+                            error: Some(format!("创建群组失败: {}", e)),
+                        });
+                    }
+                };
+
                 let group_created = match sqlx::query(
                     r#"
                     INSERT INTO privchat_groups (
                         group_id, name, description, owner_id, member_count, created_at, updated_at
                     )
-                    VALUES ($1, $2, $3, $4, 1, $5, $5)
+                    VALUES ($1, $2, $3, $4, 0, $5, $5)
                     ON CONFLICT (group_id) DO NOTHING
                     "#,
                 )
-                .bind(channel_id as i64) // PostgreSQL BIGINT
+                .bind(channel_id as i64)
                 .bind(request.name.as_ref().unwrap_or(&"未命名群组".to_string()))
                 .bind(request.description.as_ref())
-                .bind(creator_id as i64) // PostgreSQL BIGINT
+                .bind(creator_id as i64)
                 .bind(now)
-                .execute(self.channel_repository.pool())
+                .execute(&mut *tx)
                 .await
                 {
-                    Ok(_) => {
-                        info!("✅ 群组记录已创建: {}", channel_id);
-                        true
-                    }
+                    Ok(res) => res.rows_affected() > 0,
                     Err(e) => {
-                        // 如果失败（通常是 owner_id 外键约束失败），记录警告
                         warn!("⚠️ 创建群组记录失败: {}，可能是用户不存在于数据库中", e);
-                        // 不设置 group_id，让会话创建时也失败，这样错误更明确
-                        false
+                        let _ = tx.rollback().await;
+                        return Ok(ChannelResponse {
+                            channel: conv,
+                            success: false,
+                            error: Some(format!(
+                                "无法创建群组记录：用户 {} 可能不存在于数据库中",
+                                creator_id
+                            )),
+                        });
                     }
                 };
 
-                // 只有群组记录创建成功时才设置 group_id
-                if group_created {
-                    conv.group_id = Some(channel_id);
-                } else {
-                    // 如果群组记录创建失败，返回错误
+                if !group_created {
+                    let _ = tx.rollback().await;
                     return Ok(ChannelResponse {
                         channel: conv,
                         success: false,
-                        error: Some(format!(
-                            "无法创建群组记录：用户 {} 可能不存在于数据库中",
-                            creator_id
-                        )),
+                        error: Some(format!("群组 {} 已存在", channel_id)),
                     });
                 }
 
-                // 设置群聊属性
+                if let Err(e) = Self::upsert_group_members_in_tx(
+                    &mut tx,
+                    channel_id,
+                    creator_id,
+                    &initial_members,
+                    now,
+                )
+                .await
+                {
+                    error!("❌ 群成员落库失败: {}", e);
+                    let _ = tx.rollback().await;
+                    return Ok(ChannelResponse {
+                        channel: conv,
+                        success: false,
+                        error: Some(format!("群成员落库失败: {}", e)),
+                    });
+                }
+
+                if let Err(e) = tx.commit().await {
+                    error!("❌ 提交群组创建事务失败: {}", e);
+                    return Ok(ChannelResponse {
+                        channel: conv,
+                        success: false,
+                        error: Some(format!("提交群组事务失败: {}", e)),
+                    });
+                }
+
+                info!(
+                    "✅ 群组记录已创建: group_id={}, owner={}, extra_members={}",
+                    channel_id,
+                    creator_id,
+                    initial_members.len()
+                );
+
+                conv.group_id = Some(channel_id);
                 conv.metadata.description = request.description;
                 conv.metadata.is_public = request.is_public.unwrap_or(false);
                 conv.metadata.max_members =
                     request.max_members.or(Some(self.config.max_group_members));
 
-                // 添加初始成员
-                for member_id in &request.member_ids {
+                for member_id in &initial_members {
                     let _ = conv.add_member(*member_id, None);
                 }
 
@@ -2178,77 +2458,101 @@ impl ChannelService {
     ) -> Result<bool> {
         let mut channels = self.channels.write().await;
 
-        if let Some(channel) = channels.get_mut(&channel_id) {
-            // 检查会话状态
-            if !channel.is_active() {
-                return Ok(false);
-            }
+        let channel = match channels.get_mut(&channel_id) {
+            Some(c) => c,
+            None => return Ok(false),
+        };
 
-            // 检查是否允许加入
-            if !channel.metadata.allow_invite && channel.channel_type == ChannelType::Group {
-                return Ok(false);
-            }
-
-            // 添加成员
-            match channel.add_member(user_id, role) {
-                Ok(_) => {
-                    drop(channels);
-
-                    self.ensure_user_channel_rows(channel_id, &[user_id])
-                        .await?;
-
-                    // 更新用户会话索引
-                    let mut user_channels = self.user_channels.write().await;
-                    user_channels
-                        .entry(user_id)
-                        .or_insert_with(Vec::new)
-                        .push(channel_id);
-
-                    info!("User {} joined channel {}", user_id, channel_id);
-                    Ok(true)
-                }
-                Err(error) => {
-                    warn!(
-                        "Failed to add user {} to channel {}: {}",
-                        user_id, channel_id, error
-                    );
-                    Ok(false)
-                }
-            }
-        } else {
-            Ok(false)
+        if !channel.is_active() {
+            return Ok(false);
         }
+        if !channel.metadata.allow_invite && channel.channel_type == ChannelType::Group {
+            return Ok(false);
+        }
+
+        let channel_type = channel.channel_type;
+        if let Err(error) = channel.add_member(user_id, role) {
+            warn!(
+                "Failed to add user {} to channel {}: {}",
+                user_id, channel_id, error
+            );
+            return Ok(false);
+        }
+        drop(channels);
+
+        // 群聊：把成员真实落到 privchat_group_members + 刷 member_count，事务保证一致。
+        if channel_type == ChannelType::Group {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut tx = self.pool().begin().await.map_err(|e| {
+                ServerError::Database(format!("开启加群事务失败: {}", e))
+            })?;
+            Self::upsert_one_member_in_tx(
+                &mut tx,
+                channel_id,
+                user_id,
+                role.unwrap_or(MemberRole::Member),
+                now,
+            )
+            .await?;
+            Self::recompute_group_member_count_in_tx(&mut tx, channel_id, now).await?;
+            tx.commit()
+                .await
+                .map_err(|e| ServerError::Database(format!("提交加群事务失败: {}", e)))?;
+        }
+
+        self.ensure_user_channel_rows(channel_id, &[user_id]).await?;
+
+        let mut user_channels = self.user_channels.write().await;
+        user_channels
+            .entry(user_id)
+            .or_insert_with(Vec::new)
+            .push(channel_id);
+
+        info!("User {} joined channel {}", user_id, channel_id);
+        Ok(true)
     }
 
     /// 离开会话
     pub async fn leave_channel(&self, channel_id: u64, user_id: u64) -> Result<bool> {
         let mut channels = self.channels.write().await;
 
-        if let Some(channel) = channels.get_mut(&channel_id) {
-            match channel.remove_member(&user_id) {
-                Ok(_) => {
-                    drop(channels);
+        let channel = match channels.get_mut(&channel_id) {
+            Some(c) => c,
+            None => return Ok(false),
+        };
 
-                    // 更新用户会话索引
-                    let mut user_channels = self.user_channels.write().await;
-                    if let Some(conv_list) = user_channels.get_mut(&user_id) {
-                        conv_list.retain(|id| *id != channel_id);
-                    }
-
-                    info!("User {} left channel {}", user_id, channel_id);
-                    Ok(true)
-                }
-                Err(error) => {
-                    warn!(
-                        "Failed to remove user {} from channel {}: {}",
-                        user_id, channel_id, error
-                    );
-                    Ok(false)
-                }
-            }
-        } else {
-            Ok(false)
+        let channel_type = channel.channel_type;
+        if let Err(error) = channel.remove_member(&user_id) {
+            warn!(
+                "Failed to remove user {} from channel {}: {}",
+                user_id, channel_id, error
+            );
+            return Ok(false);
         }
+        drop(channels);
+
+        if channel_type == ChannelType::Group {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut tx = self.pool().begin().await.map_err(|e| {
+                ServerError::Database(format!("开启退群事务失败: {}", e))
+            })?;
+            let actually_left =
+                Self::mark_one_member_left_in_tx(&mut tx, channel_id, user_id, now).await?;
+            if actually_left {
+                Self::recompute_group_member_count_in_tx(&mut tx, channel_id, now).await?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| ServerError::Database(format!("提交退群事务失败: {}", e)))?;
+        }
+
+        let mut user_channels = self.user_channels.write().await;
+        if let Some(conv_list) = user_channels.get_mut(&user_id) {
+            conv_list.retain(|id| *id != channel_id);
+        }
+
+        info!("User {} left channel {}", user_id, channel_id);
+        Ok(true)
     }
 
     /// 更新会话信息
@@ -3606,5 +3910,283 @@ mod tests {
         cleanup_channel(&service, channel_id).await;
         cleanup_group(&service, group_id).await;
         cleanup_user(&service, owner_id).await;
+    }
+
+    // =====================================================
+    // 群成员事实源一致性测试（migration 016 + service 层修复）
+    // =====================================================
+
+    /// `privchat_groups.member_count` 必须等于 `group_members WHERE left_at IS NULL` 的真实数量。
+    async fn assert_group_count_matches_members(service: &ChannelService, group_id: u64) {
+        let cached: (i32,) = sqlx::query_as(
+            "SELECT COALESCE(member_count, 0) FROM privchat_groups WHERE group_id = $1",
+        )
+        .bind(group_id as i64)
+        .fetch_one(service.pool())
+        .await
+        .expect("fetch group");
+        let actual: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM privchat_group_members WHERE group_id = $1 AND left_at IS NULL",
+        )
+        .bind(group_id as i64)
+        .fetch_one(service.pool())
+        .await
+        .expect("count members");
+        assert_eq!(
+            cached.0 as i64, actual.0,
+            "groups.member_count={} 与 active group_members={} 脱节",
+            cached.0, actual.0
+        );
+    }
+
+    async fn count_active_members(service: &ChannelService, group_id: u64) -> i64 {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM privchat_group_members WHERE group_id = $1 AND left_at IS NULL",
+        )
+        .bind(group_id as i64)
+        .fetch_one(service.pool())
+        .await
+        .expect("count members");
+        row.0
+    }
+
+    async fn fetch_member_role(
+        service: &ChannelService,
+        group_id: u64,
+        user_id: u64,
+    ) -> Option<i16> {
+        sqlx::query_scalar(
+            "SELECT role FROM privchat_group_members WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL",
+        )
+        .bind(group_id as i64)
+        .bind(user_id as i64)
+        .fetch_optional(service.pool())
+        .await
+        .expect("fetch role")
+    }
+
+    #[tokio::test]
+    async fn create_group_inserts_owner_member() {
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip create_group_inserts_owner_member: DATABASE_URL not set");
+            return;
+        };
+        let owner = 950001_u64;
+        ensure_user(&service, owner, "g_consist_owner").await;
+
+        let req = CreateChannelRequest {
+            channel_type: ChannelType::Group,
+            name: Some("consistency-1".into()),
+            description: None,
+            member_ids: vec![],
+            is_public: None,
+            max_members: None,
+        };
+        let resp = service.create_channel(owner, req).await.unwrap();
+        assert!(resp.success, "create_channel failed: {:?}", resp.error);
+        let group_id = resp.channel.id;
+
+        assert_eq!(count_active_members(&service, group_id).await, 1);
+        assert_eq!(fetch_member_role(&service, group_id, owner).await, Some(0));
+        assert_group_count_matches_members(&service, group_id).await;
+
+        cleanup_channel(&service, group_id).await;
+        cleanup_group(&service, group_id).await;
+        cleanup_user(&service, owner).await;
+    }
+
+    #[tokio::test]
+    async fn create_group_member_count_matches_initial_member_ids() {
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip create_group_member_count_matches_initial_member_ids: DATABASE_URL not set");
+            return;
+        };
+        let owner = 950101_u64;
+        let m1 = 950102_u64;
+        let m2 = 950103_u64;
+        ensure_user(&service, owner, "g_consist_o2").await;
+        ensure_user(&service, m1, "g_consist_m1").await;
+        ensure_user(&service, m2, "g_consist_m2").await;
+
+        let req = CreateChannelRequest {
+            channel_type: ChannelType::Group,
+            name: Some("consistency-2".into()),
+            description: None,
+            member_ids: vec![m1, m2],
+            is_public: None,
+            max_members: None,
+        };
+        let resp = service.create_channel(owner, req).await.unwrap();
+        assert!(resp.success);
+        let group_id = resp.channel.id;
+
+        assert_eq!(count_active_members(&service, group_id).await, 3);
+        assert_eq!(fetch_member_role(&service, group_id, owner).await, Some(0));
+        assert_eq!(fetch_member_role(&service, group_id, m1).await, Some(2));
+        assert_eq!(fetch_member_role(&service, group_id, m2).await, Some(2));
+        assert_group_count_matches_members(&service, group_id).await;
+
+        cleanup_channel(&service, group_id).await;
+        cleanup_group(&service, group_id).await;
+        cleanup_user(&service, owner).await;
+        cleanup_user(&service, m1).await;
+        cleanup_user(&service, m2).await;
+    }
+
+    #[tokio::test]
+    async fn join_channel_persists_member_to_db() {
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip join_channel_persists_member_to_db: DATABASE_URL not set");
+            return;
+        };
+        let owner = 950201_u64;
+        let joiner = 950202_u64;
+        ensure_user(&service, owner, "g_consist_o3").await;
+        ensure_user(&service, joiner, "g_consist_j1").await;
+
+        let req = CreateChannelRequest {
+            channel_type: ChannelType::Group,
+            name: Some("consistency-3".into()),
+            description: None,
+            member_ids: vec![],
+            is_public: None,
+            max_members: None,
+        };
+        let resp = service.create_channel(owner, req).await.unwrap();
+        let group_id = resp.channel.id;
+
+        assert!(service.join_channel(group_id, joiner, None).await.unwrap());
+        assert_eq!(count_active_members(&service, group_id).await, 2);
+        assert_eq!(fetch_member_role(&service, group_id, joiner).await, Some(2));
+        assert_group_count_matches_members(&service, group_id).await;
+
+        cleanup_channel(&service, group_id).await;
+        cleanup_group(&service, group_id).await;
+        cleanup_user(&service, owner).await;
+        cleanup_user(&service, joiner).await;
+    }
+
+    #[tokio::test]
+    async fn leave_channel_marks_left_and_decrements_count() {
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip leave_channel_marks_left_and_decrements_count: DATABASE_URL not set");
+            return;
+        };
+        let owner = 950301_u64;
+        let joiner = 950302_u64;
+        ensure_user(&service, owner, "g_consist_o4").await;
+        ensure_user(&service, joiner, "g_consist_j2").await;
+
+        let req = CreateChannelRequest {
+            channel_type: ChannelType::Group,
+            name: Some("consistency-4".into()),
+            description: None,
+            member_ids: vec![joiner],
+            is_public: None,
+            max_members: None,
+        };
+        let resp = service.create_channel(owner, req).await.unwrap();
+        let group_id = resp.channel.id;
+
+        assert!(service.leave_channel(group_id, joiner).await.unwrap());
+        assert_eq!(count_active_members(&service, group_id).await, 1);
+        assert_group_count_matches_members(&service, group_id).await;
+
+        let left_at: Option<i64> = sqlx::query_scalar(
+            "SELECT left_at FROM privchat_group_members WHERE group_id = $1 AND user_id = $2",
+        )
+        .bind(group_id as i64)
+        .bind(joiner as i64)
+        .fetch_one(service.pool())
+        .await
+        .expect("fetch left_at");
+        assert!(left_at.is_some(), "leaver 应该被标记为 left_at IS NOT NULL");
+
+        cleanup_channel(&service, group_id).await;
+        cleanup_group(&service, group_id).await;
+        cleanup_user(&service, owner).await;
+        cleanup_user(&service, joiner).await;
+    }
+
+    #[tokio::test]
+    async fn admin_add_existing_active_member_does_not_double_count() {
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip admin_add_existing_active_member_does_not_double_count: DATABASE_URL not set");
+            return;
+        };
+        let owner = 950401_u64;
+        ensure_user(&service, owner, "g_consist_o5").await;
+
+        let req = CreateChannelRequest {
+            channel_type: ChannelType::Group,
+            name: Some("consistency-5".into()),
+            description: None,
+            member_ids: vec![],
+            is_public: None,
+            max_members: None,
+        };
+        let resp = service.create_channel(owner, req).await.unwrap();
+        let group_id = resp.channel.id;
+
+        assert_eq!(count_active_members(&service, group_id).await, 1);
+
+        // owner 已是活跃成员，再 add 应当报 Validation 而非默默 +1
+        let err = service.add_member_admin(group_id, owner).await.unwrap_err();
+        assert!(matches!(err, ServerError::Validation(_)), "expected Validation, got {:?}", err);
+
+        assert_eq!(count_active_members(&service, group_id).await, 1);
+        assert_group_count_matches_members(&service, group_id).await;
+
+        cleanup_channel(&service, group_id).await;
+        cleanup_group(&service, group_id).await;
+        cleanup_user(&service, owner).await;
+    }
+
+    #[tokio::test]
+    async fn admin_add_revives_left_member_without_double_count() {
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip admin_add_revives_left_member_without_double_count: DATABASE_URL not set");
+            return;
+        };
+        let owner = 950501_u64;
+        let other = 950502_u64;
+        ensure_user(&service, owner, "g_consist_o6").await;
+        ensure_user(&service, other, "g_consist_other").await;
+
+        let req = CreateChannelRequest {
+            channel_type: ChannelType::Group,
+            name: Some("consistency-6".into()),
+            description: None,
+            member_ids: vec![other],
+            is_public: None,
+            max_members: None,
+        };
+        let resp = service.create_channel(owner, req).await.unwrap();
+        let group_id = resp.channel.id;
+        assert_eq!(count_active_members(&service, group_id).await, 2);
+
+        // 退群
+        service.remove_member_admin(group_id, other).await.unwrap();
+        assert_eq!(count_active_members(&service, group_id).await, 1);
+        assert_group_count_matches_members(&service, group_id).await;
+
+        // 复活：admin add 应当把 left_at 置 NULL，count 回到 2，行数仍为 2（一行复用，一行原 owner）
+        service.add_member_admin(group_id, other).await.unwrap();
+        assert_eq!(count_active_members(&service, group_id).await, 2);
+        assert_group_count_matches_members(&service, group_id).await;
+
+        let total_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM privchat_group_members WHERE group_id = $1",
+        )
+        .bind(group_id as i64)
+        .fetch_one(service.pool())
+        .await
+        .expect("count rows");
+        assert_eq!(total_rows.0, 2, "复活应该复用旧行而非插入第二条");
+
+        cleanup_channel(&service, group_id).await;
+        cleanup_group(&service, group_id).await;
+        cleanup_user(&service, owner).await;
+        cleanup_user(&service, other).await;
     }
 }
