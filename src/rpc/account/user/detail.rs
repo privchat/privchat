@@ -114,6 +114,20 @@ pub async fn handle(
                         .is_friend(searcher_id, user_id)
                         .await;
 
+                    // ✨ Bot 关注关系（仅 user_type=2 有意义，spec SERVICE_ACCOUNT_FOLLOW_SPEC §4）
+                    let is_follow = if user_profile.user_type == 2 {
+                        services
+                            .bot_follow_repository
+                            .find(searcher_id, user_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|rec| rec.is_followed())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+
                     // 检查是否可以发消息
                     let can_send_message = {
                         // 如果是好友，可以发消息
@@ -157,6 +171,7 @@ pub async fn handle(
                         "user_type": user_profile.user_type, // 用户类型（0 普通 1 系统 2 机器人）
                         "is_friend": is_friend, // ✨ 是否好友
                         "can_send_message": can_send_message, // ✨ 是否有权限发消息
+                        "is_follow": is_follow, // ✨ 是否已关注 Bot（仅 user_type=2 有意义）
                         "source_type": source_str, // 本次查看的来源类型
                         "source_id": source_id, // 本次查看的来源 ID
                     }))

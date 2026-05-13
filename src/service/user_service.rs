@@ -198,9 +198,10 @@ impl UserService {
         &self,
         page: u32,
         page_size: u32,
+        user_type: Option<i16>,
     ) -> Result<(Vec<User>, u32), ServerError> {
         self.user_repository
-            .find_all_paginated(page, page_size)
+            .find_all_paginated(page, page_size, user_type)
             .await
             .map_err(|e| ServerError::Database(format!("获取用户列表失败: {}", e)))
     }

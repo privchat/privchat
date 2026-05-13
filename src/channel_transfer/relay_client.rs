@@ -148,15 +148,34 @@ impl ChannelTransferRelayClient {
             .map_err(|e| ChannelTransferRelayError::Transport(format!("read body: {e}")))?;
 
         if !status.is_success() {
-            let body = serde_json::from_str::<ForwardTransferResponse>(&raw).ok();
+            let body = parse_transfer_response(&raw);
             return Err(ChannelTransferRelayError::AppHttpError { status, body, raw });
         }
 
-        serde_json::from_str::<ForwardTransferResponse>(&raw).map_err(|e| {
+        parse_transfer_response(&raw).ok_or_else(|| {
             ChannelTransferRelayError::AppMalformed {
-                raw,
-                error: e.to_string(),
+                raw: raw.clone(),
+                error: format!(
+                    "body could not be parsed as flat ForwardTransferResponse \
+                     nor as ApiEnvelope-wrapped variant: {raw}"
+                ),
             }
         })
     }
+}
+
+/// Try parsing the raw body as either:
+///   1. flat `ForwardTransferResponse` (spec §5.1 shape), or
+///   2. ApiEnvelope-wrapped `{"code":0, "message":"OK", "data": ForwardTransferResponse}`
+///      — what the application currently emits via Neton's automatic envelope
+///      wrap. Removing the wrap framework-side is a much larger change; this
+///      tolerant parse keeps the wire boundary compatible without rocking
+///      that boat.
+fn parse_transfer_response(raw: &str) -> Option<ForwardTransferResponse> {
+    if let Ok(r) = serde_json::from_str::<ForwardTransferResponse>(raw) {
+        return Some(r);
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let inner = value.get("data")?;
+    serde_json::from_value::<ForwardTransferResponse>(inner.clone()).ok()
 }

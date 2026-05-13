@@ -105,6 +105,13 @@ pub struct ServerConfig {
     /// 才启用。
     #[serde(default)]
     pub channel_transfer: Option<ChannelTransferConfig>,
+    /// Service Account Event 出站配置（spec 02-server/SERVICE_ACCOUNT_FOLLOW_SPEC §5）。
+    ///
+    /// `None` 表示未配 `[service_account_event]`：bot follow / unfollow 仍然
+    /// 落 `privchat_bot_follow` 表并返回 channel_id，但**不**通知 application
+    /// （application 也不会自动写 `privchat_business_channel` binding）。
+    #[serde(default)]
+    pub service_account_event: Option<ServiceAccountEventConfig>,
 }
 
 /// JWT 算法（配置 `[auth.jwt] algorithm`）。
@@ -287,6 +294,7 @@ impl Default for ServerConfig {
             push: PushConfig::default(),
             jwt: JwtConfig::default(),
             channel_transfer: None,
+            service_account_event: None,
         }
     }
 }
@@ -795,6 +803,7 @@ struct TomlConfig {
     system_message: Option<TomlSystemMessageConfig>,
     push: Option<TomlPushConfig>,
     channel_transfer: Option<TomlChannelTransferConfig>,
+    service_account_event: Option<TomlServiceAccountEventConfig>,
 }
 
 /// TOML `[channel_transfer]` 段（spec 02-server/CHANNEL_TRANSFER_SPEC v2.0）
@@ -803,6 +812,17 @@ struct TomlChannelTransferConfig {
     /// privchat-application 基址，例如 `http://privchat-application:9100`
     application_url: Option<String>,
     /// application 端的 master key（与 server 自身的 service_master_key 不复用）
+    application_master_key: Option<String>,
+    /// server → application HTTP 调用超时，毫秒；缺省 3000
+    timeout_ms: Option<u64>,
+}
+
+/// TOML `[service_account_event]` 段（spec 02-server/SERVICE_ACCOUNT_FOLLOW_SPEC §5）
+#[derive(Debug, Deserialize)]
+struct TomlServiceAccountEventConfig {
+    /// privchat-application 基址（同 `[channel_transfer]` 通常指向同一服务）
+    application_url: Option<String>,
+    /// application 端的 master key（v1 复用与 channel_transfer 相同的 key）
     application_master_key: Option<String>,
     /// server → application HTTP 调用超时，毫秒；缺省 3000
     timeout_ms: Option<u64>,
@@ -1544,6 +1564,22 @@ impl From<TomlConfig> for ServerConfig {
             }
         }
 
+        // [service_account_event]：same gating as [channel_transfer].
+        // Missing or partial config keeps `service_account_event = None`,
+        // which means bot follow / unfollow handlers skip the webhook
+        // notification (spec §3.4 best-effort fire-and-forget).
+        if let Some(sae) = toml.service_account_event {
+            if let (Some(url), Some(key)) = (sae.application_url, sae.application_master_key) {
+                if !url.is_empty() && !key.is_empty() {
+                    config.service_account_event = Some(ServiceAccountEventConfig {
+                        application_url: url,
+                        application_master_key: key,
+                        timeout_ms: sae.timeout_ms.unwrap_or(3000),
+                    });
+                }
+            }
+        }
+
         config
     }
 }
@@ -1597,6 +1633,22 @@ pub struct ChannelTransferConfig {
     /// 与 server 自身的 `service_master_key` 不复用。
     pub application_master_key: String,
     /// HTTP 调用超时（毫秒）。spec §8.2 推荐默认 3000。
+    pub timeout_ms: u64,
+}
+
+/// Service Account Event 出站配置
+/// （spec 02-server/SERVICE_ACCOUNT_FOLLOW_SPEC §5）。
+///
+/// 形态与 [`ChannelTransferConfig`] 一致：v1 共享同一应用基址 + master key
+/// （endpoint 走 `/service/privchat/service-account/event`）。独立成结构以便
+/// 未来若 application 把 service-account event 拆到独立服务时各自配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceAccountEventConfig {
+    /// privchat-application 基址（不含路径）。
+    pub application_url: String,
+    /// application 端的 master key；放入 `X-Service-Key` header。
+    pub application_master_key: String,
+    /// HTTP 调用超时（毫秒）；缺省 3000，与 transfer / message dispatch 一致。
     pub timeout_ms: u64,
 }
 

@@ -92,6 +92,7 @@ impl<T> PaginationResult<T> {
 }
 
 // 模块导出（暂时注释掉数据库相关的）
+pub mod bot_follow_repo;
 pub mod channel_repo;
 pub mod device_repo;
 pub mod file_upload_repo;
@@ -103,6 +104,10 @@ pub mod user_device_repo; // ✨ 新增：用户设备 Repository
 pub mod user_repo;
 
 // 重新导出 PostgreSQL Repository 实现
+pub use bot_follow_repo::{
+    BotFollowRecord, BotFollowRepository, FollowUpsertOutcome,
+    STATUS_FOLLOWED, STATUS_UNFOLLOWED,
+};
 pub use channel_repo::{ChannelRepository, PgChannelRepository};
 pub use device_repo::*;
 pub use file_upload_repo::FileUploadRepository;

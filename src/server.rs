@@ -1235,6 +1235,34 @@ impl ChatServer {
             )),
         );
 
+        // Bot follow 关系仓库（spec SERVICE_ACCOUNT_FOLLOW_SPEC §4）
+        let bot_follow_repository =
+            Arc::new(crate::repository::BotFollowRepository::new(pool.clone()));
+
+        // service-account/event 出站 client（spec §5）；未配 [service_account_event] = 不通知
+        let service_account_event_client = match &config.service_account_event {
+            Some(cfg) => match crate::service_account_event::ServiceAccountEventClient::new(cfg) {
+                Ok(client) => {
+                    info!(
+                        "✅ ServiceAccountEventClient 已启用 → {}",
+                        client.endpoint()
+                    );
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ ServiceAccountEventClient 配置无效，将跳过 follow/unfollow 通知: {}",
+                        e
+                    );
+                    None
+                }
+            },
+            None => {
+                info!("ℹ️ 未配 [service_account_event]，bot follow 不会通知 application");
+                None
+            }
+        };
+
         // 初始化 RPC 系统
         info!("🔧 初始化 RPC 系统...");
         let rpc_services = crate::rpc::RpcServiceContext::new(
@@ -1277,6 +1305,8 @@ impl ChatServer {
             user_service.clone(),
             qr_login_service.clone(),
             qr_login_publisher.clone(),
+            bot_follow_repository.clone(),
+            service_account_event_client.clone(),
         );
         crate::rpc::init_rpc_system(rpc_services).await;
         info!("✅ RPC 系统初始化完成");
