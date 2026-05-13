@@ -64,6 +64,9 @@ pub struct AdminServerState {
     pub qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
     /// 统一 Token 编排服务：issue / refresh / introspect / revoke 端点共享一份。
     pub unified_token_service: Arc<crate::auth::UnifiedTokenService>,
+    /// Room subscribe ticket 配置（spec ROOM_CHANNEL_SPEC §4）。`None` = 未配
+    /// `[room_ticket]`，`/api/service/room-tickets/issue` 端点返回 503。
+    pub room_ticket: Option<Arc<crate::config::RoomTicketConfig>>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -127,6 +130,7 @@ impl AdminHttpServer {
         qr_login_service: Arc<crate::service::qr_login_service::QrLoginService>,
         qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
         unified_token_service: Arc<crate::auth::UnifiedTokenService>,
+        room_ticket: Option<Arc<crate::config::RoomTicketConfig>>,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -154,6 +158,7 @@ impl AdminHttpServer {
                 qr_login_service,
                 qr_login_publisher,
                 unified_token_service,
+                room_ticket,
             },
             port,
         }

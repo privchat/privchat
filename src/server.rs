@@ -637,6 +637,7 @@ impl ChatServer {
                 channel_service.clone(),
                 connection_manager.clone(),
                 room_history_service.clone(),
+                config.room_ticket.clone().map(Arc::new),
             )),
         );
 
@@ -2154,6 +2155,7 @@ impl ChatServer {
             self.qr_login_service.clone(),
             self.qr_login_publisher.clone(),
             self.unified_token_service.clone(),
+            self.config.room_ticket.clone().map(Arc::new),
             self.config.admin_api_port,
         );
 

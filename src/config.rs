@@ -112,6 +112,13 @@ pub struct ServerConfig {
     /// （application 也不会自动写 `privchat_business_channel` binding）。
     #[serde(default)]
     pub service_account_event: Option<ServiceAccountEventConfig>,
+    /// Room subscribe ticket 配置（spec 02-server/ROOM_CHANNEL_SPEC §4）。
+    ///
+    /// `None` 表示未配 `[room_ticket]`：Room 订阅退化为"已认证即放行"（v1
+    /// 兼容模式，直播间能跑但没有强访问控制）。配 secret 后进入完整 ticket
+    /// 校验：cid / ct / did / scope / exp 都必校验。
+    #[serde(default)]
+    pub room_ticket: Option<RoomTicketConfig>,
 }
 
 /// JWT 算法（配置 `[auth.jwt] algorithm`）。
@@ -295,6 +302,7 @@ impl Default for ServerConfig {
             jwt: JwtConfig::default(),
             channel_transfer: None,
             service_account_event: None,
+            room_ticket: None,
         }
     }
 }
@@ -804,6 +812,7 @@ struct TomlConfig {
     push: Option<TomlPushConfig>,
     channel_transfer: Option<TomlChannelTransferConfig>,
     service_account_event: Option<TomlServiceAccountEventConfig>,
+    room_ticket: Option<TomlRoomTicketConfig>,
 }
 
 /// TOML `[channel_transfer]` 段（spec 02-server/CHANNEL_TRANSFER_SPEC v2.0）
@@ -826,6 +835,20 @@ struct TomlServiceAccountEventConfig {
     application_master_key: Option<String>,
     /// server → application HTTP 调用超时，毫秒；缺省 3000
     timeout_ms: Option<u64>,
+}
+
+/// TOML `[room_ticket]` 段（spec 02-server/ROOM_CHANNEL_SPEC §4）
+#[derive(Debug, Deserialize)]
+struct TomlRoomTicketConfig {
+    /// 单 key 形式：HMAC secret（base64 / 任意字符串均可，不解码）
+    secret: Option<String>,
+    /// 多 key 形式：kid → secret
+    #[serde(default)]
+    keys: std::collections::HashMap<String, String>,
+    /// header.kid 未指定时使用的 key id；缺省 "v1"
+    default_kid: Option<String>,
+    /// 时钟容忍（秒）；缺省 30
+    leeway_secs: Option<u64>,
 }
 
 /// TOML [auth] 段（spec TOKEN_UNIFICATION_SPEC v1.3 Phase A）
@@ -1580,6 +1603,23 @@ impl From<TomlConfig> for ServerConfig {
             }
         }
 
+        // [room_ticket]: must have at least one key (`secret` or non-empty `keys`)
+        // to take effect. Otherwise Room subscribe falls back to "authenticated only"
+        // (no ticket verification — v1 compat mode).
+        if let Some(rt) = toml.room_ticket {
+            let has_secret = rt.secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+            let has_keys = !rt.keys.is_empty();
+            if has_secret || has_keys {
+                let leeway = rt.leeway_secs.unwrap_or(30).min(300);
+                config.room_ticket = Some(RoomTicketConfig {
+                    secret: rt.secret.filter(|s| !s.is_empty()),
+                    keys: rt.keys,
+                    default_kid: rt.default_kid.unwrap_or_else(|| "v1".to_string()),
+                    leeway_secs: leeway,
+                });
+            }
+        }
+
         config
     }
 }
@@ -1650,6 +1690,56 @@ pub struct ServiceAccountEventConfig {
     pub application_master_key: String,
     /// HTTP 调用超时（毫秒）；缺省 3000，与 transfer / message dispatch 一致。
     pub timeout_ms: u64,
+}
+
+/// Room subscribe ticket 校验配置
+/// （spec 02-server/ROOM_CHANNEL_SPEC §4）。
+///
+/// gateway 用 `secret` 做 HMAC-SHA256 verify。多 key 支持通过 `keys` map 实现：
+/// JWT header 的 `kid` 指明哪把 key，缺省走 `default_kid` 那把。`secret` 仍保留
+/// 作为兼容字段（等价于单 key + `default_kid=v1`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomTicketConfig {
+    /// 单 key 形式：HMAC secret。与 `keys` 二选一；同时配则 `keys` 优先。
+    /// header.kid 未指定时也用这个值（视作 default key）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+
+    /// 多 key 形式：kid → secret。轮换时旧 key 仍可校验已签发但未过期的 ticket。
+    #[serde(default)]
+    pub keys: std::collections::HashMap<String, String>,
+
+    /// header.kid 未指定时使用的 key id。配合 `keys` 用；缺省 `"v1"`。
+    #[serde(default = "default_kid")]
+    pub default_kid: String,
+
+    /// 时钟容忍（秒）；签发时钟漂移容差。建议 30，最大 300。
+    #[serde(default = "default_leeway_secs")]
+    pub leeway_secs: u64,
+}
+
+fn default_kid() -> String {
+    "v1".to_string()
+}
+
+fn default_leeway_secs() -> u64 {
+    30
+}
+
+impl RoomTicketConfig {
+    /// 查找 kid 对应的 secret。kid=None 时用 default_kid。
+    /// 返回 `None` = 该 kid 在配置中不存在。
+    pub fn resolve_secret(&self, kid: Option<&str>) -> Option<&str> {
+        let kid_lookup = kid.unwrap_or(self.default_kid.as_str());
+        if let Some(s) = self.keys.get(kid_lookup) {
+            return Some(s.as_str());
+        }
+        // 单 key 兼容：keys 为空且使用 default_kid 时回退到顶层 secret
+        if kid_lookup == self.default_kid {
+            return self.secret.as_deref();
+        }
+        None
+    }
 }
 
 /// Room 订阅配置
