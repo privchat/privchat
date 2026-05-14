@@ -18,38 +18,37 @@
 //! `MessageType::TransferRequest` (biz_type 19) wire ingress.
 //!
 //! Per server spec §1.4 this handler is **not** a business service: it does
-//! auth / format / subscription / room-membership gating, then forwards the
-//! request to the application via [`ChannelTransferRelayClient`] and turns
-//! the application's flat-shaped response back into a wire
-//! `TransferResponse` (biz_type 20).
+//! auth / format / channel access / room-membership gating, then forwards the
+//! request to the application via the **generic** [`ServerEventClient`]
+//! (envelope `event_type = "transfer.requested"`) and turns the application's
+//! `TransferResponsePayload` back into a wire `TransferResponse` (biz_type 20).
 //!
-//! It MUST NOT introduce: `service_id`, business registry, `callback_url`,
-//! `route` prefix vs `service.name` validation, application idempotency,
-//! audit, or business dispatch. All of that lives in
-//! `neton-application-module-privchat` (dispatch spec §1.4).
+//! v1.0 起 server↔app 边界不再单开 `/transfer/dispatch`；transfer 走统一的
+//! `/service/privchat/server-event/dispatch`。详见
+//! `SERVER_EVENT_DISPATCH_SPEC` § "request-response event types"。
 //!
-//! Tests live in `tests/channel_transfer_handler.rs` against the public
-//! [`process_transfer_request`] free function so the test surface does not
-//! need a constructed `RequestContext` (which would require a real
-//! msgtrans `SessionId`).
+//! 本 handler **MUST NOT** 引入：`service_id` / business registry / `callback_url` /
+//! `route` prefix vs `service.name` 校验 / application 幂等 / 审计 / 业务分发——
+//! 这些全部由 `neton-application-module-privchat` 承担。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine;
 use privchat_protocol::protocol::MessageType;
 use tracing::info;
-use uuid::Uuid;
 
 use crate::channel_transfer::{
     validate_transfer_body_size, validate_transfer_request_id, validate_transfer_route,
-    ChannelTransferRelayClient, ChannelTransferRelayError, ForwardTransferRequest,
 };
-use crate::config::ChannelTransferConfig;
 use crate::context::RequestContext;
 use crate::dispatcher::MessageDispatcher;
 use crate::error::{Result, ServerError};
 use crate::handler::MessageHandler;
 use crate::infra::{ConnectionManager, SubscribeManager};
+use crate::server_event::{ServerEvent, ServerEventClient, ServerEventError};
+use crate::server_event::types::TransferResponsePayload;
 
 // =====================================================================
 // Wire codes — subset of `protocol::ErrorCode` actually used by the
@@ -79,8 +78,8 @@ pub const CODE_INVALID_PARAMS: i32 = 10100;
 pub const CODE_PAYLOAD_TOO_LARGE: i32 = 10106;
 /// 20500 — `ChannelNotFound`. `channel_id` did not resolve to a known room.
 pub const CODE_CHANNEL_NOT_FOUND: i32 = 20500;
-/// 20900 — `ChannelNotSubscribed` (Channel Transfer segment). The user
-/// has no session subscribed to this `channel_id`.
+/// 20900 — `ChannelNotSubscribed` (Channel Transfer segment). Reserved for
+/// service-handler-level use; wire ingress generally does not return it.
 pub const CODE_CHANNEL_NOT_SUBSCRIBED: i32 = 20900;
 
 // =====================================================================
@@ -88,35 +87,13 @@ pub const CODE_CHANNEL_NOT_SUBSCRIBED: i32 = 20900;
 // ChannelService / ConnectionManager
 // =====================================================================
 
-/// Read-only lookups the wire ingress needs from the rest of the server.
-///
-/// The default implementation [`DefaultChannelTransferLookups`] composes
-/// `ConnectionManager` (user → sessions) and `SubscribeManager`
-/// (session → channels). Tests substitute a small mock that returns
-/// canned values directly.
 #[async_trait]
 pub trait ChannelTransferLookups: Send + Sync {
-    /// Whether `user_id` has at least one authenticated session subscribed
-    /// to `channel_id`.
     async fn is_subscribed(&self, user_id: u64, channel_id: u64) -> bool;
-
-    /// Resolve `channel_id` → `room_id`. Returns `None` if the channel
-    /// does not exist.
-    ///
-    /// In PrivChat's current model `room_id == channel_id`; this method
-    /// exists so the boundary is in one place if/when room and channel
-    /// identifiers diverge.
     async fn resolve_room(&self, channel_id: u64) -> Option<u64>;
-
-    /// Whether `user_id` is a member of `room_id`. Returning `true`
-    /// reflects defense-in-depth on top of [`is_subscribed`] — Subscribe
-    /// already gates membership for Private/Group, so for Phase 1 this
-    /// can simply mirror the subscription state.
     async fn is_room_member(&self, user_id: u64, room_id: u64) -> bool;
 }
 
-/// Production composition that backs [`ChannelTransferLookups`] with the
-/// real connection / subscription registries.
 pub struct DefaultChannelTransferLookups {
     connection_manager: Arc<ConnectionManager>,
     subscribe_manager: Arc<SubscribeManager>,
@@ -148,21 +125,10 @@ impl ChannelTransferLookups for DefaultChannelTransferLookups {
     }
 
     async fn resolve_room(&self, channel_id: u64) -> Option<u64> {
-        // Current PrivChat model: channel_id IS room_id. Returning Some here
-        // (rather than querying ChannelService) is safe because our caller
-        // gates this behind `is_subscribed`; if the user has any live
-        // subscription, the channel exists.
-        // TODO: when room_id and channel_id decouple, route through ChannelService.
         Some(channel_id)
     }
 
     async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
-        // Phase 1: subscription presence is treated as proof of membership.
-        // Subscribe-time membership check (SubscribeMessageHandler) already
-        // gates Private/Group; Room (channel_type=2) has no persistent
-        // membership in the current model.
-        // TODO: defense-in-depth recheck via ChannelService.get_channel_members
-        // for the kicked-while-subscribed race.
         true
     }
 }
@@ -173,17 +139,17 @@ impl ChannelTransferLookups for DefaultChannelTransferLookups {
 
 pub struct ChannelTransferHandler {
     lookups: Arc<dyn ChannelTransferLookups>,
-    relay_client: Arc<ChannelTransferRelayClient>,
+    server_event_client: Arc<ServerEventClient>,
 }
 
 impl ChannelTransferHandler {
     pub fn new(
         lookups: Arc<dyn ChannelTransferLookups>,
-        relay_client: Arc<ChannelTransferRelayClient>,
+        server_event_client: Arc<ServerEventClient>,
     ) -> Self {
         Self {
             lookups,
-            relay_client,
+            server_event_client,
         }
     }
 }
@@ -196,7 +162,7 @@ impl MessageHandler for ChannelTransferHandler {
             &ctx.data,
             auth_user_id,
             self.lookups.as_ref(),
-            self.relay_client.as_ref(),
+            self.server_event_client.as_ref(),
         )
         .await?;
         Ok(Some(bytes))
@@ -211,18 +177,30 @@ impl MessageHandler for ChannelTransferHandler {
 // Pure ingress pipeline (testable without RequestContext / SessionId)
 // =====================================================================
 
-/// Decode + validate + relay + encode. The wire bytes in / wire bytes out
-/// surface that tests target.
+/// Decode + validate + emit ServerEvent + encode wire response.
+///
+/// 实现说明：
+///
+/// 1. wire `TransferRequest` decode + 校验（auth / request_id / route / body size /
+///    channel access / room membership）
+/// 2. 包装成 `ServerEvent::transfer_requested(...)`（spec `SERVER_EVENT_DISPATCH_SPEC`
+///    §4 + `transfer.requested` event_type）；`internal_event_id` 由 envelope
+///    builder 自动生成 UUID，**不**等于 client 的 `request_id`
+/// 3. `ServerEventClient.send(event)` 发到下游统一入口
+///    `/service/privchat/server-event/dispatch`
+/// 4. 解析下游 ack：
+///    - 顶层 `accepted=true, code=0` + `response_payload` 非空 → 解码为
+///      `TransferResponsePayload`，把业务 `code` / `message` / `data` 编进 wire
+///      `TransferResponse`
+///    - 顶层 `code != 0` → 把"投递/调度失败"映射为 wire 错误码（如 handler 未注册）
+///    - 传输级失败（超时 / 连接拒绝 / 解析失败）→ 映射为 wire 错误码
 pub async fn process_transfer_request(
     raw_wire: &[u8],
     auth_user_id: Option<u64>,
     lookups: &dyn ChannelTransferLookups,
-    relay: &ChannelTransferRelayClient,
+    server_event_client: &ServerEventClient,
 ) -> Result<Vec<u8>> {
-    // 1. Decode wire TransferRequest. Failure here means the client sent
-    //    an ill-formed packet; we can't echo a meaningful request_id back,
-    //    but we still must produce *some* TransferResponse so the client
-    //    doesn't hang on its pending map.
+    // 1. Decode wire TransferRequest
     let req: privchat_protocol::TransferRequest = match privchat_protocol::decode_message(raw_wire)
     {
         Ok(r) => r,
@@ -272,22 +250,7 @@ pub async fn process_transfer_request(
         );
     }
 
-    // 4. Subscription — **不**校验。
-    //
-    // Spec: CHANNEL_TRANSFER_SPEC §1.5 Transfer Access Policy。Transfer 通用层
-    // 只做 auth / channel access / room membership / route / business_channel
-    // binding / dispatch_flag。`is_subscribed(user_id, channel_id)` 是实时
-    // 事件订阅状态，不是 RPC 调用的通用前置条件——bot / official / system /
-    // wallet / 等普通 service 拿到 channel_id 就该能调。
-    //
-    // 需要"必须订阅"的强实时业务（如 game room 下注、live room 操作），由对应
-    // PrivChatTransferHandler 在 service handler 内自行校验（结合 seat token /
-    // room ticket / action_seq 一并审计）。详见 spec §1.5 中 game 校验链示例。
-    //
-    // 20900 `ChannelNotSubscribed` 段位仍然保留，但仅在两种语义下产生：
-    //   - app→user 推送时目标 online 但未订阅（投递路由，§12.2）
-    //   - service handler 自身声明 REQUIRE_SUBSCRIPTION 时业务返回
-    // 通用层**不**返。Room membership 在第 6 步保留——那才是真正的 channel access。
+    // 4. Subscription — **不**校验（spec CHANNEL_TRANSFER_SPEC §1.5）
 
     // 5. channel_id → room_id
     let Some(room_id) = lookups.resolve_room(req.channel_id).await else {
@@ -311,46 +274,136 @@ pub async fn process_transfer_request(
         );
     }
 
-    // 7. Forward to application
-    let forward = ForwardTransferRequest {
-        internal_request_id: Uuid::new_v4().to_string(),
-        client_request_id: req.request_id.clone(),
-        channel_id: req.channel_id,
-        room_id,
+    // 7. 包装成 ServerEvent(event_type=transfer.requested) 投递给下游
+    let occurred_at_ms = chrono::Utc::now().timestamp_millis();
+    let event = match ServerEvent::transfer_requested(
+        req.request_id.clone(),
         user_id,
-        route: req.route.clone(),
-        body: req.body.clone(),
-        trace_id: Uuid::new_v4().to_string(),
+        req.channel_id,
+        room_id,
+        req.route.clone(),
+        req.body.clone(),
+        occurred_at_ms,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("ChannelTransferHandler: build ServerEvent failed: {e}");
+            return encode_response(
+                &req.request_id,
+                req.channel_id,
+                CODE_INTERNAL_ERROR,
+                "internal error",
+                &[],
+            );
+        }
     };
 
-    match relay.forward(&forward).await {
-        Ok(app_resp) => encode_response(
-            // app may have echoed client_request_id in its response — trust it,
-            // but if app misbehaved and dropped it, fall back to ours so the
-            // client's pending map can still match.
-            if app_resp.client_request_id.is_empty() {
-                &req.request_id
+    match server_event_client.send(&event).await {
+        Ok(ack) => {
+            // ack.code != 0 表示下游投递/调度失败（如 handler 未注册）；
+            // 这种情况 response_payload 为空，把顶层 code 直接当 wire 错误回。
+            if ack.code != 0 {
+                tracing::warn!(
+                    "ChannelTransferHandler: downstream non-zero envelope code: code={} message={}",
+                    ack.code,
+                    ack.message
+                );
+                return encode_response(
+                    &req.request_id,
+                    req.channel_id,
+                    CODE_SERVICE_UNAVAILABLE,
+                    &ack.message,
+                    &[],
+                );
+            }
+
+            // accepted=true, code=0 → 解码 response_payload 拿 transfer 业务结果
+            let payload_b64 = match ack.response_payload {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    tracing::warn!(
+                        "ChannelTransferHandler: downstream OK but response_payload missing"
+                    );
+                    return encode_response(
+                        &req.request_id,
+                        req.channel_id,
+                        CODE_INTERNAL_ERROR,
+                        "response_payload missing",
+                        &[],
+                    );
+                }
+            };
+            let payload_bytes = match BASE64_STD.decode(&payload_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        "ChannelTransferHandler: response_payload base64 decode failed: {e}"
+                    );
+                    return encode_response(
+                        &req.request_id,
+                        req.channel_id,
+                        CODE_INTERNAL_ERROR,
+                        "response_payload decode failed",
+                        &[],
+                    );
+                }
+            };
+            let transfer_resp: TransferResponsePayload = match serde_json::from_slice(&payload_bytes)
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        "ChannelTransferHandler: response_payload JSON parse failed: {e}"
+                    );
+                    return encode_response(
+                        &req.request_id,
+                        req.channel_id,
+                        CODE_INTERNAL_ERROR,
+                        "response_payload parse failed",
+                        &[],
+                    );
+                }
+            };
+
+            // request_id / channel_id 防御性兜底：downstream 通常按原值透传，
+            // 偶尔会漏（如它构造默认值），fall back 到请求里的原值。
+            let resp_request_id = if transfer_resp.request_id.is_empty() {
+                req.request_id.clone()
             } else {
-                &app_resp.client_request_id
-            },
-            if app_resp.channel_id == 0 {
+                transfer_resp.request_id
+            };
+            let resp_channel_id = if transfer_resp.channel_id == 0 {
                 req.channel_id
             } else {
-                app_resp.channel_id
-            },
-            app_resp.code,
-            &app_resp.message,
-            app_resp.data.as_deref().unwrap_or(&[]),
-        ),
-        Err(ChannelTransferRelayError::Timeout) => encode_response(
+                transfer_resp.channel_id
+            };
+            let resp_data_bytes = if transfer_resp.data.is_empty() {
+                Vec::new()
+            } else {
+                BASE64_STD.decode(&transfer_resp.data).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "ChannelTransferHandler: transfer_resp.data base64 decode failed: {e}; treating as empty"
+                    );
+                    Vec::new()
+                })
+            };
+            encode_response(
+                &resp_request_id,
+                resp_channel_id,
+                transfer_resp.code,
+                &transfer_resp.message,
+                &resp_data_bytes,
+            )
+        }
+        Err(ServerEventError::Timeout) => encode_response(
             &req.request_id,
             req.channel_id,
             CODE_TIMEOUT,
             "application timeout",
             &[],
         ),
-        Err(ChannelTransferRelayError::Transport(msg)) => {
-            tracing::warn!("ChannelTransferHandler: relay transport error: {msg}");
+        Err(ServerEventError::Transport(msg)) => {
+            tracing::warn!("ChannelTransferHandler: server-event transport error: {msg}");
             encode_response(
                 &req.request_id,
                 req.channel_id,
@@ -360,7 +413,7 @@ pub async fn process_transfer_request(
             )
         }
         Err(other) => {
-            tracing::warn!("ChannelTransferHandler: relay error: {other}");
+            tracing::warn!("ChannelTransferHandler: server-event relay error: {other}");
             encode_response(
                 &req.request_id,
                 req.channel_id,
@@ -395,36 +448,30 @@ fn encode_response(
 }
 
 // =====================================================================
-// Registration entry point — keeps the wiring conditional on
-// `[channel_transfer]` config being present, and keeps the construction
-// chain (relay → lookups → handler → register) in one auditable place
-// so server.rs / tests share the same path.
+// Registration entry point — gated on `server_event_client` presence
 // =====================================================================
 
 /// Register [`ChannelTransferHandler`] against `MessageType::TransferRequest`
-/// iff Channel Transfer is enabled in config (i.e. `cfg.is_some()`).
+/// iff a [`ServerEventClient`] is available (i.e. `[server_event]` configured).
 ///
-/// Returns `Ok(true)` if the handler was registered, `Ok(false)` if
-/// registration was skipped because no config is present.
+/// 没有 `[server_event]` 时跳过注册——client 发 wire `TransferRequest` 会拿到
+/// "unsupported message type"。这是预期行为：transfer wire 入站必须有下游可投递。
 ///
-/// Server boundary (server spec §1.4) is preserved: this function only
-/// constructs and registers the wire ingress relay. It does NOT touch
-/// `service_id`, business registry, `callback_url`, route prefix
-/// validation, idempotency, audit, or any HTTP routes.
+/// Returns `Ok(true)` if registered, `Ok(false)` if skipped.
 pub fn try_register_channel_transfer_handler(
     dispatcher: &mut MessageDispatcher,
-    cfg: Option<&ChannelTransferConfig>,
+    server_event_client: Option<Arc<ServerEventClient>>,
     connection_manager: Arc<ConnectionManager>,
     subscribe_manager: Arc<SubscribeManager>,
 ) -> Result<bool> {
-    let Some(cfg) = cfg else {
-        info!("📡 Channel Transfer: 未启用 ([channel_transfer] 缺省)，跳过 wire ingress 注册");
+    let Some(client) = server_event_client else {
+        info!(
+            "📡 Channel Transfer: 未启用（缺 [server_event] 配置 → 无下游可投递），\
+             跳过 wire ingress 注册"
+        );
         return Ok(false);
     };
 
-    let relay = ChannelTransferRelayClient::new(cfg).map_err(|e| {
-        ServerError::Internal(format!("ChannelTransferRelayClient init failed: {e}"))
-    })?;
     let lookups: Arc<dyn ChannelTransferLookups> =
         Arc::new(DefaultChannelTransferLookups::new(
             connection_manager,
@@ -432,11 +479,11 @@ pub fn try_register_channel_transfer_handler(
         ));
     dispatcher.register_handler(
         MessageType::TransferRequest,
-        Box::new(ChannelTransferHandler::new(lookups, Arc::new(relay))),
+        Box::new(ChannelTransferHandler::new(lookups, client.clone())),
     );
     info!(
-        "✅ Channel Transfer: wire ingress handler 已注册 (target={}, timeout={}ms)",
-        cfg.application_url, cfg.timeout_ms
+        "✅ Channel Transfer: wire ingress 已注册（出站 → {} via ServerEvent transfer.requested）",
+        client.endpoint()
     );
     Ok(true)
 }

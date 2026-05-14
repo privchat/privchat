@@ -15,37 +15,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Channel Transfer — server-side relay utilities for the
+//! Channel Transfer — server-side **wire-layer** utilities for the
 //! `TransferRequest` / `TransferResponse` wire types
-//! (spec `02-server/CHANNEL_TRANSFER_SPEC` v2.0).
+//! (spec `02-server/CHANNEL_TRANSFER_SPEC`).
 //!
-//! **Scope.** This module is *not* a business service. It hosts the
-//! request/response extension to the existing channel pub/sub pipeline
-//! (`SubscribeRequest` / `PublishRequest`). The wire ingress handler
-//! (`handler::channel_transfer_handler`) and the `/api/service/transfer/send`
-//! HTTP route both compose the helpers in here.
+//! ## Scope after v1.0 refactor
 //!
-//! Per spec §1.4, this module **MUST NOT** introduce:
+//! 本模块**只负责 wire 层**：
+//!
+//!   - decode wire `TransferRequest`
+//!   - request_id / route / body size format validation
+//!   - auth / channel access / room membership 校验
+//!   - encode wire `TransferResponse`
+//!
+//! **server→application 出站不再使用专属 client**——v1.0 起 wire ingress handler
+//! 把 `TransferRequest` 包装成 [`crate::server_event::ServerEvent`]
+//!（`event_type = "transfer.requested"`）通过 [`crate::server_event::ServerEventClient`]
+//! 投递；application 端的统一 `/service/privchat/server-event/dispatch` 入口分发。
+//! 这条通道与所有其它 server emit 事件（`bot.followed` / `bot.unfollowed` / ...）
+//! 共用同一 envelope（spec `SERVER_EVENT_DISPATCH_SPEC`）。
+//!
+//! Per spec §1.4，本模块**MUST NOT** 引入：
 //!
 //!   - business `service_id` / service registry
-//!   - `route` business dispatch
-//!   - business idempotency or audit
+//!   - `route` 业务分发 / prefix↔service.name 校验
+//!   - 业务幂等或审计
 //!
-//! All of that lives in `neton-application-module-privchat`
-//! (dispatch spec §1.4 Single Dispatch Authority).
+//! 这些一律在 `neton-application-module-privchat` 端落地。
 //!
 //! ## Layout
 //!
-//! - [`validation`]   — pure format validators (`request_id` / `route` / body size).
-//! - [`types`]        — wire-adjacent JSON DTOs for the server↔application boundary.
-//! - [`relay_client`] — outbound HTTP client for `POST /service/privchat/transfer/dispatch`.
+//! - [`validation`] — pure format validators (`request_id` / `route` / body size)。
+//!
+//! `relay_client.rs` 与 `types.rs` 在 v1.0 重构后已删除——server↔app 边界 DTO
+//! 统一搬到 [`crate::server_event::types`]（`TransferRequestedPayload` /
+//! `TransferResponsePayload`）。
 
-pub mod relay_client;
-pub mod types;
 pub mod validation;
 
-pub use relay_client::{ChannelTransferRelayClient, ChannelTransferRelayError};
-pub use types::{ForwardTransferRequest, ForwardTransferResponse, SERVICE_KEY_HEADER};
 pub use validation::{
     validate_transfer_body_size, validate_transfer_request_id, validate_transfer_route,
     ChannelTransferValidationError, MAX_TRANSFER_BODY_BYTES, MAX_TRANSFER_REQUEST_ID_LEN,

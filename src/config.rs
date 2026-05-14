@@ -97,21 +97,13 @@ pub struct ServerConfig {
     pub push: PushConfig,
     /// 统一 token 配置（HTTP API + IM RPC 共用，单一签发/验证路径）。
     pub jwt: JwtConfig,
-    /// Channel Transfer 出站配置（spec 02-server/CHANNEL_TRANSFER_SPEC v2.0）。
+    /// Server Event 出站配置（spec 02-server/SERVER_EVENT_DISPATCH_SPEC §3）。
     ///
-    /// `None` 表示 transfer 未启用：wire `TransferRequest` handler 不注册，
-    /// `/api/service/transfer/send` endpoint 仍可挂载但会返回 `ServiceUnavailable`。
-    /// 配 `[channel_transfer]` 表（含 `application_url` + `application_master_key`）
-    /// 才启用。
+    /// `None` 表示未配 `[server_event]`：server 内部 emit 的事件（bot.followed /
+    /// bot.unfollowed / 等）不会推给 application；业务持久化照常完成，仅缺事件
+    /// 通知（application 也不会自动写 `privchat_business_channel` binding）。
     #[serde(default)]
-    pub channel_transfer: Option<ChannelTransferConfig>,
-    /// Service Account Event 出站配置（spec 02-server/SERVICE_ACCOUNT_FOLLOW_SPEC §5）。
-    ///
-    /// `None` 表示未配 `[service_account_event]`：bot follow / unfollow 仍然
-    /// 落 `privchat_bot_follow` 表并返回 channel_id，但**不**通知 application
-    /// （application 也不会自动写 `privchat_business_channel` binding）。
-    #[serde(default)]
-    pub service_account_event: Option<ServiceAccountEventConfig>,
+    pub server_event: Option<ServerEventConfig>,
     /// Room subscribe ticket 配置（spec 02-server/ROOM_CHANNEL_SPEC §4）。
     ///
     /// `None` 表示未配 `[room_ticket]`：Room 订阅退化为"已认证即放行"（v1
@@ -300,8 +292,7 @@ impl Default for ServerConfig {
             redis_url: String::new(),
             push: PushConfig::default(),
             jwt: JwtConfig::default(),
-            channel_transfer: None,
-            service_account_event: None,
+            server_event: None,
             room_ticket: None,
         }
     }
@@ -810,30 +801,21 @@ struct TomlConfig {
     logging: Option<TomlLoggingConfig>,
     system_message: Option<TomlSystemMessageConfig>,
     push: Option<TomlPushConfig>,
-    channel_transfer: Option<TomlChannelTransferConfig>,
-    service_account_event: Option<TomlServiceAccountEventConfig>,
+    server_event: Option<TomlServerEventConfig>,
     room_ticket: Option<TomlRoomTicketConfig>,
 }
 
-/// TOML `[channel_transfer]` 段（spec 02-server/CHANNEL_TRANSFER_SPEC v2.0）
+/// TOML `[server_event]` 段（spec 02-server/SERVER_EVENT_DISPATCH_SPEC §3）。
+///
+/// 通用 server→下游事件出站配置——所有 server 主动 emit 的 event（bot.followed /
+/// channel.message_created / ...）共用这一份配置。
 #[derive(Debug, Deserialize)]
-struct TomlChannelTransferConfig {
-    /// privchat-application 基址，例如 `http://privchat-application:9100`
+struct TomlServerEventConfig {
+    /// privchat-application（或任何下游订阅方）基址。
     application_url: Option<String>,
-    /// application 端的 master key（与 server 自身的 service_master_key 不复用）
+    /// 下游 master key；server 调下游时放入 `X-Service-Key` header。
     application_master_key: Option<String>,
-    /// server → application HTTP 调用超时，毫秒；缺省 3000
-    timeout_ms: Option<u64>,
-}
-
-/// TOML `[service_account_event]` 段（spec 02-server/SERVICE_ACCOUNT_FOLLOW_SPEC §5）
-#[derive(Debug, Deserialize)]
-struct TomlServiceAccountEventConfig {
-    /// privchat-application 基址（同 `[channel_transfer]` 通常指向同一服务）
-    application_url: Option<String>,
-    /// application 端的 master key（v1 复用与 channel_transfer 相同的 key）
-    application_master_key: Option<String>,
-    /// server → application HTTP 调用超时，毫秒；缺省 3000
+    /// server → 下游 HTTP 调用超时，毫秒；缺省 3000。
     timeout_ms: Option<u64>,
 }
 
@@ -1571,33 +1553,18 @@ impl From<TomlConfig> for ServerConfig {
             }
         }
 
-        // [channel_transfer]：require both URL and master key to enable.
-        // Missing or partial config keeps `channel_transfer = None`, which
-        // disables wire ingress and makes /api/service/transfer/send report
-        // ServiceUnavailable.
-        if let Some(ct) = toml.channel_transfer {
-            if let (Some(url), Some(key)) = (ct.application_url, ct.application_master_key) {
+        // [server_event]：require both URL and master key to enable.
+        // Missing or partial config keeps `server_event = None`, which means
+        // all server→downstream emit (transfer.requested / bot.followed / ...)
+        // is skipped (spec §6 best-effort fire-and-forget)，且 wire
+        // `TransferRequest` ingress handler 不会注册（缺下游可投递）。
+        if let Some(se) = toml.server_event {
+            if let (Some(url), Some(key)) = (se.application_url, se.application_master_key) {
                 if !url.is_empty() && !key.is_empty() {
-                    config.channel_transfer = Some(ChannelTransferConfig {
+                    config.server_event = Some(ServerEventConfig {
                         application_url: url,
                         application_master_key: key,
-                        timeout_ms: ct.timeout_ms.unwrap_or(3000),
-                    });
-                }
-            }
-        }
-
-        // [service_account_event]：same gating as [channel_transfer].
-        // Missing or partial config keeps `service_account_event = None`,
-        // which means bot follow / unfollow handlers skip the webhook
-        // notification (spec §3.4 best-effort fire-and-forget).
-        if let Some(sae) = toml.service_account_event {
-            if let (Some(url), Some(key)) = (sae.application_url, sae.application_master_key) {
-                if !url.is_empty() && !key.is_empty() {
-                    config.service_account_event = Some(ServiceAccountEventConfig {
-                        application_url: url,
-                        application_master_key: key,
-                        timeout_ms: sae.timeout_ms.unwrap_or(3000),
+                        timeout_ms: se.timeout_ms.unwrap_or(3000),
                     });
                 }
             }
@@ -1660,35 +1627,18 @@ impl CacheConfig {
     }
 }
 
-/// Channel Transfer 出站配置（spec 02-server/CHANNEL_TRANSFER_SPEC v2.0 §5.1 / §13）。
+/// Server Event 出站配置（spec 02-server/SERVER_EVENT_DISPATCH_SPEC §3）。
 ///
-/// 本配置只描述 server 调 application 的出站方向。
-/// `/api/service/transfer/send`（app→server 入站）复用 server 现有的
-/// `service_master_key` + `verify_service_key` 中间件，不在此结构中。
+/// 通用 server→下游事件出站配置——所有 server 主动 emit 的 event（含
+/// wire `TransferRequest` 包装的 `transfer.requested` + `bot.followed` / ...）
+/// 共用这一份配置，endpoint 固定走 `/service/privchat/server-event/dispatch`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelTransferConfig {
-    /// privchat-application 基址（不含路径），例如 `http://privchat-application:9100`。
+pub struct ServerEventConfig {
+    /// 下游订阅方基址（不含路径），通常 = privchat-application。
     pub application_url: String,
-    /// application 端的 master key；server 调 application 时放入 `X-Service-Key` header。
-    /// 与 server 自身的 `service_master_key` 不复用。
+    /// 下游的 master key；放入 `X-Service-Key` header。
     pub application_master_key: String,
-    /// HTTP 调用超时（毫秒）。spec §8.2 推荐默认 3000。
-    pub timeout_ms: u64,
-}
-
-/// Service Account Event 出站配置
-/// （spec 02-server/SERVICE_ACCOUNT_FOLLOW_SPEC §5）。
-///
-/// 形态与 [`ChannelTransferConfig`] 一致：v1 共享同一应用基址 + master key
-/// （endpoint 走 `/service/privchat/service-account/event`）。独立成结构以便
-/// 未来若 application 把 service-account event 拆到独立服务时各自配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceAccountEventConfig {
-    /// privchat-application 基址（不含路径）。
-    pub application_url: String,
-    /// application 端的 master key；放入 `X-Service-Key` header。
-    pub application_master_key: String,
-    /// HTTP 调用超时（毫秒）；缺省 3000，与 transfer / message dispatch 一致。
+    /// HTTP 调用超时（毫秒）；缺省 3000，与 transfer dispatch 一致。
     pub timeout_ms: u64,
 }
 
