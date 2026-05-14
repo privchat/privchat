@@ -162,15 +162,11 @@ app_id = ""
 access_token = ""
 endpoint = "https://server-api-push.meizu.com"
 
-# server → application 出站配置
-# spec: 02-server/CHANNEL_TRANSFER_SPEC §5 + SERVICE_ACCOUNT_FOLLOW_SPEC §5
-# v1 复用同一把 application master key（即 application 端 privchat.conf 的 service_master_key）
-[channel_transfer]
-application_url = "http://localhost:8080"
-application_master_key = "your_service_master_key_here"
-timeout_ms = 3000
-
-[service_account_event]
+# server → downstream 统一出站配置（v1.1 起合并 channel_transfer + service_account_event）
+# spec: 02-server/SERVER_EVENT_DISPATCH_SPEC §3
+# 所有 server emit 都走这里：transfer.requested + bot.followed + bot.unfollowed + ...
+# v1 复用同一把 application master key（与 application 端 privchat.conf 的 service_master_key 一致）
+[server_event]
 application_url = "http://localhost:8080"
 application_master_key = "your_service_master_key_here"
 timeout_ms = 3000
