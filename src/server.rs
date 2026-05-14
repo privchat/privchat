@@ -1656,8 +1656,12 @@ impl ChatServer {
                         // 🎯 使用消息分发器处理消息（受 HandlerLimiter 限流保护）
                         let message_dispatcher = message_dispatcher.clone();
                         let session_id_clone = session_id.clone();
-                        // 保存 user_id 供 handler 使用
-                        let dispatch_user_id = auth_session_manager.get_user_id(&session_id).await;
+                        // 保存 user_id / device_id 供 handler 使用。device_id 是
+                        // Room subscribe ticket 校验（spec ROOM_CHANNEL_SPEC §4.3
+                        // ticket.did 必须匹配）等场景必需的——以前漏注入导致
+                        // ticket 全部 device_mismatch 拒绝。
+                        let dispatch_session_info =
+                            auth_session_manager.get_session_info(&session_id).await;
 
                         // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop
                         match handler_limiter.try_acquire() {
@@ -1672,8 +1676,10 @@ impl ChatServer {
                                         msg_data,
                                         "127.0.0.1:0".parse().unwrap(),
                                     );
-                                    if let Some(uid) = dispatch_user_id {
-                                        request_context = request_context.with_user_id(uid);
+                                    if let Some(info) = dispatch_session_info {
+                                        request_context = request_context
+                                            .with_user_id(info.user_id)
+                                            .with_device_id(info.device_id);
                                     }
 
                                     match message_dispatcher
