@@ -321,6 +321,46 @@ impl MessageService {
         })
     }
 
+    /// 群事件系统消息：以 `SYSTEM_USER_ID` 身份向群里写一条
+    /// [`ContentMessageType::System`] 消息，并按 [`send_message`] 的完整链路
+    /// （DB → sync commit → 未读 → 推送 → 离线队列 → last_message）分发。
+    ///
+    /// 用于"X 创建了群聊"、"X 邀请 Y 加入了群聊" 等群生命周期事件。失败仅记 warn，
+    /// 不向上传播——业务主流程（建群 / 加成员）不应被系统消息失败打断。
+    ///
+    /// - `group_id` = `channel_id`（群约定）
+    /// - `content` 已由调用方格式化好的最终展示文案
+    /// - `metadata` 附带结构化事件信息（`event`/`actor_id`/`target_ids` 等），
+    ///   方便客户端将来要做模板化重渲染时回溯
+    pub async fn send_group_system_message(
+        &self,
+        group_id: u64,
+        content: String,
+        metadata: Value,
+    ) -> std::result::Result<(), ServerError> {
+        let participants = self
+            .channel_service
+            .get_channel_participants(group_id)
+            .await
+            .map_err(|e| ServerError::Database(format!("获取群成员失败: {}", e)))?;
+        let recipient_user_ids: Vec<u64> = participants.iter().map(|p| p.user_id).collect();
+
+        let req = ServerSendMessageRequest {
+            channel_id: group_id,
+            sender_id: crate::config::SYSTEM_USER_ID,
+            content,
+            message_type: ContentMessageType::System,
+            metadata,
+            channel_type: 2, // Group
+            recipient_user_ids,
+        };
+
+        self.send_message(req)
+            .await
+            .map(|_| ())
+            .map_err(|e| ServerError::Internal(format!("发送群系统消息失败: {}", e)))
+    }
+
     /// RPC 入口——带权限与时限校验的撤回（`rpc/message/revoke.rs` 使用）。
     ///
     /// - 发送者或群主/管理员可撤回

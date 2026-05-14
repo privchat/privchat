@@ -217,4 +217,7 @@ pub enum FriendRequestSource {
 
     /// 通过手机号添加
     Phone { phone: String },
+
+    /// 通过聊天会话添加（1v1 / 群聊页打开对方资料后添加）
+    Conversation { channel_id: u64 },
 }

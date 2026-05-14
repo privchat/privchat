@@ -139,12 +139,102 @@ pub async fn handle(
                         }
                     }
 
+                    // 把请求中的初始成员（除创建者自己外）逐个加进群——一次性批量加，
+                    // 完成后发**一条**邀请系统消息（参考微信：无"X 创建了群聊"提示，直接
+                    // "X 邀请 Y、Z 加入了群聊"）。
+                    let initial_members: Vec<u64> = request
+                        .member_ids
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied()
+                        .filter(|uid| *uid != creator_id)
+                        .collect();
+
+                    for &uid in &initial_members {
+                        if let Err(e) = services
+                            .channel_service
+                            .add_participant(
+                                actual_channel_id,
+                                uid,
+                                crate::model::channel::MemberRole::Member,
+                            )
+                            .await
+                        {
+                            tracing::warn!("⚠️ 初始成员入库失败 uid={}: {}", uid, e);
+                        }
+                        if let Err(e) = services
+                            .channel_service
+                            .add_member_to_group(actual_channel_id, uid)
+                            .await
+                        {
+                            tracing::warn!("⚠️ 初始成员加入群频道失败 uid={}: {}", uid, e);
+                        }
+                    }
+
+                    if !initial_members.is_empty() {
+                        // 构建系统消息 payload —— spec §3 + §4 + §5
+                        // template = "system.member_invited"
+                        // refs = [{user, 邀请者}, {user, 受邀者1}, {user, 受邀者2}, ...]
+                        // 客户端用 `{0} 邀请 {1+} 加入了群聊` 模板 + `{1+}` 列表展开渲染。
+                        async fn resolve_name(
+                            services: &crate::rpc::RpcServiceContext,
+                            uid: u64,
+                        ) -> String {
+                            services
+                                .user_service
+                                .find_by_id(uid)
+                                .await
+                                .ok()
+                                .flatten()
+                                .and_then(|u| u.display_name.or(u.username))
+                                .unwrap_or_else(|| uid.to_string())
+                        }
+
+                        let inviter_name = resolve_name(&services, creator_id).await;
+                        let mut refs: Vec<Value> = vec![json!({
+                            "type": "user",
+                            "target_id": creator_id.to_string(),
+                            "text": inviter_name,
+                        })];
+                        for &uid in &initial_members {
+                            let name = resolve_name(&services, uid).await;
+                            refs.push(json!({
+                                "type": "user",
+                                "target_id": uid.to_string(),
+                                "text": name,
+                            }));
+                        }
+
+                        let sys_payload = json!({
+                            "message_type": "system",
+                            "template": "system.member_invited",
+                            "refs": refs,
+                        });
+                        if let Err(e) = services
+                            .message_service
+                            .send_group_system_message(
+                                actual_channel_id,
+                                sys_payload.to_string(),
+                                json!({}),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "⚠️ 写入入群系统消息失败 group_id={}: {}",
+                                actual_channel_id,
+                                e
+                            );
+                        }
+                    }
+
                     // 返回客户端期望的群组信息格式（返回 channel_id，客户端应使用此 ID 发送消息）
+                    let member_count = 1 + initial_members.len();
                     Ok(json!({
                         "group_id": actual_channel_id, // ✨ 返回会话 ID 给客户端
                         "name": name,
                         "description": description,
-                        "member_count": 1,
+                        "member_count": member_count,
                         "created_at": chrono::Utc::now().timestamp_millis(),
                         "creator_id": creator_id
                     }))

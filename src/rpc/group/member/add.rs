@@ -20,6 +20,21 @@ use crate::rpc::RpcServiceContext;
 use privchat_protocol::rpc::GroupMemberAddRequest;
 use serde_json::{json, Value};
 
+/// 查 user 的显示名（display_name → username → fallback uid 字符串）
+async fn resolve_display_name(
+    services: &RpcServiceContext,
+    user_id: u64,
+) -> String {
+    services
+        .user_service
+        .find_by_id(user_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|u| u.display_name.or(u.username))
+        .unwrap_or_else(|| user_id.to_string())
+}
+
 /// 处理 添加群成员 请求
 pub async fn handle(
     body: Value,
@@ -101,6 +116,49 @@ pub async fn handle(
                         );
                     }
                 }
+            }
+
+            // 入群系统消息——按 SYSTEM_MESSAGE_SPEC §5：
+            //   - inviter == 0 / inviter == invitee：template = "system.member_joined"  refs = [{user, 加入者}]
+            //   - inviter != invitee：               template = "system.member_invited" refs = [{user, 邀请者}, {user, 加入者}]
+            // 文案本地化由各端 i18n 负责，refs[i].text 是兜底显示名快照。
+            let invitee_name = resolve_display_name(&services, user_id).await;
+            let sys_payload = if inviter_id == 0 || inviter_id == user_id {
+                json!({
+                    "message_type": "system",
+                    "template": "system.member_joined",
+                    "refs": [{
+                        "type": "user",
+                        "target_id": user_id.to_string(),
+                        "text": invitee_name,
+                    }],
+                })
+            } else {
+                let inviter_name = resolve_display_name(&services, inviter_id).await;
+                json!({
+                    "message_type": "system",
+                    "template": "system.member_invited",
+                    "refs": [
+                        {
+                            "type": "user",
+                            "target_id": inviter_id.to_string(),
+                            "text": inviter_name,
+                        },
+                        {
+                            "type": "user",
+                            "target_id": user_id.to_string(),
+                            "text": invitee_name,
+                        },
+                    ],
+                })
+            };
+            let sys_content = sys_payload.to_string();
+            if let Err(e) = services
+                .message_service
+                .send_group_system_message(group_id, sys_content, json!({}))
+                .await
+            {
+                tracing::warn!("⚠️ 写入入群系统消息失败 group_id={}: {}", group_id, e);
             }
 
             // 简单操作，返回 true

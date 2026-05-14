@@ -65,6 +65,10 @@ fn source_to_strings(source: &Option<FriendRequestSource>) -> (Option<String>, O
         Some(FriendRequestSource::Phone { phone }) => {
             (Some("phone".to_string()), Some(phone.clone()))
         }
+        Some(FriendRequestSource::Conversation { channel_id }) => (
+            Some("conversation".to_string()),
+            Some(channel_id.to_string()),
+        ),
         None => (None, None),
     }
 }

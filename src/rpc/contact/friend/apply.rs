@@ -94,9 +94,17 @@ pub async fn handle(
                     friend_id: Some(friend_id),
                 }
             }
+            "conversation" => {
+                // 在 1v1 / 群聊里点开对方资料 → 添加好友。
+                // source_id = 来源 channel_id（server 校验 from_user_id 与对方在该 channel 共存）。
+                let channel_id = source_id_str.parse::<u64>().map_err(|_| {
+                    RpcError::validation(format!("Invalid channel_id: {}", source_id_str))
+                })?;
+                crate::model::privacy::UserDetailSource::Conversation { channel_id }
+            }
             _ => {
                 return Err(RpcError::validation(format!(
-                    "Invalid source type: {}. Must be one of: search, group, card_share, friend",
+                    "Invalid source type: {}. Must be one of: search, group, card_share, friend, conversation",
                     source_str
                 )));
             }
@@ -159,6 +167,10 @@ pub async fn handle(
                     let search_session_id = source_id_str.parse::<u64>().unwrap_or(0);
                     Some(crate::model::privacy::FriendRequestSource::Search { search_session_id })
                 }
+                "conversation" => {
+                    let channel_id = source_id_str.parse::<u64>().unwrap_or(0);
+                    Some(crate::model::privacy::FriendRequestSource::Conversation { channel_id })
+                }
                 _ => {
                     tracing::warn!("⚠️ 未知的来源类型: {}, 忽略来源信息", source_str);
                     None
@@ -215,6 +227,64 @@ pub async fn handle(
                         target_user_id,
                         message
                     );
+
+                    // 实时通知对方"收到新好友申请"。
+                    //
+                    // 设计：复用 PushMessageRequest 通道（与 message.revoke 同一套），
+                    // 用 topic="friend.request.received" 识别。SDK 侧拦截此 topic 并发出
+                    // SyncEntityChanged{entity_type="friend_request"}，Kotlin 上层据此
+                    // 触发 enqueueFriendRequestRefresh —— `friend/pending` RPC 重新拉。
+                    //
+                    // **不进 DB / 不进离线队列**——好友申请已经写库，对方离线时下次开机
+                    // 会通过常规拉取 pending 列表看到。这里只是实时唤醒。
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let push = privchat_protocol::protocol::PushMessageRequest {
+                        setting: privchat_protocol::protocol::MessageSetting::default(),
+                        msg_key: format!("friend_apply_{}_{}", from_user_id, target_user_id),
+                        server_message_id: 0,
+                        message_seq: 0,
+                        local_message_id: 0,
+                        stream_no: String::new(),
+                        stream_seq: 0,
+                        stream_flag: 0,
+                        timestamp: (now_ms / 1000) as u32,
+                        channel_id: 0,
+                        channel_type: 0,
+                        message_type: privchat_protocol::ContentMessageType::System.as_u32(),
+                        expire: 0,
+                        topic: "friend.request.received".to_string(),
+                        from_uid: from_user_id,
+                        payload: json!({
+                            "notification_type": "friend_request_received",
+                            "from_user_id": from_user_id,
+                            "message": message,
+                            "received_at": now_ms,
+                        })
+                        .to_string()
+                        .into_bytes(),
+                        deleted: false,
+                    };
+                    if let Err(e) = services
+                        .connection_manager
+                        .send_push_to_user(target_user_id, &push)
+                        .await
+                    {
+                        tracing::warn!(
+                            "⚠️ 推送好友申请事件失败 target_user_id={}: {:?}",
+                            target_user_id,
+                            e
+                        );
+                    } else {
+                        tracing::info!(
+                            "📤 已推送好友申请事件: {} -> {}",
+                            from_user_id,
+                            target_user_id
+                        );
+                    }
+
                     Ok(json!({
                         // 协议约定 user_id 必须是 u64 数字，不是字符串
                         "user_id": target_user_id,
