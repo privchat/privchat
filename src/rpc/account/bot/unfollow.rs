@@ -9,7 +9,7 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use crate::service_account_event::types::ServiceAccountEvent;
+use crate::server_event::types::ServerEvent;
 use privchat_protocol::rpc::account::bot::{BotUnfollowRequest, BotUnfollowResponse};
 use serde_json::{json, Value};
 
@@ -69,24 +69,35 @@ pub async fn handle(
 
     let channel_id = existing.channel_id as u64;
 
-    // Notify application — best-effort fire-and-forget (spec §3.4).
-    if let Some(client) = services.service_account_event_client.clone() {
-        let event = ServiceAccountEvent::unfollowed(
+    // Emit server event `bot.unfollowed` — best-effort fire-and-forget
+    // (spec SERVER_EVENT_DISPATCH_SPEC §6)。
+    if let Some(client) = services.server_event_client.clone() {
+        match ServerEvent::bot_unfollowed(
             user_id,
             bot_user_id,
             channel_id,
             USER_TYPE_BOT,
             now_ms,
-        );
-        tokio::spawn(async move {
-            if let Err(e) = client.send(&event).await {
+        ) {
+            Ok(event) => {
+                tokio::spawn(async move {
+                    if let Err(e) = client.send(&event).await {
+                        tracing::warn!(
+                            target: "bot_follow",
+                            "server-event 通知失败 (bot.unfollowed): {}",
+                            e
+                        );
+                    }
+                });
+            }
+            Err(e) => {
                 tracing::warn!(
                     target: "bot_follow",
-                    "service-account/event 通知失败 (unfollowed): {}",
+                    "server-event payload 序列化失败 (bot.unfollowed): {}",
                     e
                 );
             }
-        });
+        }
     }
 
     tracing::info!(user_id, bot_user_id, channel_id, "bot unfollow ok");

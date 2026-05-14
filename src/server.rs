@@ -641,16 +641,39 @@ impl ChatServer {
             )),
         );
 
-        // Channel Transfer wire ingress (spec 02-server/CHANNEL_TRANSFER_SPEC v2.0).
-        // Conditional on [channel_transfer] in config — when absent the handler
-        // is intentionally not registered, so `MessageType::TransferRequest`
-        // packets fall through the dispatcher's "no handler" warn path.
+        // server-event/dispatch 出站 client（spec SERVER_EVENT_DISPATCH_SPEC §3）；
+        // 统一所有 server→downstream emit（含 transfer.requested + bot.followed + ...）。
+        // 未配 [server_event] = server 内部 emit 全部跳过；wire `TransferRequest`
+        // 也无法投递，handler 不注册。
+        let server_event_client = match &config.server_event {
+            Some(cfg) => match crate::server_event::ServerEventClient::new(cfg) {
+                Ok(client) => {
+                    info!("✅ ServerEventClient 已启用 → {}", client.endpoint());
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ ServerEventClient 配置无效，将跳过 server event 通知: {}",
+                        e
+                    );
+                    None
+                }
+            },
+            None => {
+                info!("ℹ️ 未配 [server_event]，server 内部 emit 的事件不会通知下游");
+                None
+            }
+        };
+
+        // Channel Transfer wire ingress (spec 02-server/CHANNEL_TRANSFER_SPEC v2.0)。
+        // v1.0 起出站走统一 ServerEventClient（event_type=transfer.requested），
+        // 不再有独立 /transfer/dispatch endpoint。Gating 改为 server_event_client.is_some()。
         // Server boundary (§1.4): relay only — no service_id, no business
         // dispatch, no idempotency, no audit. Application-side dispatch lives
         // in neton-application-module-privchat (dispatch spec §1.4).
         crate::handler::try_register_channel_transfer_handler(
             &mut message_dispatcher,
-            config.channel_transfer.as_ref(),
+            server_event_client.clone(),
             connection_manager.clone(),
             subscribe_manager.clone(),
         )?;
@@ -1240,30 +1263,6 @@ impl ChatServer {
         let bot_follow_repository =
             Arc::new(crate::repository::BotFollowRepository::new(pool.clone()));
 
-        // service-account/event 出站 client（spec §5）；未配 [service_account_event] = 不通知
-        let service_account_event_client = match &config.service_account_event {
-            Some(cfg) => match crate::service_account_event::ServiceAccountEventClient::new(cfg) {
-                Ok(client) => {
-                    info!(
-                        "✅ ServiceAccountEventClient 已启用 → {}",
-                        client.endpoint()
-                    );
-                    Some(Arc::new(client))
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ ServiceAccountEventClient 配置无效，将跳过 follow/unfollow 通知: {}",
-                        e
-                    );
-                    None
-                }
-            },
-            None => {
-                info!("ℹ️ 未配 [service_account_event]，bot follow 不会通知 application");
-                None
-            }
-        };
-
         // 初始化 RPC 系统
         info!("🔧 初始化 RPC 系统...");
         let rpc_services = crate::rpc::RpcServiceContext::new(
@@ -1307,7 +1306,7 @@ impl ChatServer {
             qr_login_service.clone(),
             qr_login_publisher.clone(),
             bot_follow_repository.clone(),
-            service_account_event_client.clone(),
+            server_event_client.clone(),
         );
         crate::rpc::init_rpc_system(rpc_services).await;
         info!("✅ RPC 系统初始化完成");

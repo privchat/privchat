@@ -38,7 +38,7 @@ pub mod rpc; // 添加 RPC 模块
 pub mod security; // 安全模块
 pub mod server;
 pub mod service;
-pub mod service_account_event; // server → application bot follow / unfollow webhook (spec SERVICE_ACCOUNT_FOLLOW_SPEC §5)
+pub mod server_event; // server → downstream 通用事件分发 (spec SERVER_EVENT_DISPATCH_SPEC)
 pub mod sync; // ✨ 新增：Push 模块
 
 pub use config::ServerConfig;

@@ -10,7 +10,7 @@
 use crate::model::user::UserStatus;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use crate::service_account_event::types::ServiceAccountEvent;
+use crate::server_event::types::ServerEvent;
 use privchat_protocol::error_code::ErrorCode;
 use privchat_protocol::rpc::account::bot::{BotFollowRequest, BotFollowResponse};
 use serde_json::{json, Value};
@@ -83,25 +83,37 @@ pub async fn handle(
 
     let created = outcome.is_created();
 
-    // Notify application — best-effort, fire-and-forget (spec §3.4).
-    if let Some(client) = services.service_account_event_client.clone() {
-        let event = ServiceAccountEvent::followed(
+    // Emit server event `bot.followed` — best-effort, fire-and-forget
+    // (spec SERVER_EVENT_DISPATCH_SPEC §6)。Downstream 按 event_type 路由到
+    // 自己的 handler 处理 binding / 欢迎语 / 业务副作用。
+    if let Some(client) = services.server_event_client.clone() {
+        match ServerEvent::bot_followed(
             user_id,
             bot_user_id,
             channel_id,
             i32::from(target.user_type),
             created,
             now_ms,
-        );
-        tokio::spawn(async move {
-            if let Err(e) = client.send(&event).await {
+        ) {
+            Ok(event) => {
+                tokio::spawn(async move {
+                    if let Err(e) = client.send(&event).await {
+                        tracing::warn!(
+                            target: "bot_follow",
+                            "server-event 通知失败 (bot.followed): {}",
+                            e
+                        );
+                    }
+                });
+            }
+            Err(e) => {
                 tracing::warn!(
                     target: "bot_follow",
-                    "service-account/event 通知失败 (followed): {}",
+                    "server-event payload 序列化失败 (bot.followed): {}",
                     e
                 );
             }
-        });
+        }
     }
 
     let response = BotFollowResponse {
