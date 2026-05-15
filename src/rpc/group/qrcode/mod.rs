@@ -5,32 +5,36 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
-pub mod generate;
+//! 群二维码 RPC 模块（QR_CODE_SPEC v1.3）。
+
+pub mod get;
 pub mod join;
+pub mod refresh;
 
 use super::super::router::GLOBAL_RPC_ROUTER;
 use super::super::RpcServiceContext;
 
-/// 注册二维码模块的所有路由
+/// 注册群二维码模块的所有路由
 pub async fn register_routes(services: RpcServiceContext) {
     let router = GLOBAL_RPC_ROUTER.clone();
 
     router
-        .register("group/qrcode/generate", {
+        .register("group/qrcode/get", {
             let services = services.clone();
             Box::new(move |body, ctx| {
                 let services = services.clone();
-                Box::pin(async move { generate::handle(body, services, ctx).await })
+                Box::pin(async move { get::handle(body, services, ctx).await })
+            })
+        })
+        .await;
+
+    router
+        .register("group/qrcode/refresh", {
+            let services = services.clone();
+            Box::new(move |body, ctx| {
+                let services = services.clone();
+                Box::pin(async move { refresh::handle(body, services, ctx).await })
             })
         })
         .await;
@@ -45,5 +49,5 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    tracing::debug!("📋 QRCode 模块路由注册完成 (generate, join)");
+    tracing::debug!("📋 Group QRCode 路由注册完成 (get / refresh / group/join/qrcode)");
 }
