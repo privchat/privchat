@@ -5,51 +5,43 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
-use crate::model::QRType;
+//! `group/join/qrcode` handler — QR_CODE_SPEC v1.3。
+//!
+//! 与历史 `QRCodeService` 解耦：直接 `SELECT group_id FROM privchat_groups
+//! WHERE qr_key = $1`，找到群后走与邀请相同的 join_need_approval 流程。
+//! 不再用 `&token=` URL 参数，UNIQUE qr_key 本身就是不可枚举的安全凭证。
+
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
-use privchat_protocol::rpc::GroupQRCodeJoinRequest;
+use privchat_protocol::rpc::group::qrcode::GroupQRCodeJoinRequest;
 use serde_json::{json, Value};
 
 /// 处理 扫码加群 请求
 ///
-/// RPC: group/join/qrcode
+/// RPC: `group/join/qrcode`
 ///
-/// 使用新的 QR Key 系统，通过 qrkey 和 token 加入群组
-///
-/// 请求参数：
+/// 请求：
 /// ```json
-/// {
-///   "user_id": "alice",
-///   "qr_code": "privchat://group/get?qrkey=3f4g5h6i7j8k&token=xyz",
-///   "message": "我想加入群组"  // 可选：申请理由
-/// }
+/// { "qr_key": "K7sP3qXfA9eLm2nB", "message": "我想加群" }
 /// ```
 ///
 /// 响应（无需审批）：
 /// ```json
 /// {
 ///   "status": "joined",
-///   "group_id": "group_123",
-///   "message": "已成功加入群组"
+///   "group_id": 12345,
+///   "user_id": 100002091,
+///   "joined_at": 1715833200000,
+///   "message": "已加入群组"
 /// }
 /// ```
 ///
-/// 响应（需要审批）：
+/// 响应（需审批）：
 /// ```json
 /// {
 ///   "status": "pending",
-///   "group_id": "group_123",
+///   "group_id": 12345,
 ///   "request_id": "req_456",
 ///   "message": "申请已提交，等待管理员审批"
 /// }
@@ -61,58 +53,35 @@ pub async fn handle(
 ) -> RpcResult<Value> {
     tracing::debug!("🔧 处理 扫码加群 请求: {:?}", body);
 
-    // ✅ 使用 protocol 定义自动反序列化
     let request: GroupQRCodeJoinRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("Invalid request: {}", e)))?;
 
-    // ✅ 从 ctx 获取 user_id（安全性）
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
-
     let qr_key = request.qr_key;
-    let token = request.token;
     let message = request.message;
 
-    tracing::debug!(
-        "📱 扫描二维码: qr_key={}, has_token={}",
-        qr_key,
-        token.is_some()
-    );
-
-    // 1. 解析 QR Key，验证有效性
-    let record = services
-        .qrcode_service
-        .resolve(&qr_key, user_id, token.as_deref())
-        .await
-        .map_err(|e| match e {
-            crate::error::ServerError::NotFound(_) => {
-                RpcError::not_found("二维码不存在或已失效".to_string())
-            }
-            crate::error::ServerError::BadRequest(msg) => {
-                RpcError::validation(format!("二维码无效: {}", msg))
-            }
-            crate::error::ServerError::Unauthorized(msg) => {
-                RpcError::unauthorized(format!("二维码验证失败: {}", msg))
-            }
-            _ => RpcError::internal(format!("解析二维码失败: {}", e)),
-        })?;
-
-    // 2. 验证是群组二维码
-    if record.qr_type != QRType::Group {
-        return Err(RpcError::validation("不是群组二维码".to_string()));
+    if qr_key.is_empty() {
+        return Err(RpcError::validation("qr_key is required".to_string()));
     }
 
-    // 解析 group_id 为 u64
-    let group_id = record.target_id.parse::<u64>().map_err(|_| {
-        RpcError::validation(format!("Invalid group_id in QR code: {}", record.target_id))
-    })?;
+    // 1. 反查 group_id —— qr_key 是 privchat_groups 表上的 UNIQUE 字段。
+    let group_id: u64 = sqlx::query_scalar::<_, i64>(
+        "SELECT group_id FROM privchat_groups WHERE qr_key = $1",
+    )
+    .bind(&qr_key)
+    .fetch_optional(services.channel_service.pool())
+    .await
+    .map_err(|e| RpcError::internal(format!("查询群二维码失败: {}", e)))?
+    .ok_or_else(|| RpcError::not_found("二维码无效或已被旋转".to_string()))?
+    as u64;
 
     tracing::debug!(
-        "✅ 二维码验证成功: qr_key={}, group_id={}",
+        "✅ 二维码反查成功: qr_key={}, group_id={}",
         qr_key,
         group_id
     );
 
-    // 3. 验证用户是否存在（从数据库读取）
+    // 2. 验证用户存在（与历史 invite/qrcode 流程一致）
     let _user_profile = helpers::get_user_profile_with_fallback(
         user_id,
         &services.user_repository,
@@ -122,19 +91,19 @@ pub async fn handle(
     .map_err(|e| RpcError::internal(format!("获取用户信息失败: {}", e)))?
     .ok_or_else(|| RpcError::not_found(format!("用户不存在: {}", user_id)))?;
 
-    // 4. 获取群组信息
+    // 3. 拉群信息
     let channel = services
         .channel_service
         .get_channel(&group_id)
         .await
         .map_err(|e| RpcError::not_found(format!("群组不存在: {}", e)))?;
 
-    // 5. 检查用户是否已经是群成员
+    // 4. 已是群成员
     if channel.members.contains_key(&user_id) {
         return Err(RpcError::validation("您已经是群成员".to_string()));
     }
 
-    // 6. 检查群人数是否已满
+    // 5. 群人数已满
     let current_member_count = channel.members.len() as u32;
     let max_members = channel
         .settings
@@ -146,7 +115,7 @@ pub async fn handle(
         return Err(RpcError::validation("群组人数已满".to_string()));
     }
 
-    // 7. 检查是否需要审批
+    // 6. 审批分流（与邀请共用流程；method = QRCode）
     let need_approval = channel
         .settings
         .as_ref()
@@ -154,14 +123,12 @@ pub async fn handle(
         .unwrap_or(false);
 
     if need_approval {
-        // 需要审批 - 创建加群申请记录
         tracing::debug!(
             "⏰ 扫码加群需要审批: user_id={}, group_id={}",
             user_id,
             group_id
         );
 
-        // 创建审批请求
         let join_request = services
             .approval_service
             .create_join_request(
@@ -171,22 +138,19 @@ pub async fn handle(
                     qr_code_id: qr_key.clone(),
                 },
                 message,
-                Some(72), // 72小时过期
+                Some(72), // 72 小时过期
             )
             .await
             .map_err(|e| RpcError::internal(format!("创建审批请求失败: {}", e)))?;
-
-        // TODO: 通知群管理员有新的加群申请
 
         Ok(json!({
             "status": "pending",
             "group_id": group_id,
             "request_id": join_request.request_id,
             "message": "申请已提交，等待管理员审批",
-            "expires_at": join_request.expires_at.map(|dt| dt.timestamp_millis())
+            "expires_at": join_request.expires_at.map(|dt| dt.timestamp_millis()),
         }))
     } else {
-        // 无需审批 - 直接加入群组
         services
             .channel_service
             .join_channel(
@@ -206,9 +170,9 @@ pub async fn handle(
         Ok(json!({
             "status": "joined",
             "group_id": group_id,
-            "message": "已成功加入群组",
+            "message": "已加入群组",
             "user_id": user_id,
-            "joined_at": chrono::Utc::now().timestamp_millis()
+            "joined_at": chrono::Utc::now().timestamp_millis(),
         }))
     }
 }

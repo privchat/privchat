@@ -5,196 +5,183 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
-use crate::model::{QRKeyOptions, QRType};
+//! 个人名片二维码 RPC handler（QR_CODE_SPEC v1.3）。
+//!
+//! 三个 handler：
+//! - `user/qrcode/get` — 读自己的 qr_key + URL
+//! - `user/qrcode/refresh` — 旋转自己的 qr_key
+//! - `user/qrcode/resolve` — 用对端的 qrkey 拉最小用户卡片
+//!
+//! 历史 `user/qrcode/generate` 已停用：qr_key 在注册时自动产生，
+//! 不需要"生成"动作；"刷新"由 `refresh` 提供。
+
 use crate::rpc::error::{RpcError, RpcResult};
+use crate::rpc::qr::{
+    build_qr_url, generate_qr_key, is_qr_key_unique_violation, QrAction, QrEntity,
+    QR_KEY_MAX_GENERATION_RETRIES,
+};
 use crate::rpc::RpcServiceContext;
+use privchat_protocol::rpc::user_qrcode::{
+    UserQRCodeGetResponse, UserQRCodeRefreshResponse, UserQRCodeResolveRequest,
+    UserQRCodeResolveResponse,
+};
 use serde_json::{json, Value};
 
-/// 生成用户名片二维码
-///
-/// RPC: user/qrcode/generate
-///
-/// 请求参数：
-/// ```json
-/// {
-///   "user_id": "alice"
-/// }
-/// ```
-///
-/// 响应：
-/// ```json
-/// {
-///   "qr_key": "7a8b9c0d1e2f",
-///   "qr_code": "privchat://user/get?qrkey=7a8b9c0d1e2f",
-///   "created_at": "2026-01-10T12:00:00Z"
-/// }
-/// ```
-pub async fn generate(
-    body: Value,
-    services: RpcServiceContext,
-    ctx: crate::rpc::RpcContext,
-) -> RpcResult<Value> {
-    tracing::debug!("🔧 处理 生成用户二维码 请求: {:?}", body);
-
-    // 从 ctx 获取当前用户 ID
-    let user_id_u64 = crate::rpc::get_current_user_id(&ctx)?;
-    let user_id = user_id_u64.to_string();
-
-    // 生成用户二维码（永久有效，可多次使用）
-    let record = services
-        .qrcode_service
-        .generate(
-            QRType::User,
-            user_id.clone(),
-            user_id.clone(),
-            QRKeyOptions {
-                revoke_old: true, // 生成新的时撤销旧的
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| RpcError::internal(format!("生成用户二维码失败: {}", e)))?;
-
-    tracing::debug!(
-        "✅ 用户二维码生成成功: user_id={}, qr_key={}, qr_code={}",
-        user_id,
-        record.qr_key,
-        record.to_qr_code_string()
-    );
-
-    Ok(json!({
-        "qr_key": record.qr_key,
-        "qr_code": record.to_qr_code_string(),  // privchat://user/get?qrkey=xxx
-        "created_at": record.created_at.timestamp_millis(),
-    }))
-}
-
-/// 刷新用户名片二维码
-///
-/// RPC: user/qrcode/refresh
-///
-/// 请求参数：
-/// ```json
-/// {
-///   "user_id": "alice"
-/// }
-/// ```
-///
-/// 响应：
-/// ```json
-/// {
-///   "old_qr_key": "7a8b9c0d1e2f",
-///   "new_qr_key": "3f4g5h6i7j8k",
-///   "new_qr_code": "privchat://user/get?qrkey=3f4g5h6i7j8k",
-///   "revoked_at": "2026-01-10T12:00:00Z"
-/// }
-/// ```
-pub async fn refresh(
-    body: Value,
-    services: RpcServiceContext,
-    ctx: crate::rpc::RpcContext,
-) -> RpcResult<Value> {
-    tracing::debug!("🔧 处理 刷新用户二维码 请求: {:?}", body);
-
-    let user_id = body
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("user_id is required".to_string()))?;
-
-    // 刷新用户二维码
-    let (old_qr_key, new_qr_key) = services
-        .qrcode_service
-        .refresh(user_id, QRType::User, user_id)
-        .await
-        .map_err(|e| RpcError::internal(format!("刷新用户二维码失败: {}", e)))?;
-
-    // 获取新的 QR Key 记录
-    let new_record = services
-        .qrcode_service
-        .get(&new_qr_key)
-        .await
-        .ok_or_else(|| RpcError::internal("无法获取新的 QR Key".to_string()))?;
-
-    tracing::debug!(
-        "✅ 用户二维码刷新成功: user_id={}, old={}, new={}",
-        user_id,
-        old_qr_key,
-        new_qr_key
-    );
-
-    Ok(json!({
-        "old_qr_key": old_qr_key,
-        "new_qr_key": new_qr_key,
-        "new_qr_code": new_record.to_qr_code_string(),
-        "revoked_at": chrono::Utc::now().timestamp_millis(),
-    }))
-}
-
-/// 获取用户当前的二维码
-///
-/// RPC: user/qrcode/get
-///
-/// 请求参数：
-/// ```json
-/// {
-///   "user_id": "alice"
-/// }
-/// ```
-///
-/// 响应：
-/// ```json
-/// {
-///   "qr_key": "7a8b9c0d1e2f",
-///   "qr_code": "privchat://user/get?qrkey=7a8b9c0d1e2f",
-///   "created_at": "2026-01-10T12:00:00Z"
-/// }
-/// ```
+/// `user/qrcode/get` — 读自己的 qr_key。
 pub async fn get(
-    body: Value,
+    _body: Value,
     services: RpcServiceContext,
     ctx: crate::rpc::RpcContext,
 ) -> RpcResult<Value> {
-    tracing::debug!("🔧 处理 获取用户二维码 请求: {:?}", body);
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
 
-    let user_id = body
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("user_id is required".to_string()))?;
+    let qr_key: String = sqlx::query_scalar::<_, String>(
+        "SELECT qr_key FROM privchat_users WHERE user_id = $1",
+    )
+    .bind(user_id as i64)
+    .fetch_optional(services.channel_service.pool())
+    .await
+    .map_err(|e| RpcError::internal(format!("读取 qr_key 失败: {}", e)))?
+    .ok_or_else(|| RpcError::not_found("用户不存在".to_string()))?;
 
-    // 获取用户当前的二维码
-    let record = services
-        .qrcode_service
-        .get_by_target(user_id)
-        .await
-        .ok_or_else(|| RpcError::not_found("用户二维码不存在".to_string()))?;
+    let qr_code = build_qr_url(
+        &services.config.qr_base_url,
+        QrEntity::User,
+        QrAction::Get,
+        &qr_key,
+    );
 
-    // 检查是否有效
-    if !record.is_valid() {
-        return Err(RpcError::not_found(
-            "用户二维码已失效，请重新生成".to_string(),
-        ));
+    let resp = UserQRCodeGetResponse {
+        qr_key,
+        qr_code,
+        user_id,
+    };
+    Ok(json!(resp))
+}
+
+/// `user/qrcode/refresh` — 旋转自己的 qr_key（用户主动应对骚扰）。
+pub async fn refresh(
+    _body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
+
+    let old_qr_key: String = sqlx::query_scalar::<_, String>(
+        "SELECT qr_key FROM privchat_users WHERE user_id = $1",
+    )
+    .bind(user_id as i64)
+    .fetch_optional(services.channel_service.pool())
+    .await
+    .map_err(|e| RpcError::internal(format!("读取旧 qr_key 失败: {}", e)))?
+    .ok_or_else(|| RpcError::not_found("用户不存在".to_string()))?;
+
+    let mut last_err: Option<sqlx::Error> = None;
+    let mut new_qr_key: Option<String> = None;
+    for _ in 0..QR_KEY_MAX_GENERATION_RETRIES {
+        let candidate = generate_qr_key();
+        let attempt = sqlx::query(
+            "UPDATE privchat_users SET qr_key = $1, updated_at = $2 WHERE user_id = $3",
+        )
+        .bind(&candidate)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(user_id as i64)
+        .execute(services.channel_service.pool())
+        .await;
+
+        match attempt {
+            Ok(_) => {
+                new_qr_key = Some(candidate);
+                break;
+            }
+            Err(e) if is_qr_key_unique_violation(&e) => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => {
+                return Err(RpcError::internal(format!(
+                    "UPDATE qr_key failed: {}",
+                    e
+                )));
+            }
+        }
     }
 
-    tracing::debug!(
-        "✅ 用户二维码获取成功: user_id={}, qr_key={}",
-        user_id,
-        record.qr_key
+    let new_qr_key = new_qr_key.ok_or_else(|| {
+        RpcError::internal(format!(
+            "qr_key UNIQUE 冲突重试 {} 次仍失败: {:?}",
+            QR_KEY_MAX_GENERATION_RETRIES, last_err
+        ))
+    })?;
+
+    let qr_code = build_qr_url(
+        &services.config.qr_base_url,
+        QrEntity::User,
+        QrAction::Get,
+        &new_qr_key,
     );
 
-    Ok(json!({
-        "qr_key": record.qr_key,
-        "qr_code": record.to_qr_code_string(),
-        "created_at": record.created_at.timestamp_millis(),
-        "used_count": record.used_count,
-    }))
+    let resp = UserQRCodeRefreshResponse {
+        old_qr_key,
+        new_qr_key,
+        qr_code,
+        user_id,
+    };
+    Ok(json!(resp))
+}
+
+/// `user/qrcode/resolve` — 把对端 qrkey 翻译成最小用户卡片。
+///
+/// **不返回 qr_key**（避免二次扩散）；返回最少够 UI 展示 + add-friend 用的字段。
+pub async fn resolve(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
+    let req: UserQRCodeResolveRequest = serde_json::from_value(body)
+        .map_err(|e| RpcError::validation(format!("Invalid request: {}", e)))?;
+
+    let operator_id = crate::rpc::get_current_user_id(&ctx)?;
+
+    if req.qr_key.is_empty() {
+        return Err(RpcError::validation("qr_key is required".to_string()));
+    }
+
+    let row = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, i16)>(
+        r#"
+        SELECT user_id, username, display_name, avatar_url, user_type
+          FROM privchat_users
+         WHERE qr_key = $1
+        "#,
+    )
+    .bind(&req.qr_key)
+    .fetch_optional(services.channel_service.pool())
+    .await
+    .map_err(|e| RpcError::internal(format!("解析名片码失败: {}", e)))?
+    .ok_or_else(|| RpcError::not_found("名片码无效或已被旋转".to_string()))?;
+
+    let target_user_id = row.0 as u64;
+    let is_self = target_user_id == operator_id;
+
+    // 调用方与目标是否已经是好友 —— is_friend 本身是 best-effort，无 Result。
+    let is_friend = if is_self {
+        true
+    } else {
+        services
+            .friend_service
+            .is_friend(operator_id, target_user_id)
+            .await
+    };
+
+    let resp = UserQRCodeResolveResponse {
+        user_id: target_user_id,
+        username: row.1,
+        display_name: row.2,
+        avatar_url: row.3,
+        user_type: row.4,
+        is_friend,
+        is_self,
+    };
+    Ok(json!(resp))
 }
