@@ -20,40 +20,71 @@ use serde::{Deserialize, Serialize};
 
 use sqlx::Type;
 
-/// 好友关系状态
+/// 好友关系状态。
+///
+/// **F-sync.1 扩展**：原本只有 0/1/2 三态，且 Rejected 业务态被 collapse 到
+/// DB Blocked(2) 上——这导致 reject 状态无法和 block 区分、也无法通过
+/// entity sync 分发。本轮把 Rejected/Recalled/Expired 提到独立 DB code，
+/// 让所有非 accepted 状态都能流到客户端（详见 USER_INBOX_EVENT_ENVELOPE_SPEC
+/// + 下一轮 SDK/UI 接入）。
+///
+/// **不变式**：DB 列没有 CHECK 约束，扩展新值无需 schema migration；
+/// 现有 backfill 行不会因新增值而坏（旧值 0/1/2 全部保留语义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
 #[sqlx(type_name = "smallint")]
 pub enum FriendshipStatus {
-    /// 待处理
+    /// 待处理（A 发出 / B 收到的 pending 申请）。
     #[default]
     Pending = 0,
-    /// 已接受
+    /// 已接受（双向好友关系成立）。
     Accepted = 1,
-    /// 已阻止
+    /// 已拉黑。语义与 Rejected 区分：Blocked 是单向永久屏蔽，Rejected 是
+    /// 单次申请被拒（对方可再次申请）。
     Blocked = 2,
-    /// 已拒绝（注意：数据库中没有此状态，业务层使用 Blocked 表示）
-    Rejected = 3, // 业务层使用，数据库存储为 Blocked (2)
+    /// 已拒绝（receiver 拒绝了一次申请）。requester 可重新 apply。
+    Rejected = 3,
+    /// 已撤回（requester 自己撤回了未处理的 pending 申请）。
+    Recalled = 4,
+    /// 已过期（GC 任务把超期 pending 改成此态；下一轮 F-sync.4 落地）。
+    Expired = 5,
 }
 
 impl FriendshipStatus {
-    /// 从 i16 转换
+    /// 从 i16 转换。未知值兜底为 Pending，避免反序列化崩溃。
     pub fn from_i16(value: i16) -> Self {
         match value {
             0 => FriendshipStatus::Pending,
             1 => FriendshipStatus::Accepted,
-            2 => FriendshipStatus::Blocked, // 数据库中使用 2 表示 Blocked
+            2 => FriendshipStatus::Blocked,
+            3 => FriendshipStatus::Rejected,
+            4 => FriendshipStatus::Recalled,
+            5 => FriendshipStatus::Expired,
             _ => FriendshipStatus::Pending,
         }
     }
 
-    /// 转换为 i16（数据库存储值）
+    /// 转换为 i16（数据库存储值）。
     pub fn to_i16(self) -> i16 {
         match self {
             FriendshipStatus::Pending => 0,
             FriendshipStatus::Accepted => 1,
-            FriendshipStatus::Rejected => 2, // 数据库中使用 Blocked 值
             FriendshipStatus::Blocked => 2,
+            FriendshipStatus::Rejected => 3,
+            FriendshipStatus::Recalled => 4,
+            FriendshipStatus::Expired => 5,
         }
+    }
+
+    /// 是否是"非好友"状态（不应进入客户端 friends 列表，但仍可作为申请记录
+    /// 出现在 friend request 列表里）。
+    pub fn is_terminal_non_friend(self) -> bool {
+        matches!(
+            self,
+            FriendshipStatus::Rejected
+                | FriendshipStatus::Recalled
+                | FriendshipStatus::Expired
+                | FriendshipStatus::Blocked
+        )
     }
 }
 

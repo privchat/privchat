@@ -19,6 +19,8 @@ pub mod accept;
 pub mod apply;
 pub mod check;
 pub mod pending;
+pub mod push_helpers;
+pub mod recall;
 pub mod reject;
 pub mod remove;
 pub mod set_alias;
@@ -81,6 +83,16 @@ pub async fn register_routes(services: RpcServiceContext) {
             Box::new(move |body, ctx| {
                 let services = services.clone();
                 Box::pin(async move { reject::handle(body, services, ctx).await })
+            })
+        })
+        .await;
+
+    router
+        .register(routes::friend::RECALL, {
+            let services = services.clone();
+            Box::new(move |body, ctx| {
+                let services = services.clone();
+                Box::pin(async move { recall::handle(body, services, ctx).await })
             })
         })
         .await;

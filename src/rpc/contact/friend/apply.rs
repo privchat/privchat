@@ -15,11 +15,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::rpc::contact::friend::push_helpers;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
-use privchat_protocol::inbox_event::{
-    payloads::FriendRequestReceivedPayload, topics, UserInboxEventEnvelope,
-};
 use privchat_protocol::rpc::contact::friend::FriendApplyRequest;
 use serde_json::{json, Value};
 
@@ -231,76 +229,24 @@ pub async fn handle(
                         message
                     );
 
-                    // 实时通知对方"收到新好友申请"。
+                    // 双路 push（USER_INBOX_EVENT_ENVELOPE_SPEC + F-sync.1）：
+                    // 1. friend.request.received → target 所有设备；
+                    // 2. friend.request.sent → requester 自己所有设备（多端同步）。
                     //
-                    // 设计：复用 PushMessageRequest 通道，topic="friend.request.received"。
-                    // payload 必须是 UserInboxEventEnvelope v1（spec/05-feature/
-                    // USER_INBOX_EVENT_ENVELOPE_SPEC.md）—— **禁止手拼 JSON**，所有结构
-                    // 体均在 privchat-protocol 中定义。
-                    //
-                    // **v1 不变式**：
-                    // - 不进 DB / 不进离线队列；好友申请已经写 friendships，离线下次开机
-                    //   通过 `friend/pending` 全量补偿。这里只是在线唤醒。
-                    // - `event_id` 仅供客户端 dedupe，不可作 inbox diff cursor 使用。
-                    // - 事件类型由外层 topic 表达；envelope 不冗余 type 字段。
-                    // - `aggregate_id` 在接收人视角下唯一锁定一条 pending request：
-                    //   (receiver=self) 由 push 通道隐含，requester 即 from_user_id。
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0);
-                    let envelope = UserInboxEventEnvelope::new_v1(
-                        crate::infra::snowflake::next_message_id(),
-                        "friend_request",
-                        from_user_id.to_string(),
-                        now_ms,
-                        None,
-                        serde_json::to_value(FriendRequestReceivedPayload {
-                            requester_id: from_user_id,
-                            receiver_id: target_user_id,
-                            message: message.to_string(),
-                        })
-                        .expect("FriendRequestReceivedPayload is always serializable"),
-                    );
-                    let payload_bytes = envelope
-                        .to_json_bytes()
-                        .expect("UserInboxEventEnvelope is always serializable");
-                    let push = privchat_protocol::protocol::PushMessageRequest {
-                        setting: privchat_protocol::protocol::MessageSetting::default(),
-                        msg_key: format!("friend_apply_{}_{}", from_user_id, target_user_id),
-                        server_message_id: 0,
-                        message_seq: 0,
-                        local_message_id: 0,
-                        stream_no: String::new(),
-                        stream_seq: 0,
-                        stream_flag: 0,
-                        timestamp: (now_ms / 1000) as u32,
-                        channel_id: 0,
-                        channel_type: 0,
-                        message_type: privchat_protocol::ContentMessageType::System.as_u32(),
-                        expire: 0,
-                        topic: topics::FRIEND_REQUEST_RECEIVED.to_string(),
-                        from_uid: from_user_id,
-                        payload: payload_bytes,
-                        deleted: false,
-                    };
-                    if let Err(e) = services
-                        .connection_manager
-                        .send_push_to_user(target_user_id, &push)
-                        .await
-                    {
-                        tracing::warn!(
-                            "⚠️ 推送好友申请事件失败 target_user_id={}: {:?}",
-                            target_user_id,
-                            e
-                        );
-                    } else {
-                        tracing::info!(
-                            "📤 已推送好友申请事件: {} -> {}",
-                            from_user_id,
-                            target_user_id
-                        );
-                    }
+                    // 仅在线唤醒，离线补偿由 friendships 表 + entity sync 兜底。
+                    push_helpers::push_friend_request_received(
+                        &services,
+                        from_user_id,
+                        target_user_id,
+                        message,
+                    )
+                    .await;
+                    push_helpers::push_friend_request_sent(
+                        &services,
+                        from_user_id,
+                        target_user_id,
+                    )
+                    .await;
 
                     Ok(json!({
                         // 协议约定 user_id 必须是 u64 数字，不是字符串

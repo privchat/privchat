@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::rpc::contact::friend::push_helpers;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use crate::service::friend_service::AcceptFriendRequestResult;
@@ -99,6 +100,20 @@ pub async fn handle(
         from_user_id,
         channel_id
     );
+
+    // F-sync.1: 同步状态变化到双方所有设备。requester=from_user_id, target=user_id
+    // （注意命名：accept handler 里 `user_id` 是接受者=申请的 target，
+    // `from_user_id` 是 requester）。new_status=1 (Accepted)。
+    if !already_friends {
+        push_helpers::push_friend_request_status_changed(
+            &services,
+            from_user_id, // requester
+            user_id,      // target / actor
+            1,            // Accepted
+            user_id,
+        )
+        .await;
+    }
 
     // 返回会话 ID
     Ok(json!(channel_id))

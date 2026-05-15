@@ -160,13 +160,18 @@ impl FriendService {
             .map(|_| ())
     }
 
-    /// 拒绝好友申请——删除 pending row（status=0）。
+    /// 拒绝好友申请——把 pending row（status=0）改成 Rejected(3)。
     ///
-    /// 语义：让申请人可以重新申请（friendships PK 是 (user_id, friend_id)，
-    /// 重新 apply 会走 INSERT，原行已删）。**不**触碰已 accepted 的行。
+    /// **F-sync.1 行为变更**：原本是物理 DELETE，本轮改成 UPDATE status=3。
+    /// 这样 rejected 状态能通过 friendships.sync_version + entity sync 分发到
+    /// 双方所有设备，requester 自己的 Sent 列表能正确看到"已拒绝"态。
     ///
-    /// 返回 `true` 表示有 pending 行被删除；`false` 表示没找到 pending（可能
-    /// 申请已过期 / 已被接受 / 从未存在）—— 调用方据此决定提示语义。
+    /// 重新申请：requester 再次 apply 时走 `ON CONFLICT (user_id, friend_id)
+    /// DO UPDATE` 把 status 改回 0 + 刷新 source/message + 触发 sync_version
+    /// 重置（参见 `send_friend_request_with_source` 的 ON CONFLICT 子句）。
+    ///
+    /// 返回 `true` 表示真的有 pending 行被改；`false` 表示没找到 pending（已
+    /// 过期 / 已被接受 / 已被撤回 / 从未存在）—— 调用方据此决定提示语义。
     pub async fn reject_friend_request(
         &self,
         user_id: u64,
@@ -174,9 +179,11 @@ impl FriendService {
     ) -> Result<bool> {
         info!("🛑 用户 {} 拒绝来自 {} 的好友申请", user_id, from_user_id);
 
+        let now = chrono::Utc::now().timestamp_millis();
         let affected = sqlx::query(
             r#"
-            DELETE FROM privchat_friendships
+            UPDATE privchat_friendships
+            SET status = 3, updated_at = $3
             WHERE user_id = $1
               AND friend_id = $2
               AND status = 0
@@ -184,9 +191,45 @@ impl FriendService {
         )
         .bind(from_user_id as i64)
         .bind(user_id as i64)
+        .bind(now)
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("Failed to reject friend request: {}", e)))?
+        .rows_affected();
+
+        Ok(affected > 0)
+    }
+
+    /// 撤回好友申请——requester 自己把 pending(0) row 改成 Recalled(4)。
+    ///
+    /// 只能撤回自己发出的、尚未被处理的申请。如果 row 已经是 accepted /
+    /// rejected / recalled / expired 都不再可改（返回 false）。
+    pub async fn recall_friend_request(
+        &self,
+        requester_id: u64,
+        target_user_id: u64,
+    ) -> Result<bool> {
+        info!(
+            "↩️ 用户 {} 撤回发给 {} 的好友申请",
+            requester_id, target_user_id
+        );
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let affected = sqlx::query(
+            r#"
+            UPDATE privchat_friendships
+            SET status = 4, updated_at = $3
+            WHERE user_id = $1
+              AND friend_id = $2
+              AND status = 0
+            "#,
+        )
+        .bind(requester_id as i64)
+        .bind(target_user_id as i64)
+        .bind(now)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("Failed to recall friend request: {}", e)))?
         .rows_affected();
 
         Ok(affected > 0)
@@ -553,7 +596,23 @@ impl FriendService {
             .collect())
     }
 
-    /// entity/sync_entities 业务逻辑：好友分页与 SyncEntitiesResponse 构建
+    /// entity/sync_entities 业务逻辑：好友 + 好友申请 分页与 SyncEntitiesResponse 构建。
+    ///
+    /// **F-sync.1 重写**：
+    /// 1. 查询条件从 `user_id = me AND status != 0` 扩成 `user_id = me OR
+    ///    friend_id = me`——双向，且不再过滤 status。这样：
+    ///    - A 发出 (A,B,pending) 这一行 → A 多设备能拉到 (我发出的 pending)。
+    ///    - B 视角通过 `friend_id = me` 拉到同一行 → B 看到 (收到的 pending)。
+    /// 2. 单条记录有两种"viewer 视角"：
+    ///    - viewer == row.user_id → is_outgoing=true，peer = row.friend_id
+    ///    - viewer == row.friend_id → is_outgoing=false，peer = row.user_id
+    ///    `entity_id` 始终 = peer_user_id，多端在本地按 entity_id upsert。
+    /// 3. status 处理：
+    ///    - Accepted(1)：原有 friend payload（带 friend / user 块），新增 status=1。
+    ///    - Pending(0) / Rejected(3) / Recalled(4) / Expired(5)：deleted=false，
+    ///      payload 带 status + is_outgoing + request_message + request_source。
+    ///      用户 profile 仍解析（UI 要显示头像/昵称）。
+    ///    - Blocked(2)：仍然 deleted=true（tombstone 语义，从 friends 列表移除）。
     pub async fn sync_entities_page(
         &self,
         user_id: u64,
@@ -574,9 +633,13 @@ impl FriendService {
 
         #[derive(sqlx::FromRow)]
         struct FriendSyncRow {
-            friend_id: i64,
+            row_user_id: i64,
+            row_friend_id: i64,
             status: i16,
             alias: Option<String>,
+            request_message: Option<String>,
+            source: Option<String>,
+            source_id: Option<String>,
             created_at: i64,
             updated_at: i64,
             sync_version: i64,
@@ -584,12 +647,21 @@ impl FriendService {
 
         let rows = sqlx::query_as::<_, FriendSyncRow>(
             r#"
-            SELECT friend_id, status, alias, created_at, updated_at, sync_version
+            SELECT
+                user_id          AS row_user_id,
+                friend_id        AS row_friend_id,
+                status,
+                alias,
+                request_message,
+                source,
+                source_id,
+                created_at,
+                updated_at,
+                sync_version
             FROM privchat_friendships
-            WHERE user_id = $1
-              AND status != 0
+            WHERE (user_id = $1 OR friend_id = $1)
               AND sync_version > $2
-            ORDER BY sync_version ASC, friend_id ASC
+            ORDER BY sync_version ASC, user_id ASC, friend_id ASC
             LIMIT $3
             "#,
         )
@@ -607,20 +679,33 @@ impl FriendService {
             .map(|row| row.sync_version as u64)
             .unwrap_or(since_v);
 
+        let me = user_id as i64;
         let mut items = Vec::with_capacity(page.len());
         for row in &page {
-            let friend_id = row.friend_id as u64;
-            if row.status != 1 {
+            // 谁是 viewer 视角下的"对端"？— 当前 viewer 是 me，对端就是另一侧。
+            let (peer_id_i64, is_outgoing) = if row.row_user_id == me {
+                (row.row_friend_id, true) // viewer 是 requester / friend-owner（取决于 status）
+            } else {
+                (row.row_user_id, false)
+            };
+            let peer_id = peer_id_i64 as u64;
+
+            // Blocked 仍是 friends 列表的 tombstone（按既有 SDK 行为）。
+            // 注：blocked 当前没有"反向投影"，所以只在 user_id=me 这一侧生效。
+            if row.status == 2 {
                 items.push(SyncEntityItem {
-                    entity_id: friend_id.to_string(),
+                    entity_id: peer_id.to_string(),
                     version: row.sync_version as u64,
                     deleted: true,
                     payload: None,
                 });
                 continue;
             }
+
+            // 加载对端 profile（accepted / pending / rejected / recalled / expired
+            // 都需要展示头像 + 昵称）。拉不到则跳过这一项——下次 sync 会再来。
             let profile_opt =
-                get_user_profile_with_fallback(friend_id, user_repository, cache_manager)
+                get_user_profile_with_fallback(peer_id, user_repository, cache_manager)
                     .await
                     .ok()
                     .flatten();
@@ -629,38 +714,72 @@ impl FriendService {
                 None => continue,
             };
 
-            let payload_typed = FriendSyncPayload {
-                user_id: Some(friend_id),
-                uid: Some(friend_id),
-                tags: None,
-                is_pinned: Some(false),
-                pinned: Some(false),
-                created_at: Some(row.created_at),
-                updated_at: Some(row.updated_at),
-                version: Some(row.sync_version),
-                friend: Some(FriendSyncFriendPayload {
+            let user_block = FriendSyncUserPayload {
+                username: Some(profile.username.clone()),
+                nickname: Some(profile.nickname.clone()),
+                name: Some(profile.nickname.clone()),
+                // alias 只在 viewer 是 friend-owner 那一侧有意义（双向 accepted 时
+                // 双方各有自己一行带各自 alias）。对 request 态，alias 通常为 None。
+                alias: if is_outgoing { row.alias.clone() } else { None },
+                avatar: Some(profile.avatar_url.as_deref().unwrap_or("").to_string()),
+                user_type: Some(i32::from(profile.user_type)),
+                type_field: Some(i32::from(profile.user_type)),
+                updated_at: None,
+                version: None,
+            };
+
+            let payload_typed = if row.status == 1 {
+                // Accepted —— 完整 friend payload（保持既有 SDK 兼容）；status 字段
+                // 新增但老客户端 Option 忽略，新客户端按 status 区分。
+                FriendSyncPayload {
+                    user_id: Some(peer_id),
+                    uid: Some(peer_id),
+                    tags: None,
+                    is_pinned: Some(false),
+                    pinned: Some(false),
                     created_at: Some(row.created_at),
                     updated_at: Some(row.updated_at),
                     version: Some(row.sync_version),
-                }),
-                user: Some(FriendSyncUserPayload {
-                    username: Some(profile.username.clone()),
-                    nickname: Some(profile.nickname.clone()),
-                    name: Some(profile.nickname.clone()),
-                    alias: row.alias.clone(),
-                    avatar: Some(profile.avatar_url.as_deref().unwrap_or("").to_string()),
-                    user_type: Some(i32::from(profile.user_type)),
-                    type_field: Some(i32::from(profile.user_type)),
-                    updated_at: None,
-                    version: None,
-                }),
+                    friend: Some(FriendSyncFriendPayload {
+                        created_at: Some(row.created_at),
+                        updated_at: Some(row.updated_at),
+                        version: Some(row.sync_version),
+                    }),
+                    user: Some(user_block),
+                    status: Some(row.status),
+                    is_outgoing: None,
+                    request_message: None,
+                    request_source: None,
+                    request_source_id: None,
+                }
+            } else {
+                // Pending / Rejected / Recalled / Expired —— 请求态 payload。
+                // 不填 `friend` 块（这不是好友关系）；填 request_* + status + is_outgoing。
+                FriendSyncPayload {
+                    user_id: Some(peer_id),
+                    uid: Some(peer_id),
+                    tags: None,
+                    is_pinned: Some(false),
+                    pinned: Some(false),
+                    created_at: Some(row.created_at),
+                    updated_at: Some(row.updated_at),
+                    version: Some(row.sync_version),
+                    friend: None,
+                    user: Some(user_block),
+                    status: Some(row.status),
+                    is_outgoing: Some(is_outgoing),
+                    request_message: row.request_message.clone(),
+                    request_source: row.source.clone(),
+                    request_source_id: row.source_id.clone(),
+                }
             };
+
             let payload = serde_json::to_value(payload_typed).map_err(|e| {
                 ServerError::Internal(format!("friend payload serialize failed: {e}"))
             })?;
 
             items.push(SyncEntityItem {
-                entity_id: friend_id.to_string(),
+                entity_id: peer_id.to_string(),
                 version: row.sync_version as u64,
                 deleted: false,
                 payload: Some(payload),
