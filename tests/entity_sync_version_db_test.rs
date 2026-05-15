@@ -34,10 +34,12 @@ async fn cleanup_channel(pool: &sqlx::PgPool, channel_id: i64) {
 }
 
 async fn ensure_user(pool: &sqlx::PgPool, user_id: i64, username: &str) {
+    // QR_CODE_SPEC v1.3：privchat_users.qr_key NOT NULL
+    let qr_key = privchat::rpc::qr::generate_qr_key();
     let _ = sqlx::query(
         r#"
-        INSERT INTO privchat_users (user_id, username, display_name)
-        VALUES ($1, $2, $2)
+        INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+        VALUES ($1, $2, $2, $3)
         ON CONFLICT (user_id) DO UPDATE
         SET username = EXCLUDED.username,
             display_name = EXCLUDED.display_name
@@ -45,16 +47,19 @@ async fn ensure_user(pool: &sqlx::PgPool, user_id: i64, username: &str) {
     )
     .bind(user_id)
     .bind(username)
+    .bind(&qr_key)
     .execute(pool)
     .await
     .expect("ensure user");
 }
 
 async fn ensure_group(pool: &sqlx::PgPool, group_id: i64, owner_id: i64, name: &str) {
+    // QR_CODE_SPEC v1.3：privchat_groups.qr_key NOT NULL
+    let qr_key = privchat::rpc::qr::generate_qr_key();
     let _ = sqlx::query(
         r#"
-        INSERT INTO privchat_groups (group_id, owner_id, name, description)
-        VALUES ($1, $2, $3, 'sync-version-test')
+        INSERT INTO privchat_groups (group_id, owner_id, name, description, qr_key)
+        VALUES ($1, $2, $3, 'sync-version-test', $4)
         ON CONFLICT (group_id) DO UPDATE
         SET owner_id = EXCLUDED.owner_id,
             name = EXCLUDED.name
@@ -63,6 +68,7 @@ async fn ensure_group(pool: &sqlx::PgPool, group_id: i64, owner_id: i64, name: &
     .bind(group_id)
     .bind(owner_id)
     .bind(name)
+    .bind(&qr_key)
     .execute(pool)
     .await
     .expect("ensure group");

@@ -29,6 +29,7 @@ use crate::model::channel::{
     CreateChannelRequest, MemberRole,
 };
 use crate::repository::{ChannelRepository, PgChannelRepository};
+use crate::rpc::qr::{generate_qr_key, is_qr_key_unique_violation};
 
 /// 最后消息预览
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1503,12 +1504,17 @@ impl ChannelService {
                     }
                 };
 
+                // QR_CODE_SPEC v1.3：群创建时生成 qr_key opaque token。16-base62 ≈ 95 bits 熵，
+                // 碰撞概率 ~ 1/10^16，单次生成即可；若极端碰撞则整个事务失败回滚，
+                // 用户重试一次几乎必然成功。retry loop 不放在事务内是为了避免 SAVEPOINT
+                // 复杂度——存储侧 UNIQUE 约束已经兜底数据正确性。
+                let qr_key = generate_qr_key();
                 let group_id = match sqlx::query_as::<_, (i64,)>(
                     r#"
                     INSERT INTO privchat_groups (
-                        name, description, owner_id, member_count, created_at, updated_at
+                        name, description, owner_id, member_count, created_at, updated_at, qr_key
                     )
-                    VALUES ($1, $2, $3, 0, $4, $4)
+                    VALUES ($1, $2, $3, 0, $4, $4, $5)
                     RETURNING group_id
                     "#,
                 )
@@ -1516,12 +1522,18 @@ impl ChannelService {
                 .bind(group_description.as_deref())
                 .bind(creator_id as i64)
                 .bind(now)
+                .bind(&qr_key)
                 .fetch_one(&mut *tx)
                 .await
                 {
                     Ok(row) => row.0 as u64,
                     Err(e) => {
-                        error!("❌ 创建群组记录失败: {}", e);
+                        let qr_collision = is_qr_key_unique_violation(&e);
+                        if qr_collision {
+                            error!("❌ 创建群组记录失败（qr_key 碰撞，极罕见）: {}", e);
+                        } else {
+                            error!("❌ 创建群组记录失败: {}", e);
+                        }
                         let _ = tx.rollback().await;
                         return Ok(ChannelResponse {
                             channel: Channel::new_direct(0, 0, 0),
@@ -1788,12 +1800,16 @@ impl ChannelService {
                     }
                 };
 
+                // QR_CODE_SPEC v1.3：同上，群创建时生成 qr_key。`ON CONFLICT (group_id) DO NOTHING`
+                // 保证幂等：如果该 group_id 行已存在，本次 INSERT 跳过（不会因 qr_key 与已有行
+                // 冲突而失败，因为 ON CONFLICT 优先匹配 group_id PK）。
+                let qr_key = generate_qr_key();
                 let group_created = match sqlx::query(
                     r#"
                     INSERT INTO privchat_groups (
-                        group_id, name, description, owner_id, member_count, created_at, updated_at
+                        group_id, name, description, owner_id, member_count, created_at, updated_at, qr_key
                     )
-                    VALUES ($1, $2, $3, $4, 0, $5, $5)
+                    VALUES ($1, $2, $3, $4, 0, $5, $5, $6)
                     ON CONFLICT (group_id) DO NOTHING
                     "#,
                 )
@@ -1802,6 +1818,7 @@ impl ChannelService {
                 .bind(request.description.as_ref())
                 .bind(creator_id as i64)
                 .bind(now)
+                .bind(&qr_key)
                 .execute(&mut *tx)
                 .await
                 {
@@ -3652,10 +3669,12 @@ mod tests {
     }
 
     async fn ensure_user(service: &ChannelService, user_id: u64, username: &str) {
+        // QR_CODE_SPEC v1.3：privchat_users.qr_key NOT NULL，测试 helper 必须填值。
+        let qr_key = generate_qr_key();
         let _ = sqlx::query(
             r#"
-            INSERT INTO privchat_users (user_id, username, display_name)
-            VALUES ($1, $2, $2)
+            INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+            VALUES ($1, $2, $2, $3)
             ON CONFLICT (user_id) DO UPDATE
             SET username = EXCLUDED.username,
                 display_name = EXCLUDED.display_name
@@ -3663,16 +3682,20 @@ mod tests {
         )
         .bind(user_id as i64)
         .bind(username)
+        .bind(&qr_key)
         .execute(service.pool())
         .await
         .expect("ensure user");
     }
 
     async fn ensure_group(service: &ChannelService, group_id: u64, owner_id: u64, name: &str) {
+        // QR_CODE_SPEC v1.3：测试 helper 也必须填 qr_key（NOT NULL 约束）。
+        // 单一 generate_qr_key()，碰撞重试由整个测试运行外部包覆即可。
+        let qr_key = generate_qr_key();
         let _ = sqlx::query(
             r#"
-            INSERT INTO privchat_groups (group_id, owner_id, name, description)
-            VALUES ($1, $2, $3, 'channel-service-test')
+            INSERT INTO privchat_groups (group_id, owner_id, name, description, qr_key)
+            VALUES ($1, $2, $3, 'channel-service-test', $4)
             ON CONFLICT (group_id) DO UPDATE
             SET owner_id = EXCLUDED.owner_id,
                 name = EXCLUDED.name
@@ -3681,6 +3704,7 @@ mod tests {
         .bind(group_id as i64)
         .bind(owner_id as i64)
         .bind(name)
+        .bind(&qr_key)
         .execute(service.pool())
         .await
         .expect("ensure group");
