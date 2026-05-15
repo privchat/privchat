@@ -111,6 +111,21 @@ pub struct ServerConfig {
     /// 校验：cid / ct / did / scope / exp 都必校验。
     #[serde(default)]
     pub room_ticket: Option<RoomTicketConfig>,
+    /// QR 二维码 URL 基址（spec 02-server/QR_CODE_SPEC v1.3 §7.2）。
+    ///
+    /// 用于拼 `qr_code` 响应字段：`{qr_base_url}/privchat:protocol/<entity>/<action>?qrkey=...`
+    ///
+    /// 部署方可覆写为自有品牌域名，可带 sub-path（`https://example.com/app`），
+    /// 但**不能**已经带 `/privchat:protocol` 前缀（builder 会双拼）。
+    ///
+    /// 启动期 normalize 由 [`crate::rpc::qr::normalize_qr_base_url`] 完成，
+    /// 校验失败 server 拒启动。
+    #[serde(default = "default_qr_base_url")]
+    pub qr_base_url: String,
+}
+
+fn default_qr_base_url() -> String {
+    "https://privchat.app".to_string()
 }
 
 /// JWT 算法（配置 `[auth.jwt] algorithm`）。
@@ -294,6 +309,7 @@ impl Default for ServerConfig {
             jwt: JwtConfig::default(),
             server_event: None,
             room_ticket: None,
+            qr_base_url: default_qr_base_url(),
         }
     }
 }
@@ -648,6 +664,11 @@ impl ServerConfig {
             self.push.meizu.endpoint = Some(endpoint);
         }
 
+        // QR_CODE_SPEC v1.3 — 二维码 URL 基址环境覆盖
+        if let Ok(qr_base_url) = env::var("PRIVCHAT_QR_BASE_URL") {
+            self.qr_base_url = qr_base_url;
+        }
+
         Ok(())
     }
 
@@ -754,6 +775,13 @@ impl ServerConfig {
 
         // 5. 校验必填项
         config.validate()?;
+
+        // 6. QR_CODE_SPEC v1.3 §7.2：qr_base_url 启动期 normalize（trim、去尾斜杠、
+        //    scheme 校验、禁止预拼 /privchat:protocol）。生产环境强制 https。
+        //    failure → server 拒启动。
+        let require_https = matches!(cli.env.as_deref(), Some("production") | Some("prod"));
+        config.qr_base_url = crate::rpc::qr::normalize_qr_base_url(&config.qr_base_url, require_https)
+            .map_err(|e| anyhow::anyhow!("[qr_base_url] {}", e))?;
 
         Ok(config)
     }

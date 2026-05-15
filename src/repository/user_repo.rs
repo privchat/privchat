@@ -19,6 +19,7 @@
 
 use crate::error::DatabaseError;
 use crate::model::user::User;
+use crate::rpc::qr::{generate_qr_key, is_qr_key_unique_violation, QR_KEY_MAX_GENERATION_RETRIES};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -368,49 +369,70 @@ impl UserRepository {
             }
         }
 
-        let result = sqlx::query!(
-            r#"
-            INSERT INTO privchat_users (
-                username, password_hash, phone, email, display_name, avatar_url,
-                user_type, status, privacy_settings, created_at, updated_at, last_active_at,
-                business_system_id
+        // QR_CODE_SPEC v1.3：每行 INSERT 都生成一个新的 qr_key；与 qr_key UNIQUE
+        // 约束的冲突走重试（理论概率 ≈ 1/2^95，但仍保留 5 次防御性兜底）；
+        // username/email/phone 等其他 UNIQUE 冲突仍按原有的 DuplicateEntry 返回。
+        let mut last_err: Option<sqlx::Error> = None;
+        for _ in 0..QR_KEY_MAX_GENERATION_RETRIES {
+            let qr_key = generate_qr_key();
+            let attempt = sqlx::query!(
+                r#"
+                INSERT INTO privchat_users (
+                    username, password_hash, phone, email, display_name, avatar_url,
+                    user_type, status, privacy_settings, created_at, updated_at, last_active_at,
+                    business_system_id, qr_key
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                RETURNING user_id
+                "#,
+                username,
+                password_hash,
+                phone,
+                email,
+                display_name,
+                avatar_url,
+                user_type,
+                status,
+                serde_json::to_value(&privacy_settings)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                created_at,
+                updated_at,
+                last_active_at,
+                business_system_id,
+                qr_key,
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING user_id
-            "#,
-            username,
-            password_hash,
-            phone,
-            email,
-            display_name,
-            avatar_url,
-            user_type,
-            status,
-            serde_json::to_value(&privacy_settings)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-            created_at,
-            updated_at,
-            last_active_at,
-            business_system_id,
-        )
-        .fetch_one(self.pool.as_ref())
-        .await
-        .map_err(|e| {
-            // PostgreSQL 23505 = unique_violation：转 DuplicateEntry，让 service 层走幂等兜底
-            if let sqlx::Error::Database(db_err) = &e {
-                if db_err.code().as_deref() == Some("23505") {
-                    return DatabaseError::DuplicateEntry(
-                        db_err.constraint().unwrap_or("unknown_unique").to_string(),
-                    );
+            .fetch_one(self.pool.as_ref())
+            .await;
+
+            match attempt {
+                Ok(row) => {
+                    let mut created_user = user.clone();
+                    created_user.id = row.user_id as u64;
+                    return Ok(created_user);
+                }
+                Err(e) if is_qr_key_unique_violation(&e) => {
+                    // 极小概率：重新生成 qr_key 再试
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    // 其他 23505 = username/email/phone 等业务级 UNIQUE 冲突
+                    if let sqlx::Error::Database(db_err) = &e {
+                        if db_err.code().as_deref() == Some("23505") {
+                            return Err(DatabaseError::DuplicateEntry(
+                                db_err.constraint().unwrap_or("unknown_unique").to_string(),
+                            ));
+                        }
+                    }
+                    return Err(DatabaseError::Database(format!("Failed to create user: {}", e)));
                 }
             }
-            DatabaseError::Database(format!("Failed to create user: {}", e))
-        })?;
-
-        // 返回创建的用户（包含数据库生成的 user_id）
-        let mut created_user = user.clone();
-        created_user.id = result.user_id as u64;
-        Ok(created_user)
+        }
+        // 5 次都撞 qr_key UNIQUE，极其罕见，把最后一次错抛出
+        Err(DatabaseError::Database(format!(
+            "Failed to create user: exhausted qr_key retries; last={:?}",
+            last_err
+        )))
     }
 
     /// 创建用户（指定 user_id，用于系统用户等特殊情况）
@@ -483,40 +505,62 @@ impl UserRepository {
             }
         }
 
-        let result = sqlx::query!(
-            r#"
-            INSERT INTO privchat_users (
-                user_id, username, password_hash, phone, email, display_name, avatar_url,
-                user_type, status, privacy_settings, created_at, updated_at, last_active_at,
-                business_system_id
+        // QR_CODE_SPEC v1.3：同 `create()`，对 qr_key UNIQUE 冲突做重试。
+        let mut last_err: Option<sqlx::Error> = None;
+        for _ in 0..QR_KEY_MAX_GENERATION_RETRIES {
+            let qr_key = generate_qr_key();
+            let attempt = sqlx::query!(
+                r#"
+                INSERT INTO privchat_users (
+                    user_id, username, password_hash, phone, email, display_name, avatar_url,
+                    user_type, status, privacy_settings, created_at, updated_at, last_active_at,
+                    business_system_id, qr_key
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                RETURNING user_id
+                "#,
+                user_id as i64,
+                username,
+                password_hash,
+                phone,
+                email,
+                display_name,
+                avatar_url,
+                user_type,
+                status,
+                serde_json::to_value(&privacy_settings)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                created_at,
+                updated_at,
+                last_active_at,
+                business_system_id,
+                qr_key,
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            RETURNING user_id
-            "#,
-            user_id as i64,
-            username,
-            password_hash,
-            phone,
-            email,
-            display_name,
-            avatar_url,
-            user_type,
-            status,
-            serde_json::to_value(&privacy_settings)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-            created_at,
-            updated_at,
-            last_active_at,
-            business_system_id,
-        )
-        .fetch_one(self.pool.as_ref())
-        .await
-        .map_err(|e| DatabaseError::Database(format!("Failed to create user with id: {}", e)))?;
+            .fetch_one(self.pool.as_ref())
+            .await;
 
-        // 返回创建的用户
-        let mut created_user = user.clone();
-        created_user.id = result.user_id as u64;
-        Ok(created_user)
+            match attempt {
+                Ok(row) => {
+                    let mut created_user = user.clone();
+                    created_user.id = row.user_id as u64;
+                    return Ok(created_user);
+                }
+                Err(e) if is_qr_key_unique_violation(&e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(DatabaseError::Database(format!(
+                        "Failed to create user with id: {}",
+                        e
+                    )));
+                }
+            }
+        }
+        Err(DatabaseError::Database(format!(
+            "Failed to create user with id: exhausted qr_key retries; last={:?}",
+            last_err
+        )))
     }
 
     /// 更新用户

@@ -865,10 +865,12 @@ mod tests {
     }
 
     async fn ensure_user(pool: &PgPool, user_id: u64, username: &str) {
+        // QR_CODE_SPEC v1.3：privchat_users.qr_key NOT NULL，测试 helper 必须填值。
+        let qr_key = crate::rpc::qr::generate_qr_key();
         sqlx::query(
             r#"
-            INSERT INTO privchat_users (user_id, username, display_name)
-            VALUES ($1, $2, $2)
+            INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+            VALUES ($1, $2, $2, $3)
             ON CONFLICT (user_id) DO UPDATE
             SET username = EXCLUDED.username,
                 display_name = EXCLUDED.display_name
@@ -876,6 +878,7 @@ mod tests {
         )
         .bind(user_id as i64)
         .bind(username)
+        .bind(&qr_key)
         .execute(pool)
         .await
         .expect("ensure user");

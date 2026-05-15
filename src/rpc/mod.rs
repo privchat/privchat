@@ -31,6 +31,7 @@ pub mod file;
 pub mod group;
 pub mod message;
 pub mod presence;
+pub mod qr; // QR_CODE_SPEC v1.3 — user/group qr_key 永久字段 + URL builder（与历史 qrcode 模块解耦）
 pub mod qr_login;
 pub mod qrcode;
 pub mod sticker;
