@@ -160,6 +160,38 @@ impl FriendService {
             .map(|_| ())
     }
 
+    /// 拒绝好友申请——删除 pending row（status=0）。
+    ///
+    /// 语义：让申请人可以重新申请（friendships PK 是 (user_id, friend_id)，
+    /// 重新 apply 会走 INSERT，原行已删）。**不**触碰已 accepted 的行。
+    ///
+    /// 返回 `true` 表示有 pending 行被删除；`false` 表示没找到 pending（可能
+    /// 申请已过期 / 已被接受 / 从未存在）—— 调用方据此决定提示语义。
+    pub async fn reject_friend_request(
+        &self,
+        user_id: u64,
+        from_user_id: u64,
+    ) -> Result<bool> {
+        info!("🛑 用户 {} 拒绝来自 {} 的好友申请", user_id, from_user_id);
+
+        let affected = sqlx::query(
+            r#"
+            DELETE FROM privchat_friendships
+            WHERE user_id = $1
+              AND friend_id = $2
+              AND status = 0
+            "#,
+        )
+        .bind(from_user_id as i64)
+        .bind(user_id as i64)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("Failed to reject friend request: {}", e)))?
+        .rows_affected();
+
+        Ok(affected > 0)
+    }
+
     /// 检查接受好友申请的状态
     pub async fn check_accept_state(&self, user_id: u64, from_user_id: u64) -> FriendAcceptState {
         if self.is_friend(user_id, from_user_id).await {
