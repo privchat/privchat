@@ -58,7 +58,7 @@ use crate::error::Result;
 
 /// HTTP API 统一响应信封
 ///
-/// 所有 `/api/service/*` 与 `/api/admin/*` 的响应都使用本结构。
+/// 所有 `/api/service/*` 与 `/api/service/*` 的响应都使用本结构。
 #[derive(Debug, Serialize)]
 pub struct ApiEnvelope<T> {
     /// 错误码：0 表示成功，非 0 表示错误（来自 `protocol::ErrorCode`）

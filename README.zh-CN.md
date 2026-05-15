@@ -384,10 +384,10 @@ privchat-server --dev
 
 与 HTTP 文件服务共用同一端口（配置项 `file.server_port`，默认 9083），使用 `X-Service-Key` 认证：
 
-- `POST/GET /api/admin/users`、`/api/admin/users/{user_id}` - 用户管理
-- `GET/DELETE /api/admin/groups`、`/api/admin/groups/{group_id}` - 群组管理
-- `POST/GET /api/admin/friendships`、`/api/admin/friendships`、`/api/admin/friendships/user/{user_id}` - 好友关系
-- `GET /api/admin/login-logs`、`/api/admin/devices`、`/api/admin/stats/*`、`/api/admin/messages` 等
+- `POST/GET /api/service/users`、`/api/service/users/{user_id}` - 用户管理
+- `GET/DELETE /api/service/groups`、`/api/service/groups/{group_id}` - 群组管理
+- `POST/GET /api/service/friendships`、`/api/service/friendships`、`/api/service/friendships/user/{user_id}` - 好友关系
+- `GET /api/service/login-logs`、`/api/service/devices`、`/api/service/stats/*`、`/api/service/messages` 等
 
 详见 `scripts/README.md` 与 `scripts/test_admin_api.py`。
 

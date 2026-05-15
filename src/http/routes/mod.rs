@@ -21,9 +21,10 @@
 //! - 文件服务（端口 9083，对外）：
 //!   - `/api/app/files/upload` - 文件上传
 //!   - `/metrics` - Prometheus 指标
-//! - 管理 API（端口 9090，仅内网）：
-//!   - `/api/admin/*` - 管理接口 legacy 前缀（向后兼容）
-//!   - `/api/service/*` - 管理接口 v1.2 前缀（与 legacy 完全等价）
+//! - Service API（端口 9090，仅内网）：
+//!   - `/api/service/*` - 服务对服务的内网管理接口（统一前缀，X-Service-Key 鉴权）
+//!
+//! 历史 `/api/admin/*` 前缀已于 v1.3 移除（spec SERVICE_API_SPEC v1.3）。
 
 pub mod admin;
 pub mod auth;
@@ -43,17 +44,16 @@ pub fn create_file_routes() -> Router<FileServerState> {
         .merge(upload::create_route())
 }
 
-/// 创建管理 API 路由
+/// 创建 Service API 路由（统一 `/api/service/*` 前缀）。
 ///
-/// 同 handler 同时挂载到 `/api/admin` 和 `/api/service` 两个前缀下，行为完全一致。
-/// `/api/admin` 是 v1.0/v1.1 兼容前缀；`/api/service` 是 v1.2 推荐前缀。
+/// 历史 `/api/admin/*` 前缀已于 v1.3 移除（spec SERVICE_API_SPEC v1.3）。
+/// 所有内网 service-to-service 接口都走 X-Service-Key 鉴权，权限一致。
 ///
 /// `/api/service/auth/*` 是 spec TOKEN_UNIFICATION_SPEC v1.3 §6.1 unified token API：
 /// - `/auth/issue|refresh|introspect|revoke` 走 service-key（在 handler 里 `verify_service_key`）
 /// - `/auth/jwks` **不**走 service master key（公钥发布，安全边界在私钥）
 pub fn create_admin_routes() -> Router<AdminServerState> {
     Router::new()
-        .nest("/api/admin", admin::create_route())
         .nest("/api/service", admin::create_route())
         .nest("/api/service/auth", auth::create_route())
         .route("/api/service/auth/jwks", get(auth_jwks::handler))

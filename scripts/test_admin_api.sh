@@ -73,7 +73,7 @@ test_create_user() {
 EOF
 )
     
-    local response=$(make_request "POST" "/api/admin/users" "$data")
+    local response=$(make_request "POST" "/api/service/users" "$data")
     local http_code=$(echo "$response" | tail -n1)
     local body=$(echo "$response" | sed '$d')
     
@@ -92,7 +92,7 @@ EOF
 test_list_users() {
     log_info "获取用户列表"
     
-    local response=$(make_request "GET" "/api/admin/users?page=1&page_size=10")
+    local response=$(make_request "GET" "/api/service/users?page=1&page_size=10")
     local http_code=$(echo "$response" | tail -n1)
     local body=$(echo "$response" | sed '$d')
     
@@ -121,7 +121,7 @@ test_create_friendship() {
 EOF
 )
     
-    local response=$(make_request "POST" "/api/admin/friendships" "$data")
+    local response=$(make_request "POST" "/api/service/friendships" "$data")
     local http_code=$(echo "$response" | tail -n1)
     local body=$(echo "$response" | sed '$d')
     
@@ -138,7 +138,7 @@ EOF
 test_get_stats() {
     log_info "获取系统统计"
     
-    local response=$(make_request "GET" "/api/admin/stats")
+    local response=$(make_request "GET" "/api/service/stats")
     local http_code=$(echo "$response" | tail -n1)
     local body=$(echo "$response" | sed '$d')
     

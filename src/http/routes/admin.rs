@@ -20,8 +20,8 @@
 //! 统一的管理接口，使用 X-Service-Key 进行安全认证
 //!
 //! 路径前缀：本模块返回相对路径（如 `/users`），由 `routes::create_admin_routes`
-//! 通过 axum `nest()` 同时挂载到 `/api/admin/*`（legacy）和 `/api/service/*`（v1.2）
-//! 两个前缀下，行为完全一致。下方 handler 文档里 `/api/admin/...` 的示例同样适用
+//! 通过 axum `nest()` 同时挂载到 `/api/service/*`（legacy）和 `/api/service/*`（v1.2）
+//! 两个前缀下，行为完全一致。下方 handler 文档里 `/api/service/...` 的示例同样适用
 //! `/api/service/...`。
 //!
 //! 包含以下管理功能：
@@ -245,9 +245,9 @@ pub(crate) async fn verify_service_key(headers: &HeaderMap, state: &AdminServerS
 /// 3. JWT token 中已绑定 `device_id`，连接时验证会检查一致性，不匹配将拒绝连接
 ///
 /// **注意**：如果需要管理员为用户签发 token（管理层面），可以添加新接口：
-/// - `POST /api/admin/users/{user_id}/token` - 管理员为用户签发 token
+/// - `POST /api/service/users/{user_id}/token` - 管理员为用户签发 token
 ///
-/// POST /api/admin/token/issue
+/// POST /api/service/token/issue
 /// Headers: X-Service-Key: <service_key>
 /// Body: IssueTokenRequest
 ///
@@ -334,7 +334,7 @@ struct UidScopedIssueTokenRequest {
 ///
 /// `POST /api/service/users/{user_id}/tokens`
 ///
-/// 跟老的 `POST /api/admin/token/issue` 等价，但路径上把 uid 显式从 body 提到 path，
+/// 跟老的 `POST /api/service/token/issue` 等价，但路径上把 uid 显式从 body 提到 path，
 /// 同时返回 `session_version` + `device_created`。老路径保留为 deprecated alias。
 async fn issue_token_for_user(
     State(state): State<AdminServerState>,
@@ -500,7 +500,7 @@ struct CreateUserRequest {
 
 /// 创建用户（多键幂等）
 ///
-/// `POST /api/service/users`（v1.2）/ `POST /api/admin/users`（兼容别名）
+/// `POST /api/service/users`（v1.2）/ `POST /api/service/users`（兼容别名）
 ///
 /// 行为详见 USER_API §3：phone > email > username 顺序判幂等；命中已有用户返回
 /// `created=false` + 不覆盖任何字段；全空合法。
@@ -569,7 +569,7 @@ struct UserListQuery {
 
 /// 获取用户列表
 ///
-/// GET /api/admin/users?page=1&page_size=20&search=alice
+/// GET /api/service/users?page=1&page_size=20&search=alice
 async fn list_users(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -623,7 +623,7 @@ async fn list_users(
 
 /// 获取用户详情
 ///
-/// GET /api/admin/users/:user_id
+/// GET /api/service/users/:user_id
 async fn get_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -655,7 +655,7 @@ async fn get_user(
 
 /// 更新用户信息
 ///
-/// PUT /api/admin/users/:user_id
+/// PUT /api/service/users/:user_id
 ///
 /// `username` 是 application member 改名的镜像通道（spec
 /// MODULE_MEMBER_PROFILE_SPEC §7.1）：server 不做格式校验、保留词、频控；
@@ -711,7 +711,7 @@ async fn update_user(
 
 /// 删除/禁用用户
 ///
-/// DELETE /api/admin/users/:user_id
+/// DELETE /api/service/users/:user_id
 async fn delete_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -734,7 +734,7 @@ async fn delete_user(
 
 /// 获取群组列表
 ///
-/// GET /api/admin/groups?page=1&page_size=20
+/// GET /api/service/groups?page=1&page_size=20
 async fn list_groups(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -768,7 +768,7 @@ async fn list_groups(
 
 /// 获取群组详情
 ///
-/// GET /api/admin/groups/:group_id
+/// GET /api/service/groups/:group_id
 async fn get_group(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -790,7 +790,7 @@ async fn get_group(
 
 /// 解散群组
 ///
-/// DELETE /api/admin/groups/:group_id
+/// DELETE /api/service/groups/:group_id
 async fn dissolve_group(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -822,7 +822,7 @@ use crate::infra::next_channel_id;
 
 /// 创建 Room 频道
 ///
-/// POST /api/admin/room
+/// POST /api/service/room
 async fn create_room_channel(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -850,7 +850,7 @@ async fn create_room_channel(
 
 /// 获取 Room 频道列表
 ///
-/// GET /api/admin/room?page=1&page_size=20
+/// GET /api/service/room?page=1&page_size=20
 async fn list_room_channels(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -898,7 +898,7 @@ async fn list_room_channels(
 
 /// 获取 Room 频道详情
 ///
-/// GET /api/admin/room/:channel_id
+/// GET /api/service/room/:channel_id
 async fn get_room_channel(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -916,7 +916,7 @@ async fn get_room_channel(
 
 /// Room 频道广播
 ///
-/// POST /api/admin/room/:channel_id/broadcast
+/// POST /api/service/room/:channel_id/broadcast
 async fn room_broadcast(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1030,7 +1030,7 @@ async fn room_broadcast(
 
 /// 创建好友关系
 ///
-/// POST /api/admin/friendships
+/// POST /api/service/friendships
 ///
 /// 让两个用户成为好友，并自动创建私聊会话
 async fn create_friendship(
@@ -1072,7 +1072,7 @@ async fn create_friendship(
 
 /// 获取好友关系列表
 ///
-/// GET /api/admin/friendships?page=1&page_size=20
+/// GET /api/service/friendships?page=1&page_size=20
 ///
 /// 注意：好友关系存储在内存中（FriendService），这里通过私聊会话推断好友关系
 async fn list_friendships(
@@ -1108,7 +1108,7 @@ async fn list_friendships(
 
 /// 获取用户的好友列表
 ///
-/// GET /api/admin/friendships/:user_id
+/// GET /api/service/friendships/:user_id
 ///
 /// 通过私聊会话推断用户的好友列表
 async fn get_user_friends(
@@ -1150,7 +1150,7 @@ async fn get_user_friends(
 
 /// 获取用户加入的群组列表
 ///
-/// GET /api/admin/users/:user_id/groups
+/// GET /api/service/users/:user_id/groups
 async fn get_user_groups(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1188,7 +1188,7 @@ struct LoginLogQuery {
 
 /// 获取登录日志列表
 ///
-/// GET /api/admin/login-logs?user_id=123&page=1&page_size=20
+/// GET /api/service/login-logs?user_id=123&page=1&page_size=20
 async fn list_login_logs(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1246,7 +1246,7 @@ async fn list_login_logs(
 
 /// 获取登录日志详情
 ///
-/// GET /api/admin/login-logs/:log_id
+/// GET /api/service/login-logs/:log_id
 async fn get_login_log(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1297,7 +1297,7 @@ async fn get_login_log(
 
 /// 获取设备列表
 ///
-/// GET /api/admin/devices?user_id=123&page=1&page_size=20
+/// GET /api/service/devices?user_id=123&page=1&page_size=20
 async fn list_devices(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1359,7 +1359,7 @@ async fn list_devices(
 
 /// 获取设备详情
 ///
-/// GET /api/admin/devices/:device_id
+/// GET /api/service/devices/:device_id
 async fn get_device(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1402,7 +1402,7 @@ async fn get_device(
 
 /// 获取用户的所有设备
 ///
-/// GET /api/admin/devices/user/:user_id
+/// GET /api/service/devices/user/:user_id
 async fn get_user_devices(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1456,7 +1456,7 @@ async fn get_user_devices(
 
 /// 获取系统统计信息
 ///
-/// GET /api/admin/stats
+/// GET /api/service/stats
 async fn get_stats(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1503,7 +1503,7 @@ async fn get_stats(
 
 /// 获取用户统计
 ///
-/// GET /api/admin/stats/users
+/// GET /api/service/stats/users
 async fn get_user_stats(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1521,7 +1521,7 @@ async fn get_user_stats(
 
 /// 获取群组统计
 ///
-/// GET /api/admin/stats/groups
+/// GET /api/service/stats/groups
 async fn get_group_stats(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1539,7 +1539,7 @@ async fn get_group_stats(
 
 /// 获取消息统计
 ///
-/// GET /api/admin/stats/messages
+/// GET /api/service/stats/messages
 async fn get_message_stats(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1568,7 +1568,7 @@ struct MessageQuery {
 
 /// 获取消息列表
 ///
-/// GET /api/admin/messages?channel_id=123&user_id=456&page=1&page_size=20
+/// GET /api/service/messages?channel_id=123&user_id=456&page=1&page_size=20
 async fn list_messages(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1601,7 +1601,7 @@ async fn list_messages(
 
 /// 获取消息详情
 ///
-/// GET /api/admin/messages/:message_id
+/// GET /api/service/messages/:message_id
 async fn get_message(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1624,7 +1624,7 @@ async fn get_message(
 
 /// 封禁用户
 ///
-/// POST /api/admin/users/:user_id/suspend
+/// POST /api/service/users/:user_id/suspend
 async fn suspend_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1649,7 +1649,7 @@ async fn suspend_user(
 
 /// 解封用户
 ///
-/// POST /api/admin/users/:user_id/unsuspend
+/// POST /api/service/users/:user_id/unsuspend
 async fn unsuspend_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1674,7 +1674,7 @@ async fn unsuspend_user(
 
 /// 踢出指定设备
 ///
-/// POST /api/admin/devices/:device_id/revoke
+/// POST /api/service/devices/:device_id/revoke
 async fn revoke_device(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1699,7 +1699,7 @@ async fn revoke_device(
 
 /// 撤销用户的全部设备
 ///
-/// POST /api/admin/users/:user_id/revoke-all-devices
+/// POST /api/service/users/:user_id/revoke-all-devices
 async fn revoke_all_user_devices(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1728,7 +1728,7 @@ async fn revoke_all_user_devices(
 
 /// 获取群组成员列表
 ///
-/// GET /api/admin/groups/:group_id/members
+/// GET /api/service/groups/:group_id/members
 async fn list_group_members(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1761,7 +1761,7 @@ async fn list_group_members(
 
 /// 移除群组成员
 ///
-/// DELETE /api/admin/groups/:group_id/members/:user_id
+/// DELETE /api/service/groups/:group_id/members/:user_id
 async fn remove_group_member(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1784,7 +1784,7 @@ async fn remove_group_member(
 
 /// 更新群成员角色（管理 API，仅 Admin / Member 互切；Owner 不允许通过此接口设置）
 ///
-/// PUT /api/admin/groups/:group_id/members/:user_id/role
+/// PUT /api/service/groups/:group_id/members/:user_id/role
 /// body: { "role": "admin" | "member" }
 #[derive(Debug, serde::Deserialize)]
 struct SetMemberRoleRequest {
@@ -1835,7 +1835,7 @@ async fn set_group_member_role(
 
 /// 管理员撤回消息
 ///
-/// POST /api/admin/messages/:message_id/revoke
+/// POST /api/service/messages/:message_id/revoke
 ///
 /// admin 入口只做权限校验（`verify_service_key`）+ 委托到 `MessageService::revoke_message_admin`。
 /// 跳过发送者/48h 限制，但共享 RPC 侧同一套副作用编排（事件/缓存/PTS/推送/离线清理）。
@@ -1864,7 +1864,7 @@ async fn revoke_message(
 
 /// 发送系统消息
 ///
-/// POST /api/admin/messages/send-system
+/// POST /api/service/messages/send-system
 async fn send_system_message(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -1912,7 +1912,7 @@ async fn send_system_message(
 
 /// 发送系统消息到指定用户（私聊形式）
 ///
-/// POST /api/admin/system-messages/send-to-user
+/// POST /api/service/system-messages/send-to-user
 ///
 /// body: { "user_id": <u64>, "content": <string>, "message_type": "text"?, "metadata": {}? }
 ///
@@ -1982,7 +1982,7 @@ async fn send_system_message_to_user(
 
 /// 获取 Shadow Ban 用户列表
 ///
-/// GET /api/admin/security/shadow-banned
+/// GET /api/service/security/shadow-banned
 async fn list_shadow_banned(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2010,7 +2010,7 @@ async fn list_shadow_banned(
 
 /// 解除用户的 Shadow Ban
 ///
-/// DELETE /api/admin/security/shadow-ban/:user_id
+/// DELETE /api/service/security/shadow-ban/:user_id
 async fn unshadow_ban_user(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2040,7 +2040,7 @@ async fn unshadow_ban_user(
 
 /// 获取用户安全状态
 ///
-/// GET /api/admin/security/users/:user_id/state
+/// GET /api/service/security/users/:user_id/state
 async fn get_user_security_state(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2081,7 +2081,7 @@ async fn get_user_security_state(
 
 /// 重置用户安全状态
 ///
-/// POST /api/admin/security/users/:user_id/reset
+/// POST /api/service/security/users/:user_id/reset
 async fn reset_user_security_state(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2115,7 +2115,7 @@ async fn reset_user_security_state(
 
 /// 获取在线连接数
 ///
-/// GET /api/admin/presence/online-count
+/// GET /api/service/presence/online-count
 async fn get_online_count(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2135,7 +2135,7 @@ async fn get_online_count(
 
 /// 健康检查
 ///
-/// GET /api/admin/system/health
+/// GET /api/service/system/health
 async fn health_check(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2158,7 +2158,7 @@ async fn health_check(
 
 /// 管理端发送消息（可指定发送者）
 ///
-/// POST /api/admin/messages/send
+/// POST /api/service/messages/send
 ///
 /// 与 send-system 不同，此接口允许指定任意 sender_id 作为消息发送者。
 /// 用于业务系统让某个用户给另一个用户发消息的场景。
@@ -2228,7 +2228,7 @@ async fn send_message(
 
 /// 添加用户到群组
 ///
-/// POST /api/admin/groups/:group_id/members
+/// POST /api/service/groups/:group_id/members
 ///
 /// 自动添加用户到群组并发送系统公告 "[XXX加入了本群]"
 async fn add_group_member(
@@ -2259,7 +2259,7 @@ async fn add_group_member(
 
 /// 获取在线用户列表
 ///
-/// GET /api/admin/presence/users
+/// GET /api/service/presence/users
 ///
 /// 返回当前所有在线用户及其设备信息
 async fn list_online_users(
@@ -2305,7 +2305,7 @@ async fn list_online_users(
 
 /// 获取指定用户的连接详情
 ///
-/// GET /api/admin/presence/user/:user_id
+/// GET /api/service/presence/user/:user_id
 async fn get_user_connection(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2347,10 +2347,10 @@ async fn get_user_connection(
 
 /// 获取会话列表
 ///
-/// GET /api/admin/channels
+/// GET /api/service/channels
 /// 获取用户会话列表
 ///
-/// GET /api/admin/users/:user_id/channels
+/// GET /api/service/users/:user_id/channels
 async fn list_user_channels(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2410,7 +2410,7 @@ async fn list_user_channels(
 
 /// 获取会话详情
 ///
-/// GET /api/admin/channels/:channel_id
+/// GET /api/service/channels/:channel_id
 async fn get_channel(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2430,7 +2430,7 @@ async fn get_channel(
 
 /// 按两个用户 ID 查找他们之间的私聊频道。
 ///
-/// GET /api/admin/direct-channels/lookup?user_a=&user_b=
+/// GET /api/service/direct-channels/lookup?user_a=&user_b=
 ///
 /// 返回 `{ "channel_id": <u64> }` 或 404。供 admin 端"查 A 与 B 的聊天记录"
 /// 这条 UX 用：先 lookup 拿 channel_id，再走 list_messages 取消息。
@@ -2487,7 +2487,7 @@ async fn lookup_direct_channel(
 
 /// 获取会话参与者列表
 ///
-/// GET /api/admin/channels/:channel_id/participants
+/// GET /api/service/channels/:channel_id/participants
 async fn list_channel_participants(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2518,7 +2518,7 @@ async fn list_channel_participants(
 
 /// 全局广播消息
 ///
-/// POST /api/admin/messages/broadcast
+/// POST /api/service/messages/broadcast
 async fn broadcast_message(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2550,7 +2550,7 @@ async fn broadcast_message(
 
 /// 搜索消息
 ///
-/// GET /api/admin/messages/search
+/// GET /api/service/messages/search
 async fn search_messages(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
@@ -2621,7 +2621,7 @@ async fn search_messages(
 
 /// 列出 user_type ∈ {System, Bot} 的所有用户，作为 admin 系统消息可用 sender 列表。
 ///
-/// GET /api/admin/system-messages/senders
+/// GET /api/service/system-messages/senders
 async fn list_system_senders(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
