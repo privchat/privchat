@@ -17,6 +17,9 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
+use privchat_protocol::inbox_event::{
+    payloads::FriendRequestReceivedPayload, topics, UserInboxEventEnvelope,
+};
 use privchat_protocol::rpc::contact::friend::FriendApplyRequest;
 use serde_json::{json, Value};
 
@@ -230,17 +233,38 @@ pub async fn handle(
 
                     // 实时通知对方"收到新好友申请"。
                     //
-                    // 设计：复用 PushMessageRequest 通道（与 message.revoke 同一套），
-                    // 用 topic="friend.request.received" 识别。SDK 侧拦截此 topic 并发出
-                    // SyncEntityChanged{entity_type="friend_request"}，Kotlin 上层据此
-                    // 触发 enqueueFriendRequestRefresh —— `friend/pending` RPC 重新拉。
+                    // 设计：复用 PushMessageRequest 通道，topic="friend.request.received"。
+                    // payload 必须是 UserInboxEventEnvelope v1（spec/05-feature/
+                    // USER_INBOX_EVENT_ENVELOPE_SPEC.md）—— **禁止手拼 JSON**，所有结构
+                    // 体均在 privchat-protocol 中定义。
                     //
-                    // **不进 DB / 不进离线队列**——好友申请已经写库，对方离线时下次开机
-                    // 会通过常规拉取 pending 列表看到。这里只是实时唤醒。
+                    // **v1 不变式**：
+                    // - 不进 DB / 不进离线队列；好友申请已经写 friendships，离线下次开机
+                    //   通过 `friend/pending` 全量补偿。这里只是在线唤醒。
+                    // - `event_id` 仅供客户端 dedupe，不可作 inbox diff cursor 使用。
+                    // - 事件类型由外层 topic 表达；envelope 不冗余 type 字段。
+                    // - `aggregate_id` 在接收人视角下唯一锁定一条 pending request：
+                    //   (receiver=self) 由 push 通道隐含，requester 即 from_user_id。
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
+                        .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
+                    let envelope = UserInboxEventEnvelope::new_v1(
+                        crate::infra::snowflake::next_message_id(),
+                        "friend_request",
+                        from_user_id.to_string(),
+                        now_ms,
+                        None,
+                        serde_json::to_value(FriendRequestReceivedPayload {
+                            requester_id: from_user_id,
+                            receiver_id: target_user_id,
+                            message: message.to_string(),
+                        })
+                        .expect("FriendRequestReceivedPayload is always serializable"),
+                    );
+                    let payload_bytes = envelope
+                        .to_json_bytes()
+                        .expect("UserInboxEventEnvelope is always serializable");
                     let push = privchat_protocol::protocol::PushMessageRequest {
                         setting: privchat_protocol::protocol::MessageSetting::default(),
                         msg_key: format!("friend_apply_{}_{}", from_user_id, target_user_id),
@@ -255,16 +279,9 @@ pub async fn handle(
                         channel_type: 0,
                         message_type: privchat_protocol::ContentMessageType::System.as_u32(),
                         expire: 0,
-                        topic: "friend.request.received".to_string(),
+                        topic: topics::FRIEND_REQUEST_RECEIVED.to_string(),
                         from_uid: from_user_id,
-                        payload: json!({
-                            "notification_type": "friend_request_received",
-                            "from_user_id": from_user_id,
-                            "message": message,
-                            "received_at": now_ms,
-                        })
-                        .to_string()
-                        .into_bytes(),
+                        payload: payload_bytes,
                         deleted: false,
                     };
                     if let Err(e) = services
