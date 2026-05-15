@@ -309,10 +309,10 @@ privchat-server --dev
 
 Same port as the file HTTP server (config `file.server_port`, default **9083**), authenticated with `X-Service-Key`:
 
-- `POST/GET /api/admin/users`, `/api/admin/users/{user_id}` – user management
-- `GET/DELETE /api/admin/groups`, `/api/admin/groups/{group_id}` – group management
-- `POST/GET /api/admin/friendships`, `/api/admin/friendships`, `/api/admin/friendships/user/{user_id}` – friendships
-- `GET /api/admin/login-logs`, `/api/admin/devices`, `/api/admin/stats/*`, `/api/admin/messages`, etc.
+- `POST/GET /api/service/users`, `/api/service/users/{user_id}` – user management
+- `GET/DELETE /api/service/groups`, `/api/service/groups/{group_id}` – group management
+- `POST/GET /api/service/friendships`, `/api/service/friendships`, `/api/service/friendships/user/{user_id}` – friendships
+- `GET /api/service/login-logs`, `/api/service/devices`, `/api/service/stats/*`, `/api/service/messages`, etc.
 
 See `scripts/README.md` and `scripts/test_admin_api.py`.
 

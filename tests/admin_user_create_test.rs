@@ -103,7 +103,7 @@ async fn post_create_user(client: &Client, path: &str, body: Value) -> EnvelopeR
 }
 
 async fn post_admin(client: &Client, body: Value) -> EnvelopeResp {
-    post_create_user(client, "/api/admin/users", body).await
+    post_create_user(client, "/api/service/users", body).await
 }
 
 async fn post_service(client: &Client, body: Value) -> EnvelopeResp {

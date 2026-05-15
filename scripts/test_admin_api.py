@@ -112,7 +112,7 @@ class AdminAPITester:
             "phone": phone
         }
         
-        success, result, error = self.make_request("POST", "/api/admin/users", data)
+        success, result, error = self.make_request("POST", "/api/service/users", data)
         
         if success and result.get("success"):
             user_id = result.get("user_id")
@@ -140,7 +140,7 @@ class AdminAPITester:
         self.log_info(f"获取用户列表: page={page}, page_size={page_size}")
         
         params = {"page": page, "page_size": page_size}
-        success, result, error = self.make_request("GET", "/api/admin/users", params)
+        success, result, error = self.make_request("GET", "/api/service/users", params)
         
         if success:
             users = result.get("users", [])
@@ -167,7 +167,7 @@ class AdminAPITester:
         """测试获取用户详情"""
         self.log_info(f"获取用户详情: user_id={user_id}")
         
-        success, result, error = self.make_request("GET", f"/api/admin/users/{user_id}")
+        success, result, error = self.make_request("GET", f"/api/service/users/{user_id}")
         
         if success:
             username = result.get("username", "未知")
@@ -198,7 +198,7 @@ class AdminAPITester:
             "user2_id": user2_id
         }
         
-        success, result, error = self.make_request("POST", "/api/admin/friendships", data)
+        success, result, error = self.make_request("POST", "/api/service/friendships", data)
         
         if success and result.get("success"):
             channel_id = result.get("channel_id")
@@ -226,7 +226,7 @@ class AdminAPITester:
         self.log_info(f"获取好友关系列表: page={page}, page_size={page_size}")
         
         params = {"page": page, "page_size": page_size}
-        success, result, error = self.make_request("GET", "/api/admin/friendships", params)
+        success, result, error = self.make_request("GET", "/api/service/friendships", params)
         
         if success:
             friendships = result.get("friendships", [])
@@ -253,7 +253,7 @@ class AdminAPITester:
         """测试获取用户的好友列表"""
         self.log_info(f"获取用户好友列表: user_id={user_id}")
         
-        success, result, error = self.make_request("GET", f"/api/admin/friendships/{user_id}")
+        success, result, error = self.make_request("GET", f"/api/service/friendships/{user_id}")
         
         if success:
             friends = result.get("friends", [])
@@ -281,7 +281,7 @@ class AdminAPITester:
         self.log_info(f"获取群组列表: page={page}, page_size={page_size}")
         
         params = {"page": page, "page_size": page_size}
-        success, result, error = self.make_request("GET", "/api/admin/groups", params)
+        success, result, error = self.make_request("GET", "/api/service/groups", params)
         
         if success:
             groups = result.get("groups", [])
@@ -308,7 +308,7 @@ class AdminAPITester:
         """测试获取群组详情"""
         self.log_info(f"获取群组详情: group_id={group_id}")
         
-        success, result, error = self.make_request("GET", f"/api/admin/groups/{group_id}")
+        success, result, error = self.make_request("GET", f"/api/service/groups/{group_id}")
         
         if success:
             name = result.get("name", "未知")
@@ -335,7 +335,7 @@ class AdminAPITester:
         """测试获取系统统计"""
         self.log_info("获取系统统计")
         
-        success, result, error = self.make_request("GET", "/api/admin/stats")
+        success, result, error = self.make_request("GET", "/api/service/stats")
         
         if success:
             users = result.get("users", {}).get("total", 0)
