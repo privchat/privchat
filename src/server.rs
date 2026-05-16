@@ -468,6 +468,34 @@ impl ChatServer {
         ));
         info!("✅ UserDeviceRepository 创建完成（提前创建）");
 
+        // server-event/dispatch 出站 client（spec SERVER_EVENT_DISPATCH_SPEC §3）；
+        // 统一所有 server→downstream emit（含 transfer.requested + bot.followed +
+        // system_user.message_received + ...）。未配 [server_event] = server 内部
+        // emit 全部跳过；wire `TransferRequest` 也无法投递，handler 不注册。
+        //
+        // 提前到这里创建是为了能注入到 SendMessageHandler（system_user.message_received
+        // 需要在 SendMessage 持久化成功后 fire-and-forget emit）；保持 Channel
+        // Transfer wire ingress 在原有顺序消费。
+        let server_event_client = match &config.server_event {
+            Some(cfg) => match crate::server_event::ServerEventClient::new(cfg) {
+                Ok(client) => {
+                    info!("✅ ServerEventClient 已启用 → {}", client.endpoint());
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ ServerEventClient 配置无效，将跳过 server event 通知: {}",
+                        e
+                    );
+                    None
+                }
+            },
+            None => {
+                info!("ℹ️ 未配 [server_event]，server 内部 emit 的事件不会通知下游");
+                None
+            }
+        };
+
         // 创建 SendMessageHandler（需要 FileService、ChannelService 和 MessageRouter）
         let mut send_handler_inner = SendMessageHandler::new(
             message_history_service.clone(),
@@ -488,6 +516,14 @@ impl ChatServer {
             Some(user_device_repo.clone()), // ✨ Phase 3.5: 传递 user_device_repo
         );
         send_handler_inner.set_delivery_tracker(delivery_tracker.clone());
+        // Inject ServerEvent emit deps（spec SERVER_EVENT_DISPATCH_SPEC §11.1：
+        // system_user.message_received）。`server_event_client` 可能为 None
+        // （未配 [server_event]），此时 emit 整体跳过。
+        send_handler_inner.set_system_user_event_deps(
+            server_event_client.clone(),
+            user_repository.clone(),
+            cache_manager.clone(),
+        );
         let send_message_handler = Arc::new(send_handler_inner);
 
         // 创建通用服务端发消息服务（供登录通知、Admin API 等复用）
@@ -641,29 +677,8 @@ impl ChatServer {
             )),
         );
 
-        // server-event/dispatch 出站 client（spec SERVER_EVENT_DISPATCH_SPEC §3）；
-        // 统一所有 server→downstream emit（含 transfer.requested + bot.followed + ...）。
-        // 未配 [server_event] = server 内部 emit 全部跳过；wire `TransferRequest`
-        // 也无法投递，handler 不注册。
-        let server_event_client = match &config.server_event {
-            Some(cfg) => match crate::server_event::ServerEventClient::new(cfg) {
-                Ok(client) => {
-                    info!("✅ ServerEventClient 已启用 → {}", client.endpoint());
-                    Some(Arc::new(client))
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ ServerEventClient 配置无效，将跳过 server event 通知: {}",
-                        e
-                    );
-                    None
-                }
-            },
-            None => {
-                info!("ℹ️ 未配 [server_event]，server 内部 emit 的事件不会通知下游");
-                None
-            }
-        };
+        // server_event_client 已在 SendMessageHandler 创建之前提前实例化（见前面"
+        // ServerEventClient 已启用"日志附近），此处直接复用。
 
         // Channel Transfer wire ingress (spec 02-server/CHANNEL_TRANSFER_SPEC v2.0)。
         // v1.0 起出站走统一 ServerEventClient（event_type=transfer.requested），

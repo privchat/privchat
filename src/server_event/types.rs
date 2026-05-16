@@ -55,6 +55,18 @@ pub const EVENT_TYPE_BOT_UNFOLLOWED: &str = "bot.unfollowed";
 /// [`TransferResponsePayload`]。详见 spec `CHANNEL_TRANSFER_SPEC` §5。
 pub const EVENT_TYPE_TRANSFER_REQUESTED: &str = "transfer.requested";
 
+/// 普通用户向 System User (user_type=1) 发私聊 —— **ack-only**。
+/// Payload: [`SystemUserMessageReceivedPayload`]。
+///
+/// 路由模型（spec 07-application/SYSTEM_USER_SPEC §3）：server 端只 emit
+/// `system_user_id`，**不**查 service_id；application 端按
+/// `privchat_system_user_profile.service_id` 1:1 查表后再二次 dispatch。
+/// 一级 handler **禁止**硬编码到 Assistant 或任何特定 service。
+///
+/// **payload 不携带 body**——只做触发索引；业务方需要消息内容必须调
+/// `listMessages(channel_id, limit=N)` 拉 server 权威。
+pub const EVENT_TYPE_SYSTEM_USER_MESSAGE_RECEIVED: &str = "system_user.message_received";
+
 /// 通用 server event envelope（spec §4.2）。
 ///
 /// 顶层字段**只能**是传输元数据；业务字段全部在 [`payload`](Self::payload) 里。
@@ -129,6 +141,36 @@ impl ServerEvent {
             occurred_at: occurred_at_ms,
         };
         Self::new(EVENT_TYPE_BOT_UNFOLLOWED, &payload, occurred_at_ms)
+    }
+
+    /// Convenience builder: `system_user.message_received`（ack-only）。
+    ///
+    /// Payload v1 只携带消息 **identity**（system_user_id / from_user_id /
+    /// channel_id / server_message_id / pts / message_type / occurred_at）——
+    /// **不**带 message body。下游业务方需要消息内容必须调 `listMessages`。
+    pub fn system_user_message_received(
+        system_user_id: u64,
+        from_user_id: u64,
+        channel_id: u64,
+        server_message_id: u64,
+        pts: u64,
+        message_type: String,
+        occurred_at_ms: i64,
+    ) -> Result<Self, serde_json::Error> {
+        let payload = SystemUserMessageReceivedPayload {
+            system_user_id,
+            from_user_id,
+            channel_id,
+            server_message_id,
+            pts,
+            message_type,
+            occurred_at: occurred_at_ms,
+        };
+        Self::new(
+            EVENT_TYPE_SYSTEM_USER_MESSAGE_RECEIVED,
+            &payload,
+            occurred_at_ms,
+        )
     }
 
     /// Convenience builder: `transfer.requested`（request-response 类型）。
@@ -206,6 +248,29 @@ pub struct BotUnfollowedPayload {
     pub bot_user_id: u64,
     pub channel_id: u64,
     pub account_user_type: i32,
+    pub occurred_at: i64,
+}
+
+/// Payload for `system_user.message_received`（spec 07-application/SYSTEM_USER_SPEC §3.2）。
+///
+/// **v1 不携带 message body** —— 只做触发索引。downstream 业务方需要消息
+/// 内容必须调 `listMessages(channel_id, limit=N)` 拉 server 权威；event payload
+/// **不**是消息历史副本（避免 envelope 膨胀 + 消息格式演进污染 event schema）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemUserMessageReceivedPayload {
+    /// 接收方 System User user_id；application 端按它查 `privchat_system_user_profile.service_id`。
+    pub system_user_id: u64,
+    /// 发送方普通用户 user_id。
+    pub from_user_id: u64,
+    /// 该消息所在 direct channel id。
+    pub channel_id: u64,
+    /// Server 分配的 message id；用于业务侧幂等 / 后续 `listMessages` 定位。
+    pub server_message_id: u64,
+    /// PrivChat sync pts；业务侧可用于过滤已处理 cursor。
+    pub pts: u64,
+    /// Message type 字符串（如 `"text"` / `"image"`）；便于业务侧快速过滤。
+    pub message_type: String,
+    /// Server 端事件发生时间 Unix ms。
     pub occurred_at: i64,
 }
 

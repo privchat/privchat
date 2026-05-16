@@ -16,9 +16,12 @@
 // limitations under the License.
 
 use crate::rpc::error::{RpcError, RpcResult};
-use crate::rpc::RpcServiceContext;
+use crate::rpc::{helpers, RpcServiceContext};
+use privchat_protocol::error_code::ErrorCode;
 use privchat_protocol::rpc::GroupMemberAddRequest;
 use serde_json::{json, Value};
+
+const USER_TYPE_SYSTEM: i16 = 1;
 
 /// 查 user 的显示名（display_name → username → fallback uid 字符串）
 async fn resolve_display_name(
@@ -60,6 +63,32 @@ pub async fn handle(
         group_id,
         role
     );
+
+    // System User (user_type=1) 禁止入群——spec 07-application/SYSTEM_USER_SPEC §4
+    // + 02-server/CHANNEL_SPEC §10.5。
+    match helpers::lookup_user_type(
+        user_id,
+        &services.user_repository,
+        &services.cache_manager,
+    )
+    .await
+    {
+        Ok(Some(t)) if t == USER_TYPE_SYSTEM => {
+            return Err(RpcError::from_code(
+                ErrorCode::SystemUserNotGroupInvitable,
+                format!("user {} is a system user and cannot join a group", user_id),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(
+                "校验被邀请人 user_type 失败 user_id={}: {}",
+                user_id,
+                e
+            );
+            return Err(RpcError::internal("校验成员身份失败".to_string()));
+        }
+    }
 
     // 确定成员角色
     let member_role = match role.to_lowercase().as_str() {

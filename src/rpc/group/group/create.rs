@@ -17,8 +17,11 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
+use privchat_protocol::error_code::ErrorCode;
 use privchat_protocol::rpc::group::group::GroupCreateRequest;
 use serde_json::{json, Value};
+
+const USER_TYPE_SYSTEM: i16 = 1;
 
 /// 处理 创建群组 请求
 pub async fn handle(
@@ -38,6 +41,36 @@ pub async fn handle(
     let name = &request.name;
     let description = request.description.as_deref().unwrap_or("");
     let creator_id = request.creator_id;
+
+    // System User (user_type=1) 禁止入群——spec 07-application/SYSTEM_USER_SPEC §4
+    // + 02-server/CHANNEL_SPEC §10.5。这里前置校验 initial_members，避免后续
+    // add_participant / add_member_to_group 写入再回滚。
+    if let Some(initial_members) = request.member_ids.as_deref() {
+        for &uid in initial_members {
+            if uid == creator_id {
+                continue;
+            }
+            match helpers::lookup_user_type(
+                uid,
+                &services.user_repository,
+                &services.cache_manager,
+            )
+            .await
+            {
+                Ok(Some(t)) if t == USER_TYPE_SYSTEM => {
+                    return Err(RpcError::from_code(
+                        ErrorCode::SystemUserNotGroupInvitable,
+                        format!("user {} is a system user and cannot join a group", uid),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("校验 initial_members user_type 失败 uid={}: {}", uid, e);
+                    return Err(RpcError::internal("校验成员身份失败".to_string()));
+                }
+            }
+        }
+    }
 
     // 检查创建者是否存在（从数据库读取）
     match helpers::get_user_profile_with_fallback(

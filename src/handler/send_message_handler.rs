@@ -77,6 +77,15 @@ pub struct SendMessageHandler {
     auth_session_manager: Arc<AuthSessionManager>,
     /// 送达水位追踪器
     delivery_tracker: Option<Arc<crate::service::DeliveryTracker>>,
+    /// ServerEvent 出站 client（用于 fire-and-forget 向 application 投递
+    /// `system_user.message_received` 等事件；spec SERVER_EVENT_DISPATCH_SPEC §11.1）。
+    /// None = 未配 `[server_event]` 段，server 内部 emit 全部跳过。
+    server_event_client: Option<Arc<crate::server_event::ServerEventClient>>,
+    /// 用户仓库（用于 direct channel 对端 user_type 查询，判定是否触发
+    /// `system_user.message_received` emit）。
+    user_repository: Option<Arc<crate::repository::UserRepository>>,
+    /// 缓存管理器（user_type 查询的 L1 入口）。
+    cache_manager: Option<Arc<crate::infra::CacheManager>>,
 }
 
 // 临时全局 EventBus（MVP 阶段简化方案）
@@ -135,11 +144,30 @@ impl SendMessageHandler {
             auth_session_manager,
             user_device_repo, // ✨ Phase 3.5
             delivery_tracker: None,
+            server_event_client: None,
+            user_repository: None,
+            cache_manager: None,
         }
     }
 
     pub fn set_delivery_tracker(&mut self, tracker: Arc<crate::service::DeliveryTracker>) {
         self.delivery_tracker = Some(tracker);
+    }
+
+    /// Inject the deps needed for `system_user.message_received` emit
+    /// (spec SERVER_EVENT_DISPATCH_SPEC §11.1)。
+    ///
+    /// Server boot 期间 `SendMessageHandler::new` 在 `server_event_client` 创建之前
+    /// 就被实例化，因此用 setter pattern；调用方在两者都就绪后注入。
+    pub fn set_system_user_event_deps(
+        &mut self,
+        server_event_client: Option<Arc<crate::server_event::ServerEventClient>>,
+        user_repository: Arc<crate::repository::UserRepository>,
+        cache_manager: Arc<crate::infra::CacheManager>,
+    ) {
+        self.server_event_client = server_event_client;
+        self.user_repository = Some(user_repository);
+        self.cache_manager = Some(cache_manager);
     }
 
     /// 设置事件总线（在服务器启动后调用）
@@ -1231,6 +1259,100 @@ impl MessageHandler for SendMessageHandler {
                 "⚠️ SendMessageHandler: SyncService 未就绪，跳过 commit 记录 channel_id={} message_id={}",
                 channel_id, message.message_id
             );
+        }
+
+        // ✨ ServerEvent emit: `system_user.message_received`
+        // (spec SERVER_EVENT_DISPATCH_SPEC §11.1 + SYSTEM_USER_SPEC §3)
+        //
+        // 触发条件（同时满足）：
+        //   1. server_event_client 已就绪（即 [server_event] 配置存在）
+        //   2. channel.channel_type == Direct
+        //   3. channel 对端 user_type == 1 (System User)
+        //   4. 发送方 user_type != 1（System User 之间不互推；避免循环 + 误派发）
+        //
+        // 失败语义：best-effort，warn-log，不阻塞主链路。
+        // 注意：server 端**不**查 service_id —— application 端按 system_user_id 1:1 查表。
+        if channel.channel_type == crate::model::channel::ChannelType::Direct {
+            if let (Some(event_client), Some(user_repo), Some(cache)) = (
+                self.server_event_client.clone(),
+                self.user_repository.clone(),
+                self.cache_manager.clone(),
+            ) {
+                let peer_id_opt = channel
+                    .get_member_ids()
+                    .into_iter()
+                    .find(|&id| id != from_uid);
+                if let Some(peer_id) = peer_id_opt {
+                    let sender_id = from_uid;
+                    let chan_id_for_emit = channel_id;
+                    let msg_id_for_emit = message.message_id;
+                    let pts_for_emit = pts as u64;
+                    let mtype_for_emit = content_message_type.as_str().to_string();
+                    let occurred_at_ms = message_record.created_at.timestamp_millis();
+                    tokio::spawn(async move {
+                        let sender_t = match crate::rpc::helpers::lookup_user_type(
+                            sender_id, &user_repo, &cache,
+                        )
+                        .await
+                        {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!(
+                                    "system_user.message_received: 查 sender user_type 失败 uid={}: {}",
+                                    sender_id, e
+                                );
+                                return;
+                            }
+                        };
+                        // System User 之间互发不触发（避免循环 + 防呆）。
+                        if sender_t == Some(1) {
+                            return;
+                        }
+                        let peer_t = match crate::rpc::helpers::lookup_user_type(
+                            peer_id, &user_repo, &cache,
+                        )
+                        .await
+                        {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!(
+                                    "system_user.message_received: 查 peer user_type 失败 uid={}: {}",
+                                    peer_id, e
+                                );
+                                return;
+                            }
+                        };
+                        if peer_t != Some(1) {
+                            return; // 对端不是 System User，跳过。
+                        }
+                        let event = match crate::server_event::ServerEvent::system_user_message_received(
+                            peer_id,
+                            sender_id,
+                            chan_id_for_emit,
+                            msg_id_for_emit,
+                            pts_for_emit,
+                            mtype_for_emit,
+                            occurred_at_ms,
+                        ) {
+                            Ok(ev) => ev,
+                            Err(e) => {
+                                warn!(
+                                    "system_user.message_received: payload 序列化失败: {}",
+                                    e
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(e) = event_client.send(&event).await {
+                            warn!(
+                                target: "system_user_event",
+                                "system_user.message_received emit 失败 system_user_id={} channel_id={}: {}",
+                                peer_id, chan_id_for_emit, e
+                            );
+                        }
+                    });
+                }
+            }
         }
 
         // ✨ 发布 MessageCommitted 事件（用于 Push）

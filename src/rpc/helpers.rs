@@ -66,3 +66,26 @@ pub async fn get_user_profile_with_fallback(
         None => Ok(None),
     }
 }
+
+/// 查 user_type（0=普通 / 1=系统 / 2=机器人）。
+///
+/// 顺序：1~99 区段直接判内置 System User；缓存命中读 `CachedUserProfile.user_type`；
+/// 缓存未命中走 `user_repository.find_by_id`。未找到的 user 返回 `None`——调用方
+/// 自行决定是当成普通用户放行还是拒绝。
+pub async fn lookup_user_type(
+    user_id: u64,
+    user_repository: &crate::repository::UserRepository,
+    cache_manager: &crate::infra::CacheManager,
+) -> Result<Option<i16>, crate::error::ServerError> {
+    if crate::config::is_system_user(user_id) {
+        return Ok(Some(1));
+    }
+    if let Ok(Some(profile)) = cache_manager.get_user_profile(user_id).await {
+        return Ok(Some(profile.user_type));
+    }
+    let user = user_repository
+        .find_by_id(user_id)
+        .await
+        .map_err(|e| crate::error::ServerError::Internal(format!("查询用户失败: {}", e)))?;
+    Ok(user.map(|u| u.user_type))
+}
