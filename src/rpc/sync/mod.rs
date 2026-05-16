@@ -372,6 +372,79 @@ async fn project_submit_to_message_views(
         .await;
     // channel last preview is derived on client from local message table.
 
+    // ServerEvent emit: `system_user.message_received`
+    // (spec SERVER_EVENT_DISPATCH_SPEC §11.1 + SYSTEM_USER_SPEC §3)
+    //
+    // 与 wire SendMessageHandler 的逻辑同形：direct channel + 对端 user_type=1
+    // + 发送方 user_type!=1 才 emit。fire-and-forget，失败 warn-log，不阻塞
+    // 投影主流程。
+    if let Some(event_client) = services.server_event_client.clone() {
+        let channel_id = request.channel_id;
+        let pts_val = pts;
+        let mtype_str = msg.message_type.as_str().to_string();
+        let server_ts_ms = response.server_timestamp;
+        let user_repo = services.user_repository.clone();
+        let cache = services.cache_manager.clone();
+        let channel_service = services.channel_service.clone();
+        tokio::spawn(async move {
+            let channel = match channel_service.get_channel_opt(channel_id).await {
+                Some(c) => c,
+                None => return,
+            };
+            if channel.channel_type != crate::model::channel::ChannelType::Direct {
+                return;
+            }
+            let peer_id_opt = channel
+                .get_member_ids()
+                .into_iter()
+                .find(|&id| id != sender_id);
+            let Some(peer_id) = peer_id_opt else {
+                return;
+            };
+            let sender_t = match crate::rpc::helpers::lookup_user_type(
+                sender_id, &user_repo, &cache,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            if sender_t == Some(1) {
+                return;
+            }
+            let peer_t = match crate::rpc::helpers::lookup_user_type(peer_id, &user_repo, &cache)
+                .await
+            {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            if peer_t != Some(1) {
+                return;
+            }
+            let event = match crate::server_event::ServerEvent::system_user_message_received(
+                peer_id,
+                sender_id,
+                channel_id,
+                server_msg_id,
+                pts_val as u64,
+                mtype_str,
+                server_ts_ms,
+            ) {
+                Ok(ev) => ev,
+                Err(_) => return,
+            };
+            if let Err(e) = event_client.send(&event).await {
+                tracing::warn!(
+                    target: "system_user_event",
+                    "system_user.message_received emit 失败 system_user_id={} channel_id={}: {}",
+                    peer_id,
+                    channel_id,
+                    e
+                );
+            }
+        });
+    }
+
     Ok(())
 }
 
