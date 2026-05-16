@@ -219,7 +219,7 @@ fn build_user_get_against_plain_host() {
     let base = normalize_qr_base_url("https://privchat.app", true).unwrap();
     assert_eq!(
         build_qr_url(&base, QrEntity::User, QrAction::Get, "abc123"),
-        "https://privchat.app/privchat:protocol/user/get?qrkey=abc123"
+        "https://privchat.app/privchat:protocol/user/get/abc123"
     );
 }
 
@@ -228,7 +228,7 @@ fn build_user_get_after_trailing_slash_normalization() {
     let base = normalize_qr_base_url("https://privchat.app/", true).unwrap();
     assert_eq!(
         build_qr_url(&base, QrEntity::User, QrAction::Get, "abc123"),
-        "https://privchat.app/privchat:protocol/user/get?qrkey=abc123"
+        "https://privchat.app/privchat:protocol/user/get/abc123"
     );
 }
 
@@ -237,7 +237,7 @@ fn build_user_get_preserves_subpath_no_trailing_slash() {
     let base = normalize_qr_base_url("https://example.com/app", true).unwrap();
     assert_eq!(
         build_qr_url(&base, QrEntity::User, QrAction::Get, "abc123"),
-        "https://example.com/app/privchat:protocol/user/get?qrkey=abc123"
+        "https://example.com/app/privchat:protocol/user/get/abc123"
     );
 }
 
@@ -246,7 +246,7 @@ fn build_group_join_preserves_subpath_with_trailing_slash() {
     let base = normalize_qr_base_url("https://example.com/app/", true).unwrap();
     assert_eq!(
         build_qr_url(&base, QrEntity::Group, QrAction::Join, "abc123"),
-        "https://example.com/app/privchat:protocol/group/join?qrkey=abc123"
+        "https://example.com/app/privchat:protocol/group/join/abc123"
     );
 }
 
@@ -255,20 +255,23 @@ fn build_http_localhost_dev_works() {
     let base = normalize_qr_base_url("http://localhost:8080", false).unwrap();
     assert_eq!(
         build_qr_url(&base, QrEntity::User, QrAction::Get, "abc123"),
-        "http://localhost:8080/privchat:protocol/user/get?qrkey=abc123"
+        "http://localhost:8080/privchat:protocol/user/get/abc123"
     );
 }
 
 #[test]
 fn build_qrkey_with_special_chars_is_percent_encoded() {
     // 实际生产 qr_key 永远是 base62，不需要 encode；这个测试验证 builder 的
-    // defensive percent-encoding 行为，未来如果换字符集（含 +/= 等）也不破 URL
+    // defensive percent-encoding 行为：path 段里如果含 `/` `?` 等会撕裂 URL 结构
+    // 的字符，必须 encode
     let base = normalize_qr_base_url("https://privchat.app", true).unwrap();
     let out = build_qr_url(&base, QrEntity::User, QrAction::Get, "a b/c?d&e=f");
     assert!(
-        out.contains("qrkey=a%20b%2Fc%3Fd%26e%3Df"),
-        "expected percent-encoded special chars, got: {out}"
+        out.ends_with("/get/a%20b%2Fc%3Fd%26e%3Df"),
+        "expected percent-encoded special chars in path tail, got: {out}"
     );
+    // 不再生成 query string
+    assert!(!out.contains('?'), "v1.4 must not generate ?qrkey= query, got: {out}");
 }
 
 #[test]
@@ -277,7 +280,7 @@ fn build_qrkey_pure_base62_not_modified() {
     let out = build_qr_url(&base, QrEntity::Group, QrAction::Join, "K7sP3qXfA9eLm2nB");
     assert_eq!(
         out,
-        "https://privchat.app/privchat:protocol/group/join?qrkey=K7sP3qXfA9eLm2nB"
+        "https://privchat.app/privchat:protocol/group/join/K7sP3qXfA9eLm2nB"
     );
 }
 
@@ -287,7 +290,9 @@ fn build_end_to_end_generated_qr_key_lands_in_url() {
     let base = normalize_qr_base_url("https://privchat.app", true).unwrap();
     let key = generate_qr_key();
     let url = build_qr_url(&base, QrEntity::User, QrAction::Get, &key);
-    assert!(url.starts_with("https://privchat.app/privchat:protocol/user/get?qrkey="));
+    let expected_prefix = "https://privchat.app/privchat:protocol/user/get/";
+    assert!(url.starts_with(expected_prefix));
     assert!(url.ends_with(&key));
-    assert_eq!(url.len(), "https://privchat.app/privchat:protocol/user/get?qrkey=".len() + key.len());
+    assert_eq!(url.len(), expected_prefix.len() + key.len());
+    assert!(!url.contains('?'));
 }

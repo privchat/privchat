@@ -11,9 +11,9 @@
 //! 所有 user/group qrcode 的响应 `qr_code` 字段都必须经此模块拼接，
 //! **禁止** handler 自行 `format!` URL（否则部署到 sub-path 域名时会丢路径）。
 //!
-//! ## 模板
+//! ## 模板（v1.4：qr_key 在 path 最后一段，不再用 `?qrkey=` query）
 //! ```text
-//! {qr_base_url}/privchat:protocol/{entity}/{action}?qrkey={percent-encode(qr_key)}
+//! {qr_base_url}/privchat:protocol/{entity}/{action}/{percent-encode(qr_key)}
 //! ```
 //!
 //! ## 启动期校验
@@ -24,7 +24,7 @@
 //! - **不能**已经带 `/privchat:protocol` 路径前缀（防止 builder 双拼）
 //! - **允许** base 带任意其他 path 前缀（部署在 sub-path 下的场景），builder 保留
 //!
-//! 见 [QR_CODE_SPEC v1.3 §7.2](../../../../../privchat-docs/spec/02-server/QR_CODE_SPEC.md)
+//! 见 [QR_CODE_SPEC v1.4 §7.2](../../../../../privchat-docs/spec/02-server/QR_CODE_SPEC.md)
 //! 验收用例表（本文件 #[test] 完整覆盖 10 条）。
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -216,11 +216,13 @@ const QR_KEY_PERCENT_SET: &AsciiSet = &CONTROLS
 /// - `qr_key`：opaque token（generator 来源，调用方不做额外加工）
 ///
 /// # 返回
-/// 形如 `{base}/privchat:protocol/{entity}/{action}?qrkey={percent-encoded}` 的字符串。
+/// 形如 `{base}/privchat:protocol/{entity}/{action}/{percent-encoded qr_key}` 的字符串。
+///
+/// **注意**：v1.3 历史形态 `?qrkey=<key>` 不再生成（但 client parser 仍兼容输入）。
 pub fn build_qr_url(base: &str, entity: QrEntity, action: QrAction, qr_key: &str) -> String {
     let encoded = utf8_percent_encode(qr_key, QR_KEY_PERCENT_SET).to_string();
     format!(
-        "{base}{prefix}/{entity}/{action}?qrkey={encoded}",
+        "{base}{prefix}/{entity}/{action}/{encoded}",
         base = base,
         prefix = QR_PROTOCOL_PATH_PREFIX,
         entity = entity.as_str(),
@@ -379,7 +381,7 @@ mod tests {
         let base = normalize_qr_base_url("https://privchat.app", true).unwrap();
         assert_eq!(
             build_qr_url(&base, QrEntity::User, QrAction::Get, "abc123"),
-            "https://privchat.app/privchat:protocol/user/get?qrkey=abc123"
+            "https://privchat.app/privchat:protocol/user/get/abc123"
         );
     }
 
@@ -388,7 +390,7 @@ mod tests {
         let base = normalize_qr_base_url("https://privchat.app/", true).unwrap();
         assert_eq!(
             build_qr_url(&base, QrEntity::User, QrAction::Get, "abc123"),
-            "https://privchat.app/privchat:protocol/user/get?qrkey=abc123"
+            "https://privchat.app/privchat:protocol/user/get/abc123"
         );
     }
 
@@ -397,7 +399,7 @@ mod tests {
         let base = normalize_qr_base_url("https://example.com/app", true).unwrap();
         assert_eq!(
             build_qr_url(&base, QrEntity::User, QrAction::Get, "abc123"),
-            "https://example.com/app/privchat:protocol/user/get?qrkey=abc123"
+            "https://example.com/app/privchat:protocol/user/get/abc123"
         );
     }
 
@@ -406,7 +408,7 @@ mod tests {
         let base = normalize_qr_base_url("https://example.com/app/", true).unwrap();
         assert_eq!(
             build_qr_url(&base, QrEntity::Group, QrAction::Join, "abc123"),
-            "https://example.com/app/privchat:protocol/group/join?qrkey=abc123"
+            "https://example.com/app/privchat:protocol/group/join/abc123"
         );
     }
 
@@ -415,20 +417,23 @@ mod tests {
         let base = normalize_qr_base_url("http://localhost:8080", false).unwrap();
         assert_eq!(
             build_qr_url(&base, QrEntity::User, QrAction::Get, "abc123"),
-            "http://localhost:8080/privchat:protocol/user/get?qrkey=abc123"
+            "http://localhost:8080/privchat:protocol/user/get/abc123"
         );
     }
 
     #[test]
     fn build_qrkey_percent_encoded_when_needed() {
-        // qr_key 含特殊字符（不会自然发生，但 builder 必须 defensive）
+        // qr_key 含特殊字符（不会自然发生，但 builder 必须 defensive 把 path 段
+        // 分隔符 `/` `?` 等 encode，否则会把 URL 撕裂成多段）
         let base = normalize_qr_base_url("https://privchat.app", true).unwrap();
         let out = build_qr_url(&base, QrEntity::User, QrAction::Get, "a b/c?d&e=f");
-        // 空格 → %20，斜杠/问号/&/= 全部编码
+        // 期望尾段是 percent-encoded 后的 qr_key，紧贴 /get/ 后面
         assert!(
-            out.contains("qrkey=a%20b%2Fc%3Fd%26e%3Df"),
+            out.ends_with("/get/a%20b%2Fc%3Fd%26e%3Df"),
             "got: {out}"
         );
+        // 不应混进任何 query string
+        assert!(!out.contains('?'), "v1.4 must not generate query string: {out}");
     }
 
     #[test]
@@ -438,7 +443,7 @@ mod tests {
         let out = build_qr_url(&base, QrEntity::Group, QrAction::Join, "K7sP3qXfA9eLm2nB");
         assert_eq!(
             out,
-            "https://privchat.app/privchat:protocol/group/join?qrkey=K7sP3qXfA9eLm2nB"
+            "https://privchat.app/privchat:protocol/group/join/K7sP3qXfA9eLm2nB"
         );
     }
 }
