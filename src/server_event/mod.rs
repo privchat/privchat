@@ -36,5 +36,6 @@ pub mod types;
 pub use client::{ServerEventClient, ServerEventError};
 pub use types::{
     BotFollowedPayload, BotUnfollowedPayload, ServerEvent, ServerEventAck,
-    EVENT_TYPE_BOT_FOLLOWED, EVENT_TYPE_BOT_UNFOLLOWED, SERVER_EVENT_DISPATCH_PATH,
+    SystemUserMessageReceivedPayload, EVENT_TYPE_BOT_FOLLOWED, EVENT_TYPE_BOT_UNFOLLOWED,
+    EVENT_TYPE_SYSTEM_USER_MESSAGE_RECEIVED, SERVER_EVENT_DISPATCH_PATH,
 };
