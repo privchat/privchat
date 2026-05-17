@@ -260,11 +260,12 @@ mod tests {
             iat: Utc::now().timestamp(),
             jti: uuid::Uuid::new_v4().to_string(),
             iss: "test".to_string(),
-            aud: "test".to_string(),
+            aud: vec!["test".to_string()],
             business_system_id: "test-business".to_string(),
             app_id: "test-app".to_string(),
             session_version: 1,
-            typ: "access".to_string(),
+            token_type: "access".to_string(),
+            scope: vec!["im".to_string()],
         }
     }
 
