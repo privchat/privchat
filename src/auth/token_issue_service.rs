@@ -215,10 +215,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_issue_token() {
-        let jwt_service = Arc::new(TokenService::new(
-            "test-secret-key-at-least-32-chars".to_string(),
-            3600,
-        ));
+        let jwt_service = Arc::new(
+            TokenService::from_config(crate::config::JwtConfig {
+                algorithm: crate::config::JwtAlgorithm::Hs256,
+                secret: "test-secret-key-at-least-32-chars".to_string(),
+                access_ttl_secs: 3600,
+                ..Default::default()
+            })
+            .expect("test TokenService::from_config"),
+        );
 
         let service_key_manager =
             Arc::new(ServiceKeyManager::new_master_key("test-key".to_string()));
@@ -265,10 +270,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_issue_token_invalid_service_key() {
-        let jwt_service = Arc::new(TokenService::new(
-            "test-secret-key-at-least-32-chars".to_string(),
-            3600,
-        ));
+        let jwt_service = Arc::new(
+            TokenService::from_config(crate::config::JwtConfig {
+                algorithm: crate::config::JwtAlgorithm::Hs256,
+                secret: "test-secret-key-at-least-32-chars".to_string(),
+                access_ttl_secs: 3600,
+                ..Default::default()
+            })
+            .expect("test TokenService::from_config"),
+        );
 
         let service_key_manager =
             Arc::new(ServiceKeyManager::new_master_key("correct-key".to_string()));
