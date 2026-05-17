@@ -1777,7 +1777,48 @@ impl ChatServer {
         // 🔐 启动安全系统清理任务
         self.start_security_cleaner().await;
 
+        // 🛡️ 启动未认证连接 watchdog（SESSION_LIFECYCLE_SPEC §5）
+        self.start_unauth_session_watchdog().await;
+
         info!("✅ 后台任务启动完成");
+    }
+
+    /// 启动 unauth connecting session watchdog（spec SESSION_LIFECYCLE_SPEC §5）。
+    ///
+    /// transport 建立后 N 秒内必须完成 Authenticate（state 转 `Authenticated`），
+    /// 否则 watchdog 主动 `cleanup_stale_connecting()` 释放 transport + Index B。
+    /// `config.unauth_session_timeout_secs == 0` → 不启动该 task（开发调试用）。
+    async fn start_unauth_session_watchdog(&self) {
+        let timeout_secs = self.config.unauth_session_timeout_secs;
+        let interval_secs = self.config.unauth_cleanup_interval_secs;
+        if timeout_secs == 0 {
+            info!(
+                "🛡️ 未认证连接 watchdog: disabled (unauth_session_timeout_secs=0)"
+            );
+            return;
+        }
+        if interval_secs == 0 {
+            warn!(
+                "🛡️ 未认证连接 watchdog: unauth_cleanup_interval_secs=0 不合法，回退到 30s"
+            );
+        }
+        let actual_interval = if interval_secs == 0 { 30 } else { interval_secs };
+        info!(
+            "🛡️ 启动未认证连接 watchdog: timeout={}s interval={}s",
+            timeout_secs, actual_interval
+        );
+        let connection_manager = self.connection_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(actual_interval));
+            // 跳过第一次立即 tick，让 server 完成启动后再开始扫描
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let _ = connection_manager
+                    .cleanup_stale_connecting(timeout_secs)
+                    .await;
+            }
+        });
     }
 
     /// 启动统计更新任务

@@ -122,10 +122,38 @@ pub struct ServerConfig {
     /// 校验失败 server 拒启动。
     #[serde(default = "default_qr_base_url")]
     pub qr_base_url: String,
+
+    /// 未认证连接 watchdog 超时（秒）。
+    /// 详见 spec `02-server/SESSION_LIFECYCLE_SPEC.md`。
+    ///
+    /// transport 建立后 N 秒内必须完成认证（state 转 `Authenticated`），
+    /// 否则 watchdog 主动 `force_close_session` 释放 transport + 移除 Index B。
+    /// 给 client 留出 access_token refresh + 重 Authenticate 的窗口。
+    ///
+    /// **`0` 表示禁用** watchdog（开发调试用，断点暂停时不会被踢）。
+    /// 生产默认 `90`，可调 `60` / `120`。
+    #[serde(default = "default_unauth_session_timeout_secs")]
+    pub unauth_session_timeout_secs: u64,
+
+    /// 未认证连接 watchdog 扫描周期（秒）。
+    /// `unauth_session_timeout_secs = 0` 时此参数无效。
+    ///
+    /// 默认 `30`：每 30s 扫一遍 Index B 找 `state == Connecting` 且
+    /// 超 `unauth_session_timeout_secs` 的条目。
+    #[serde(default = "default_unauth_cleanup_interval_secs")]
+    pub unauth_cleanup_interval_secs: u64,
 }
 
 fn default_qr_base_url() -> String {
     "https://privchat.app".to_string()
+}
+
+fn default_unauth_session_timeout_secs() -> u64 {
+    90
+}
+
+fn default_unauth_cleanup_interval_secs() -> u64 {
+    30
 }
 
 /// JWT 算法（配置 `[auth.jwt] algorithm`）。
@@ -310,6 +338,8 @@ impl Default for ServerConfig {
             server_event: None,
             room_ticket: None,
             qr_base_url: default_qr_base_url(),
+            unauth_session_timeout_secs: default_unauth_session_timeout_secs(),
+            unauth_cleanup_interval_secs: default_unauth_cleanup_interval_secs(),
         }
     }
 }

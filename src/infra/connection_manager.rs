@@ -480,6 +480,109 @@ impl ConnectionManager {
         Ok(devices_to_disconnect)
     }
 
+    // ---------------------------------------------------------------------
+    // spec §4.6：Unauth Watchdog（SESSION_LIFECYCLE_SPEC §5）
+    //
+    // transport 建立后若 N 秒内未完成 Authenticate（state 留在 Connecting），
+    // 后台 watchdog 主动 force close transport + 让 ConnectionClosed 事件清 Index B。
+    // ---------------------------------------------------------------------
+
+    /// 扫描所有 `state == Connecting` 且超 `timeout_secs` 未完成认证的条目，
+    /// 主动断 transport。Authenticated / Replaced / Closing / Closed 一律跳过。
+    ///
+    /// 返回本次实际关闭的 session 数量。
+    ///
+    /// **`timeout_secs == 0` → 立即返回 0（watchdog disabled）。**
+    ///
+    /// race protection：每个候选会在 `index_b.get_mut` guard 内做 atomic 二次校验
+    /// （仍是 Connecting 才 mark Closing 并继续 close），避免与并发 `authenticate()`
+    /// 撞到 — 已 authenticate 的连接绝不会被本方法误踢。
+    pub async fn cleanup_stale_connecting(&self, timeout_secs: u64) -> usize {
+        if timeout_secs == 0 {
+            return 0;
+        }
+        let timeout_ms = (timeout_secs * 1000) as i64;
+        let cutoff = chrono::Utc::now().timestamp_millis() - timeout_ms;
+
+        // Step 1：收集候选（短锁，不持锁 await）。
+        // 用 connected_at 作为 watchdog 起点 —— spec §4.1 `register_connecting`
+        // 已经在此字段写入 transport 建立时间。
+        let candidates: Vec<SessionId> = self
+            .index_b
+            .iter()
+            .filter_map(|entry| {
+                let e = entry.value();
+                if e.state == SessionState::Connecting && e.connected_at < cutoff {
+                    Some(e.session_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Step 2：逐个原子 "state==Connecting → Closing"，命中才真断 transport。
+        // 若 entry 在 collect 与 get_mut 之间已经被 authenticate()（state 转
+        // Authenticated）或被 unregister（条目被删），都跳过。
+        let mut closed = 0usize;
+        for sid in candidates {
+            let should_close = {
+                if let Some(mut entry) = self.index_b.get_mut(&sid) {
+                    if entry.state == SessionState::Connecting {
+                        entry.state = SessionState::Closing;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if !should_close {
+                continue;
+            }
+            // 真断 transport：ConnectionClosed 事件触发 unregister_connection() 清 Index B。
+            // 这里调 transport.close_session 而不复用 force_close_session()，
+            // 因为后者会再做一次 state mutation（Authenticated → Closing），
+            // 而我们已经在 guard 内完成状态切换；保持单一职责更清晰。
+            let transport = self.transport_server.read().await;
+            if let Some(server) = transport.as_ref() {
+                match server.close_session(sid).await {
+                    Ok(_) => {
+                        closed += 1;
+                        info!(
+                            target: "connection.watchdog.close",
+                            session_id = %sid,
+                            timeout_secs = timeout_secs,
+                            "unauth connecting session timed out; transport closed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "⚠️ ConnectionManager: watchdog close_session 失败 sid={} err={}",
+                            sid, e
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "⚠️ ConnectionManager: TransportServer 未设置，watchdog 无法关闭 sid={}",
+                    sid
+                );
+            }
+        }
+        if closed > 0 {
+            info!(
+                "🧹 ConnectionManager: unauth watchdog 清理 {} 个超时连接 (timeout={}s)",
+                closed, timeout_secs
+            );
+        }
+        closed
+    }
+
     /// 强制关闭指定 session（按 session_id 精确断开）。
     ///
     /// 与 `disconnect_device` 的区别：此方法不需要 user_id/device_id，
@@ -1297,5 +1400,101 @@ mod tests {
         // 计数不重复
         assert_eq!(manager.get_connection_count().await, 1);
         assert!(manager.self_check().is_clean());
+    }
+
+    // ---- spec SESSION_LIFECYCLE_SPEC §5：unauth watchdog ----
+    //
+    // 测试方法学：cleanup_stale_connecting 依赖 connected_at 时间戳。这里直接
+    // 通过 dashmap.get_mut 把 connected_at 改成"很久以前"模拟超时，不依赖 sleep。
+    // 没有真实 transport_server 时，cleanup 不会 increment closed count（warn log
+    // 后跳过），但已经把命中 entry 的 state 切到 Closing —— 测试以 state 转 Closing
+    // 作为"watchdog 命中"信号。
+
+    fn force_connected_at(manager: &ConnectionManager, sid: SessionId, ts_ms: i64) {
+        let mut entry = manager.index_b.get_mut(&sid).expect("entry must exist");
+        entry.connected_at = ts_ms;
+    }
+
+    /// case 1：connecting_not_expired_is_kept
+    /// connected_at 在 timeout 窗口内 → cleanup 跳过，state 不变。
+    #[tokio::test]
+    async fn test_watchdog_connecting_not_expired_is_kept() {
+        let manager = ConnectionManager::new();
+        let sid = SessionId::new(9001);
+        manager.register_connecting(sid);
+        // connected_at 默认 = now，远在 timeout=90s 窗口内
+        let closed = manager.cleanup_stale_connecting(90).await;
+        assert_eq!(closed, 0);
+        let entry = manager.index_b.get(&sid).expect("entry kept");
+        assert_eq!(entry.state, SessionState::Connecting);
+    }
+
+    /// case 2：connecting_expired_is_closed_and_removed
+    /// connected_at 超 timeout → cleanup 命中 → state 转 Closing（race guard 完成）。
+    /// 真实环境后续 ConnectionClosed 事件会 unregister_connection 清 Index B。
+    /// 单测无 transport，断言到 state==Closing 即证明 watchdog 命中。
+    #[tokio::test]
+    async fn test_watchdog_connecting_expired_is_marked_closing() {
+        let manager = ConnectionManager::new();
+        let sid = SessionId::new(9002);
+        manager.register_connecting(sid);
+        // 强制 connected_at = 200s 前；timeout=90s → 命中
+        let now = chrono::Utc::now().timestamp_millis();
+        force_connected_at(&manager, sid, now - 200_000);
+        let _ = manager.cleanup_stale_connecting(90).await;
+        let entry = manager.index_b.get(&sid).expect("entry still in index_b");
+        // state 必须已被 watchdog 切到 Closing（race protection 第一步）
+        assert_eq!(entry.state, SessionState::Closing);
+    }
+
+    /// case 3：authenticated_session_is_not_cleaned_even_if_old
+    /// connected_at 老但 state 已 Authenticated → cleanup 必须跳过，不踢已认证连接。
+    #[tokio::test]
+    async fn test_watchdog_does_not_touch_authenticated_sessions() {
+        let manager = ConnectionManager::new();
+        let sid = SessionId::new(9003);
+        manager.register_connecting(sid);
+        let _ = manager.authenticate(sid, 42, "device-X".to_string());
+        // 强制 connected_at = 1 小时前；state 是 Authenticated
+        let now = chrono::Utc::now().timestamp_millis();
+        force_connected_at(&manager, sid, now - 3_600_000);
+        let closed = manager.cleanup_stale_connecting(90).await;
+        assert_eq!(closed, 0);
+        let entry = manager.index_b.get(&sid).expect("entry kept");
+        assert_eq!(entry.state, SessionState::Authenticated);
+        // Index A 仍指向该 session
+        assert!(manager.is_device_online(42, "device-X").await);
+    }
+
+    /// case 4：auth_retry_success_before_timeout_survives
+    /// Connecting → authenticate 成功（state 转 Authenticated）→ watchdog 跑也不踢。
+    #[tokio::test]
+    async fn test_watchdog_auth_retry_before_timeout_survives() {
+        let manager = ConnectionManager::new();
+        let sid = SessionId::new(9004);
+        manager.register_connecting(sid);
+        // 模拟 client auth 成功 retry：state 转 Authenticated
+        let _ = manager.authenticate(sid, 7, "device-Y".to_string());
+        // 此后即使 connected_at 已经"老"，也不应被踢
+        let now = chrono::Utc::now().timestamp_millis();
+        force_connected_at(&manager, sid, now - 200_000);
+        let closed = manager.cleanup_stale_connecting(90).await;
+        assert_eq!(closed, 0);
+        let entry = manager.index_b.get(&sid).expect("entry kept");
+        assert_eq!(entry.state, SessionState::Authenticated);
+    }
+
+    /// case 5：timeout_secs == 0 → disabled，无论多老都不踢
+    #[tokio::test]
+    async fn test_watchdog_timeout_zero_disables_cleanup() {
+        let manager = ConnectionManager::new();
+        let sid = SessionId::new(9005);
+        manager.register_connecting(sid);
+        let now = chrono::Utc::now().timestamp_millis();
+        force_connected_at(&manager, sid, now - 86_400_000); // 24h ago
+        let closed = manager.cleanup_stale_connecting(0).await;
+        assert_eq!(closed, 0);
+        let entry = manager.index_b.get(&sid).expect("entry kept");
+        assert_eq!(entry.state, SessionState::Connecting);
     }
 }
