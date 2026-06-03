@@ -247,6 +247,15 @@ enabled = false
 # enabled = false
 # app_id = "your-huawei-app-id"
 # access_token = "your-access-token"
+
+# 房间 ticket：HS256 JWT for SubscribeRequest.param (spec ROOM_CHANNEL_SPEC §4.5)
+# 必填；不配则 application 调 /api/service/room-tickets/issue 端点全部返回
+# "room_ticket not configured on server"，客户端 join room 直接 500。
+# 部署时把 secret 换成 prod-grade 随机串，例：openssl rand -base64 48
+[room_ticket]
+secret = "your-room-ticket-secret"
+default_kid = "v1"
+leeway_secs = 30
 "#;
 
     fs::write(path, default_config).with_context(|| format!("无法写入配置文件: {}", path))?;
