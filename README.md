@@ -418,32 +418,53 @@ privchat-server/
 
 ### SDK vs server alignment
 
-**Overall: 95%** ✅
+**Current alignment: high, but not a blanket 100%.**
+
+The core SDK-facing IM surface is implemented, while a few endpoints are still
+partial or intentionally delegated to client/local storage. The table below is
+kept conservative and reflects the current server code rather than the older
+"26/26 phases" status.
 
 | Category      | SDK | Server RPC | Status | Notes |
 |---------------|-----|------------|--------|-------|
-| Account       | ✅  | ✅         | ✅ 100% | register, login, authenticate |
-| Send message  | ✅  | ✅         | ✅ 100% | send_message, send_attachment |
-| Message query | ✅  | ✅         | ✅ 100% | get_message_history, search_messages |
-| Message ops   | ✅  | ✅         | ✅ 100% | revoke, add/remove_reaction |
-| Conversations | ✅  | ✅         | ✅ 100% | list via entity/sync_entities + get_channels; pin, hide, mute, direct/get_or_create |
-| Friends       | ✅  | ✅         | ✅ 100% | apply, accept, reject, remove, list |
-| Groups        | ✅  | ✅         | ✅ 100% | create, invite, remove, leave, settings |
-| Presence      | ✅  | ✅         | ✅ 100% | subscribe, query, batch_query |
-| Typing        | ✅  | ✅         | ✅ 100% | send_typing, stop_typing |
-| File up/down  | ✅  | ✅         | ✅ 100% | request_upload_token, HTTP upload/download |
-| Sync          | ✅  | ✅         | ✅ 100% | Idempotency, gap detection, Redis, Commit Log, Fan-out |
-| Devices       | ✅  | ✅         | ✅ 100% | list, revoke, update_name, kick |
-| Search        | ✅  | ✅         | ✅ 100% | search_users, search_by_qrcode |
-| Privacy       | ✅  | ✅         | ✅ 100% | get, update |
-| Blacklist     | ✅  | ✅         | ✅ 100% | add, remove, list, check |
+| Account       | ✅  | ✅         | Stable | register, login, refresh, unified token API, device sessions |
+| Send message  | ✅  | ✅         | Stable | send, attachments, echo, dedup, persistence |
+| Message query | ✅  | ✅         | Stable | history, read state, entity sync; full-text search still planned |
+| Message ops   | ✅  | ✅         | Stable | revoke, add/remove/list/stats reactions |
+| Conversations | ✅  | ✅         | Stable | entity/sync_entities + local get_channels; pin, hide, mute, direct/get_or_create |
+| Friends       | ✅  | ✅         | Stable | apply, accept, reject, recall, remove, alias, tombstone sync |
+| Groups        | ✅  | ✅         | Stable | create, members, roles, settings, QR join, approval |
+| Presence      | ✅  | ✅         | Stable | current status and realtime `presence_changed` delivery |
+| Typing        | ✅  | ✅         | Stable | send typing with server-side rate limit |
+| File up/down  | ✅  | ✅         | Mostly done | upload token, HTTP upload/download, local + S3-compatible backends; quota/callback enrichment pending |
+| Sync          | ✅  | ✅         | Mostly done | pts, idempotency, gap detection, Commit Log, cache, fan-out; permission check cleanup still pending |
+| Devices       | ✅  | ✅         | Stable | list, revoke, revoke_all, update_name, kick |
+| Search        | ✅  | ✅         | Mostly done | user and QR search; advanced/full-text message search pending |
+| Privacy       | ✅  | ✅         | Stable | get/update privacy settings and source validation |
+| Blacklist     | ✅  | ✅         | Stable | add, remove, list, check |
+| QR login      | ✅  | ✅         | Stable | unauth scene creation, scan/confirm/reject state machine, push pipeline |
+| Bot follow    | ✅  | ✅         | Stable | account/bot/follow and unfollow, relation persistence, server-event emit |
+| Channel transfer | ✅ | ✅      | Stable | wire-layer transfer relay via server-event dispatch |
+| Push          | ✅  | ✅         | Mostly done | planner/worker with APNS, FCM, HMS, Xiaomi, Oppo, Vivo, Honor, Lenovo, ZTE, Meizu |
 
 **Sync**:
-- `SyncService` full (P0/P1/P2), beyond Telegram PTS
-- Idempotency, gap detection, Redis cache, Commit Log, Fan-out, batch query, cleanup
-- Routes: `sync/submit`, `sync/get_difference`, `sync/get_channel_pts`, `sync/batch_get_channel_pts`
+- Active routes: `sync/submit`, `sync/get_difference`, `sync/get_channel_pts`,
+  `sync/batch_get_channel_pts`, `sync/session_ready`
+- Implemented: pts allocation, idempotency, gap detection, Commit Log, cache,
+  fan-out, batch query
+- Remaining hardening: channel permission validation, online-user cache cleanup,
+  and integration-test refresh
 
-**Channel model (2026-01-27)**:
+**Recent server-side additions after the old README snapshot**:
+- Unified service token API: `/api/service/auth/{issue,refresh,introspect,revoke}` + JWKS
+- Web/PC QR login: unauth RPC `qr_login/create_scene` and HTTP scan/confirm/reject flow
+- Permanent user/group QR keys and QR URL builder
+- Bot follow/unfollow and generic server-event dispatch
+- Room subscribe tickets and channel transfer send endpoint
+- Multi-vendor offline push provider pipeline
+- Prometheus `/metrics` endpoint with core connection/RPC/delivery counters
+
+**Channel model**:
 - Removed `channel/create` and `channel/join`; channels auto-created from friend/group actions
 - `channel/delete` → `channel/hide` (local hide)
 - Added `channel/mute` (notification preference)
@@ -451,45 +472,54 @@ privchat-server/
 
 ### ✅ Implemented
 
-#### Auth & connection (100%)
-- JWT, device management, token revocation
-- Login: `AuthorizationRequest`/`AuthorizationResponse`
+#### Auth & connection
+- JWT, refresh tokens, device management, token revocation, unified service token API
+- Login: `AuthorizationRequest`/`AuthorizationResponse`; HTTP service token endpoints
 - Multi-device: SessionManager
-- Heartbeat: PingRequest/PongResponse
+- Heartbeat: PingRequest/PongResponse; unauth connecting-session watchdog
 - Devices: `device/list`, `device/revoke`, `device/update`
 
-#### Messaging (100%)
+#### Messaging
 - Send/Recv, MessageRouter, offline push, storage (PostgreSQL), history (`message/history/get`), revoke (`message/revoke`, 2 min), @mentions, reply, Reactions (add/remove/list/stats), echo, dedup
 
-#### Friends (100%)
+#### Friends
 - Apply, accept, list, remove, pending; blacklist add/remove/list/check; block non-friend messages; optional non-friend messaging
 
-#### Groups (100%)
+#### Groups
 - Create, info, list; member add/remove/list/leave; roles (Owner/Admin/Member), transfer_owner, set admin, permissions, mute/unmute, mute_all, settings get/update, QR generate/join, approval list/handle
 
-#### Message status (100%)
+#### Message status
 - `message/status/read_pts`, `count`, `read_list`, `read_stats`
 
-#### Presence (100%)
+#### Presence
 - subscribe, query, batch_query, unsubscribe, stats
 
-#### Typing (100%)
+#### Typing
 - `typing/send`, receive, stats
 
-#### Notifications (100%)
+#### Notifications and push
 - Friend request, group invite, kick, revoke, system (5 types)
+- Push planner/worker with Redis online check and multi-vendor providers
 
-#### Search & privacy (100%)
+#### Search & privacy
 - `account/search/query`, `by-qrcode`, `account/user/detail`, share_card; `account/privacy/get`, `update`; source verification
 
-#### File upload/download (100%)
+#### File upload/download
 - `file/request_upload_token`, `upload_callback`, `validate_token`; HTTP file server (port **9083**); **multi-backend** (local FS + S3/OSS/COS/MinIO/Garage via OpenDAL, `default_storage_source_id`); token and URL validation
 
-#### Devices (100%)
+#### Devices
 - list, revoke, revoke_all, update_name, kick_device, kick_other_devices
 
-#### pts sync (100%) ⭐
+#### pts sync
 - PtsGenerator, MessageWithPts, DeviceSyncState, OfflineQueueService, UnreadCountService; idempotency, gap detection, Redis cache, Commit Log, Fan-out, batch query; RPCs: `sync/get_channel_pts`, `sync/get_difference`, `sync/submit`, `sync/batch_get_channel_pts`
+
+#### QR, service API, and server integration
+- QR login scene lifecycle and unauth push pipeline
+- User/group QR key persistence and URL builder
+- Bot follow/unfollow with server-event notification
+- Channel Transfer wire-layer utilities and `/api/service/transfer/send`
+- Room subscribe ticket issuer
+- Generic server-event envelope for downstream application modules
 
 ### ⚠️ Partial
 
@@ -503,110 +533,114 @@ privchat-server/
 - **Multi-backend**: local FS + S3/OSS/COS/MinIO/Garage (OpenDAL, `[[file.storage_sources]]`) ✅
 - Stickers: RPC done, storage TBD
 - **Image compression & thumbnails**: SDK (default thumbnail, video hook Thumbnail/Compress, auto-download thumb on receive) ✅
+- Upload callback, quotas, media post-processing and content review hooks still need hardening
 
 #### Persistence
 - PostgreSQL, repositories, migrations ✅; all business logic uses DB; memory cache for perf
 - Index/query tuning TBD
 
-#### Batch read
-- Single read ✅ (Phase 8)
-- Batch mark-read RPC ❌
-- Batch read receipt broadcast ❌
+#### Sync and offline hardening
+- `sync/submit` still needs explicit channel permission validation
+- Online-user Redis removal and expired-offline-message cleanup need completion
+- Some older integration tests and examples still need protocol-shape updates
 
 ### ❌ Not implemented (planned)
 
-- **Batch read** (P0): batch mark-read RPC, per-conversation batch, batch receipt broadcast, batch SQL
-- **Monitoring** (P1): Prometheus, tracing, alerts, dashboard
+- **Monitoring** (P1): Grafana dashboard, alerts, tracing
 - **Network** (P1): connection quality, reconnect, backoff, weak network
 - **Perf** (P2): batch send, index/query, cache warmup, slow-query tuning
+- **Production ops** (P2): load test, backup, restore, DR runbooks
 
 ## 📊 Project status
 
 ### Completion
 
-- **Server**: 96% ✅ (core + multi-backend S3/OSS)
+- **Server feature coverage**: high, roughly mid/high-90s for core IM features; not a verified 99%
 - **SDK**: 95% ✅ (core + media preprocessing/thumbnails)
-- **Production readiness**: 86% ⚠️ (persistence 95%, core 100%, multi-backend ✅; monitoring/perf TBD)
-- **Tests**: 100% ✅ (26/26 phases)
-- **SDK–server alignment**: 95% ✅
+- **Production readiness**: in progress (monitoring basics done; load test, alerting, DR and backup still pending)
+- **Tests**: library unit tests pass (`cargo test --lib`: 241 passed, 3 ignored); full `cargo test --no-fail-fast` currently needs test/example updates after protocol and transfer refactors
+- **SDK–server alignment**: high for core workflows, with advanced search/media/sticker/storage gaps still tracked
 
 ### Module completion (summary)
 
-| Module        | Completion | Status | Notes |
-|---------------|-------------|--------|-------|
-| Core messaging| 95%         | ✅     | Send, receive, forward, reply |
-| Message types | 95%         | ✅     | 10+ types |
-| Offline       | 100%        | ✅     | Push + tests |
-| Revoke        | 100%        | ✅     | 2 min |
-| @Mention      | 100%        | ✅     | + tests |
-| Reply         | 100%        | ✅     | + tests |
-| Reaction      | 100%        | ✅     | Full |
-| Auth          | 95%         | ✅     | JWT, devices |
-| Conversations | 100%        | ✅     | list, pin, hide, mute |
-| Read receipts | 100%        | ✅     | RPC + broadcast |
-| Groups        | 100%        | ✅     | Full |
-| File storage  | 98%         | ✅     | Local + S3/OSS (OpenDAL) |
-| Friends       | 100%        | ✅     | Full |
-| Presence      | 100%        | ✅     | Full |
-| Typing        | 100%        | ✅     | Full |
-| Notifications | 100%        | ✅     | 5 types |
-| Stickers      | 60%         | ⚠️     | RPC only |
-| Search        | 90%         | ✅     | User + SDK local |
-| pts sync      | 100%        | ✅     | P0/P1/P2, all routes |
-| Dedup         | 100%        | ✅     | Server + SDK |
-| Persistence   | 95%         | ✅     | PostgreSQL + repos |
+| Module        | Status | Notes |
+|---------------|--------|-------|
+| Core messaging| Stable | Send, receive, revoke, mention, reply, reaction, dedup |
+| Message types | Mostly done | Common types supported; richer payload parsing and advanced types pending |
+| Offline       | Mostly done | Queue and push path exist; cleanup and load verification pending |
+| Auth          | Stable | JWT, refresh token repository, devices, unified service token API |
+| Conversations | Stable | entity sync, direct get/create, pin, hide, mute |
+| Read receipts | Stable | `read_pts`, count, list, stats |
+| Groups        | Stable | Members, roles, settings, QR join, approval |
+| File storage  | Mostly done | Local + S3-compatible OpenDAL; quota/callback hooks pending |
+| Friends       | Stable | Request lifecycle, alias, blacklist, tombstone sync |
+| Presence      | Stable | User aggregation and realtime delivery |
+| Push          | Mostly done | Planner/worker + multi-vendor providers; operational validation pending |
+| QR login      | Stable | Scene state machine and unauth push pipeline |
+| Bot follow    | Stable | Follow relation and server-event emit |
+| Channel transfer | Stable | Wire validation and server-event dispatch path |
+| Stickers      | Partial | Package/list RPC exists; durable storage still TBD |
+| Search        | Mostly done | User/QR search; full-text message search pending |
+| pts sync      | Mostly done | Core path works; permission validation and test refresh pending |
+| Persistence   | Mostly done | PostgreSQL + repositories + migrations; index/query tuning pending |
 
 ### Production checklist
 
-**Required**: ✅ Persistence, dedup, auth, encrypted transport; ⚠️ Monitoring; ✅ Logging, errors, functional tests (26/26); ❌ Load test, DR, backup
+**Ready or mostly ready**: persistence, dedup, auth/session/device management, structured logging, `/metrics`, core IM workflows, QR login, transfer, Push pipeline.
 
-**Recommended**: ✅ Revoke, read receipt, offline, groups, @mention, reply, Reaction, presence, typing; ⚠️ Stickers; ❌ Batch read; ❌ Message edit (by design: revoke+resend only)
+**Still required before production sign-off**: full integration test refresh, load testing, Grafana/alerts/tracing, backup/restore, DR plan, sync permission validation, offline cleanup.
+
+**By design**: message editing is not implemented. Use revoke-and-resend.
 
 ## 🚀 Roadmap
 
 ### Near-term (P0)
-1. Batch read RPC, per-conversation batch, batch receipt, batch SQL
-2. Prometheus, metrics, Grafana, alerts, tracing
-3. Load test, throughput, DB/query/cache/connection tuning
+1. Refresh failing tests/examples after FlatBuffers and transfer refactors
+2. Finish sync permission validation and online/offline cleanup tasks
+3. Add Grafana dashboard, alerts, tracing, and production scrape examples
+4. Run load tests and tune DB/query/cache/connection pools
 
 ### Short-term (P1)
-4. Message pin, forward improvements, full-text search
-5. **Media**: ✅ Image (SDK thumbnails, optional compress; server S3/OSS); ✅ Video (SDK hook, auto-download thumb; server multi-backend); Voice (STT, progress); File preview (Office, PDF)
-6. Group: announcements, polls, files, sub-channels
+5. Message pin, forward improvements, full-text search
+6. **Media**: ✅ Image (SDK thumbnails, optional compress; server S3/OSS); ✅ Video (SDK hook, auto-download thumb; server multi-backend); Voice (STT, progress); File preview (Office, PDF)
+7. Group: announcements, polls, files, sub-channels
 
 ### Mid-term (P2)
-7. Voice/video (WebRTC), group calls, screen share, recording
-8. E2EE (Signal, X3DH, Double Ratchet, safety number, secret chat, disappearing)
-9. Bots: API, webhooks, /commands, auto-reply, scheduled, templates
-10. Enterprise: org, permissions, audit, SSO, export, admin UI
+8. Voice/video (WebRTC), group calls, screen share, recording
+9. E2EE (Signal, X3DH, Double Ratchet, safety number, secret chat, disappearing)
+10. Bots: API, webhooks, /commands, auto-reply, scheduled, templates
+11. Enterprise: org, permissions, audit, SSO, export, admin UI
 
 ### Long-term (P3)
-11. Multi-region, routing, sync, failover, CDN
-12. AI: translation, moderation, recommendations, assistant, STT, OCR
-13. Compression, connection pool, multi-level cache, load balancing, scaling
+12. Multi-region, routing, sync, failover, CDN
+13. AI: translation, moderation, recommendations, assistant, STT, OCR
+14. Compression, connection pool, multi-level cache, load balancing, scaling
 
-## 📊 Progress (2026-02-02)
+## 📊 Progress (2026-05-28)
 
-- **Core**: 96%; **Production**: 86%; **Tests**: 100%; **Docs**: 85%
-- **Recent**: Multi-backend file storage (OpenDAL, S3/OSS/COS/MinIO/Garage); SDK image compression & thumbnails, video hook, auto-download thumb; Channel model and API (hide/mute, auto-creation)
-- **Done**: Messaging, friends, groups, presence, typing, notifications, pts sync, persistence, file up/down (multi-backend), SDK media preprocessing
-- **Next**: Batch read RPC, monitoring, load testing
+- **Core feature coverage**: high; core IM workflows, multi-device, persistence, sync, file storage, QR login, bot follow, transfer, Push and service APIs are present.
+- **Production readiness**: still in progress; monitoring basics exist, but alerting, tracing, load testing, backup and DR need completion.
+- **Tests**: `cargo test --lib` passes; full test suite currently has stale integration tests/examples after protocol and transfer refactors.
+- **Recent**: unified token API, QR login, user/group QR keys, server-event dispatch, bot follow, room tickets, channel transfer, multi-vendor Push.
+- **Next**: test refresh, sync/offline hardening, observability, load testing.
 
 ## 📚 Docs
 
 Design docs live under **privchat-docs** or **privchat-server/docs**; see repo layout.
 
-- [GROUP_SIMPLE_DESIGN.md](../privchat-docs/design/GROUP_SIMPLE_DESIGN.md) (if present)
-- MESSAGE_STATUS_SYSTEM, SEARCH_SYSTEM_DESIGN, TELEGRAM_SYNC_IMPLEMENTATION, OFFLINE_MESSAGE_SIMPLE_DESIGN – under `privchat-docs/design/` or `docs/`
+- [OFFLINE_SPEC.md](../privchat-docs/spec/02-server/OFFLINE_SPEC.md)
+- [SEARCH_SPEC.md](../privchat-docs/spec/05-feature/SEARCH_SPEC.md)
+- [DEPLOYMENT_SPEC.md](../privchat-docs/spec/06-ops/DEPLOYMENT_SPEC.md)
+- Legacy design notes are archived under `../privchat-docs/_archive/legacy/` and `../privchat-docs/_archive/design-iterations/`.
 - Auth, blacklist, message revoke, read receipt, persistence, RPC, file storage – under `privchat-docs` or `docs/`
 
 ## 📄 License
 
-MIT. See [LICENSE](../LICENSE).
+MIT. See [LICENSE](LICENSE).
 
 ## 🤝 Contributing
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md).
+Contribution guide is not yet checked into this package. Please open an issue or follow the repository conventions for now.
 
 ## 📞 Support
 
@@ -634,14 +668,14 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md).
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Rust Version](https://img.shields.io/badge/rust-1.90%2B-orange)]()
 
-**Core**: 96% | **Production**: 86% | **Tests**: 100% ✅ | **SDK alignment**: 95% ✅ | **Sync**: 100% ✅
+**Core**: high coverage | **Production**: in progress | **Tests**: lib tests pass, full suite needs refresh | **SDK alignment**: high
 
-*Last updated: 2026-02-02*  
-*Status: 26/26 test phases pass; SDK–server 95% aligned*  
-*Done: Messaging, groups, friends, @mention, reply, Reaction, presence, typing, notifications, file up/down (multi-backend S3/OSS), conversations; SDK image/video preprocessing and thumbnails*  
-*Recent: Multi-backend (OpenDAL), S3/OSS/COS/MinIO/Garage; SDK media (thumbnails, video Thumbnail/Compress)*  
-*Next: Batch read RPC, monitoring, load testing*
+*Last updated: 2026-05-28*
+*Status: core library tests pass; integration tests/examples need refresh after protocol and transfer refactors*
+*Done: Messaging, groups, friends, @mention, reply, Reaction, presence, typing, notifications, file up/down, conversations, QR login, bot follow, transfer, Push*
+*Recent: unified token API, QR keys, server-event dispatch, room tickets, multi-vendor Push*
+*Next: test refresh, sync/offline hardening, observability, load testing*
 
-[Quick Start](#-quick-start) • [Feature List](#-feature-list) • [Docs](docs/) • [Contributing](../CONTRIBUTING.md)
+[Quick Start](#-quick-start) • [Feature List](#-feature-list) • [Docs](../privchat-docs/spec)
 
 </div>
