@@ -55,6 +55,27 @@ pub struct FileUrlResponse {
     pub cek: Option<String>,
 }
 
+/// 附件访问授权纯决策（无 IO，便于单测；ATTACHMENT_ENCRYPTION_SPEC §授权）。
+///
+/// 由调用方先把 IO 解析好再传入：
+/// - `bound_message_id`：file 绑定的 message_id；`None` = 未绑定（pending）。
+/// - `member_of_message_channel`：当 bound 时，当前用户是否是该 message 所在 channel 成员；
+///   `Some(true)`=是成员；`Some(false)`=非成员；`None`=消息/channel 无法解析（broken binding）。
+///
+/// 规则：pending → 仅 uploader；bound → 必须是成员（broken/非成员一律拒绝，不 fallback 放行）。
+/// 注意：bound 文件即使是 uploader，若非成员也拒绝（不能靠 uploader 身份绕过）。
+pub fn authorize_file_access(
+    user_id: u64,
+    uploader_id: u64,
+    bound_message_id: Option<u64>,
+    member_of_message_channel: Option<bool>,
+) -> bool {
+    match bound_message_id {
+        None => uploader_id == user_id,
+        Some(_) => member_of_message_channel == Some(true),
+    }
+}
+
 /// 文件服务（多存储源，按 default_storage_source_id 选择；存储层统一用 OpenDAL Operator）
 pub struct FileService {
     sources_by_id: HashMap<u32, FileStorageSourceConfig>,
@@ -443,5 +464,50 @@ impl FileService {
             return format!("/{}", file_path);
         }
         format!("{{unsupported:storage_source_id={}}}", storage_source_id)
+    }
+}
+
+#[cfg(test)]
+mod authz_tests {
+    use super::authorize_file_access;
+
+    // pending（未绑定 message）：仅 uploader 可访问
+    #[test]
+    fn pending_uploader_allowed() {
+        assert!(authorize_file_access(1, 1, None, None));
+    }
+
+    #[test]
+    fn pending_non_uploader_denied() {
+        assert!(!authorize_file_access(2, 1, None, None));
+    }
+
+    // bound（已绑定 message）：成员可访问
+    #[test]
+    fn bound_member_allowed() {
+        assert!(authorize_file_access(2, 1, Some(99), Some(true)));
+    }
+
+    #[test]
+    fn bound_non_member_denied() {
+        assert!(!authorize_file_access(2, 1, Some(99), Some(false)));
+    }
+
+    // broken binding（消息/channel 解析不出）：拒绝，不 fallback 放行
+    #[test]
+    fn bound_broken_binding_denied() {
+        assert!(!authorize_file_access(2, 1, Some(99), None));
+    }
+
+    // bound 文件即使是 uploader，非成员也不能靠 uploader 身份绕过
+    #[test]
+    fn bound_uploader_but_non_member_denied() {
+        assert!(!authorize_file_access(1, 1, Some(99), Some(false)));
+    }
+
+    // bound 文件 uploader 且是成员 → 允许
+    #[test]
+    fn bound_uploader_and_member_allowed() {
+        assert!(authorize_file_access(1, 1, Some(99), Some(true)));
     }
 }

@@ -55,19 +55,28 @@ pub async fn get_file_url(
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|id| *id > 0);
 
-    let authorized = match bound_message_id {
+    // 解析 bound 消息的成员关系（IO），再交给纯函数 authorize_file_access 决策（便于单测）。
+    let member_of_message_channel = match bound_message_id {
         Some(message_id) => match services.message_repository.get_channel_id(message_id).await {
-            Ok(Some(channel_id)) => services
-                .channel_service
-                .is_channel_member(channel_id, user_id)
-                .await
-                .unwrap_or(false),
-            // 消息不存在 / channel 缺失 / 查询失败 → 拒绝
-            _ => false,
+            Ok(Some(channel_id)) => Some(
+                services
+                    .channel_service
+                    .is_channel_member(channel_id, user_id)
+                    .await
+                    .unwrap_or(false),
+            ),
+            // 消息不存在 / channel 缺失 / 查询失败 → broken binding
+            _ => None,
         },
-        // pending：未绑定消息，只允许上传者本人（发送端预览/重试）
-        None => file_meta.uploader_id == user_id,
+        None => None,
     };
+
+    let authorized = crate::service::file_service::authorize_file_access(
+        user_id,
+        file_meta.uploader_id,
+        bound_message_id,
+        member_of_message_channel,
+    );
 
     if !authorized {
         tracing::warn!(
