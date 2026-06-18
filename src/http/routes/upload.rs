@@ -22,6 +22,8 @@
 
 use axum::{extract::DefaultBodyLimit, extract::State, routing::post, Router};
 use axum_extra::extract::Multipart;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::Serialize;
 use tracing::info;
 
@@ -111,8 +113,11 @@ async fn upload_file(
     let mut filename: Option<String> = None;
     let mut mime_type: Option<String> = None;
     let mut business_id: Option<String> = None;
+    // 附件加密 v1：encryption_version 0/1；version=1 时 cek=base64url(32B)，nonce 在 blob 头。
+    let mut encryption_version: i32 = 0;
+    let mut cek: Option<String> = None;
 
-    // 解析 multipart/form-data：file 必填；business_id 可选（字符串，兼容各类业务）
+    // 解析 multipart/form-data：file 必填；business_id / encryption_version / cek 可选
     while let Some(field) = multipart
         .next_field()
         .await
@@ -133,6 +138,19 @@ async fn upload_file(
                     let s = s.trim().to_string();
                     if !s.is_empty() {
                         business_id = Some(s);
+                    }
+                }
+            }
+            "encryption_version" => {
+                if let Ok(s) = field.text().await {
+                    encryption_version = s.trim().parse::<i32>().unwrap_or(0);
+                }
+            }
+            "cek" => {
+                if let Ok(s) = field.text().await {
+                    let s = s.trim().to_string();
+                    if !s.is_empty() {
+                        cek = Some(s);
                     }
                 }
             }
@@ -158,6 +176,45 @@ async fn upload_file(
         )));
     }
 
+    // 附件加密结构校验（服务端不解密、不验 GCM tag，仅防脏数据入库；ATTACHMENT_ENCRYPTION_SPEC §3.2）。
+    // 注意：cek 绝不进日志。
+    match encryption_version {
+        0 => {
+            if cek.is_some() {
+                return Err(ServerError::Validation(
+                    "encryption_version=0 时不应携带 cek".to_string(),
+                ));
+            }
+        }
+        1 => {
+            let cek_str = cek.as_deref().ok_or_else(|| {
+                ServerError::Validation("encryption_version=1 缺少 cek".to_string())
+            })?;
+            let decoded = URL_SAFE_NO_PAD
+                .decode(cek_str.as_bytes())
+                .map_err(|_| ServerError::Validation("cek 不是合法 base64url".to_string()))?;
+            if decoded.len() != 32 {
+                return Err(ServerError::Validation(format!(
+                    "cek 解码后必须为 32 字节，实际 {}",
+                    decoded.len()
+                )));
+            }
+            // blob = nonce(12) || ciphertext(>=0) || tag(16)，最少 28 字节
+            if file_data.len() < 28 {
+                return Err(ServerError::Validation(format!(
+                    "加密 blob 至少 28 字节（12 nonce + 16 tag），实际 {}",
+                    file_data.len()
+                )));
+            }
+        }
+        v => {
+            return Err(ServerError::Validation(format!(
+                "不支持的 encryption_version: {}",
+                v
+            )));
+        }
+    }
+
     // 从请求头取客户端 IP（兼容反向代理：X-Forwarded-For 取第一个，否则 X-Real-IP）
     let uploader_ip = client_ip_from_headers(&headers);
 
@@ -180,6 +237,8 @@ async fn upload_file(
             uploader_ip,
             token_info.business_type.clone(),
             business_id,
+            encryption_version,
+            cek,
         )
         .await?;
 
