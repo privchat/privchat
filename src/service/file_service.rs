@@ -394,7 +394,9 @@ impl FileService {
             file_size: metadata.file_size,
             mime_type: metadata.mime_type,
             storage_source_id: metadata.storage_source_id,
-            // 加密元数据：CEK 仅鉴权后随 detail 返回（调用方 get_file_url 已校验 user_id）。
+            // ⚠️ P0 安全：此处随 detail 返回 CEK，但调用方 get_file_url 目前 **未做** 访问授权
+            // （user_id 未使用）。返回 cek 前必须校验当前用户有权访问该附件（file→message→channel
+            // 成员）。授权补齐前，加密形同虚设。见 ATTACHMENT_ENCRYPTION_SPEC §授权。
             encryption_version: metadata.encryption_version,
             cek: metadata.cek,
         })
