@@ -49,6 +49,10 @@ pub struct FileUrlResponse {
     pub file_size: u64,
     pub mime_type: String,
     pub storage_source_id: u32,
+    /// 附件加密版本：0=明文；1=AES-256-GCM。
+    pub encryption_version: i32,
+    /// CEK（base64url 32B）；仅鉴权后返回，绝不进日志/URL。version=0 时 None。
+    pub cek: Option<String>,
 }
 
 /// 文件服务（多存储源，按 default_storage_source_id 选择；存储层统一用 OpenDAL Operator）
@@ -223,6 +227,8 @@ impl FileService {
         uploader_ip: Option<String>,
         business_type: String,
         business_id: Option<String>,
+        encryption_version: i32,
+        cek: Option<String>,
     ) -> Result<FileMetadata> {
         let file_type = self.detect_file_type(&mime_type)?;
         self.validate_file_size(&file_data, &file_type)?;
@@ -264,6 +270,8 @@ impl FileService {
             file_hash: Some(file_hash),
             business_type: Some(business_type),
             business_id,
+            encryption_version,
+            cek,
         };
         self.file_upload_repo.insert(&metadata).await?;
 
@@ -386,6 +394,9 @@ impl FileService {
             file_size: metadata.file_size,
             mime_type: metadata.mime_type,
             storage_source_id: metadata.storage_source_id,
+            // 加密元数据：CEK 仅鉴权后随 detail 返回（调用方 get_file_url 已校验 user_id）。
+            encryption_version: metadata.encryption_version,
+            cek: metadata.cek,
         })
     }
 

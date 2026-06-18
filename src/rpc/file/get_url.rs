@@ -49,6 +49,8 @@ pub async fn get_file_url(
         expires_at: url.expires_at,
         file_size: url.file_size as u64,
         mime_type: url.mime_type,
+        encryption_version: url.encryption_version,
+        cek: url.cek,
     };
 
     Ok(serde_json::to_value(response)

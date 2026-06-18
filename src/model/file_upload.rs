@@ -83,4 +83,9 @@ pub struct FileMetadata {
     pub business_type: Option<String>,
     /// 业务具体ID（字符串，兼容各类业务如 message_id/uuid 等），便于随业务数据删除时清理
     pub business_id: Option<String>,
+    /// 附件加密版本：0=明文 legacy；1=AES-256-GCM（客户端加密，见 ATTACHMENT_ENCRYPTION_SPEC）
+    pub encryption_version: i32,
+    /// 内容密钥 CEK：base64url(no-pad) 的 32 字节；nonce 在密文 blob 头部，不入库。
+    /// 仅在鉴权后的 get_url 响应返回，绝不进日志/URL。version=0 时为 None。
+    pub cek: Option<String>,
 }
