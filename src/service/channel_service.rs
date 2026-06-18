@@ -3261,6 +3261,13 @@ impl ChannelService {
     }
 
     /// 获取频道成员列表
+    /// 判断 user 是否是 channel 成员（附件访问授权用，ATTACHMENT_ENCRYPTION_SPEC §授权）。
+    /// 1.0 复用 get_channel_members 遍历；TODO: 改 SQL `EXISTS` 查询避免拉全量。
+    pub async fn is_channel_member(&self, channel_id: u64, user_id: u64) -> Result<bool> {
+        let members = self.get_channel_members(&channel_id).await?;
+        Ok(members.iter().any(|m| m.user_id == user_id))
+    }
+
     pub async fn get_channel_members(
         &self,
         channel_id: &u64,
