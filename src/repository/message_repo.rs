@@ -90,6 +90,18 @@ impl PgMessageRepository {
         &self.pool
     }
 
+    /// 按 message_id 取 channel_id（附件访问授权用：file→message→channel）。
+    /// 返回 None 表示消息不存在（授权方应据此拒绝）。
+    pub async fn get_channel_id(&self, message_id: u64) -> Result<Option<u64>, DatabaseError> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT channel_id FROM privchat_messages WHERE message_id = $1")
+                .bind(message_id as i64)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(|e| DatabaseError::Database(format!("查询消息 channel_id 失败: {}", e)))?;
+        Ok(row.map(|r| r.0 as u64))
+    }
+
     // =====================================================
     // 管理 API 方法
     // =====================================================

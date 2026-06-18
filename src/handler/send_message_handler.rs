@@ -1208,6 +1208,35 @@ impl MessageHandler for SendMessageHandler {
             message.message_id
         );
 
+        // 附件 file→message 绑定（ATTACHMENT_ENCRYPTION_SPEC §授权）：消息落库成功后，把
+        // file_id / thumbnail_file_id 绑定到 message_id（business_type="message"），使接收端
+        // get_url 能按 channel 成员授权访问/拿 CEK。绑定失败 → 回滚消息 + 发送失败，
+        // 绝不发出"不可下载"的附件消息。服务端做，不靠客户端后补（断线/崩溃会变 orphan）。
+        let bind_file_ids = Self::extract_attachment_file_ids(&message.metadata);
+        for fid in &bind_file_ids {
+            if let Err(e) = self
+                .file_service
+                .update_business(*fid, "message", &message.message_id.to_string())
+                .await
+            {
+                error!(
+                    "❌ SendMessageHandler: 绑定附件 file_id={} → message_id={} 失败: {}",
+                    fid, message.message_id, e
+                );
+                let _ = sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
+                    .bind(message.message_id as i64)
+                    .execute(self.message_repository.pool())
+                    .await;
+                return self
+                    .create_error_response(
+                        &send_message_request,
+                        ErrorCode::MessageSendFailed,
+                        "附件绑定失败",
+                    )
+                    .await;
+            }
+        }
+
         if let Some(sync_service) = get_global_sync_service() {
             let commit = privchat_protocol::rpc::sync::ServerCommit {
                 pts: pts as u64,
@@ -1692,6 +1721,26 @@ impl SendMessageHandler {
                 self.validate_link_metadata(&metadata).await
             }
         }
+    }
+
+    /// 从消息 metadata 提取所有附件 file_id（原文件 + 缩略图），用于 file→message 绑定授权。
+    /// 覆盖 image/video/voice/file 的 `file_id` 与 video/link/location 的 `thumbnail_file_id`。
+    /// 数字或字符串均兼容；去重；忽略 0/缺失。
+    fn extract_attachment_file_ids(metadata: &serde_json::Value) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for key in ["file_id", "thumbnail_file_id"] {
+            if let Some(v) = metadata.get(key) {
+                let id = v
+                    .as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()));
+                if let Some(id) = id {
+                    if id > 0 && !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        ids
     }
 
     /// 验证文件类型消息的 metadata（image/video/audio/file）
