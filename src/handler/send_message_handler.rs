@@ -2429,3 +2429,41 @@ impl SendMessageHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod attachment_bind_tests {
+    use super::SendMessageHandler;
+    use serde_json::json;
+
+    // 原图 + 缩略图都要被提取（缩略图同等绑定 → 接收方能授权下载缩略图）
+    #[test]
+    fn extracts_file_and_thumbnail() {
+        let meta = json!({ "file_id": 100u64, "thumbnail_file_id": 200u64, "width": 800 });
+        let ids = SendMessageHandler::extract_attachment_file_ids(&meta);
+        assert!(ids.contains(&100));
+        assert!(ids.contains(&200));
+        assert_eq!(ids.len(), 2);
+    }
+
+    // 字符串形式 id 兼容
+    #[test]
+    fn accepts_string_ids() {
+        let meta = json!({ "file_id": "300", "thumbnail_file_id": "0" });
+        let ids = SendMessageHandler::extract_attachment_file_ids(&meta);
+        assert_eq!(ids, vec![300]); // 0 被忽略
+    }
+
+    // 文本消息无附件 → 空
+    #[test]
+    fn text_message_has_no_attachments() {
+        let meta = json!({ "text": "hello" });
+        assert!(SendMessageHandler::extract_attachment_file_ids(&meta).is_empty());
+    }
+
+    // 去重：原图与缩略图同 id 只保留一个
+    #[test]
+    fn dedups_same_id() {
+        let meta = json!({ "file_id": 5u64, "thumbnail_file_id": 5u64 });
+        assert_eq!(SendMessageHandler::extract_attachment_file_ids(&meta), vec![5]);
+    }
+}
