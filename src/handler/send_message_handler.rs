@@ -35,6 +35,40 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+/// 附件加密 v1：缩略图 `thumbnail_cek` 现随消息 metadata 下发，主文件 `cek` 永不进 metadata。
+/// 任何打印 message metadata/payload 的日志都必须先经此函数把 `cek`/`thumbnail_cek` 值
+/// redact 成 `"***"`，CEK 绝不落日志（ATTACHMENT_ENCRYPTION_SPEC §3.2 日志红线）。
+fn redact_cek_in_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if k == "cek" || k == "thumbnail_cek" {
+                    *v = Value::String("***".to_string());
+                } else {
+                    redact_cek_in_value(v);
+                }
+            }
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(redact_cek_in_value),
+        _ => {}
+    }
+}
+
+/// 把消息 metadata（JSON 字符串）转成可安全打印的 redacted 形式。
+fn redact_metadata_for_log(metadata: &Option<String>) -> String {
+    match metadata {
+        None => "None".to_string(),
+        Some(s) => match serde_json::from_str::<Value>(s) {
+            Ok(mut v) => {
+                redact_cek_in_value(&mut v);
+                v.to_string()
+            }
+            // 解析失败也不回退打印原文（原文可能含 cek）。
+            Err(_) => "<unparseable metadata redacted>".to_string(),
+        },
+    }
+}
+
 /// 发送消息处理器
 #[derive(Clone)]
 pub struct SendMessageHandler {
@@ -946,8 +980,8 @@ impl MessageHandler for SendMessageHandler {
                 }
             };
 
-        info!("📩 SendMessageHandler: message_type={}, content={}, metadata={:?}, reply_to={:?}, mentioned={:?}, source={:?}",
-              send_message_request.message_type, content, metadata, reply_to_message_id, mentioned_user_ids, message_source);
+        info!("📩 SendMessageHandler: message_type={}, content={}, metadata={}, reply_to={:?}, mentioned={:?}, source={:?}",
+              send_message_request.message_type, content, redact_metadata_for_log(&metadata), reply_to_message_id, mentioned_user_ids, message_source);
 
         // 3.5. ✅ 检查好友关系、黑名单和非好友消息权限（仅限私聊）
         if channel.channel_type == crate::model::channel::ChannelType::Direct {
