@@ -101,6 +101,8 @@ pub async fn get_file_url(
         expires_at: url.expires_at,
         file_size: url.file_size as u64,
         mime_type: url.mime_type,
+        // 文件名取自 file 表（已在上方鉴权时拉取的 file_meta），统一由 get_url 下发。
+        original_filename: file_meta.original_filename,
         encryption_version: url.encryption_version,
         cek: url.cek,
     };
