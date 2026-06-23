@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// 会话状态（spec §3）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +283,17 @@ impl ConnectionManager {
     ) -> Result<()> {
         self.register_connecting(session_id);
         let outcome = self.authenticate(session_id, user_id, device_id.clone());
+        // [DIAG: SESSION_REGISTER] 关键诊断：device_id 是否稳定。若同一物理设备每次重连
+        // 携带不同 device_id，则旧 session 不会被 supersede（按 device_id 去重），会以
+        // 「活的」状态残留 → push 分裂到死会话 → success 虚高、客户端收不到。
+        trace!(
+            target: "diag.session_lifecycle",
+            user_id = user_id,
+            device_id = %device_id,
+            session_id = %session_id,
+            replaced_session_id = ?outcome.replaced_session_id,
+            "[SESSION_REGISTER] device_id 应跨重连稳定；replaced=None 且该 user 已有其它 device 条目即为 stale 泄漏"
+        );
         if let Some(old_sid) = outcome.replaced_session_id {
             // 异步关闭旧连接（§4.2 Step 4），不阻塞本路径
             let transport = self.transport_server.clone();
@@ -767,6 +778,38 @@ impl ConnectionManager {
             crate::infra::metrics::increment_delivery_filtered("missing_in_b", filtered_missing_b);
         }
 
+        // [DIAG: PUSH_ROUTE_TARGET] 逐 session 投递诊断（排查 stale session / 收不到消息）。
+        // 打印该 user 在 Index A 的全部设备条目（含被过滤的）+ 本次实际投递目标集合。
+        {
+            let snapshot: Vec<String> = match self.index_a.get(&user_id) {
+                Some(a) => a
+                    .value()
+                    .iter()
+                    .map(|(dev, sid)| {
+                        let (state, superseded) = match self.index_b.get(sid) {
+                            Some(b) => (format!("{:?}", b.state), format!("{:?}", b.superseded_by)),
+                            None => ("MISSING_B".to_string(), "-".to_string()),
+                        };
+                        format!("dev={} sid={} state={} superseded_by={}", dev, sid, state, superseded)
+                    })
+                    .collect(),
+                None => vec![],
+            };
+            trace!(
+                target: "diag.push_route",
+                user_id = user_id,
+                server_message_id = message.server_message_id,
+                index_a_entries = snapshot.len(),
+                live_targets = live_sessions.len(),
+                filtered_not_auth = filtered_not_auth,
+                filtered_superseded = filtered_superseded,
+                filtered_missing_b = filtered_missing_b,
+                "[PUSH_ROUTE_TARGET] index_a=[{}] live_targets={:?}",
+                snapshot.join(" | "),
+                live_sessions.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")
+            );
+        }
+
         if live_sessions.is_empty() {
             crate::infra::metrics::increment_delivery_zero_success(1);
             return Ok(0);
@@ -791,11 +834,24 @@ impl ConnectionManager {
             packet
                 .set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
             match server.send_to_session(sid, packet).await {
-                Ok(()) => success += 1,
+                Ok(()) => {
+                    success += 1;
+                    trace!(
+                        target: "diag.push_route",
+                        user_id = user_id,
+                        sid = %sid,
+                        server_message_id = message.server_message_id,
+                        "[PUSH_ROUTE_WRITE] write_ok (note: 写入传输层成功 ≠ 客户端已收到，半开连接也可能 Ok)"
+                    );
+                }
                 Err(e) => {
                     warn!(
-                        "⚠️ ConnectionManager: 实时推送失败 user={} sid={} server_message_id={} err={}",
-                        user_id, sid, message.server_message_id, e
+                        target: "diag.push_route",
+                        user_id = user_id,
+                        sid = %sid,
+                        server_message_id = message.server_message_id,
+                        "[PUSH_ROUTE_WRITE] write_FAILED err={} （应触发 stale session 清理）",
+                        e
                     );
                 }
             }
