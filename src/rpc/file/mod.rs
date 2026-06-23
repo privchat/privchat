@@ -35,9 +35,9 @@ pub async fn register_routes(services: RpcServiceContext) {
     // 客户端 RPC（公开接口）
     let services1 = services.clone();
     GLOBAL_RPC_ROUTER
-        .register("file/request_upload_token", move |params, _ctx| {
+        .register("file/request_upload_token", move |params, ctx| {
             let services = services1.clone();
-            Box::pin(async move { request_upload_token(services, params).await })
+            Box::pin(async move { request_upload_token(services, params, ctx).await })
         })
         .await;
 

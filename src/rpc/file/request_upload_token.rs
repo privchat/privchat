@@ -20,17 +20,23 @@
 use serde_json::Value;
 use tracing::warn;
 
-use crate::rpc::{RpcError, RpcResult, RpcServiceContext};
+use crate::rpc::{RpcContext, RpcError, RpcResult, RpcServiceContext};
 use crate::service::FileType;
 use privchat_protocol::rpc::{FileRequestUploadTokenRequest, FileRequestUploadTokenResponse};
 
 /// 请求上传 token
-pub async fn request_upload_token(services: RpcServiceContext, params: Value) -> RpcResult<Value> {
+pub async fn request_upload_token(
+    services: RpcServiceContext,
+    params: Value,
+    ctx: RpcContext,
+) -> RpcResult<Value> {
     // ✨ 使用协议层类型自动反序列化
     let request: FileRequestUploadTokenRequest = serde_json::from_value(params)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
-    let user_id = request.user_id;
+    // uploader 必须取自鉴权 session，绝不信客户端传的 user_id（TS SDK 传 0，且客户端
+    // 伪造 uploader 会让 send 校验 file 所有权失效）。这也是 web 发文件失败的根因。
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
     let file_type_str = &request.file_type;
     let file_size = request.file_size;
     let mime_type = request.mime_type;

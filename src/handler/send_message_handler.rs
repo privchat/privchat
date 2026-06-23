@@ -214,12 +214,26 @@ impl SendMessageHandler {
         *self.transport.write().await = Some(transport);
     }
 
-    fn sync_commit_content_from_payload(payload: &[u8], fallback_text: &str) -> serde_json::Value {
-        if payload.is_empty() {
-            return serde_json::json!({ "text": fallback_text });
+    /// 用已解析的 content + metadata 构造 sync commit 内容（{content, metadata?}）。
+    /// 与 `create_push_message_request` 的 push payload 同形，保证 realtime / sync / history
+    /// 三条路径在客户端拿到等价的媒体 metadata。CEK 不进 metadata（解析时已不含）。
+    fn sync_commit_content_from_parsed(
+        content: &str,
+        metadata: &Option<String>,
+    ) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "content".to_string(),
+            serde_json::Value::String(content.to_string()),
+        );
+        if let Some(meta_str) = metadata {
+            if let Ok(meta_val) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                if !meta_val.is_null() {
+                    obj.insert("metadata".to_string(), meta_val);
+                }
+            }
         }
-        serde_json::from_slice::<serde_json::Value>(payload)
-            .unwrap_or_else(|_| serde_json::json!({ "text": fallback_text }))
+        serde_json::Value::Object(obj)
     }
 }
 
@@ -1283,10 +1297,12 @@ impl MessageHandler for SendMessageHandler {
                     crate::model::channel::ChannelType::Room => 3,
                 },
                 message_type: content_message_type.as_str().to_string(),
-                content: Self::sync_commit_content_from_payload(
-                    &send_message_request.payload,
-                    &content,
-                ),
+                // 用 send_message_handler 已解析出的 content + metadata 构造 commit 内容，
+                // 不再把 raw wire payload 当 JSON 重解析（iOS/Rust 发的是 FlatBuffers，重解析
+                // 必失败 → 退化成 {"text":"[图片]"}，media metadata 丢失，sync/历史路径全坏）。
+                // 与 create_push_message_request 同形：{content, metadata?}，让 sync 补洞路径
+                // 拿到 file_id/thumbnail_file_id/file_name/width/height（CEK 不在 metadata）。
+                content: Self::sync_commit_content_from_parsed(&content, &metadata),
                 server_timestamp: message.created_at.timestamp_millis(),
                 sender_id: from_uid,
                 sender_info: None,
