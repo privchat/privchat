@@ -102,7 +102,17 @@ impl PresenceService {
             }
         }
 
-        let items = self.presence_tracker.batch_get_snapshots(allowed_ids).await;
+        let mut items = self.presence_tracker.batch_get_snapshots(allowed_ids).await;
+
+        // online/offline 的唯一权威 = ConnectionManager（与投递路径同源的连接真源，
+        // CONNECTION_LIFECYCLE_SPEC §1）。PresenceStateStore 只保留 last_seen_at/version 等历史，
+        // 不再决定 online —— 否则与投递路径 split-brain（能发图/typing 却显示离线）。
+        // is_online = 存在 Authenticated 且未 superseded 的有效 session；device_count 同源。
+        for item in items.iter_mut() {
+            let conns = self.connection_manager.get_user_connections(item.user_id).await;
+            item.is_online = !conns.is_empty();
+            item.device_count = conns.len() as u32;
+        }
 
         PresenceBatchStatusResponse {
             items,
@@ -143,8 +153,18 @@ impl PresenceService {
         self.publish_presence_changed(snapshot).await
     }
 
-    async fn publish_presence_changed(&self, snapshot: PresenceSnapshot) -> Result<(), ServerError> {
+    async fn publish_presence_changed(
+        &self,
+        mut snapshot: PresenceSnapshot,
+    ) -> Result<(), ServerError> {
         let user_id = snapshot.user_id;
+        // 与 batch_get_status 同源：presence_changed push 的 online/device_count 也以
+        // ConnectionManager 为权威，保证「实时推送」与「查询」一致（不再让 PresenceStateStore
+        // 的 is_online 漂移进推送）。注：断开路径若在 unregister 之前触发，本次可能仍显示在线，
+        // 由下一次 batch_get_status（轮询/进会话）最终纠正——最终一致。
+        let conns = self.connection_manager.get_user_connections(user_id).await;
+        snapshot.is_online = !conns.is_empty();
+        snapshot.device_count = conns.len() as u32;
         let related_channels = self.list_presence_channels_for_user(user_id).await?;
 
         if related_channels.is_empty() {
