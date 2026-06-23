@@ -241,6 +241,67 @@ impl PresenceService {
         Ok(())
     }
 
+    /// presence 与订阅严格绑定：客户端 subscribe 某频道成功后，把该频道相关 user 的**当前**
+    /// presence 快照（ConnectionManager 权威 online + state_store last_seen）直接推给**这一个**
+    /// 订阅会话，作为初始状态；后续变化由 publish_presence_changed 广播。这样订阅即拿到 presence，
+    /// 不依赖客户端额外 presence/status/get 查询。topic 与广播一致（"presence_changed"）。
+    pub async fn push_presence_to_session(
+        &self,
+        session_id: SessionId,
+        channel_id: u64,
+        user_ids: Vec<u64>,
+    ) {
+        if user_ids.is_empty() {
+            return;
+        }
+        let transport = self.connection_manager.transport_server.read().await;
+        let Some(server) = transport.as_ref() else {
+            return;
+        };
+        let snapshots = self.presence_tracker.batch_get_snapshots(user_ids).await;
+        for mut snapshot in snapshots {
+            // 与 batch_get_status / publish 同源：online/device_count 以 ConnectionManager 为权威。
+            let conns = self
+                .connection_manager
+                .get_user_connections(snapshot.user_id)
+                .await;
+            snapshot.is_online = !conns.is_empty();
+            snapshot.device_count = conns.len() as u32;
+            let user_id = snapshot.user_id;
+            let version = snapshot.version;
+            let payload = PresenceChangedNotification {
+                user_id,
+                version,
+                snapshot,
+            };
+            let Ok(payload_bytes) = serde_json::to_vec(&payload) else {
+                continue;
+            };
+            let publish_request = PublishRequest {
+                channel_id,
+                topic: Some("presence_changed".to_string()),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                payload: payload_bytes,
+                publisher: Some(user_id.to_string()),
+                server_message_id: None,
+            };
+            let Ok(encoded) = privchat_protocol::encode_message(&publish_request) else {
+                continue;
+            };
+            let mut packet = Packet::one_way(crate::infra::next_packet_id(), encoded);
+            packet.set_biz_type(MessageType::PublishRequest as u8);
+            if let Err(e) = server.send_to_session(session_id, packet).await {
+                warn!(
+                    "⚠️ PresenceService: push initial presence to session {} failed: {}",
+                    session_id, e
+                );
+            }
+        }
+    }
+
     pub async fn on_heartbeat_by_session(&self, session_id: &SessionId) -> Result<(), ServerError> {
         if let Some(connection) = self.connection_manager.get_connection_by_session(session_id).await
         {

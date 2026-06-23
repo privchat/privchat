@@ -673,6 +673,7 @@ impl ChatServer {
                 channel_service.clone(),
                 connection_manager.clone(),
                 room_history_service.clone(),
+                presence_service.clone(),
                 config.room_ticket.clone().map(Arc::new),
             )),
         );

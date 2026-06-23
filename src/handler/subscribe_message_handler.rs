@@ -48,6 +48,8 @@ pub struct SubscribeMessageHandler {
     channel_service: Arc<crate::service::ChannelService>,
     connection_manager: Arc<ConnectionManager>,
     room_history_service: Arc<crate::service::RoomHistoryService>,
+    /// presence 与订阅绑定：subscribe 成功后推对端初始 presence 快照。
+    presence_service: Arc<crate::service::PresenceService>,
     /// Room subscribe ticket 配置。`None` = 进入 v1 兼容模式（"已认证即放行"
     /// 无 ticket 校验，与 spec §4 不一致；仅过渡用）。配上 secret 才走完整
     /// ticket 校验。
@@ -60,6 +62,7 @@ impl SubscribeMessageHandler {
         channel_service: Arc<crate::service::ChannelService>,
         connection_manager: Arc<ConnectionManager>,
         room_history_service: Arc<crate::service::RoomHistoryService>,
+        presence_service: Arc<crate::service::PresenceService>,
         room_ticket: Option<Arc<RoomTicketConfig>>,
     ) -> Self {
         Self {
@@ -67,6 +70,7 @@ impl SubscribeMessageHandler {
             channel_service,
             connection_manager,
             room_history_service,
+            presence_service,
             room_ticket,
         }
     }
@@ -283,6 +287,31 @@ impl MessageHandler for SubscribeMessageHandler {
                             );
                             should_replay_room_history = channel_type == 2
                                 && self.room_history_service.subscribe_history_enabled();
+                            // presence 与订阅严格绑定：DM/Group 订阅成功后，立即把频道对端成员的
+                            // 当前 presence 快照推给**本会话**（初始态），后续变化由广播跟进。
+                            // 这样「订阅即拿到 presence」，不依赖客户端单独 presence/status/get。
+                            if channel_type == 0 || channel_type == 1 {
+                                let self_uid = context
+                                    .user_id
+                                    .as_ref()
+                                    .and_then(|s| s.parse::<u64>().ok());
+                                if let Ok(members) =
+                                    self.channel_service.get_channel_members(&channel_id).await
+                                {
+                                    let others: Vec<u64> = members
+                                        .iter()
+                                        .map(|m| m.user_id)
+                                        .filter(|u| Some(*u) != self_uid)
+                                        .collect();
+                                    self.presence_service
+                                        .push_presence_to_session(
+                                            context.session_id.clone(),
+                                            channel_id,
+                                            others,
+                                        )
+                                        .await;
+                                }
+                            }
                         }
                         Err(e) => {
                             reason_code = if e == "too many subscriptions" { 8 } else { 3 };
