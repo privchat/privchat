@@ -622,15 +622,19 @@ impl ConnectMessageHandler {
             .await
             .map_err(|e| anyhow::anyhow!("get_or_create system channel failed: {}", e))?;
 
-        let device_label = {
-            let name = connect_request.device_info.device_name.trim();
-            if name.is_empty() {
-                format!("{:?}", connect_request.device_info.device_type).to_lowercase()
-            } else {
-                name.to_string()
-            }
+        // 用 device_type 映射成友好的端类型，而不是 device_name（Web 上报的 device_name
+        // 可能是宿主系统 "macos"，会让用户误以为有 macOS 客户端登录）。
+        use privchat_protocol::protocol::DeviceType;
+        let device_label = match connect_request.device_info.device_type {
+            DeviceType::iOS => "iPhone",
+            DeviceType::Android => "Android",
+            DeviceType::Web => "Web 端",
+            DeviceType::MacOS => "macOS 客户端",
+            DeviceType::Windows => "Windows 客户端",
+            DeviceType::Linux => "Linux 客户端",
+            _ => "新", // Unknown / IoT / 未来新增
         };
-        let content = format!("您的账号在 {} 设备登录了。", device_label);
+        let content = format!("您的账号在 {} 登录了。", device_label);
 
         message_service
             .send_message(ServerSendMessageRequest {
