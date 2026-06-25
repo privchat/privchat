@@ -216,7 +216,8 @@ impl Default for JwtConfig {
             public_key_path: String::new(),
             kid: "v1".to_string(),
             access_ttl_secs: 3600,
-            refresh_ttl_secs: 604800,
+            // 30 天（之前 7 天偏短）。access 1h 不变，靠静默 refresh；30 天让长期活跃用户不掉线。
+            refresh_ttl_secs: 2592000,
             issuer: "privchat-server".to_string(),
             default_audience: vec![
                 "privchat-application".to_string(),
