@@ -17,37 +17,17 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use serde_json::{json, Value};
+use privchat_protocol::rpc::group::settings::{
+    GroupSettingsUpdateRequest, GroupSettingsUpdateResponse,
+};
+use serde_json::Value;
 
 /// 处理 更新群设置 请求
 ///
-/// RPC: group/settings/update
+/// RPC: `group/settings/update`
 ///
-/// 请求参数：
-/// ```json
-/// {
-///   "group_id": "group_123",
-///   "operator_id": "alice",  // 操作者ID（需验证权限，仅群主）
-///   "settings": {
-///     "join_need_approval": true,      // 可选
-///     "member_can_invite": false,      // 可选
-///     "all_muted": false,              // 可选
-///     "max_members": 1000,             // 可选
-///     "announcement": "新公告",         // 可选
-///     "description": "新描述"           // 可选
-///   }
-/// }
-/// ```
-///
-/// 响应：
-/// ```json
-/// {
-///   "success": true,
-///   "group_id": "group_123",
-///   "message": "群设置更新成功",
-///   "updated_at": "2026-01-10T12:00:00Z"
-/// }
-/// ```
+/// 请求/响应均使用 privchat-protocol 的 typed 类型
+/// ([`GroupSettingsUpdateRequest`] / [`GroupSettingsUpdateResponse`])，不手写 JSON 解析。
 pub async fn handle(
     body: Value,
     services: RpcServiceContext,
@@ -55,35 +35,23 @@ pub async fn handle(
 ) -> RpcResult<Value> {
     tracing::debug!("🔧 处理 更新群设置 请求: {:?}", body);
 
-    // 解析参数
-    let group_id_str = body
-        .get("group_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("group_id is required".to_string()))?;
-    let group_id = group_id_str
-        .parse::<u64>()
-        .map_err(|_| RpcError::validation(format!("Invalid group_id: {}", group_id_str)))?;
+    // 1. 反序列化为协议类型（typed）
+    let request: GroupSettingsUpdateRequest = serde_json::from_value(body)
+        .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
+    let group_id = request.group_id;
 
-    let operator_id_str = body
-        .get("operator_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("operator_id is required".to_string()))?;
-    let operator_id = operator_id_str
-        .parse::<u64>()
-        .map_err(|_| RpcError::validation(format!("Invalid operator_id: {}", operator_id_str)))?;
+    // operator_id 以连接上下文为准，避免客户端伪造越权
+    let operator_id = crate::rpc::get_current_user_id(&ctx).unwrap_or(request.operator_id);
+    let patch = &request.settings;
 
-    let settings = body
-        .get("settings")
-        .ok_or_else(|| RpcError::validation("settings is required".to_string()))?;
-
-    // 1. 获取群组信息
+    // 2. 获取群组信息
     let channel = services
         .channel_service
         .get_channel(&group_id)
         .await
         .map_err(|e| RpcError::not_found(format!("群组不存在: {}", e)))?;
 
-    // 2. 验证操作者权限（仅群主可以修改群设置）
+    // 3. 验证操作者权限（仅群主可以修改群设置）
     let operator_member = channel
         .members
         .get(&operator_id)
@@ -96,25 +64,42 @@ pub async fn handle(
         return Err(RpcError::forbidden("只有群主可以修改群设置".to_string()));
     }
 
-    // 3. 提取要更新的设置
-    let join_need_approval = settings.get("join_need_approval").and_then(|v| v.as_bool());
-    let member_can_invite = settings.get("member_can_invite").and_then(|v| v.as_bool());
-    let all_muted = settings.get("all_muted").and_then(|v| v.as_bool());
-    let max_members = settings
-        .get("max_members")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let announcement = settings
-        .get("announcement")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let description = settings
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // 4. 从 typed patch 取各可选项
+    let join_need_approval = patch.join_need_approval;
+    let member_can_invite = patch.member_can_invite;
+    let all_muted = patch.all_muted;
+    let allow_member_add_friend = patch.allow_member_add_friend;
+    let allow_search = patch.allow_search;
+    let join_policy = patch.join_policy;
+    let max_members = patch.max_members;
+    let announcement = patch.announcement.clone();
+    let description = patch.description.clone();
 
-    // 4. 更新群设置
+    // 5. 更新群设置
     let mut update_count = 0;
+
+    // 5.0. 群业务策略先落库（DB 为真源），再由下方 setter 同步内存缓存。
+    //      仅当存在 policy 字段变更时才写库，避免无谓 UPDATE。
+    if allow_search.is_some()
+        || join_policy.is_some()
+        || member_can_invite.is_some()
+        || allow_member_add_friend.is_some()
+        || all_muted.is_some()
+    {
+        services
+            .channel_service
+            .update_group_policy(
+                group_id,
+                allow_search,
+                join_policy.map(|v| v as i16),
+                member_can_invite,
+                allow_member_add_friend,
+                all_muted,
+            )
+            .await
+            .map_err(|e| RpcError::internal(format!("群设置落库失败: {}", e)))?;
+        tracing::debug!("✅ 群设置已落库: group_id={}", group_id);
+    }
 
     // 4.1. 更新描述
     if let Some(desc) = description {
@@ -176,6 +161,39 @@ pub async fn handle(
         tracing::debug!("✅ 更新成员邀请权限成功: {}", invite);
     }
 
+    // 4.5.1. 更新"群成员私自加好友"开关（P0-5）
+    if let Some(allow) = allow_member_add_friend {
+        services
+            .channel_service
+            .set_channel_allow_member_add_friend(&group_id, allow)
+            .await
+            .map_err(|e| RpcError::internal(format!("更新加好友权限失败: {}", e)))?;
+        update_count += 1;
+        tracing::debug!("✅ 更新群成员加好友权限成功: {}", allow);
+    }
+
+    // 4.5.2. 更新"群可被搜索"开关（P0-4）
+    if let Some(allow) = allow_search {
+        services
+            .channel_service
+            .set_channel_allow_search(&group_id, allow)
+            .await
+            .map_err(|e| RpcError::internal(format!("更新群搜索开关失败: {}", e)))?;
+        update_count += 1;
+        tracing::debug!("✅ 更新群可被搜索成功: {}", allow);
+    }
+
+    // 4.5.3. 更新"加入策略"（P0-4）
+    if let Some(policy) = join_policy {
+        services
+            .channel_service
+            .set_channel_join_policy(&group_id, policy)
+            .await
+            .map_err(|e| RpcError::internal(format!("更新加入策略失败: {}", e)))?;
+        update_count += 1;
+        tracing::debug!("✅ 更新加入策略成功: {}", policy);
+    }
+
     // 4.6. 更新成员上限
     if let Some(max) = max_members {
         services
@@ -193,11 +211,15 @@ pub async fn handle(
         update_count
     );
 
-    Ok(json!({
-        "success": true,
-        "group_id": group_id_str,
-        "message": format!("群设置更新成功，共更新 {} 项", update_count),
-        "updated_count": update_count,
-        "updated_at": chrono::Utc::now().timestamp_millis()
-    }))
+    // 6. 构建 typed 响应并序列化
+    let response = GroupSettingsUpdateResponse {
+        success: true,
+        group_id: group_id.to_string(),
+        message: format!("群设置更新成功，共更新 {} 项", update_count),
+        updated_count: update_count as u32,
+        updated_at: chrono::Utc::now().timestamp_millis() as u64,
+    };
+
+    serde_json::to_value(response)
+        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }

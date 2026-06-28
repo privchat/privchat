@@ -16,6 +16,7 @@
 // limitations under the License.
 
 pub mod history;
+pub mod pin;
 pub mod reaction;
 pub mod revoke;
 pub mod status;
@@ -41,5 +42,29 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    tracing::debug!("📋 Message 系统路由注册完成 (history, status, reaction, revoke)");
+    // 注册群消息置顶 / 取消置顶路由（P1）
+    GLOBAL_RPC_ROUTER
+        .register(routes::message::PIN, {
+            let services = services.clone();
+            move |params, ctx| {
+                let services = services.clone();
+                Box::pin(async move { pin::handle(params, services, ctx).await })
+            }
+        })
+        .await;
+
+    // 注册群置顶消息列表路由（P1）
+    GLOBAL_RPC_ROUTER
+        .register(routes::message::PIN_LIST, {
+            let services = services.clone();
+            move |params, ctx| {
+                let services = services.clone();
+                Box::pin(async move { pin::handle_list(params, services, ctx).await })
+            }
+        })
+        .await;
+
+    tracing::debug!(
+        "📋 Message 系统路由注册完成 (history, status, reaction, revoke, pin, pin/list)"
+    );
 }

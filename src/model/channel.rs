@@ -480,12 +480,46 @@ pub struct ChannelSettings {
     pub allow_member_invite: bool,
     /// 是否需要管理员审核加入
     pub require_approval: bool,
+    /// 群成员之间是否允许私自加好友（群业务设置，source-of-truth 为 privchat_groups.allow_member_add_friend）。
+    /// false 时，仅 source=group 的好友申请受限；群主/管理员、已是好友、其它来源不受影响。
+    pub allow_member_add_friend: bool,
+    /// 群是否允许被搜索发现（source-of-truth 为 privchat_groups.allow_search）
+    pub allow_search: bool,
+    /// 加入策略（source-of-truth 为 privchat_groups.join_policy）：
+    /// 0=不允许申请加入 1=允许申请需审核 2=允许直接加入
+    pub join_policy: u8,
     /// 最大成员数量
     pub max_members: Option<u32>,
     /// 消息历史可见性
     pub history_visible: bool,
     /// 是否允许匿名发言
     pub allow_anonymous: bool,
+}
+
+/// 群业务策略（source-of-truth: privchat_groups 表的结构化列）。
+///
+/// 与 [`ChannelSettings`]（运行时内存缓存）区分：`GroupPolicy` 是从 DB 直接读出的可靠值，
+/// 用于好友申请强校验、全员禁言强校验等"重启后仍须生效"的场景。
+#[derive(Debug, Clone, Copy)]
+pub struct GroupPolicy {
+    pub allow_search: bool,
+    /// 0=不允许申请加入 1=允许申请需审核 2=允许直接加入
+    pub join_policy: i16,
+    pub allow_member_invite: bool,
+    pub allow_member_add_friend: bool,
+    pub all_muted: bool,
+}
+
+impl Default for GroupPolicy {
+    fn default() -> Self {
+        Self {
+            allow_search: true,
+            join_policy: 1,
+            allow_member_invite: true,
+            allow_member_add_friend: true,
+            all_muted: false,
+        }
+    }
 }
 
 impl Default for ChannelSettings {
@@ -496,6 +530,9 @@ impl Default for ChannelSettings {
             is_public: false,
             allow_member_invite: true,
             require_approval: false,
+            allow_member_add_friend: true,
+            allow_search: true,
+            join_policy: 1,
             max_members: None,
             history_visible: true,
             allow_anonymous: false,

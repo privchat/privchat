@@ -17,7 +17,8 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use serde_json::{json, Value};
+use privchat_protocol::rpc::group::settings::{GroupSettingsData, GroupSettingsGetResponse};
+use serde_json::Value;
 
 /// 处理 获取群设置 请求
 ///
@@ -78,32 +79,36 @@ pub async fn handle(
         return Err(RpcError::forbidden("您不是群组成员".to_string()));
     }
 
-    // 3. 返回群设置（从 channel.settings 转换）
-    // 注意：当前 Channel.settings 是 ChannelSettings，我们需要映射到 GroupSettings
-    let settings = json!({
-        "join_need_approval": channel.settings.as_ref()
-            .map(|s| s.require_approval)
-            .unwrap_or(false),
-        "member_can_invite": channel.settings.as_ref()
-            .map(|s| s.allow_member_invite)
-            .unwrap_or(false),
-        "all_muted": channel.settings.as_ref()
-            .map(|s| s.is_muted)
-            .unwrap_or(false),
-        "max_members": channel.settings.as_ref()
+    // 3. 群业务策略以 DB(privchat_groups) 为真源（重启不丢）；
+    //    公告/描述/成员上限/时间仍取自频道。
+    let policy = services
+        .channel_service
+        .get_group_policy(group_id)
+        .await
+        .map_err(|e| RpcError::internal(format!("查询群设置失败: {}", e)))?
+        .unwrap_or_default();
+    let s = channel.settings.as_ref();
+    let settings = GroupSettingsData {
+        // 兼容旧字段：join_need_approval 由 join_policy==1（需审核）派生
+        join_need_approval: policy.join_policy == 1,
+        member_can_invite: policy.allow_member_invite,
+        allow_member_add_friend: policy.allow_member_add_friend,
+        allow_search: policy.allow_search,
+        join_policy: policy.join_policy as u8,
+        all_muted: policy.all_muted,
+        max_members: s
             .and_then(|s| s.max_members.map(|m| m as usize))
-            .or_else(|| channel.metadata.max_members)
+            .or(channel.metadata.max_members)
             .unwrap_or(500),
-        "announcement": channel.metadata.announcement,
-        "description": channel.metadata.description,
-        "created_at": channel.created_at.timestamp_millis(),
-        "updated_at": channel.updated_at.timestamp_millis()
-    });
+        announcement: channel.metadata.announcement.clone(),
+        description: channel.metadata.description.clone(),
+        created_at: channel.created_at.timestamp_millis() as u64,
+        updated_at: channel.updated_at.timestamp_millis() as u64,
+    };
 
     tracing::debug!("✅ 获取群设置成功: group_id={}", group_id);
 
-    Ok(json!({
-        "group_id": group_id,
-        "settings": settings
-    }))
+    let response = GroupSettingsGetResponse { group_id, settings };
+    serde_json::to_value(response)
+        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
