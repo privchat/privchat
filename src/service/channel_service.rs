@@ -2281,16 +2281,22 @@ impl ChannelService {
             .map(|row| {
                 let channel_id = row.channel_id as u64;
                 let channel_type_enum = ChannelType::from_i16(row.channel_type);
-                let channel_name = if channel_type_enum == ChannelType::Direct {
-                    let peer_id = match (
+                // DM 对端 user_id：仅私聊设置，群聊为空。直接下发给客户端持久化，
+                // 客户端不再靠 channel_member JOIN / message.from_uid 推断。
+                let peer_user_id = if channel_type_enum == ChannelType::Direct {
+                    match (
                         row.direct_user1_id.map(|v| v as u64),
                         row.direct_user2_id.map(|v| v as u64),
                     ) {
                         (Some(left), Some(right)) if left == user_id => Some(right),
                         (Some(left), Some(right)) if right == user_id => Some(left),
                         _ => None,
-                    };
-                    peer_id.map(|uid| uid.to_string()).unwrap_or_default()
+                    }
+                } else {
+                    None
+                };
+                let channel_name = if channel_type_enum == ChannelType::Direct {
+                    peer_user_id.map(|uid| uid.to_string()).unwrap_or_default()
                 } else {
                     row.group_name.clone().unwrap_or_default()
                 };
@@ -2325,6 +2331,7 @@ impl ChannelService {
                     last_msg_timestamp: Some(last_msg_timestamp),
                     top: Some(if row.is_pinned { 1 } else { 0 }),
                     mute: Some(if row.is_muted { 1 } else { 0 }),
+                    peer_user_id,
                 })
                 .unwrap_or_else(|_| serde_json::json!({}));
                 SyncEntityItem {
