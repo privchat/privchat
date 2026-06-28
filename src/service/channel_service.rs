@@ -3531,6 +3531,139 @@ impl ChannelService {
         }
     }
 
+    /// 设置"群成员之间是否允许私自加好友"（群业务策略，P0-5）。
+    ///
+    /// 注意：与现有 set_channel_* 群设置一致，权威值维护在内存频道缓存的 ChannelSettings 上。
+    /// 持久化到 privchat_groups.allow_member_add_friend 列为后续硬化项（需 DB 在环）。
+    pub async fn set_channel_allow_member_add_friend(
+        &self,
+        channel_id: &u64,
+        allow: bool,
+    ) -> Result<()> {
+        let mut channels = self.channels.write().await;
+        if let Some(channel) = channels.get_mut(channel_id) {
+            if channel.settings.is_none() {
+                channel.settings = Some(crate::model::channel::ChannelSettings::default());
+            }
+            if let Some(settings) = channel.settings.as_mut() {
+                settings.allow_member_add_friend = allow;
+            }
+            channel.updated_at = chrono::Utc::now();
+            Ok(())
+        } else {
+            Err(ServerError::NotFound(format!(
+                "Channel not found: {}",
+                channel_id
+            )))
+        }
+    }
+
+    /// 设置"群是否允许被搜索发现"（群业务策略，P0-4）。
+    pub async fn set_channel_allow_search(&self, channel_id: &u64, allow: bool) -> Result<()> {
+        let mut channels = self.channels.write().await;
+        if let Some(channel) = channels.get_mut(channel_id) {
+            if channel.settings.is_none() {
+                channel.settings = Some(crate::model::channel::ChannelSettings::default());
+            }
+            if let Some(settings) = channel.settings.as_mut() {
+                settings.allow_search = allow;
+            }
+            channel.updated_at = chrono::Utc::now();
+            Ok(())
+        } else {
+            Err(ServerError::NotFound(format!(
+                "Channel not found: {}",
+                channel_id
+            )))
+        }
+    }
+
+    /// 设置"群加入策略"（群业务策略，P0-4）：0=不允许 1=需审核 2=直接加入。
+    pub async fn set_channel_join_policy(&self, channel_id: &u64, policy: u8) -> Result<()> {
+        let mut channels = self.channels.write().await;
+        if let Some(channel) = channels.get_mut(channel_id) {
+            if channel.settings.is_none() {
+                channel.settings = Some(crate::model::channel::ChannelSettings::default());
+            }
+            if let Some(settings) = channel.settings.as_mut() {
+                settings.join_policy = policy;
+                // 与既有 require_approval 语义保持一致：policy==1 视为需审核。
+                settings.require_approval = policy == 1;
+            }
+            channel.updated_at = chrono::Utc::now();
+            Ok(())
+        } else {
+            Err(ServerError::NotFound(format!(
+                "Channel not found: {}",
+                channel_id
+            )))
+        }
+    }
+
+    /// 从 DB(`privchat_groups`) 读取群业务策略（source-of-truth）。
+    ///
+    /// 用运行时 `sqlx::query_as`，不依赖编译期 DB。群不存在返回 `Ok(None)`。
+    pub async fn get_group_policy(
+        &self,
+        group_id: u64,
+    ) -> Result<Option<crate::model::channel::GroupPolicy>> {
+        let row = sqlx::query_as::<_, (bool, i16, bool, bool, bool)>(
+            "SELECT allow_search, join_policy, allow_member_invite, allow_member_add_friend, all_muted \
+             FROM privchat_groups WHERE group_id = $1",
+        )
+        .bind(group_id as i64)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询群设置失败: {}", e)))?;
+
+        Ok(row.map(
+            |(allow_search, join_policy, allow_member_invite, allow_member_add_friend, all_muted)| {
+                crate::model::channel::GroupPolicy {
+                    allow_search,
+                    join_policy,
+                    allow_member_invite,
+                    allow_member_add_friend,
+                    all_muted,
+                }
+            },
+        ))
+    }
+
+    /// 将群业务策略落库到 `privchat_groups`（DB 为真源）。
+    ///
+    /// 各字段 `None` 表示不修改（`COALESCE` 保留原值）。用运行时 `sqlx::query`，不依赖编译期 DB。
+    pub async fn update_group_policy(
+        &self,
+        group_id: u64,
+        allow_search: Option<bool>,
+        join_policy: Option<i16>,
+        allow_member_invite: Option<bool>,
+        allow_member_add_friend: Option<bool>,
+        all_muted: Option<bool>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE privchat_groups SET \
+             allow_search = COALESCE($2, allow_search), \
+             join_policy = COALESCE($3, join_policy), \
+             allow_member_invite = COALESCE($4, allow_member_invite), \
+             allow_member_add_friend = COALESCE($5, allow_member_add_friend), \
+             all_muted = COALESCE($6, all_muted), \
+             updated_at = $7 \
+             WHERE group_id = $1",
+        )
+        .bind(group_id as i64)
+        .bind(allow_search)
+        .bind(join_policy)
+        .bind(allow_member_invite)
+        .bind(allow_member_add_friend)
+        .bind(all_muted)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("更新群设置失败: {}", e)))?;
+        Ok(())
+    }
+
     /// 设置频道最大成员数
     pub async fn set_channel_max_members(&self, channel_id: &u64, max_members: u32) -> Result<()> {
         let mut channels = self.channels.write().await;

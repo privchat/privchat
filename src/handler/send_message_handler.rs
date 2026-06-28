@@ -901,29 +901,39 @@ impl MessageHandler for SendMessageHandler {
                         .await;
                 }
 
-                // 3.1.2. 检查全员禁言（群主和管理员不受影响）
-                if channel
-                    .settings
-                    .as_ref()
-                    .map(|s| s.is_muted)
-                    .unwrap_or(false)
-                    && !matches!(
-                        member.role,
-                        crate::model::channel::MemberRole::Owner
-                            | crate::model::channel::MemberRole::Admin
-                    )
-                {
-                    warn!(
-                        "❌ SendMessageHandler: 群 {} 全员禁言中，用户 {} 无权发言",
-                        send_message_request.channel_id, send_message_request.from_uid
-                    );
-                    return self
-                        .create_error_response(
-                            &send_message_request,
-                            ErrorCode::GroupMuted,
-                            "群组全员禁言中",
-                        )
-                        .await;
+                // 3.1.2. 检查全员禁言（群主/管理员不受影响）。
+                //   全员禁言是强权限：以 DB(privchat_groups.all_muted) 为真源，server 重启后仍生效，
+                //   不依赖可能丢失的内存缓存。仅对非群主/管理员成员查询，避免拖慢热路径。
+                let is_privileged = matches!(
+                    member.role,
+                    crate::model::channel::MemberRole::Owner
+                        | crate::model::channel::MemberRole::Admin
+                );
+                if !is_privileged {
+                    let all_muted = if let Some(gid) = channel.group_id {
+                        self.channel_service
+                            .get_group_policy(gid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|p| p.all_muted)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if all_muted {
+                        warn!(
+                            "❌ SendMessageHandler: 群 {} 全员禁言中，用户 {} 无权发言",
+                            send_message_request.channel_id, send_message_request.from_uid
+                        );
+                        return self
+                            .create_error_response(
+                                &send_message_request,
+                                ErrorCode::GroupMuted,
+                                "群组全员禁言中",
+                            )
+                            .await;
+                    }
                 }
 
                 // 3.1.3. 检查发送消息权限（基于角色的细粒度权限）

@@ -527,17 +527,27 @@ impl ChatServer {
         let send_message_handler = Arc::new(send_handler_inner);
 
         // 创建通用服务端发消息服务（供登录通知、Admin API 等复用）
-        let message_service = Arc::new(crate::service::MessageService::new(
-            channel_service.clone(),
-            pts_generator.clone(),
-            message_repository.clone(),
-            user_message_index.clone(),
-            offline_queue_service.clone(),
-            connection_manager.clone(),
-            unread_count_service.clone(),
-            message_history_service.clone(),
-        ));
-        info!("✅ MessageService 创建完成");
+        let message_service = Arc::new(
+            crate::service::MessageService::new(
+                channel_service.clone(),
+                pts_generator.clone(),
+                message_repository.clone(),
+                user_message_index.clone(),
+                offline_queue_service.clone(),
+                connection_manager.clone(),
+                unread_count_service.clone(),
+                message_history_service.clone(),
+            )
+            .with_recall_time_limit_secs(config.message.recall_time_limit_secs),
+        );
+        info!(
+            "✅ MessageService 创建完成（撤回时效: {}）",
+            if config.message.recall_time_limit_secs > 0 {
+                format!("{}s", config.message.recall_time_limit_secs)
+            } else {
+                "不限制".to_string()
+            }
+        );
 
         // 用户服务：admin / RPC / job 对 User 领域对象的唯一入口
         let user_service = Arc::new(crate::service::UserService::new(user_repository.clone()));

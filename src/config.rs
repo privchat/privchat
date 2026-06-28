@@ -84,6 +84,10 @@ pub struct ServerConfig {
     pub account: AccountConfig,
     /// 系统消息配置
     pub system_message: SystemMessageConfig,
+
+    /// 消息相关配置（撤回时效等）
+    #[serde(default)]
+    pub message: MessageConfig,
     /// 安全防护配置
     pub security: SecurityProtectionConfig,
     /// 业务 Handler 最大并发数（Semaphore 限流）
@@ -330,6 +334,7 @@ impl Default for ServerConfig {
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
             account: AccountConfig::default(), // 默认 BUILTIN（独立部署 / 测试）
             system_message: SystemMessageConfig::default(),
+            message: MessageConfig::default(),
             security: SecurityProtectionConfig::default(),
             handler_max_inflight: 2000,
             service_master_key: String::new(),
@@ -859,6 +864,7 @@ struct TomlConfig {
     account: Option<TomlAccountConfig>,
     logging: Option<TomlLoggingConfig>,
     system_message: Option<TomlSystemMessageConfig>,
+    message: Option<TomlMessageConfig>,
     push: Option<TomlPushConfig>,
     server_event: Option<TomlServerEventConfig>,
     room_ticket: Option<TomlRoomTicketConfig>,
@@ -1460,6 +1466,13 @@ impl From<TomlConfig> for ServerConfig {
             }
             if let Some(auto_send) = system_msg.auto_send_welcome {
                 config.system_message.auto_send_welcome = auto_send;
+            }
+        }
+
+        if let Some(message) = toml.message {
+            if let Some(limit) = message.recall_time_limit_secs {
+                // 允许 0 表示不限制时效；负数归一化为 0。
+                config.message.recall_time_limit_secs = limit.max(0);
             }
         }
 
@@ -2172,6 +2185,41 @@ struct TomlSystemMessageConfig {
     welcome_message: Option<String>,
     auto_create_channel: Option<bool>,
     auto_send_welcome: Option<bool>,
+}
+
+// =====================================================
+// 消息配置（撤回时效等）
+// =====================================================
+
+/// 消息相关配置。
+///
+/// 目前承载"撤回时效"——普通用户撤回自己消息的时间窗口。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageConfig {
+    /// 普通用户撤回自己消息的时效（秒）。群主/管理员不受限。
+    ///
+    /// - `> 0`：普通用户仅能在发送后该秒数内撤回
+    /// - `0`（或配置为 null / 省略）：**不限制时效**，普通用户任意时间均可撤回自己的消息
+    #[serde(default = "default_recall_time_limit_secs")]
+    pub recall_time_limit_secs: i64,
+}
+
+fn default_recall_time_limit_secs() -> i64 {
+    // 默认 48h，保持历史行为；运营可在 [message] 段改为 0 表示不限制。
+    172800
+}
+
+impl Default for MessageConfig {
+    fn default() -> Self {
+        Self {
+            recall_time_limit_secs: default_recall_time_limit_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlMessageConfig {
+    recall_time_limit_secs: Option<i64>,
 }
 
 // =====================================================

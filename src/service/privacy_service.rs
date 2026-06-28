@@ -171,6 +171,34 @@ impl PrivacyService {
             )));
         }
 
+        // 2.5. 群策略：是否允许群成员之间私自加好友（P0-5）。
+        //   - 直接读 DB(privchat_groups.allow_member_add_friend)，重启后仍可靠，不依赖内存缓存。
+        //   - 群主/管理员（任一方）不受限；已是好友不受限；其它来源（搜索/扫码/名片）不走此分支。
+        let allow_member_add_friend = self
+            .channel_service
+            .get_group_policy(group_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.allow_member_add_friend)
+            .unwrap_or(true);
+        if !allow_member_add_friend {
+            use crate::model::channel::MemberRole;
+            let is_privileged = |uid: &u64| {
+                channel
+                    .members
+                    .get(uid)
+                    .map(|m| matches!(m.role, MemberRole::Owner | MemberRole::Admin))
+                    .unwrap_or(false)
+            };
+            let already_friends = self.friend_service.is_friend(searcher_id, target_id).await;
+            if !is_privileged(&searcher_id) && !is_privileged(&target_id) && !already_friends {
+                return Err(ServerError::Forbidden(
+                    "该群已关闭成员私自加好友".to_string(),
+                ));
+            }
+        }
+
         // 3. 验证隐私设置：是否允许通过群添加好友
         let privacy = self
             .cache_manager

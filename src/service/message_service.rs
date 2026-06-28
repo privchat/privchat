@@ -43,7 +43,34 @@ use crate::service::sync::get_global_sync_service;
 use crate::service::{ChannelService, OfflineQueueService, UnreadCountService};
 
 /// 撤回时限（秒）——普通用户在此窗口内才能撤回自己的消息；群主/管理员不受限。
+///
+/// 默认值，保持历史行为。实际生效值由 [`MessageService::recall_time_limit_secs`]
+/// 承载，可经 `[message] recall_time_limit_secs` 配置覆盖；配置为 `0` 表示不限制时效。
 pub const DEFAULT_REVOKE_TIME_LIMIT_SECS: i64 = 172800; // 48h
+
+/// 撤回时效判定（纯函数，便于单测）。
+///
+/// - `limit_secs <= 0`：不限制时效，永远允许（按权限）撤回 → 返回 `true`
+/// - `limit_secs > 0`：仅当 `now_ts - msg_ts <= limit_secs` 时允许
+///
+/// 仅约束"普通发送者撤回自己消息"的场景；群主/管理员豁免在调用方判断。
+pub fn recall_allowed_by_time(limit_secs: i64, now_ts: i64, msg_ts: i64) -> bool {
+    if limit_secs <= 0 {
+        return true;
+    }
+    now_ts - msg_ts <= limit_secs
+}
+
+/// 撤回超时的人类可读错误信息（按秒/分/时自动选择单位）。
+fn format_recall_timeout_message(limit_secs: i64) -> String {
+    if limit_secs % 3600 == 0 {
+        format!("消息发送已超过 {} 小时，无法撤回", limit_secs / 3600)
+    } else if limit_secs % 60 == 0 {
+        format!("消息发送已超过 {} 分钟，无法撤回", limit_secs / 60)
+    } else {
+        format!("消息发送已超过 {} 秒，无法撤回", limit_secs)
+    }
+}
 
 /// 服务端发消息的请求参数
 pub struct ServerSendMessageRequest {
@@ -92,6 +119,8 @@ pub struct MessageService {
     connection_manager: Arc<ConnectionManager>,
     unread_count_service: Arc<UnreadCountService>,
     message_history_service: Arc<MessageHistoryService>,
+    /// 普通用户撤回时效（秒）。`<= 0` 表示不限制时效。群主/管理员始终不受限。
+    recall_time_limit_secs: i64,
 }
 
 impl MessageService {
@@ -114,7 +143,16 @@ impl MessageService {
             connection_manager,
             unread_count_service,
             message_history_service,
+            recall_time_limit_secs: DEFAULT_REVOKE_TIME_LIMIT_SECS,
         }
+    }
+
+    /// 设置普通用户撤回时效（秒）。来自 `[message] recall_time_limit_secs` 配置。
+    ///
+    /// 传入 `0`（或负数）表示**不限制时效**——普通用户可在任意时间撤回自己的消息。
+    pub fn with_recall_time_limit_secs(mut self, secs: i64) -> Self {
+        self.recall_time_limit_secs = secs.max(0);
+        self
     }
 
     /// 服务端发送消息的完整链路
@@ -399,13 +437,14 @@ impl MessageService {
             ));
         }
 
+        // 普通发送者受撤回时效限制；群主/管理员不受限。
+        // recall_time_limit_secs <= 0 表示不限制时效（配置 [message] recall_time_limit_secs = 0）。
         if is_sender && !is_admin {
             let now_ts = Utc::now().timestamp();
             let msg_ts = message.created_at.timestamp();
-            if now_ts - msg_ts > DEFAULT_REVOKE_TIME_LIMIT_SECS {
-                return Err(ServerError::Validation(format!(
-                    "消息发送已超过 {} 小时，无法撤回",
-                    DEFAULT_REVOKE_TIME_LIMIT_SECS / 3600
+            if !recall_allowed_by_time(self.recall_time_limit_secs, now_ts, msg_ts) {
+                return Err(ServerError::Validation(format_recall_timeout_message(
+                    self.recall_time_limit_secs,
                 )));
             }
         }
@@ -730,5 +769,49 @@ impl MessageService {
             .get_message_stats_admin()
             .await
             .map_err(|e| ServerError::Database(format!("获取消息统计失败: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod recall_time_tests {
+    use super::{format_recall_timeout_message, recall_allowed_by_time};
+
+    #[test]
+    fn unlimited_when_limit_is_zero() {
+        // recall_time_limit_secs = 0 → 永远允许（按权限）撤回，与消息年龄无关
+        assert!(recall_allowed_by_time(0, 1_000_000, 0));
+        assert!(recall_allowed_by_time(0, i64::MAX, 0));
+    }
+
+    #[test]
+    fn unlimited_when_limit_is_negative() {
+        // 负数归一化为不限制
+        assert!(recall_allowed_by_time(-1, 1_000_000, 0));
+    }
+
+    #[test]
+    fn enforced_when_limit_positive() {
+        let limit = 172800; // 48h
+        // 刚好在窗口内 / 边界上 → 允许
+        assert!(recall_allowed_by_time(limit, 100 + limit, 100));
+        assert!(recall_allowed_by_time(limit, 100, 100));
+        // 超过窗口 1 秒 → 拒绝
+        assert!(!recall_allowed_by_time(limit, 101 + limit, 100));
+    }
+
+    #[test]
+    fn timeout_message_picks_unit() {
+        assert_eq!(
+            format_recall_timeout_message(172800),
+            "消息发送已超过 48 小时，无法撤回"
+        );
+        assert_eq!(
+            format_recall_timeout_message(120),
+            "消息发送已超过 2 分钟，无法撤回"
+        );
+        assert_eq!(
+            format_recall_timeout_message(45),
+            "消息发送已超过 45 秒，无法撤回"
+        );
     }
 }
