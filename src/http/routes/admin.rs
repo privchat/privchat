@@ -1897,6 +1897,7 @@ async fn send_system_message(
             metadata,
             channel_type,
             recipient_user_ids: recipients,
+            dedup_key: None, // 系统灰条通知不需要卡片幂等
         })
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
@@ -1962,6 +1963,7 @@ async fn send_system_message_to_user(
             metadata,
             channel_type: 1, // 1 = Direct
             recipient_user_ids: vec![sender_id, request.user_id],
+            dedup_key: None,
         })
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
@@ -2197,6 +2199,7 @@ async fn send_message(
             metadata,
             channel_type,
             recipient_user_ids: recipients,
+            dedup_key: request.dedup_key.clone(),
         })
         .await
         .map_err(|e| {
@@ -2702,6 +2705,10 @@ fn parse_content_message_type(s: Option<&str>) -> privchat_protocol::ContentMess
         Some("sticker") => ContentMessageType::Sticker,
         Some("forward") => ContentMessageType::Forward,
         Some("link") => ContentMessageType::Link,
+        // RP-12：资金消息卡片由 platform 服务端注入（server-authoritative）。
+        // 协议枚举早已支持 RedPacket=11 / MoneyTransfer=12，此前该 match 漏映射会兜底成 Text。
+        Some("red_packet") => ContentMessageType::RedPacket,
+        Some("money_transfer") => ContentMessageType::MoneyTransfer,
         _ => ContentMessageType::Text,
     }
 }
