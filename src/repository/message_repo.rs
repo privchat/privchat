@@ -31,6 +31,20 @@ pub trait MessageRepository: Send + Sync {
     /// 创建消息
     async fn create(&self, message: &Message) -> Result<Message, DatabaseError>;
 
+    /// 创建消息并带幂等键（RP-12：资金消息卡片注入 exactly-once）。
+    /// 返回 `true` = 本次真正插入；`false` = dedup_key 已存在（未插入，调用方应跳过推送）。
+    async fn create_with_dedup_key(
+        &self,
+        message: &Message,
+        dedup_key: Option<&str>,
+    ) -> Result<bool, DatabaseError>;
+
+    /// 按 dedup_key 查已存在消息的 (message_id, created_at_ms)；无则 None。
+    async fn find_message_id_by_dedup_key(
+        &self,
+        dedup_key: &str,
+    ) -> Result<Option<(u64, i64)>, DatabaseError>;
+
     /// 更新消息
     async fn update(&self, message: &Message) -> Result<Message, DatabaseError>;
 
@@ -567,6 +581,85 @@ impl MessageRepository for PgMessageRepository {
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
 
         Ok(message.clone())
+    }
+
+    async fn create_with_dedup_key(
+        &self,
+        message: &Message,
+        dedup_key: Option<&str>,
+    ) -> Result<bool, DatabaseError> {
+        let (
+            message_id,
+            channel_id,
+            sender_id,
+            pts,
+            local_message_id,
+            content,
+            message_type,
+            metadata,
+            reply_to_message_id,
+            created_at,
+            updated_at,
+            deleted,
+            deleted_at,
+            revoked,
+            revoked_at,
+            revoked_by,
+        ) = message.to_db_values();
+
+        let metadata_json = serde_json::to_value(&metadata)
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+        // dedup_key 命中唯一索引 → DO NOTHING（rows_affected==0），调用方据此跳过推送。
+        let result = sqlx::query(
+            r#"
+            INSERT INTO privchat_messages (
+                message_id, channel_id, sender_id, pts, local_message_id,
+                message_type, content, metadata, reply_to_message_id,
+                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by,
+                dedup_key
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+            "#,
+        )
+        .bind(message_id)
+        .bind(channel_id)
+        .bind(sender_id)
+        .bind(pts)
+        .bind(local_message_id)
+        .bind(message_type)
+        .bind(content)
+        .bind(&metadata_json)
+        .bind(reply_to_message_id)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(deleted)
+        .bind(deleted_at)
+        .bind(revoked)
+        .bind(revoked_at)
+        .bind(revoked_by)
+        .bind(dedup_key)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn find_message_id_by_dedup_key(
+        &self,
+        dedup_key: &str,
+    ) -> Result<Option<(u64, i64)>, DatabaseError> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT message_id, created_at FROM privchat_messages WHERE dedup_key = $1 LIMIT 1",
+        )
+        .bind(dedup_key)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to query dedup_key: {}", e)))?;
+
+        Ok(row.map(|(id, created)| (id as u64, created)))
     }
 
     /// 更新消息

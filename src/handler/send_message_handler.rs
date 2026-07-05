@@ -1748,7 +1748,10 @@ impl SendMessageHandler {
 
         match message_type {
             privchat_protocol::ContentMessageType::Text
-            | privchat_protocol::ContentMessageType::System => Ok(()),
+            | privchat_protocol::ContentMessageType::System
+            // RP-12：资金消息卡片的 content 是订单引用 JSON，无 file/location metadata 需校验。
+            | privchat_protocol::ContentMessageType::RedPacket
+            | privchat_protocol::ContentMessageType::MoneyTransfer => Ok(()),
             privchat_protocol::ContentMessageType::Image => {
                 self.validate_file_metadata(&metadata, "image", sender_id)
                     .await

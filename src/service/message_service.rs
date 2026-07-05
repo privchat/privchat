@@ -88,6 +88,9 @@ pub struct ServerSendMessageRequest {
     pub channel_type: u8,
     /// 需要接收该消息的用户 ID 列表
     pub recipient_user_ids: Vec<u64>,
+    /// RP-12 幂等键（资金消息卡片注入用，如 `red_packet:{id}` / `money_transfer:{id}`）。
+    /// 普通消息为 None。重复注入返回既有 message_id，不重复落库/推送。
+    pub dedup_key: Option<String>,
 }
 
 /// 服务端发消息的结果
@@ -171,6 +174,21 @@ impl MessageService {
         req: ServerSendMessageRequest,
     ) -> anyhow::Result<ServerSendMessageResult> {
         let now = Utc::now();
+
+        // RP-12 幂等前置检查：已注入过（dedup_key 命中）→ 直接返回既有 message_id，不重复落库/推送。
+        if let Some(k) = req.dedup_key.as_deref() {
+            if let Some((existing_id, existing_created)) =
+                self.message_repository.find_message_id_by_dedup_key(k).await?
+            {
+                info!("💠 幂等命中，跳过重复注入: dedup_key={}, message_id={}", k, existing_id);
+                return Ok(ServerSendMessageResult {
+                    message_id: existing_id,
+                    pts: 0,
+                    created_at: existing_created,
+                });
+            }
+        }
+
         let message_id = crate::infra::next_message_id();
 
         // 1. 分配 pts
@@ -208,10 +226,27 @@ impl MessageService {
             revoked_at: None,
             revoked_by: None,
         };
-        self.message_repository
-            .create(&msg)
+        let inserted = self
+            .message_repository
+            .create_with_dedup_key(&msg, req.dedup_key.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("写入消息失败: {}", e))?;
+
+        // 并发注入撞车（dedup_key 唯一索引 DO NOTHING）→ 查回既有 message_id，跳过 sync/index/推送。
+        if !inserted {
+            if let Some(k) = req.dedup_key.as_deref() {
+                if let Some((existing_id, existing_created)) =
+                    self.message_repository.find_message_id_by_dedup_key(k).await?
+                {
+                    info!("💠 并发幂等撞车，返回既有: dedup_key={}, message_id={}", k, existing_id);
+                    return Ok(ServerSendMessageResult {
+                        message_id: existing_id,
+                        pts: 0,
+                        created_at: existing_created,
+                    });
+                }
+            }
+        }
 
         // 3. 记录 sync commit
         if let Some(sync_service) = get_global_sync_service() {
@@ -391,6 +426,7 @@ impl MessageService {
             metadata,
             channel_type: 2, // Group
             recipient_user_ids,
+            dedup_key: None,
         };
 
         self.send_message(req)

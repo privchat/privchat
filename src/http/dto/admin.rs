@@ -281,6 +281,10 @@ pub struct SendMessageRequest {
     pub message_type: Option<String>,
     /// 附加元数据（可选）
     pub metadata: Option<serde_json::Value>,
+    /// RP-12 幂等键（service API 专用，如 `red_packet:{id}` / `money_transfer:{id}`）。
+    /// 普通客户端消息路径不经此 DTO，故不暴露给普通客户端。
+    #[serde(default)]
+    pub dedup_key: Option<String>,
 }
 
 /// 管理端发送消息响应
