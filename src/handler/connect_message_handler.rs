@@ -645,6 +645,7 @@ impl ConnectMessageHandler {
                 metadata: serde_json::Value::Object(serde_json::Map::new()),
                 channel_type: 1, // DM (system ↔ user)
                 recipient_user_ids: vec![user_id],
+                dedup_key: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("send login notice failed: {}", e))?;

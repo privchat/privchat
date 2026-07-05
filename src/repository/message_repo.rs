@@ -588,6 +588,15 @@ impl MessageRepository for PgMessageRepository {
         message: &Message,
         dedup_key: Option<&str>,
     ) -> Result<bool, DatabaseError> {
+        // 无 dedup_key（普通消息路径）→ 与 create 等价，永远算「已插入」。
+        let dk = match dedup_key {
+            None => {
+                self.create(message).await?;
+                return Ok(true);
+            }
+            Some(k) => k,
+        };
+
         let (
             message_id,
             channel_id,
@@ -610,17 +619,44 @@ impl MessageRepository for PgMessageRepository {
         let metadata_json = serde_json::to_value(&metadata)
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-        // dedup_key 命中唯一索引 → DO NOTHING（rows_affected==0），调用方据此跳过推送。
-        let result = sqlx::query(
+        // privchat_messages 按 created_at RANGE 分区，无法在 dedup_key 上建全局唯一索引，
+        // 故用独立非分区表 privchat_message_dedup 承载幂等键：同事务先 claim dedup_key，
+        // ON CONFLICT DO NOTHING → rows_affected==0 表示已被抢占（重复注入），跳过消息插入 +
+        // 让调用方跳过推送；抢占成功才写消息，二者原子（消息失败则 dedup 键回滚，可重试）。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("Failed to begin tx: {}", e)))?;
+
+        let claim = sqlx::query(
+            r#"
+            INSERT INTO privchat_message_dedup (dedup_key, message_id, created_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (dedup_key) DO NOTHING
+            "#,
+        )
+        .bind(dk)
+        .bind(message_id)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to claim dedup_key: {}", e)))?;
+
+        if claim.rows_affected() == 0 {
+            // 已存在同 dedup_key → 不重复插入消息，调用方据此跳过推送。
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+
+        sqlx::query(
             r#"
             INSERT INTO privchat_messages (
                 message_id, channel_id, sender_id, pts, local_message_id,
                 message_type, content, metadata, reply_to_message_id,
-                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by,
-                dedup_key
+                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-            ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             "#,
         )
         .bind(message_id)
@@ -639,12 +675,15 @@ impl MessageRepository for PgMessageRepository {
         .bind(revoked)
         .bind(revoked_at)
         .bind(revoked_by)
-        .bind(dedup_key)
-        .execute(self.pool.as_ref())
+        .execute(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("Failed to commit tx: {}", e)))?;
+
+        Ok(true)
     }
 
     async fn find_message_id_by_dedup_key(
@@ -652,7 +691,7 @@ impl MessageRepository for PgMessageRepository {
         dedup_key: &str,
     ) -> Result<Option<(u64, i64)>, DatabaseError> {
         let row: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT message_id, created_at FROM privchat_messages WHERE dedup_key = $1 LIMIT 1",
+            "SELECT message_id, created_at FROM privchat_message_dedup WHERE dedup_key = $1 LIMIT 1",
         )
         .bind(dedup_key)
         .fetch_optional(self.pool.as_ref())
