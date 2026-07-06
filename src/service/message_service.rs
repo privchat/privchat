@@ -329,10 +329,12 @@ impl MessageService {
             deleted: false,
         };
 
-        // 7. 推送给接收者（跳过 sender，sender 通过 sync pull 同步到自己其他设备）
-        //    实时推送成功则跳过离线队列；否则写入离线队列等上线拉取
+        // 7. 推送给接收者。普通消息跳过 sender（其客户端本地已乐观插入，靠 sync pull 同步到其它设备）；
+        //    但服务端注入消息（有 dedup_key，如 RP-12 红包/转账卡片）sender 本地并未创建，必须也推给
+        //    sender，否则发送方在会话里看不到自己刚发的卡片（要等冷同步才出现）。
+        let push_to_sender = req.dedup_key.is_some();
         for &uid in &req.recipient_user_ids {
-            if uid == req.sender_id {
+            if uid == req.sender_id && !push_to_sender {
                 continue;
             }
             let online_sessions = match self
