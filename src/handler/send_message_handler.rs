@@ -886,19 +886,29 @@ impl MessageHandler for SendMessageHandler {
             if let Some(member) = channel.members.get(&from_uid) {
                 // 3.1.1. 检查个人禁言状态（优先检查，返回错误码5）
                 if member.is_muted {
-                    // ChannelMember 只有 is_muted 字段，没有 mute_until
-                    // 如果需要支持临时禁言，需要从 ChannelParticipant 查询 mute_until
-                    warn!(
-                        "❌ SendMessageHandler: 用户 {} 在群 {} 中被禁言",
-                        send_message_request.from_uid, send_message_request.channel_id
-                    );
-                    return self
-                        .create_error_response(
-                            &send_message_request,
-                            ErrorCode::MemberMuted,
-                            "您已被禁言",
-                        )
-                        .await;
+                    let now = chrono::Utc::now();
+                    if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now) {
+                        let reject = crate::model::channel::mute_reject_message(member.mute_until, now);
+                        warn!(
+                            "❌ SendMessageHandler: 用户 {} 在群 {} 中被禁言（mute_until={:?}）",
+                            send_message_request.from_uid, send_message_request.channel_id, member.mute_until
+                        );
+                        return self
+                            .create_error_response(
+                                &send_message_request,
+                                ErrorCode::MemberMuted,
+                                &reject,
+                            )
+                            .await;
+                    }
+                    // 临时禁言已到期：放行本条消息，异步懒清理 DB + 缓存（此处持成员引用，不能同步取写锁）。
+                    let cs = self.channel_service.clone();
+                    let (lazy_channel_id, lazy_uid) = (channel.id, from_uid);
+                    tokio::spawn(async move {
+                        if let Err(e) = cs.set_member_muted(&lazy_channel_id, &lazy_uid, false, None).await {
+                            tracing::warn!("mute lazy-clear failed: channel={} uid={} err={}", lazy_channel_id, lazy_uid, e);
+                        }
+                    });
                 }
 
                 // 3.1.2. 检查全员禁言（群主/管理员不受影响）。

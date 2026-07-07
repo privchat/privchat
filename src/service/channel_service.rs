@@ -3356,6 +3356,7 @@ impl ChannelService {
         if let Some(channel) = channels.get_mut(channel_id) {
             if let Some(member) = channel.members.get_mut(user_id) {
                 member.is_muted = muted;
+                member.mute_until = if muted { mute_until } else { None };
                 Ok(())
             } else {
                 Err(ServerError::NotFound(format!(

@@ -40,6 +40,30 @@ pub async fn handle(
     let user_id = request.user_id;
 
     // 调用 Channel 服务取消禁言
+    // 权限矩阵（MEMBER_MUTE）：群主>管理员>成员；不能操作自己/群主。
+    {
+        let channel = services
+            .channel_service
+            .get_channel(&group_id)
+            .await
+            .map_err(|e| RpcError::not_found(format!("Group not found: {}", e)))?;
+        let operator_member = channel
+            .members
+            .get(&operator_id)
+            .ok_or_else(|| RpcError::forbidden("操作者不是群成员".to_string()))?;
+        let target_member = channel
+            .members
+            .get(&user_id)
+            .ok_or_else(|| RpcError::not_found("目标用户不是群成员".to_string()))?;
+        crate::model::channel::can_moderate_mute(
+            operator_id,
+            user_id,
+            operator_member.role,
+            target_member.role,
+        )
+        .map_err(|msg| RpcError::forbidden(msg.to_string()))?;
+    }
+
     match services
         .channel_service
         .set_member_muted(&group_id, &user_id, false, None)
