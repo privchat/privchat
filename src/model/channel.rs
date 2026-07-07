@@ -289,10 +289,68 @@ pub struct ChannelMember {
     pub last_active_at: DateTime<Utc>,
     /// 是否静音
     pub is_muted: bool,
+    /// 禁言截止时间。发送拦截以本字段为最终判定（见 `mute_is_active`）：
+    /// None + is_muted=true = 永久（兼容旧缓存）；<= now = 已过期视为未禁言。
+    pub mute_until: Option<DateTime<Utc>>,
     /// 是否已读最新消息（兼容单条已读，可选）
     pub last_read_message_id: Option<u64>,
     /// 最后已读 pts（区间语义，主模型）：已读 pts <= last_read_pts 的所有消息
     pub last_read_pts: u64,
+}
+
+/// 禁言/解禁的操作权限矩阵（MEMBER_MUTE 规则，对标 QQ/TG 群管理）：
+/// 群主可操作任何非群主成员；管理员只能操作普通成员；普通成员不能操作任何人；
+/// 不能操作自己；不能操作群主。Ok(()) = 允许，Err(文案) = 拒绝原因。
+pub fn can_moderate_mute(
+    operator_id: u64,
+    target_id: u64,
+    operator_role: MemberRole,
+    target_role: MemberRole,
+) -> std::result::Result<(), &'static str> {
+    if operator_id == target_id {
+        return Err("不能对自己执行禁言操作");
+    }
+    if matches!(target_role, MemberRole::Owner) {
+        return Err("不能对群主执行禁言操作");
+    }
+    match operator_role {
+        MemberRole::Owner => Ok(()),
+        MemberRole::Admin => {
+            if matches!(target_role, MemberRole::Admin) {
+                Err("管理员不能对其他管理员执行禁言操作")
+            } else {
+                Ok(())
+            }
+        }
+        MemberRole::Member => Err("只有群主或管理员可以执行禁言操作"),
+    }
+}
+
+/// 禁言是否仍然生效（发送拦截的最终判定，MEMBER_MUTE 规则）：
+/// is_muted=false → 未禁言；mute_until=None → 永久（兼容旧缓存快照）；
+/// mute_until>now → 禁言中；mute_until<=now → 已过期，视为未禁言（调用方懒清理）。
+pub fn mute_is_active(is_muted: bool, mute_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    is_muted && mute_until.map_or(true, |u| u > now)
+}
+
+/// 被禁言时的拒绝提示：区分「永久」与「剩余时长」（对标 QQ/Telegram 体验）。
+pub fn mute_reject_message(mute_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    const PERMANENT_THRESHOLD_SECS: i64 = 50 * 365 * 86_400; // rpc 层「永久」= now+100 年
+    match mute_until {
+        None => "您已被永久禁言".to_string(),
+        Some(u) => {
+            let secs = (u - now).num_seconds().max(0);
+            if secs >= PERMANENT_THRESHOLD_SECS {
+                "您已被永久禁言".to_string()
+            } else if secs >= 86_400 {
+                format!("您已被禁言，剩余 {} 天", (secs + 86_399) / 86_400)
+            } else if secs >= 3_600 {
+                format!("您已被禁言，剩余 {} 小时", (secs + 3_599) / 3_600)
+            } else {
+                format!("您已被禁言，剩余 {} 分钟", ((secs + 59) / 60).max(1))
+            }
+        }
+    }
 }
 
 impl ChannelMember {
@@ -312,6 +370,7 @@ impl ChannelMember {
             joined_at: Utc::now(),
             last_active_at: Utc::now(),
             is_muted: false,
+            mute_until: None,
             last_read_message_id: None,
             last_read_pts: 0,
         }
@@ -418,6 +477,7 @@ impl ChannelParticipant {
             joined_at: self.joined_at,
             last_active_at: self.joined_at, // 默认使用加入时间
             is_muted: self.mute_until.map_or(false, |dt| dt > Utc::now()),
+            mute_until: self.mute_until,
             last_read_message_id: None, // 需要从其他表查询
             last_read_pts: 0,
         }
@@ -1228,5 +1288,80 @@ mod tests {
         assert!(member_perms.can_send_message);
 
         // 注意：MemberPermissions 没有 guest() 方法，已删除此测试
+    }
+}
+
+#[cfg(test)]
+mod mute_tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn not_muted_can_send() {
+        let now = Utc::now();
+        assert!(!mute_is_active(false, None, now));
+        assert!(!mute_is_active(false, Some(now + Duration::minutes(10)), now));
+    }
+
+    #[test]
+    fn temp_mute_rejects_before_expiry() {
+        let now = Utc::now();
+        // 禁言 10 分钟,now+5min 时仍在禁言
+        let until = now + Duration::minutes(10);
+        assert!(mute_is_active(true, Some(until), now + Duration::minutes(5)));
+    }
+
+    #[test]
+    fn temp_mute_expires() {
+        let now = Utc::now();
+        // 禁言 10 分钟,now+11min 时已过期 → 可发言
+        let until = now + Duration::minutes(10);
+        assert!(!mute_is_active(true, Some(until), now + Duration::minutes(11)));
+        assert!(!mute_is_active(true, Some(until), until)); // 恰好到期(<=now)也放行
+    }
+
+    #[test]
+    fn permanent_mute_always_rejects() {
+        let now = Utc::now();
+        // 旧缓存快照(None)按永久保守处理
+        assert!(mute_is_active(true, None, now));
+        // rpc 层「永久」= now+100 年
+        assert!(mute_is_active(true, Some(now + Duration::days(365 * 100)), now + Duration::days(365)));
+    }
+
+    #[test]
+    fn manual_unmute_allows() {
+        let now = Utc::now();
+        // set_member_muted(false) 后 is_muted=false/mute_until=None
+        assert!(!mute_is_active(false, None, now));
+    }
+
+    #[test]
+    fn moderation_matrix() {
+        use MemberRole::*;
+        // 群主可禁普通成员与管理员
+        assert!(can_moderate_mute(1, 2, Owner, Member).is_ok());
+        assert!(can_moderate_mute(1, 2, Owner, Admin).is_ok());
+        // 管理员只能禁普通成员
+        assert!(can_moderate_mute(1, 2, Admin, Member).is_ok());
+        assert!(can_moderate_mute(1, 2, Admin, Admin).is_err());
+        // 普通成员不能禁任何人
+        assert!(can_moderate_mute(1, 2, Member, Member).is_err());
+        // 不能禁自己、不能禁群主
+        assert!(can_moderate_mute(1, 1, Owner, Owner).is_err());
+        assert!(can_moderate_mute(1, 2, Admin, Owner).is_err());
+        assert!(can_moderate_mute(1, 2, Owner, Owner).is_err());
+    }
+
+    #[test]
+    fn reject_message_wording() {
+        let now = Utc::now();
+        assert_eq!(mute_reject_message(None, now), "您已被永久禁言");
+        assert_eq!(mute_reject_message(Some(now + Duration::days(365 * 100)), now), "您已被永久禁言");
+        assert_eq!(mute_reject_message(Some(now + Duration::minutes(9)), now), "您已被禁言，剩余 9 分钟");
+        assert_eq!(mute_reject_message(Some(now + Duration::minutes(80)), now), "您已被禁言，剩余 2 小时");
+        assert_eq!(mute_reject_message(Some(now + Duration::days(3)), now), "您已被禁言，剩余 3 天");
+        // 已过期不应出现在拒绝路径,但函数本身不 panic
+        assert_eq!(mute_reject_message(Some(now - Duration::minutes(1)), now), "您已被禁言，剩余 1 分钟");
     }
 }
