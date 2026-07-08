@@ -178,6 +178,26 @@ pub async fn push_friend_request_status_changed(
     new_status: i16,
     actor_user_id: u64,
 ) {
+    push_friend_request_status_changed_via(
+        &services.connection_manager,
+        requester_id,
+        target_user_id,
+        new_status,
+        actor_user_id,
+    )
+    .await
+}
+
+/// 与 [push_friend_request_status_changed] 等价，但只依赖 ConnectionManager ——
+/// 供 service HTTP 路径（如 `/api/service/friendships` 直建好友）复用：
+/// 建立后立刻通知双方在线设备，客户端无需重登即可看到新好友。
+pub async fn push_friend_request_status_changed_via(
+    connection_manager: &crate::infra::connection_manager::ConnectionManager,
+    requester_id: u64,
+    target_user_id: u64,
+    new_status: i16,
+    actor_user_id: u64,
+) {
     let payload = serde_json::to_value(FriendRequestStatusChangedPayload {
         requester_id,
         target_user_id,
@@ -209,8 +229,7 @@ pub async fn push_friend_request_status_changed(
             ),
             payload_bytes,
         );
-        if let Err(e) = services
-            .connection_manager
+        if let Err(e) = connection_manager
             .send_push_to_user(requester_id, &push)
             .await
         {
@@ -246,8 +265,7 @@ pub async fn push_friend_request_status_changed(
             ),
             payload_bytes,
         );
-        if let Err(e) = services
-            .connection_manager
+        if let Err(e) = connection_manager
             .send_push_to_user(target_user_id, &push)
             .await
         {

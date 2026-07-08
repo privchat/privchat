@@ -193,7 +193,7 @@ impl ChatServer {
 
                     let mut system_user = crate::model::user::User::new(
                         crate::config::SYSTEM_USER_ID,
-                        format!("__system_{}__", crate::config::SYSTEM_USER_ID), // 使用特殊前缀确保唯一性
+                        "system".to_string(), // 固定用户名(用户可见,保留字已挡普通注册)
                     );
                     system_user.display_name = Some(system_user_def.display_name.clone());
                     system_user.user_type = 1; // 系统用户类型
