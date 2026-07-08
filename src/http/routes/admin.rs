@@ -1061,6 +1061,16 @@ async fn create_friendship(
             _ => ServerError::Database(format!("创建好友关系失败: {}", e)),
         })?;
 
+    // 通知双方在线设备(与常规 accept 同一事件),避免客户端要重登才看到新好友。
+    crate::rpc::contact::friend::push_helpers::push_friend_request_status_changed_via(
+        &state.connection_manager,
+        user1_id,
+        user2_id,
+        1,
+        user1_id,
+    )
+    .await;
+
     Ok(ApiEnvelope::ok(dto::CreateFriendshipResponse {
         success: true,
         user1_id,

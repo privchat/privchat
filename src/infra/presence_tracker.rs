@@ -113,10 +113,17 @@ impl PresenceTracker {
 
     fn to_snapshot(&self, status: OnlineStatusInfo) -> PresenceSnapshot {
         let device_count = self.device_count(status.user_id);
+        // 存储层 last_seen 为 Unix 秒；对外契约是 UTC 毫秒（客户端 Formatter 假设
+        // 毫秒，秒值会被格式化成 1970-01-21）。在唯一组装点转换；已是毫秒量级则透传。
+        let last_seen_ms = if status.last_seen > 0 && status.last_seen < 1_000_000_000_000 {
+            status.last_seen * 1000
+        } else {
+            status.last_seen
+        };
         PresenceSnapshot {
             user_id: status.user_id,
             is_online: device_count > 0,
-            last_seen_at: status.last_seen,
+            last_seen_at: last_seen_ms,
             device_count,
             version: self.current_version(status.user_id),
         }
