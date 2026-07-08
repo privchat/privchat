@@ -55,37 +55,39 @@ pub async fn handle(
 
     let mut results = Vec::new();
 
-    // ✨ 关键字精确搜索：username → phone → email 三步级联，与 doc
-    // 注释一致（"支持搜索 username、phone、email"）。phone 的 query
-    // 用未小写化的原文：privchat_users.phone 存储为 E.164（含 `+`），
-    // 大小写不敏感但前缀字符必须保留。
-    let (user_opt, search_type) = match services
-        .user_repository
-        .find_by_username(&query)
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(user) => (Some(user), SearchType::Username),
-        None => match services
-            .user_repository
-            .find_by_phone(&raw_query)
-            .await
-            .ok()
-            .flatten()
-        {
-            Some(user) => (Some(user), SearchType::Phone),
-            None => (
-                services
-                    .user_repository
-                    .find_by_email(&query)
-                    .await
-                    .ok()
-                    .flatten(),
-                SearchType::Email,
-            ),
-        },
-    };
+    // ✨ 关键字精确搜索：username → user_id → phone → email 四步级联。
+    // phone 的 query 用未小写化的原文：privchat_users.phone 存储为
+    // E.164（含 `+`），大小写不敏感但前缀字符必须保留。
+    // user_id：query 为纯数字时按 id 精确查（username 规则要求字母开头，
+    // 纯数字必然 miss username，级联安全）；隐私开关沿用 username 的
+    // allows_search（同为账号标识搜索，不新增隐私维度）。
+    let mut user_opt: Option<crate::model::user::User> = None;
+    let mut search_type = SearchType::Username;
+    if let Ok(Some(user)) = services.user_repository.find_by_username(&query).await {
+        user_opt = Some(user);
+    }
+    if user_opt.is_none() {
+        if let Ok(uid) = raw_query.parse::<u64>() {
+            if uid > 0 {
+                if let Ok(Some(user)) = services.user_repository.find_by_id(uid).await {
+                    user_opt = Some(user);
+                }
+            }
+        }
+    }
+    if user_opt.is_none() {
+        if let Ok(Some(user)) = services.user_repository.find_by_phone(&raw_query).await {
+            user_opt = Some(user);
+            search_type = SearchType::Phone;
+        }
+    }
+    if user_opt.is_none() {
+        if let Ok(Some(user)) = services.user_repository.find_by_email(&query).await {
+            user_opt = Some(user);
+            search_type = SearchType::Email;
+        }
+    }
+    let (user_opt, search_type) = (user_opt, search_type);
 
     // 处理找到的用户
     if let Some(user) = user_opt {
