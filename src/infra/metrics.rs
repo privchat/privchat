@@ -192,3 +192,44 @@ pub fn increment_offline_enqueue(by: u64) {
 pub fn increment_delivery_filtered(reason: &'static str, by: u64) {
     metrics::counter!(COUNTER_DELIVERY_FILTERED, "reason" => reason).increment(by);
 }
+
+// ---------------------------------------------------------------------------
+// P1-00 Observability baseline：entity sync 维度 + 进程内大 map 水位
+// （PRIVCHAT_SERVER_REMEDIATION_TASKS P1-00；SERVER_BUSY 已由
+//   privchat_handler_rejected_total 覆盖——限流拒绝与 SERVER_BUSY 响应同源）
+// ---------------------------------------------------------------------------
+
+/// entity/sync_entities 请求数（按 entity_type 分）
+const COUNTER_SYNC_ENTITIES_REQUESTS: &str = "privchat_sync_entities_requests_total";
+/// entity/sync_entities 处理时长（按 entity_type 分）
+const HISTOGRAM_SYNC_ENTITIES_DURATION: &str = "privchat_sync_entities_duration_seconds";
+/// entity/sync_entities 下发 item 总数（按 entity_type 分）。
+/// 重连风暴放大的直接观测面：增量正常时 channel 类应接近 0。
+const COUNTER_SYNC_ENTITIES_ITEMS: &str = "privchat_sync_entities_items_total";
+/// 进程内大 map 当前条目数（label: map）。P1-15 有界化的水位依据。
+const GAUGE_MEMORY_MAP_ENTRIES: &str = "privchat_memory_map_entries";
+/// room 订阅：当前有订阅者的 channel 数
+const GAUGE_ROOM_SUBSCRIBED_CHANNELS: &str = "privchat_room_subscribed_channels";
+/// room 订阅：当前 session 订阅总数
+const GAUGE_ROOM_SUBSCRIBER_SESSIONS: &str = "privchat_room_subscriber_sessions";
+
+/// 记录一次 entity/sync_entities 请求：次数 + 时长 + 下发 item 数。
+pub fn record_sync_entities(entity_type: &str, duration_secs: f64, items: usize) {
+    metrics::counter!(COUNTER_SYNC_ENTITIES_REQUESTS, "entity_type" => entity_type.to_string())
+        .increment(1);
+    metrics::histogram!(HISTOGRAM_SYNC_ENTITIES_DURATION, "entity_type" => entity_type.to_string())
+        .record(duration_secs);
+    metrics::counter!(COUNTER_SYNC_ENTITIES_ITEMS, "entity_type" => entity_type.to_string())
+        .increment(items as u64);
+}
+
+/// 更新某个进程内大 map 的条目数（Gauge，由 60s 轮询写入）。
+pub fn record_memory_map_entries(map: &'static str, entries: usize) {
+    metrics::gauge!(GAUGE_MEMORY_MAP_ENTRIES, "map" => map).set(entries as f64);
+}
+
+/// 更新 room 订阅规模（Gauge，由 60s 轮询写入）。
+pub fn record_room_subscribers(channels: usize, sessions: usize) {
+    metrics::gauge!(GAUGE_ROOM_SUBSCRIBED_CHANNELS).set(channels as f64);
+    metrics::gauge!(GAUGE_ROOM_SUBSCRIBER_SESSIONS).set(sessions as f64);
+}
