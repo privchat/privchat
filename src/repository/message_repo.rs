@@ -96,7 +96,8 @@ pub struct PgMessageRepository {
 #[derive(Debug, Clone)]
 pub struct AtomicMessageCommitRequest {
     pub message: Message,
-    pub dedup_key: String,
+    /// None = 客户端未提供幂等键（local_message_id=0），事务内不 claim dedup key。
+    pub dedup_key: Option<String>,
     pub attachment_file_ids: Vec<u64>,
     pub channel_type: i16,
     pub commit_content: serde_json::Value,
@@ -181,53 +182,56 @@ impl PgMessageRepository {
             })?;
 
         let created_at = request.message.created_at.timestamp_millis();
-        let claim = sqlx::query(
-            r#"
-            INSERT INTO privchat_message_dedup (dedup_key, message_id, created_at)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (dedup_key) DO NOTHING
-            "#,
-        )
-        .bind(&request.dedup_key)
-        .bind(request.message.message_id as i64)
-        .bind(created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DatabaseError::Database(format!("Failed to claim dedup_key: {}", e)))?;
-
-        if claim.rows_affected() == 0 {
-            let existing = sqlx::query_as::<_, MessageRow>(
+        // dedup_key=None（local_message_id=0）时不 claim：无幂等键的发送不做判重。
+        if let Some(dedup_key) = request.dedup_key.as_deref() {
+            let claim = sqlx::query(
                 r#"
-                SELECT
-                    m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
-                    m.content, m.message_type, m.metadata, m.reply_to_message_id,
-                    m.created_at, m.updated_at, m.deleted, m.deleted_at,
-                    m.revoked, m.revoked_at, m.revoked_by
-                FROM privchat_message_dedup d
-                JOIN privchat_messages m ON m.message_id = d.message_id
-                WHERE d.dedup_key = $1
-                ORDER BY m.created_at DESC
-                LIMIT 1
+                INSERT INTO privchat_message_dedup (dedup_key, message_id, created_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (dedup_key) DO NOTHING
                 "#,
             )
-            .bind(&request.dedup_key)
-            .fetch_optional(&mut *tx)
+            .bind(dedup_key)
+            .bind(request.message.message_id as i64)
+            .bind(created_at)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                DatabaseError::Database(format!("Failed to fetch duplicate message: {}", e))
-            })?;
+            .map_err(|e| DatabaseError::Database(format!("Failed to claim dedup_key: {}", e)))?;
 
-            tx.rollback().await.ok();
-            let message = existing.ok_or_else(|| {
-                DatabaseError::Database(format!(
-                    "dedup_key exists but message is missing: {}",
-                    request.dedup_key
-                ))
-            })?;
-            return Ok(AtomicMessageCommitResult {
-                message: Self::message_from_row(message),
-                inserted: false,
-            });
+            if claim.rows_affected() == 0 {
+                let existing = sqlx::query_as::<_, MessageRow>(
+                    r#"
+                    SELECT
+                        m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
+                        m.content, m.message_type, m.metadata, m.reply_to_message_id,
+                        m.created_at, m.updated_at, m.deleted, m.deleted_at,
+                        m.revoked, m.revoked_at, m.revoked_by
+                    FROM privchat_message_dedup d
+                    JOIN privchat_messages m ON m.message_id = d.message_id
+                    WHERE d.dedup_key = $1
+                    ORDER BY m.created_at DESC
+                    LIMIT 1
+                    "#,
+                )
+                .bind(dedup_key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Database(format!("Failed to fetch duplicate message: {}", e))
+                })?;
+
+                tx.rollback().await.ok();
+                let message = existing.ok_or_else(|| {
+                    DatabaseError::Database(format!(
+                        "dedup_key exists but message is missing: {}",
+                        dedup_key
+                    ))
+                })?;
+                return Ok(AtomicMessageCommitResult {
+                    message: Self::message_from_row(message),
+                    inserted: false,
+                });
+            }
         }
 
         let now = chrono::Utc::now().timestamp_millis();
