@@ -1979,6 +1979,9 @@ impl ChatServer {
         let database = self.database.clone();
         let offline_worker = self.offline_worker.clone();
         let connection_manager = self.connection_manager.clone();
+        // P1-00：进程内大 map 水位 + room 订阅规模采样源
+        let channel_service_metrics = self.channel_service.clone();
+        let subscribe_manager_metrics = self.subscribe_manager.clone();
 
         // 扫码登录 scene 到期扫描（spec QR_API §5）：每 5 秒推一次 expired
         // 给仍然在线的 unauth 连接，并解绑 publisher。比 lazy 检查更及时。
@@ -2037,6 +2040,19 @@ impl ChatServer {
                 let online_sessions = connection_manager.online_sessions_count() as u64;
                 crate::infra::metrics::record_online_users(online_users);
                 crate::infra::metrics::record_online_sessions(online_sessions);
+
+                // P1-00：进程内大 map 水位（P1-15 有界化的观测前置）+ room 订阅规模。
+                // MessageHistoryService 未挂到 ChatServer 字段，其水位随 P1-15 一起补。
+                let (ch_map, uch_map, direct_idx, last_msg_cache) =
+                    channel_service_metrics.memory_cache_entries().await;
+                crate::infra::metrics::record_memory_map_entries("channels", ch_map);
+                crate::infra::metrics::record_memory_map_entries("user_channels", uch_map);
+                crate::infra::metrics::record_memory_map_entries("direct_channel_index", direct_idx);
+                crate::infra::metrics::record_memory_map_entries("last_message_cache", last_msg_cache);
+                crate::infra::metrics::record_room_subscribers(
+                    subscribe_manager_metrics.get_channel_count(),
+                    subscribe_manager_metrics.get_total_session_count(),
+                );
 
                 let secs = stats_guard.uptime_seconds;
                 let days = secs / 86400;

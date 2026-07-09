@@ -2171,6 +2171,16 @@ impl ChannelService {
     }
 
     /// entity/sync_entities 业务逻辑：会话列表分页与 SyncEntitiesResponse 构建（私聊+群聊+系统）
+    /// P1-00/P1-15：进程内 channel 相关 cache 的条目数快照（水位观测）。
+    /// 返回 (channels, user_channels, direct_channel_index, last_message_cache)。
+    pub async fn memory_cache_entries(&self) -> (usize, usize, usize, usize) {
+        let channels = self.channels.read().await.len();
+        let user_channels = self.user_channels.read().await.len();
+        let direct_index = self.direct_channel_index.read().await.len();
+        let last_message = self.last_message_cache.read().await.len();
+        (channels, user_channels, direct_index, last_message)
+    }
+
     pub async fn sync_entities_page_for_channels(
         &self,
         user_id: u64,

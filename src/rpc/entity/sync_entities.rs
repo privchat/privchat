@@ -90,6 +90,7 @@ fn validate_group_member_scope(scope: Option<&str>) -> RpcResult<()> {
 /// 处理 entity/sync_entities 请求
 pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -> RpcResult<Value> {
     tracing::debug!("🔧 处理 entity/sync_entities 请求: {:?}", body);
+    let started = std::time::Instant::now();
 
     let request: SyncEntitiesRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
@@ -255,6 +256,14 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
             )));
         }
     };
+
+    // P1-00：sync 维度观测（请求数/时长/下发 item 数，按 entity_type 分）。
+    // items 是重连风暴放大的直接观测面：增量正常时 channel 类应接近 0。
+    crate::infra::metrics::record_sync_entities(
+        request.entity_type.as_str(),
+        started.elapsed().as_secs_f64(),
+        response.items.len(),
+    );
 
     serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
