@@ -75,6 +75,12 @@ impl SubscribeMessageHandler {
         }
     }
 
+    /// P1-05 room replay 契约（ROOM_CHANNEL_SPEC §5）：
+    /// 历史按 server_message_id 升序（oldest→newest）逐帧回放，每帧携带其
+    /// 单调 server_message_id。订阅注册（live fanout 开始）在回放之前发生，故
+    /// 回放与实时广播在 (snapshot, register) 窗口内会重复投递同一帧——这是
+    /// **有意的 no-loss 取舍**：客户端 SDK 按 (channel_id, server_message_id) 去重，
+    /// 并用该 id 排序。服务端不做 per-session 缓冲（room 是高频广播，缓冲代价大）。
     async fn replay_room_history_to_session(
         connection_manager: Arc<ConnectionManager>,
         room_history_service: Arc<crate::service::RoomHistoryService>,
