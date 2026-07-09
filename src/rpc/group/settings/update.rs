@@ -80,6 +80,19 @@ pub async fn handle(
 
     // 5.0. 群业务策略先落库（DB 为真源），再由下方 setter 同步内存缓存。
     //      仅当存在 policy 字段变更时才写库，避免无谓 UPDATE。
+    // 全员禁言变化要发系统灰条:先取旧值判断是否真的翻转
+    let prev_all_muted = if all_muted.is_some() {
+        services
+            .channel_service
+            .get_group_policy(group_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.all_muted)
+    } else {
+        None
+    };
+
     if allow_search.is_some()
         || join_policy.is_some()
         || member_can_invite.is_some()
@@ -99,6 +112,36 @@ pub async fn handle(
             .await
             .map_err(|e| RpcError::internal(format!("群设置落库失败: {}", e)))?;
         tracing::debug!("✅ 群设置已落库: group_id={}", group_id);
+    }
+
+    // 5.0.1 全员禁言开/关系统灰条(template + refs[操作人],三端共用同一渲染)
+    if let Some(muted) = all_muted {
+        if prev_all_muted != Some(muted) {
+            let operator_name = services
+                .user_service
+                .find_by_id(operator_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|u| u.display_name.or(u.username))
+                .unwrap_or_else(|| operator_id.to_string());
+            let sys_payload = serde_json::json!({
+                "message_type": "system",
+                "template": if muted { "system.group_mute_all_on" } else { "system.group_mute_all_off" },
+                "refs": [{
+                    "type": "user",
+                    "target_id": operator_id.to_string(),
+                    "text": operator_name,
+                }],
+            });
+            if let Err(e) = services
+                .message_service
+                .send_group_system_message(group_id, sys_payload.to_string(), serde_json::json!({}))
+                .await
+            {
+                tracing::warn!("⚠️ 写入全员禁言系统消息失败 group_id={}: {}", group_id, e);
+            }
+        }
     }
 
     // 4.1. 更新描述

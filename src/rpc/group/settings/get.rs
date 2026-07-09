@@ -56,13 +56,13 @@ pub async fn handle(
     tracing::debug!("🔧 处理 获取群设置 请求: {:?}", body);
 
     // 解析参数
-    let group_id_str = body
-        .get("group_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("group_id is required".to_string()))?;
-    let group_id = group_id_str
-        .parse::<u64>()
-        .map_err(|_| RpcError::validation(format!("Invalid group_id: {}", group_id_str)))?;
+    // 兼容数字与字符串两种形态(typed FFI 客户端发数字,老客户端发字符串)
+    let group_id = match body.get("group_id") {
+        Some(Value::String(s)) => s.parse::<u64>().ok(),
+        Some(v) => v.as_u64(),
+        None => None,
+    }
+    .ok_or_else(|| RpcError::validation("group_id is required".to_string()))?;
 
     // 从 ctx 获取当前用户 ID
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
