@@ -93,6 +93,22 @@ pub struct PgMessageRepository {
     pool: Arc<PgPool>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AtomicMessageCommitRequest {
+    pub message: Message,
+    pub dedup_key: String,
+    pub attachment_file_ids: Vec<u64>,
+    pub channel_type: i16,
+    pub commit_content: serde_json::Value,
+    pub sender_username: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AtomicMessageCommitResult {
+    pub message: Message,
+    pub inserted: bool,
+}
+
 impl PgMessageRepository {
     /// 创建新的消息仓库
     pub fn new(pool: Arc<PgPool>) -> Self {
@@ -102,6 +118,251 @@ impl PgMessageRepository {
     /// 获取数据库连接池（用于管理 API）
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    fn message_from_row(row: MessageRow) -> Message {
+        Message::from_db_row(
+            row.message_id,
+            row.channel_id,
+            row.sender_id,
+            row.pts,
+            row.local_message_id.map(|n| n as u64),
+            row.content,
+            row.message_type,
+            row.metadata
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+            row.reply_to_message_id,
+            row.created_at,
+            row.updated_at,
+            row.deleted,
+            row.deleted_at,
+            row.revoked,
+            row.revoked_at,
+            row.revoked_by,
+        )
+    }
+
+    /// 按 dedup_key 查完整消息。
+    pub async fn find_message_by_dedup_key(
+        &self,
+        dedup_key: &str,
+    ) -> Result<Option<Message>, DatabaseError> {
+        let row = sqlx::query_as::<_, MessageRow>(
+            r#"
+            SELECT
+                m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
+                m.content, m.message_type, m.metadata, m.reply_to_message_id,
+                m.created_at, m.updated_at, m.deleted, m.deleted_at,
+                m.revoked, m.revoked_at, m.revoked_by
+            FROM privchat_message_dedup d
+            JOIN privchat_messages m ON m.message_id = d.message_id
+            WHERE d.dedup_key = $1
+            ORDER BY m.created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(dedup_key)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to query dedup message: {}", e)))?;
+
+        Ok(row.map(Self::message_from_row))
+    }
+
+    /// 普通客户端消息的权威写入路径：在同一个 DB transaction 内完成
+    /// dedup claim、pts 分配、消息落库、附件绑定和 commit log 写入。
+    pub async fn create_message_and_commit_atomic(
+        &self,
+        request: AtomicMessageCommitRequest,
+    ) -> Result<AtomicMessageCommitResult, DatabaseError> {
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                DatabaseError::Database(format!("Failed to begin message tx: {}", e))
+            })?;
+
+        let created_at = request.message.created_at.timestamp_millis();
+        let claim = sqlx::query(
+            r#"
+            INSERT INTO privchat_message_dedup (dedup_key, message_id, created_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (dedup_key) DO NOTHING
+            "#,
+        )
+        .bind(&request.dedup_key)
+        .bind(request.message.message_id as i64)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to claim dedup_key: {}", e)))?;
+
+        if claim.rows_affected() == 0 {
+            let existing = sqlx::query_as::<_, MessageRow>(
+                r#"
+                SELECT
+                    m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
+                    m.content, m.message_type, m.metadata, m.reply_to_message_id,
+                    m.created_at, m.updated_at, m.deleted, m.deleted_at,
+                    m.revoked, m.revoked_at, m.revoked_by
+                FROM privchat_message_dedup d
+                JOIN privchat_messages m ON m.message_id = d.message_id
+                WHERE d.dedup_key = $1
+                ORDER BY m.created_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(&request.dedup_key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                DatabaseError::Database(format!("Failed to fetch duplicate message: {}", e))
+            })?;
+
+            tx.rollback().await.ok();
+            let message = existing.ok_or_else(|| {
+                DatabaseError::Database(format!(
+                    "dedup_key exists but message is missing: {}",
+                    request.dedup_key
+                ))
+            })?;
+            return Ok(AtomicMessageCommitResult {
+                message: Self::message_from_row(message),
+                inserted: false,
+            });
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let pts_row = sqlx::query(
+            r#"
+            INSERT INTO privchat_channel_pts
+            (channel_id, current_pts, created_at, updated_at)
+            VALUES ($1, 1, $2, $2)
+            ON CONFLICT (channel_id) DO UPDATE
+            SET current_pts = privchat_channel_pts.current_pts + 1,
+                updated_at = $2
+            RETURNING current_pts
+            "#,
+        )
+        .bind(request.message.channel_id as i64)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to allocate pts: {}", e)))?;
+
+        let pts = pts_row.get::<i64, _>("current_pts");
+        let mut message = request.message;
+        message.pts = Some(pts);
+
+        let (
+            message_id,
+            channel_id,
+            sender_id,
+            pts,
+            local_message_id,
+            content,
+            message_type,
+            metadata,
+            reply_to_message_id,
+            created_at,
+            updated_at,
+            deleted,
+            deleted_at,
+            revoked,
+            revoked_at,
+            revoked_by,
+        ) = message.to_db_values();
+
+        let metadata_json = serde_json::to_value(&metadata)
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_messages (
+                message_id, channel_id, sender_id, pts, local_message_id,
+                message_type, content, metadata, reply_to_message_id,
+                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            "#,
+        )
+        .bind(message_id)
+        .bind(channel_id)
+        .bind(sender_id)
+        .bind(pts)
+        .bind(local_message_id)
+        .bind(message_type)
+        .bind(content)
+        .bind(&metadata_json)
+        .bind(reply_to_message_id)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(deleted)
+        .bind(deleted_at)
+        .bind(revoked)
+        .bind(revoked_at)
+        .bind(revoked_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
+
+        for file_id in request.attachment_file_ids {
+            let updated = sqlx::query(
+                r#"
+                UPDATE privchat_file_uploads
+                SET business_type = $1, business_id = $2
+                WHERE file_id = $3
+                "#,
+            )
+            .bind("message")
+            .bind(message.message_id.to_string())
+            .bind(file_id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                DatabaseError::Database(format!(
+                    "Failed to bind attachment file_id={} to message_id={}: {}",
+                    file_id, message.message_id, e
+                ))
+            })?;
+
+            if updated.rows_affected() == 0 {
+                return Err(DatabaseError::Database(format!(
+                    "attachment file_id={} not found while binding message_id={}",
+                    file_id, message.message_id
+                )));
+            }
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_commit_log
+            (pts, server_msg_id, local_message_id, channel_id, channel_type,
+             message_type, content, server_timestamp, sender_id, sender_username, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(message.pts.unwrap_or(0))
+        .bind(message.message_id as i64)
+        .bind(message.local_message_id.map(|v| v as i64))
+        .bind(message.channel_id as i64)
+        .bind(request.channel_type)
+        .bind(message.message_type.as_str())
+        .bind(&request.commit_content)
+        .bind(message.created_at.timestamp_millis())
+        .bind(message.sender_id as i64)
+        .bind(request.sender_username.as_deref())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to save commit: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("Failed to commit message tx: {}", e)))?;
+
+        Ok(AtomicMessageCommitResult {
+            message,
+            inserted: true,
+        })
     }
 
     /// 按 message_id 取 channel_id（附件访问授权用：file→message→channel）。

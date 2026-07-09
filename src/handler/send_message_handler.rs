@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::Result;
 use crate::context::RequestContext;
 use crate::error::ServerError;
 use crate::handler::MessageHandler;
@@ -22,11 +23,10 @@ use crate::infra::RouteResult;
 use crate::infra::SessionManager as AuthSessionManager;
 use crate::model::channel::{MessageId, UserId};
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
-use crate::repository::{MessageRepository, PgMessageRepository};
-use crate::service::message_history_service::MessageHistoryService;
+use crate::repository::{AtomicMessageCommitRequest, PgMessageRepository};
+use crate::service::message_history_service::{MessageHistoryRecord, MessageHistoryService};
 use crate::service::sync::get_global_sync_service;
 use crate::service::{MessageDedupService, OfflineQueueService, UnreadCountService};
-use crate::Result;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use privchat_protocol::error_code::ErrorCode;
@@ -226,6 +226,38 @@ impl SendMessageHandler {
         *self.transport.write().await = Some(transport);
     }
 
+    fn client_dedup_key(sender_id: u64, local_message_id: u64) -> String {
+        format!("client:{}:{}", sender_id, local_message_id)
+    }
+
+    fn message_to_history_record(message: &crate::model::message::Message) -> MessageHistoryRecord {
+        MessageHistoryRecord {
+            message_id: message.message_id,
+            channel_id: message.channel_id,
+            sender_id: message.sender_id,
+            content: message.content.clone(),
+            message_type: message.message_type.as_u32(),
+            seq: message.pts.unwrap_or(0).max(0) as u64,
+            created_at: message.created_at,
+            updated_at: message.updated_at,
+            is_deleted: message.deleted,
+            deleted_at: message.deleted_at,
+            is_revoked: message.revoked,
+            revoked_at: message.revoked_at,
+            revoker_id: message.revoked_by,
+            reply_to_message_id: message.reply_to_message_id,
+            metadata: Some(message.metadata.to_string()),
+        }
+    }
+
+    fn channel_type_code(channel_type: crate::model::channel::ChannelType) -> u8 {
+        match channel_type {
+            crate::model::channel::ChannelType::Direct => 1,
+            crate::model::channel::ChannelType::Group => 2,
+            crate::model::channel::ChannelType::Room => 3,
+        }
+    }
+
     /// 用已解析的 content + metadata 构造 sync commit 内容（{content, metadata?}）。
     /// 与 `create_push_message_request` 的 push payload 同形，保证 realtime / sync / history
     /// 三条路径在客户端拿到等价的媒体 metadata。CEK 不进 metadata（解析时已不含）。
@@ -272,6 +304,8 @@ impl MessageHandler for SendMessageHandler {
         // from_uid 和 channel_id 现在已经是 u64 类型
         let from_uid = send_message_request.from_uid;
         let channel_id = send_message_request.channel_id;
+        let client_dedup_key =
+            Self::client_dedup_key(from_uid, send_message_request.local_message_id);
 
         // ✨ 1.4. 防御性检查：拒绝无效的 channel_id
         if channel_id == 0 {
@@ -288,18 +322,25 @@ impl MessageHandler for SendMessageHandler {
                 .await;
         }
 
-        // 1.5. 检查消息去重（基于 local_message_id）
-        if self
-            .message_dedup_service
-            .is_duplicate(from_uid, send_message_request.local_message_id)
+        // 1.5. DB 级幂等预查（server 重启后仍生效）。
+        if let Some(existing_message) = self
+            .message_repository
+            .find_message_by_dedup_key(&client_dedup_key)
             .await
+            .map_err(|e| ServerError::Database(format!("查询消息幂等键失败: {}", e)))?
         {
-            warn!(
-                "🔄 SendMessageHandler: 检测到重复消息 - 用户: {}, local_message_id: {}",
-                send_message_request.from_uid, send_message_request.local_message_id
+            let existing_pts = existing_message.pts.unwrap_or(0).max(0) as u64;
+            let existing_record = Self::message_to_history_record(&existing_message);
+            info!(
+                "🔄 SendMessageHandler: DB 幂等命中 - user={}, local_message_id={}, message_id={}, pts={}",
+                from_uid,
+                send_message_request.local_message_id,
+                existing_message.message_id,
+                existing_pts
             );
-            // 返回成功响应，但不处理消息（幂等性）
-            return self.create_duplicate_response(&send_message_request).await;
+            return self
+                .create_success_response(&send_message_request, &existing_record, existing_pts)
+                .await;
         }
 
         // 2. 验证频道存在性和用户权限
@@ -353,8 +394,10 @@ impl MessageHandler for SendMessageHandler {
                             // 用户是会话参与者，添加到频道
                             let role = match db_channel.channel_type {
                                 crate::model::channel::ChannelType::Direct => {
-                                    info!("🔧 SendMessageHandler: 用户 {} 不在私聊频道 {} 的成员列表中，但从数据库会话中发现是参与者，自动添加",
-                                          from_uid, channel_id);
+                                    info!(
+                                        "🔧 SendMessageHandler: 用户 {} 不在私聊频道 {} 的成员列表中，但从数据库会话中发现是参与者，自动添加",
+                                        from_uid, channel_id
+                                    );
                                     crate::model::channel::MemberRole::Member
                                 }
                                 crate::model::channel::ChannelType::Group => {
@@ -384,8 +427,10 @@ impl MessageHandler for SendMessageHandler {
                                             .unwrap_or(crate::model::channel::MemberRole::Member)
                                     };
 
-                                    info!("🔧 SendMessageHandler: 用户 {} 不在群聊频道 {} 的成员列表中，但从数据库会话中发现是参与者（角色: {:?}），自动添加",
-                                          from_uid, channel_id, participant_role);
+                                    info!(
+                                        "🔧 SendMessageHandler: 用户 {} 不在群聊频道 {} 的成员列表中，但从数据库会话中发现是参与者（角色: {:?}），自动添加",
+                                        from_uid, channel_id, participant_role
+                                    );
 
                                     match participant_role {
                                         crate::model::channel::MemberRole::Owner => {
@@ -517,8 +562,10 @@ impl MessageHandler for SendMessageHandler {
 
                                 // ✨ 双重验证：确保发送者在成员列表中
                                 if !channel.members.contains_key(&from_uid) {
-                                    warn!("❌ SendMessageHandler: 恢复私聊频道后，发送者 {} 不在成员列表中",
-                                          send_message_request.from_uid);
+                                    warn!(
+                                        "❌ SendMessageHandler: 恢复私聊频道后，发送者 {} 不在成员列表中",
+                                        send_message_request.from_uid
+                                    );
                                     return self
                                         .create_error_response(
                                             &send_message_request,
@@ -688,8 +735,10 @@ impl MessageHandler for SendMessageHandler {
                                         }
                                     };
 
-                                    info!("🔧 SendMessageHandler: 发送者 {} 不在恢复的群聊频道成员列表中，从数据库参与者信息中添加",
-                                          send_message_request.from_uid);
+                                    info!(
+                                        "🔧 SendMessageHandler: 发送者 {} 不在恢复的群聊频道成员列表中，从数据库参与者信息中添加",
+                                        send_message_request.from_uid
+                                    );
 
                                     if let Err(e) = self
                                         .channel_service
@@ -700,7 +749,10 @@ impl MessageHandler for SendMessageHandler {
                                         )
                                         .await
                                     {
-                                        warn!("❌ SendMessageHandler: 添加发送者到恢复的群聊频道失败: {}", e);
+                                        warn!(
+                                            "❌ SendMessageHandler: 添加发送者到恢复的群聊频道失败: {}",
+                                            e
+                                        );
                                         return self
                                             .create_error_response(
                                                 &send_message_request,
@@ -838,8 +890,10 @@ impl MessageHandler for SendMessageHandler {
                         _ => crate::model::channel::MemberRole::Member,
                     };
 
-                    info!("🔧 SendMessageHandler: 用户 {} 不在频道 {} 的成员列表中，但从数据库会话中发现是参与者，自动添加",
-                          from_uid, channel_id);
+                    info!(
+                        "🔧 SendMessageHandler: 用户 {} 不在频道 {} 的成员列表中，但从数据库会话中发现是参与者，自动添加",
+                        from_uid, channel_id
+                    );
 
                     if let Err(e) = self
                         .channel_service
@@ -899,11 +953,18 @@ impl MessageHandler for SendMessageHandler {
                 // 3.1.1. 检查个人禁言状态（优先检查，返回错误码5）
                 if member.is_muted {
                     let now = chrono::Utc::now();
-                    if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now) {
-                        let reject = crate::model::channel::mute_reject_message(member.mute_until, now);
+                    if crate::model::channel::mute_is_active(
+                        member.is_muted,
+                        member.mute_until,
+                        now,
+                    ) {
+                        let reject =
+                            crate::model::channel::mute_reject_message(member.mute_until, now);
                         warn!(
                             "❌ SendMessageHandler: 用户 {} 在群 {} 中被禁言（mute_until={:?}）",
-                            send_message_request.from_uid, send_message_request.channel_id, member.mute_until
+                            send_message_request.from_uid,
+                            send_message_request.channel_id,
+                            member.mute_until
                         );
                         return self
                             .create_error_response(
@@ -917,8 +978,16 @@ impl MessageHandler for SendMessageHandler {
                     let cs = self.channel_service.clone();
                     let (lazy_channel_id, lazy_uid) = (channel.id, from_uid);
                     tokio::spawn(async move {
-                        if let Err(e) = cs.set_member_muted(&lazy_channel_id, &lazy_uid, false, None).await {
-                            tracing::warn!("mute lazy-clear failed: channel={} uid={} err={}", lazy_channel_id, lazy_uid, e);
+                        if let Err(e) = cs
+                            .set_member_muted(&lazy_channel_id, &lazy_uid, false, None)
+                            .await
+                        {
+                            tracing::warn!(
+                                "mute lazy-clear failed: channel={} uid={} err={}",
+                                lazy_channel_id,
+                                lazy_uid,
+                                e
+                            );
                         }
                     });
                 }
@@ -1026,8 +1095,15 @@ impl MessageHandler for SendMessageHandler {
                 }
             };
 
-        info!("📩 SendMessageHandler: message_type={}, content={}, metadata={}, reply_to={:?}, mentioned={:?}, source={:?}",
-              send_message_request.message_type, content, redact_metadata_for_log(&metadata), reply_to_message_id, mentioned_user_ids, message_source);
+        info!(
+            "📩 SendMessageHandler: message_type={}, content={}, metadata={}, reply_to={:?}, mentioned={:?}, source={:?}",
+            send_message_request.message_type,
+            content,
+            redact_metadata_for_log(&metadata),
+            reply_to_message_id,
+            mentioned_user_ids,
+            message_source
+        );
 
         // 3.5. ✅ 检查好友关系、黑名单和非好友消息权限（仅限私聊）
         if channel.channel_type == crate::model::channel::ChannelType::Direct {
@@ -1086,8 +1162,10 @@ impl MessageHandler for SendMessageHandler {
                     {
                         Ok(privacy_settings) => {
                             if !privacy_settings.allow_receive_message_from_non_friend {
-                                warn!("🚫 SendMessageHandler: 用户 {} 不允许接收非好友消息，发送者 {} 不是好友",
-                                      receiver_id, from_uid);
+                                warn!(
+                                    "🚫 SendMessageHandler: 用户 {} 不允许接收非好友消息，发送者 {} 不是好友",
+                                    receiver_id, from_uid
+                                );
                                 return self
                                     .create_error_response(
                                         &send_message_request,
@@ -1096,17 +1174,24 @@ impl MessageHandler for SendMessageHandler {
                                     )
                                     .await;
                             } else {
-                                info!("✅ SendMessageHandler: 用户 {} 允许接收非好友消息，发送者 {} 可以发送",
-                                      receiver_id, from_uid);
+                                info!(
+                                    "✅ SendMessageHandler: 用户 {} 允许接收非好友消息，发送者 {} 可以发送",
+                                    receiver_id, from_uid
+                                );
 
                                 if let Some(ref source) = message_source {
-                                    info!("📝 SendMessageHandler: 记录非好友消息来源: {} -> {} (source: {:?})",
-                                          from_uid, receiver_id, source);
+                                    info!(
+                                        "📝 SendMessageHandler: 记录非好友消息来源: {} -> {} (source: {:?})",
+                                        from_uid, receiver_id, source
+                                    );
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("⚠️ SendMessageHandler: 获取用户 {} 隐私设置失败: {}，默认允许非好友消息", receiver_id, e);
+                            warn!(
+                                "⚠️ SendMessageHandler: 获取用户 {} 隐私设置失败: {}，默认允许非好友消息",
+                                receiver_id, e
+                            );
                         }
                     }
                 }
@@ -1157,36 +1242,8 @@ impl MessageHandler for SendMessageHandler {
             || content.contains("@all")
             || content.contains("@everyone");
 
-        // 5.1. 存储消息到历史记录（内存）
-        let message_record = match self
-            .message_history_service
-            .store_message(
-                &send_message_request.channel_id,
-                &send_message_request.from_uid,
-                content.clone(),
-                send_message_request.message_type,
-                reply_to_message_id
-                    .as_ref()
-                    .and_then(|s| s.parse::<u64>().ok()),
-                metadata.clone(),
-            )
-            .await
-        {
-            Ok(record) => record,
-            Err(e) => {
-                error!("❌ SendMessageHandler: 存储消息到内存失败: {}", e);
-                return self
-                    .create_error_response(
-                        &send_message_request,
-                        ErrorCode::MessageSendFailed,
-                        "存储消息失败",
-                    )
-                    .await;
-            }
-        };
-
-        // ✨ 5.1.5. 保存消息到数据库
-        // channel_id 现在直接是 u64，使用 channel.id 作为 channel_id
+        // ✨ 5.1.5. 持久化消息、pts、commit 和附件绑定。
+        // channel_id 现在直接是 u64，使用 channel.id 作为 channel_id。
         let channel_id = channel.id;
 
         // 首先确保会话存在
@@ -1221,22 +1278,6 @@ impl MessageHandler for SendMessageHandler {
                 .await;
         }
 
-        // 生成 pts（per-channel，Phase 8）
-        // 优先走 SyncService 的数据库分配，避免重启后内存计数器回退。
-        let pts = if let Some(sync_service) = get_global_sync_service() {
-            sync_service.allocate_next_pts(send_message_request.channel_id).await.map_err(|e| {
-                error!(
-                    "❌ SendMessageHandler: 分配同步 pts 失败 channel_id={} error={}",
-                    send_message_request.channel_id, e
-                );
-                e
-            })?
-        } else {
-            self.pts_generator
-                .next_pts(send_message_request.channel_id)
-                .await
-        };
-
         // 创建 Message 模型
         use crate::model::message::Message;
         let metadata_value = if let Some(ref meta_str) = metadata {
@@ -1246,24 +1287,24 @@ impl MessageHandler for SendMessageHandler {
             serde_json::Value::Object(serde_json::Map::new())
         };
 
-        // ✨ 修复：使用内存中已生成的 message_id，确保客户端收到的 ID 和数据库中的一致
-        let message_id = message_record.message_id;
+        let message_id = crate::infra::next_message_id();
 
         // 解析 reply_to_message_id 为 u64（如果存在）
         let reply_to_id = reply_to_message_id.and_then(|id| id.parse::<u64>().ok());
+        let now = chrono::Utc::now();
 
         let message = Message {
             message_id,
             channel_id,
             sender_id: from_uid,
-            pts: Some(pts as i64),
+            pts: None,
             local_message_id: Some(send_message_request.local_message_id),
             content: content.clone(),
             message_type: content_message_type,
             metadata: metadata_value,
             reply_to_message_id: reply_to_id,
-            created_at: message_record.created_at,
-            updated_at: message_record.updated_at,
+            created_at: now,
+            updated_at: now,
             deleted: false,
             deleted_at: None,
             revoked: false,
@@ -1271,103 +1312,94 @@ impl MessageHandler for SendMessageHandler {
             revoked_by: None,
         };
 
-        // 保存到数据库（必须成功，否则返回错误）
-        if let Err(e) = self.message_repository.create(&message).await {
-            error!("❌ SendMessageHandler: 保存消息到数据库失败: {}", e);
-            return self
-                .create_error_response(
-                    &send_message_request,
-                    ErrorCode::DatabaseError,
-                    &format!("保存消息到数据库失败: {}", e),
-                )
-                .await;
-        }
-
-        info!(
-            "✅ SendMessageHandler: 消息已保存到数据库: {}",
-            message.message_id
-        );
-
-        // 附件 file→message 绑定（ATTACHMENT_ENCRYPTION_SPEC §授权）：消息落库成功后，把
+        // 附件 file→message 绑定（ATTACHMENT_ENCRYPTION_SPEC §授权）：把
         // file_id / thumbnail_file_id 绑定到 message_id（business_type="message"），使接收端
-        // get_url 能按 channel 成员授权访问/拿 CEK。绑定失败 → 回滚消息 + 发送失败，
-        // 绝不发出"不可下载"的附件消息。服务端做，不靠客户端后补（断线/崩溃会变 orphan）。
+        // get_url 能按 channel 成员授权访问/拿 CEK。绑定、消息、commit 在同一 DB tx 内提交。
         let bind_file_ids = Self::extract_attachment_file_ids(&message.metadata);
-        for fid in &bind_file_ids {
-            if let Err(e) = self
-                .file_service
-                .update_business(*fid, "message", &message.message_id.to_string())
-                .await
-            {
+        let commit_content = Self::sync_commit_content_from_parsed(&content, &metadata);
+        let channel_type_code = Self::channel_type_code(channel.channel_type);
+        let tx_result = match self
+            .message_repository
+            .create_message_and_commit_atomic(AtomicMessageCommitRequest {
+                message,
+                dedup_key: client_dedup_key.clone(),
+                attachment_file_ids: bind_file_ids,
+                channel_type: channel_type_code as i16,
+                commit_content: commit_content.clone(),
+                sender_username: None,
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
                 error!(
-                    "❌ SendMessageHandler: 绑定附件 file_id={} → message_id={} 失败: {}",
-                    fid, message.message_id, e
+                    "❌ SendMessageHandler: 事务化保存消息失败 channel_id={} user={} local_message_id={}: {}",
+                    channel_id, from_uid, send_message_request.local_message_id, e
                 );
-                let _ = sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
-                    .bind(message.message_id as i64)
-                    .execute(self.message_repository.pool())
-                    .await;
-                return self
-                    .create_error_response(
-                        &send_message_request,
-                        ErrorCode::MessageSendFailed,
-                        "附件绑定失败",
-                    )
-                    .await;
-            }
-        }
-
-        if let Some(sync_service) = get_global_sync_service() {
-            let commit = privchat_protocol::rpc::sync::ServerCommit {
-                pts: pts as u64,
-                server_msg_id: message.message_id,
-                local_message_id: Some(send_message_request.local_message_id),
-                channel_id,
-                channel_type: match channel.channel_type {
-                    crate::model::channel::ChannelType::Direct => 1,
-                    crate::model::channel::ChannelType::Group => 2,
-                    crate::model::channel::ChannelType::Room => 3,
-                },
-                message_type: content_message_type.as_str().to_string(),
-                // 用 send_message_handler 已解析出的 content + metadata 构造 commit 内容，
-                // 不再把 raw wire payload 当 JSON 重解析（iOS/Rust 发的是 FlatBuffers，重解析
-                // 必失败 → 退化成 {"text":"[图片]"}，media metadata 丢失，sync/历史路径全坏）。
-                // 与 create_push_message_request 同形：{content, metadata?}，让 sync 补洞路径
-                // 拿到 file_id/thumbnail_file_id/file_name/width/height（CEK 不在 metadata）。
-                content: Self::sync_commit_content_from_parsed(&content, &metadata),
-                server_timestamp: message.created_at.timestamp_millis(),
-                sender_id: from_uid,
-                sender_info: None,
-            };
-            if let Err(e) = sync_service.record_existing_commit(&commit).await {
-                error!(
-                    "❌ SendMessageHandler: 记录同步 commit 失败 channel_id={} message_id={} pts={} error={}",
-                    channel_id, message.message_id, pts, e
-                );
-                // 同步 commit 失败时回滚已写入的业务消息，避免出现“发送失败但历史可见”的脏数据。
-                if let Err(clean_err) = sqlx::query(
-                    "DELETE FROM privchat_messages WHERE message_id = $1",
-                )
-                .bind(message.message_id as i64)
-                .execute(self.message_repository.pool())
-                .await
-                {
-                    warn!(
-                        "⚠️ SendMessageHandler: 回滚失败消息记录失败 message_id={} error={}",
-                        message.message_id, clean_err
-                    );
-                }
                 return self
                     .create_error_response(
                         &send_message_request,
                         ErrorCode::DatabaseError,
-                        "消息同步日志记录失败",
+                        &format!("保存消息失败: {}", e),
                     )
                     .await;
             }
-        } else {
+        };
+
+        let message = tx_result.message;
+        let pts = message.pts.unwrap_or(0).max(0) as u64;
+        let message_record = Self::message_to_history_record(&message);
+
+        if !tx_result.inserted {
+            info!(
+                "🔄 SendMessageHandler: 并发 DB 幂等命中 - user={}, local_message_id={}, message_id={}, pts={}",
+                from_uid, send_message_request.local_message_id, message.message_id, pts
+            );
+            return self
+                .create_success_response(&send_message_request, &message_record, pts)
+                .await;
+        }
+
+        if let Err(e) = self
+            .message_history_service
+            .store_messages_batch(vec![message_record.clone()])
+            .await
+        {
             warn!(
-                "⚠️ SendMessageHandler: SyncService 未就绪，跳过 commit 记录 channel_id={} message_id={}",
+                "⚠️ SendMessageHandler: 事务提交后写入内存历史失败 message_id={}: {}",
+                message.message_id, e
+            );
+        }
+
+        info!(
+            "✅ SendMessageHandler: 消息/PTS/Commit 已事务化保存 message_id={}, pts={}",
+            message.message_id, pts
+        );
+
+        let commit = privchat_protocol::rpc::sync::ServerCommit {
+            pts,
+            server_msg_id: message.message_id,
+            local_message_id: Some(send_message_request.local_message_id),
+            channel_id,
+            channel_type: channel_type_code,
+            message_type: content_message_type.as_str().to_string(),
+            content: commit_content,
+            server_timestamp: message.created_at.timestamp_millis(),
+            sender_id: from_uid,
+            sender_info: None,
+        };
+
+        if let Some(sync_service) = get_global_sync_service() {
+            if let Err(e) = sync_service.cache_committed_commit(&commit).await {
+                warn!(
+                    "⚠️ SendMessageHandler: 事务提交后刷新 sync cache 失败 channel_id={} message_id={} pts={} error={}",
+                    channel_id, message.message_id, pts, e
+                );
+            }
+        } else {
+            self.pts_generator.set_pts(channel_id, pts).await;
+            warn!(
+                "⚠️ SendMessageHandler: SyncService 未就绪，commit 已落库但跳过 Redis sync cache channel_id={} message_id={}",
                 channel_id, message.message_id
             );
         }
@@ -1436,24 +1468,25 @@ impl MessageHandler for SendMessageHandler {
                         if peer_t != Some(1) {
                             return; // 对端不是 System User，跳过。
                         }
-                        let event = match crate::server_event::ServerEvent::system_user_message_received(
-                            peer_id,
-                            sender_id,
-                            chan_id_for_emit,
-                            msg_id_for_emit,
-                            pts_for_emit,
-                            mtype_for_emit,
-                            occurred_at_ms,
-                        ) {
-                            Ok(ev) => ev,
-                            Err(e) => {
-                                warn!(
-                                    "system_user.message_received: payload 序列化失败: {}",
-                                    e
-                                );
-                                return;
-                            }
-                        };
+                        let event =
+                            match crate::server_event::ServerEvent::system_user_message_received(
+                                peer_id,
+                                sender_id,
+                                chan_id_for_emit,
+                                msg_id_for_emit,
+                                pts_for_emit,
+                                mtype_for_emit,
+                                occurred_at_ms,
+                            ) {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    warn!(
+                                        "system_user.message_received: payload 序列化失败: {}",
+                                        e
+                                    );
+                                    return;
+                                }
+                            };
                         if let Err(e) = event_client.send(&event).await {
                             warn!(
                                 target: "system_user_event",
@@ -1699,8 +1732,7 @@ impl SendMessageHandler {
 
         // metadata: 把 typed 枚举转回 inner JSON shape（不带 type 标签）
         let metadata = parsed.metadata.as_ref().map(|m| {
-            serde_json::to_string(&m.to_inner_json_value())
-                .unwrap_or_else(|_| "{}".to_string())
+            serde_json::to_string(&m.to_inner_json_value()).unwrap_or_else(|_| "{}".to_string())
         });
 
         // reply_to_message_id: u64 → Option<String> for downstream API contract
@@ -1950,9 +1982,7 @@ impl SendMessageHandler {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                crate::error::ServerError::Validation(
-                    "link 消息缺少 metadata.url".to_string(),
-                )
+                crate::error::ServerError::Validation("link 消息缺少 metadata.url".to_string())
             })?;
 
         if url.trim().is_empty() {
@@ -2192,12 +2222,13 @@ impl SendMessageHandler {
                 crate::model::channel::ChannelType::Room => 2i32,
             };
             let delivered_at = chrono::Utc::now().timestamp_millis() as u64;
-            let receipt_notification = privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
-                channel.id,
-                channel_type_i32,
-                push_message_request.server_message_id,
-                delivered_at,
-            );
+            let receipt_notification =
+                privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
+                    channel.id,
+                    channel_type_i32,
+                    push_message_request.server_message_id,
+                    delivered_at,
+                );
             let receipt_bytes = serde_json::to_vec(&receipt_notification).unwrap_or_default();
             let receipt_push = privchat_protocol::protocol::PushMessageRequest {
                 setting: Default::default(),
@@ -2549,6 +2580,9 @@ mod attachment_bind_tests {
     #[test]
     fn dedups_same_id() {
         let meta = json!({ "file_id": 5u64, "thumbnail_file_id": 5u64 });
-        assert_eq!(SendMessageHandler::extract_attachment_file_ids(&meta), vec![5]);
+        assert_eq!(
+            SendMessageHandler::extract_attachment_file_ids(&meta),
+            vec![5]
+        );
     }
 }

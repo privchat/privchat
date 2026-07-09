@@ -105,17 +105,16 @@ pub mod user_repo;
 
 // 重新导出 PostgreSQL Repository 实现
 pub use bot_follow_repo::{
-    BotFollowRecord, BotFollowRepository, FollowUpsertOutcome,
-    STATUS_FOLLOWED, STATUS_UNFOLLOWED,
+    BotFollowRecord, BotFollowRepository, FollowUpsertOutcome, STATUS_FOLLOWED, STATUS_UNFOLLOWED,
 };
 pub use channel_repo::{ChannelRepository, PgChannelRepository};
 pub use device_repo::*;
 pub use file_upload_repo::FileUploadRepository;
 pub use login_log_repository::{CreateLoginLogRequest, LoginLogQuery, LoginLogRepository};
-pub use message_repo::{MessageRepository, PgMessageRepository};
+pub use message_repo::{AtomicMessageCommitRequest, MessageRepository, PgMessageRepository};
 pub use presence_repository::PresenceRepository;
 pub use refresh_token_repository::{
-    hash_refresh_token, RefreshTokenRecord, RefreshTokenRepository,
+    RefreshTokenRecord, RefreshTokenRepository, hash_refresh_token,
 };
 pub use user_device_repo::{UserDevice, UserDeviceRepository}; // ✨ 新增
 pub use user_repo::UserRepository;
