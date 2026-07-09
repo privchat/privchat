@@ -235,6 +235,8 @@ pub struct ChatServer {
     qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
     /// Unified token 编排服务（issue / refresh / introspect / revoke）
     unified_token_service: Arc<crate::auth::UnifiedTokenService>,
+    /// P1-15：内存消息历史（水位采样 + 有界逐出由 60s 统计循环驱动）
+    message_history_service: Arc<MessageHistoryService>,
 }
 
 impl ChatServer {
@@ -1533,6 +1535,7 @@ impl ChatServer {
             qr_login_service,
             qr_login_publisher,
             unified_token_service,
+            message_history_service,
         })
     }
 
@@ -1984,6 +1987,8 @@ impl ChatServer {
         // P1-00：进程内大 map 水位 + room 订阅规模采样源
         let channel_service_metrics = self.channel_service.clone();
         let subscribe_manager_metrics = self.subscribe_manager.clone();
+        // P1-15：内存消息历史（水位 + 有界逐出）
+        let message_history_metrics = self.message_history_service.clone();
 
         // 扫码登录 scene 到期扫描（spec QR_API §5）：每 5 秒推一次 expired
         // 给仍然在线的 unauth 连接，并解绑 publisher。比 lazy 检查更及时。
@@ -2086,8 +2091,7 @@ impl ChatServer {
                 crate::infra::metrics::record_online_users(online_users);
                 crate::infra::metrics::record_online_sessions(online_sessions);
 
-                // P1-00：进程内大 map 水位（P1-15 有界化的观测前置）+ room 订阅规模。
-                // MessageHistoryService 未挂到 ChatServer 字段，其水位随 P1-15 一起补。
+                // P1-00/P1-15：进程内大 map 水位 + room 订阅规模。
                 let (ch_map, uch_map, direct_idx, last_msg_cache) =
                     channel_service_metrics.memory_cache_entries().await;
                 crate::infra::metrics::record_memory_map_entries("channels", ch_map);
@@ -2098,6 +2102,40 @@ impl ChatServer {
                     subscribe_manager_metrics.get_channel_count(),
                     subscribe_manager_metrics.get_total_session_count(),
                 );
+
+                // P1-15：内存消息历史 —— 水位 + 有界逐出（cache 语义，读路径回源 DB）。
+                let (hist_channels, hist_messages) = message_history_metrics.memory_entries();
+                crate::infra::metrics::record_memory_map_entries("history_channels", hist_channels);
+                crate::infra::metrics::record_memory_map_entries("history_messages", hist_messages);
+                let evicted = message_history_metrics
+                    .evict_stale_channels(crate::service::MessageHistoryService::DEFAULT_MAX_CHANNELS);
+                if evicted > 0 {
+                    info!(
+                        "🧹 内存消息历史逐出 {} 个最久未活跃 channel（cap={}）",
+                        evicted,
+                        crate::service::MessageHistoryService::DEFAULT_MAX_CHANNELS
+                    );
+                }
+
+                // P1-15 水位 warning：channels 系 map 尚未有界（逐出依赖 P1-16 hydration
+                // 完整性验证，暂列 debt），超阈值先告警可见。
+                const CHANNELS_MAP_WARN: usize = 100_000;
+                const USER_CHANNELS_MAP_WARN: usize = 500_000;
+                const DIRECT_INDEX_WARN: usize = 200_000;
+                const LAST_MSG_CACHE_WARN: usize = 100_000;
+                for (name, size, limit) in [
+                    ("channels", ch_map, CHANNELS_MAP_WARN),
+                    ("user_channels", uch_map, USER_CHANNELS_MAP_WARN),
+                    ("direct_channel_index", direct_idx, DIRECT_INDEX_WARN),
+                    ("last_message_cache", last_msg_cache, LAST_MSG_CACHE_WARN),
+                ] {
+                    if size > limit {
+                        warn!(
+                            "⚠️ 内存 map {} 条目数 {} 超过水位 {}（未有界，见任务板 P1-15 debt）",
+                            name, size, limit
+                        );
+                    }
+                }
 
                 let secs = stats_guard.uptime_seconds;
                 let days = secs / 86400;
