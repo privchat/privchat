@@ -128,6 +128,50 @@ pub struct MessageHistoryService {
 }
 
 impl MessageHistoryService {
+    /// P1-15：内存历史的 channel 总数上限。per-channel 已有 `max_messages_per_channel`
+    /// 截断，但历史累计活跃 channel 数无界 → 慢性 OOM。60s 统计循环按此 cap 逐出。
+    pub const DEFAULT_MAX_CHANNELS: usize = 10_000;
+
+    /// P1-15 水位：当前 (channel 数, 消息总数)。message_index 每条消息一项，即总量。
+    pub fn memory_entries(&self) -> (usize, usize) {
+        (self.channel_messages.len(), self.message_index.len())
+    }
+
+    /// P1-15 有界逐出：channel 数超过 `max_channels` 时，按「最后一条消息时间」
+    /// 逐出最久未活跃的超额 channel。内存历史是 DB 之上的 cache，逐出后读路径
+    /// 回源 DB；`seq_generators` 保留（seq 回退会破坏顺序语义）。返回逐出数。
+    pub fn evict_stale_channels(&self, max_channels: usize) -> usize {
+        let total = self.channel_messages.len();
+        if total <= max_channels {
+            return 0;
+        }
+        let mut last_activity: Vec<(ChannelId, DateTime<Utc>)> = self
+            .channel_messages
+            .iter()
+            .map(|entry| {
+                let last = entry
+                    .value()
+                    .values()
+                    .next_back()
+                    .map(|r| r.created_at)
+                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                (*entry.key(), last)
+            })
+            .collect();
+        last_activity.sort_by_key(|(_, ts)| *ts);
+
+        let mut evicted = 0usize;
+        for (channel_id, _) in last_activity.into_iter().take(total - max_channels) {
+            if let Some((_, messages)) = self.channel_messages.remove(&channel_id) {
+                for record in messages.values() {
+                    self.message_index.remove(&record.message_id);
+                }
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
     /// 创建新的消息历史服务
     pub fn new(max_messages_per_channel: usize) -> Self {
         Self {
@@ -685,5 +729,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(next.seq, 89);
+    }
+
+    #[tokio::test]
+    async fn evict_stale_channels_drops_oldest_and_cleans_index() {
+        let service = MessageHistoryService::new(10);
+        // 三个 channel 按时间先后写入；sleep 保证 created_at 严格递增。
+        for channel_id in [101u64, 102, 103] {
+            service
+                .store_message(&channel_id, &1, format!("m-{channel_id}"), 1, None, None)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        let (channels, messages) = service.memory_entries();
+        assert_eq!((channels, messages), (3, 3));
+
+        // cap=2 → 逐出最久未活跃的 101。
+        assert_eq!(service.evict_stale_channels(2), 1);
+        let (channels, messages) = service.memory_entries();
+        assert_eq!((channels, messages), (2, 2));
+        assert!(service.channel_messages.get(&101).is_none());
+        assert!(service.channel_messages.get(&102).is_some());
+        assert!(service.channel_messages.get(&103).is_some());
+
+        // 未超限时是 no-op。
+        assert_eq!(service.evict_stale_channels(2), 0);
+
+        // seq generator 保留：逐出后再写入 101，seq 不回退。
+        let record = service
+            .store_message(&101, &1, "again".to_string(), 1, None, None)
+            .await
+            .unwrap();
+        assert!(record.seq >= 2, "seq must not regress after eviction");
     }
 }
