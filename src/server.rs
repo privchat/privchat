@@ -2117,8 +2117,22 @@ impl ChatServer {
                     );
                 }
 
-                // P1-15 水位 warning：channels 系 map 尚未有界（逐出依赖 P1-16 hydration
-                // 完整性验证，暂列 debt），超阈值先告警可见。
+                // P1-15：channels / last_message_cache 有界逐出（hydration 已经
+                // P1-16 验证完整，被逐出的条目由读路径按需回源重建）。
+                const CHANNELS_CACHE_CAP: usize = 50_000;
+                const LAST_MSG_CACHE_CAP: usize = 50_000;
+                let (ev_ch, ev_prev) = channel_service_metrics
+                    .evict_stale_memory(CHANNELS_CACHE_CAP, LAST_MSG_CACHE_CAP)
+                    .await;
+                if ev_ch + ev_prev > 0 {
+                    info!(
+                        "🧹 channel 内存 cache 逐出: channels={} previews={}（cap={}/{}）",
+                        ev_ch, ev_prev, CHANNELS_CACHE_CAP, LAST_MSG_CACHE_CAP
+                    );
+                }
+
+                // P1-15 水位 warning：cap 之上的告警线（触发说明逐出失灵或索引类
+                // map 异常膨胀；user_channels/direct_index 是小条目索引不逐出）。
                 const CHANNELS_MAP_WARN: usize = 100_000;
                 const USER_CHANNELS_MAP_WARN: usize = 500_000;
                 const DIRECT_INDEX_WARN: usize = 200_000;
