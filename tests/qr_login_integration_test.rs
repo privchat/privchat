@@ -56,7 +56,7 @@ async fn scan_transition_pushes_scanned_without_unbind() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60));
+    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
     let session = SessionId::new(101);
     publisher.bind(scene.scene_id.clone(), session);
     assert_eq!(publisher.binding_count(), 1);
@@ -70,6 +70,7 @@ async fn scan_transition_pushes_scanned_without_unbind() {
             None,
             Some("Alice".into()),
         )
+        .await
         .expect("scan_scene must succeed");
     assert_eq!(result.scene.state, QrSceneState::Scanned);
 
@@ -96,19 +97,21 @@ async fn reject_transition_pushes_rejected_and_unbinds() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60));
+    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
     let session = SessionId::new(202);
     publisher.bind(scene.scene_id.clone(), session);
 
     // 必须先 scan 才能 reject
     let scan = service
         .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+        .await
         .expect("scan");
     settle().await;
     assert_eq!(publisher.binding_count(), 1, "scanned 后 binding 还在");
 
     let rejected = service
         .reject_scene(&scene.scene_id, 100, &scan.confirm_token)
+        .await
         .expect("reject");
     assert_eq!(rejected.state, QrSceneState::Rejected);
 
@@ -141,7 +144,7 @@ async fn tick_expired_pushes_expired_and_unbinds() {
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
     // ttl=1s，到期最快
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(1));
+    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(1)).await;
     let session = SessionId::new(303);
     publisher.bind(scene.scene_id.clone(), session);
 
@@ -153,6 +156,7 @@ async fn tick_expired_pushes_expired_and_unbinds() {
     // 状态机：scene 应已切到 expired
     let after = service
         .get_scene(&scene.scene_id)
+        .await
         .expect("scene still queryable for status");
     assert_eq!(after.state, QrSceneState::Expired);
 
@@ -171,10 +175,11 @@ async fn reject_failure_does_not_touch_publisher() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60));
+    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
     publisher.bind(scene.scene_id.clone(), SessionId::new(404));
     let _scan = service
         .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+        .await
         .expect("scan");
     settle().await;
     assert_eq!(publisher.binding_count(), 1);
@@ -182,6 +187,7 @@ async fn reject_failure_does_not_touch_publisher() {
     // 错误的 confirm_token → reject 失败
     let err = service
         .reject_scene(&scene.scene_id, 100, "wrong-confirm-token")
+        .await
         .unwrap_err();
     assert!(
         format!("{}", err).contains("QR_CONFIRM_TOKEN_INVALID"),
@@ -197,7 +203,7 @@ async fn reject_failure_does_not_touch_publisher() {
     );
 
     // 状态机也不应被改写
-    let after = service.get_scene(&scene.scene_id).expect("query");
+    let after = service.get_scene(&scene.scene_id).await.expect("query");
     assert_eq!(after.state, QrSceneState::Scanned, "状态机必须保留 scanned");
 }
 
@@ -209,17 +215,18 @@ async fn no_subscriber_does_not_rollback_state_machine() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60));
+    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
     // 故意不 bind —— Web 还没建连接
     assert_eq!(publisher.binding_count(), 0);
 
     let r = service
         .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+        .await
         .expect("scan_scene 必须成功，即便没有订阅者");
     settle().await;
 
     assert_eq!(r.scene.state, QrSceneState::Scanned);
-    let after = service.get_scene(&scene.scene_id).expect("query");
+    let after = service.get_scene(&scene.scene_id).await.expect("query");
     assert_eq!(
         after.state,
         QrSceneState::Scanned,
@@ -229,6 +236,7 @@ async fn no_subscriber_does_not_rollback_state_machine() {
     // reject 也一样
     let rejected = service
         .reject_scene(&scene.scene_id, 100, &r.confirm_token)
+        .await
         .expect("reject_scene 必须成功，即便没有订阅者");
     settle().await;
     assert_eq!(rejected.state, QrSceneState::Rejected);
@@ -241,8 +249,8 @@ async fn concurrent_scenes_unbind_is_isolated() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let s1 = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60));
-    let s2 = service.create_scene("login".into(), "web-2".into(), make_device(), Some(60));
+    let s1 = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
+    let s2 = service.create_scene("login".into(), "web-2".into(), make_device(), Some(60)).await;
     publisher.bind(s1.scene_id.clone(), SessionId::new(501));
     publisher.bind(s2.scene_id.clone(), SessionId::new(502));
     assert_eq!(publisher.binding_count(), 2);
@@ -250,15 +258,18 @@ async fn concurrent_scenes_unbind_is_isolated() {
     // 都 scan，都 reject scene 1
     let scan1 = service
         .scan_scene(&s1.scene_id, 100, "ios-1".into(), &s1.qr_token, None, None)
+        .await
         .unwrap();
     let _scan2 = service
         .scan_scene(&s2.scene_id, 200, "ios-2".into(), &s2.qr_token, None, None)
+        .await
         .unwrap();
     settle().await;
     assert_eq!(publisher.binding_count(), 2);
 
     let _ = service
         .reject_scene(&s1.scene_id, 100, &scan1.confirm_token)
+        .await
         .unwrap();
     settle().await;
 

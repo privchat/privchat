@@ -688,11 +688,12 @@ impl ChatServer {
         // 扫码登录（spec QR_API §4–§5）：service 持有内存状态机，publisher 维护
         // scene_id ↔ session_id 双向映射，让 scan/reject/expired 自动回推 unauth 连接。
         let qr_login_publisher = Arc::new(crate::service::QrLoginPublisher::new());
+        // P2-06：Redis 后端，scene 状态跨实例共享（多实例部署不依赖单进程内存态）。
         let qr_login_service = Arc::new(
-            crate::service::qr_login_service::QrLoginService::new()
+            crate::service::qr_login_service::QrLoginService::new_with_redis(redis_client.clone())
                 .with_publisher(qr_login_publisher.clone(), connection_manager.clone()),
         );
-        info!("✅ QrLoginService + Publisher 创建完成");
+        info!("✅ QrLoginService + Publisher 创建完成（Redis 后端）");
 
         // Unified token 编排服务（spec TOKEN_UNIFICATION_SPEC v1.3）：
         // 复用前面已经创建的 jwt_service（同一 TokenService 实例既给 IM RPC 用，

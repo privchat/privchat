@@ -2798,7 +2798,7 @@ async fn create_qr_scene(
         request.device_id,
         request.device_info.into_snapshot(),
         request.ttl,
-    );
+    ).await;
     Ok(ApiEnvelope::ok(qr_dto::QrSceneResponse {
         rpc_topic: scene.rpc_topic(),
         scene_id: scene.scene_id,
@@ -2814,7 +2814,7 @@ async fn get_qr_scene(
     Path(scene_id): Path<String>,
 ) -> ApiResult<qr_dto::QrSceneStatusResponse> {
     verify_service_key(&headers, &state).await?;
-    let scene = state.qr_login_service.get_scene(&scene_id)?;
+    let scene = state.qr_login_service.get_scene(&scene_id).await?;
     Ok(ApiEnvelope::ok(qr_dto::QrSceneStatusResponse {
         scene_id: scene.scene_id,
         state: scene.state,
@@ -2841,7 +2841,7 @@ async fn scan_qr_scene(
         &request.qr_token,
         request.scanner_avatar,
         request.scanner_display_name,
-    )?;
+    ).await?;
     Ok(ApiEnvelope::ok(qr_dto::ScanQrSceneResponse {
         scene_id: result.scene.scene_id,
         state: result.scene.state,
@@ -2864,7 +2864,7 @@ async fn confirm_qr_scene(
         request.scanner_uid,
         &request.scanner_device_id,
         &request.confirm_token,
-    )?;
+    ).await?;
     let uid = scene.scanner_uid.unwrap_or_default();
     Ok(ApiEnvelope::ok(qr_dto::ConfirmQrSceneResponse {
         scene_id: scene.scene_id,
@@ -2887,7 +2887,7 @@ async fn reject_qr_scene(
         &scene_id,
         request.scanner_uid,
         &request.confirm_token,
-    )?;
+    ).await?;
     Ok(ApiEnvelope::ok(qr_dto::RejectQrSceneResponse {
         scene_id: scene.scene_id,
         state: scene.state,
@@ -2910,7 +2910,7 @@ async fn push_qr_authorized(
 ) -> ApiResult<qr_dto::PushQrAuthorizedResponse> {
     verify_service_key(&headers, &state).await?;
     // 把状态机标记为 authorized（兜底；正常 confirm 已经切过去了）
-    let _ = state.qr_login_service.mark_authorized(&scene_id).ok();
+    let _ = state.qr_login_service.mark_authorized(&scene_id).await.ok();
     let event = privchat_protocol::rpc::qr_login::QrLoginPushEvent {
         event: "qr_login.authorized".to_string(),
         scene_id: scene_id.clone(),

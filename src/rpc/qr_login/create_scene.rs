@@ -75,7 +75,7 @@ pub async fn handle(
         request.web_device_id,
         snapshot,
         request.ttl_secs,
-    );
+    ).await;
 
     services
         .qr_login_publisher
