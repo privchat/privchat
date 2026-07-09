@@ -2113,17 +2113,28 @@ impl ChannelService {
         let channel_ids = user_channels.get(&user_id).cloned().unwrap_or_default();
         drop(user_channels);
 
-        let channels_lock = self.channels.read().await;
-        let mut channels = Vec::new();
-
-        for conv_id in channel_ids {
-            if let Some(conv) = channels_lock.get(&conv_id) {
+        let (mut channels, missing) = {
+            let channels_lock = self.channels.read().await;
+            let mut have = Vec::new();
+            let mut miss = Vec::new();
+            for conv_id in channel_ids {
+                match channels_lock.get(&conv_id) {
+                    Some(conv) if conv.is_active() => have.push(conv.clone()),
+                    Some(_) => {}
+                    // P1-15：被逐出的条目按需回源（访问驱动 rehydrate），
+                    // 用户列表不因逐出缺条目。锁外处理避免与 get_channel_opt 死锁。
+                    None => miss.push(conv_id),
+                }
+            }
+            (have, miss)
+        };
+        for conv_id in missing {
+            if let Some(conv) = self.get_channel_opt(conv_id).await {
                 if conv.is_active() {
-                    channels.push(conv.clone());
+                    channels.push(conv);
                 }
             }
         }
-        drop(channels_lock);
 
         // 按最后消息时间排序
         channels.sort_by(|a, b| b.last_message_at.cmp(&a.last_message_at));
@@ -2250,6 +2261,51 @@ impl ChannelService {
         let direct_index = self.direct_channel_index.read().await.len();
         let last_message = self.last_message_cache.read().await.len();
         (channels, user_channels, direct_index, last_message)
+    }
+
+    /// P1-15：channels / last_message_cache 有界逐出（60s 统计循环驱动）。
+    /// hydration 已验证完整（P1-16：群名/settings/成员禁言/direct 都能回源重建），
+    /// 逐出后读路径 get_channel_opt / get_user_channels 按需 rehydrate。
+    /// 按最旧 updated_at / preview.timestamp 逐出超额部分。user_channels 与
+    /// direct_channel_index 是小条目索引，不逐出（水位 warning 盯守）。
+    pub async fn evict_stale_memory(
+        &self,
+        max_channels: usize,
+        max_previews: usize,
+    ) -> (usize, usize) {
+        let mut evicted_channels = 0usize;
+        {
+            let mut channels = self.channels.write().await;
+            if channels.len() > max_channels {
+                let mut by_age: Vec<(u64, chrono::DateTime<chrono::Utc>)> = channels
+                    .iter()
+                    .map(|(id, c)| (*id, c.updated_at))
+                    .collect();
+                by_age.sort_by_key(|(_, t)| *t);
+                let overflow = channels.len() - max_channels;
+                for (id, _) in by_age.into_iter().take(overflow) {
+                    channels.remove(&id);
+                    evicted_channels += 1;
+                }
+            }
+        }
+        let mut evicted_previews = 0usize;
+        {
+            let mut cache = self.last_message_cache.write().await;
+            if cache.len() > max_previews {
+                let mut by_age: Vec<(u64, chrono::DateTime<chrono::Utc>)> = cache
+                    .iter()
+                    .map(|(id, p)| (*id, p.timestamp))
+                    .collect();
+                by_age.sort_by_key(|(_, t)| *t);
+                let overflow = cache.len() - max_previews;
+                for (id, _) in by_age.into_iter().take(overflow) {
+                    cache.remove(&id);
+                    evicted_previews += 1;
+                }
+            }
+        }
+        (evicted_channels, evicted_previews)
     }
 
     pub async fn sync_entities_page_for_channels(
@@ -3897,6 +3953,36 @@ mod tests {
         let page = vec![3_u64, 7_u64, 9_u64];
         assert_eq!(next_version_from_page(&page, 2, |v| *v), 9);
         assert_eq!(next_version_from_page::<u64, _>(&[], 12, |v| *v), 12);
+    }
+
+    /// P1-15：channels 内存 cache 超 cap 时按最旧 updated_at 逐出；未超限 no-op。
+    /// 纯内存行为，直接向私有 map 注入条目（同模块可见）。
+    #[tokio::test]
+    async fn evict_stale_memory_drops_oldest_channels() {
+        // lazy pool 不建立连接；本测试只碰内存 map。
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let service = ChannelService::new_with_repository(Arc::new(PgChannelRepository::new(
+            Arc::new(pool),
+        )));
+        {
+            let mut channels = service.channels.write().await;
+            for (i, id) in [901u64, 902, 903].iter().enumerate() {
+                let mut c = crate::model::channel::Channel::new_direct(*id, 1, 2);
+                c.updated_at = chrono::Utc::now() - chrono::Duration::minutes(10 - i as i64);
+                channels.insert(*id, c);
+            }
+        }
+        // cap=3 → no-op
+        assert_eq!(service.evict_stale_memory(3, 10).await, (0, 0));
+        // cap=1 → 逐出最旧的 901、902
+        let (ev_ch, _) = service.evict_stale_memory(1, 10).await;
+        assert_eq!(ev_ch, 2);
+        let channels = service.channels.read().await;
+        assert!(channels.get(&901).is_none());
+        assert!(channels.get(&902).is_none());
+        assert!(channels.get(&903).is_some());
     }
 
     async fn open_test_service() -> Option<ChannelService> {
