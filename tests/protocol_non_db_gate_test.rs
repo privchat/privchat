@@ -34,14 +34,16 @@ fn protocol_encode_decode_roundtrip_without_db() {
     let decoded: PingRequest = decode_message(&encoded).expect("decode ping");
     assert_eq!(decoded.timestamp, ping.timestamp);
 
+    // RpcRequest.body 是不透明 JSON 字节（per-route 编码），不是 serde_json::Value。
     let rpc = RpcRequest {
         route: "system/health".to_string(),
-        body: serde_json::json!({"probe": "ready"}),
+        body: serde_json::to_vec(&serde_json::json!({"probe": "ready"})).expect("encode body"),
     };
     let encoded = encode_message(&rpc).expect("encode rpc");
     let decoded: RpcRequest = decode_message(&encoded).expect("decode rpc");
     assert_eq!(decoded.route, "system/health");
-    assert_eq!(decoded.body["probe"], "ready");
+    let body: serde_json::Value = serde_json::from_slice(&decoded.body).expect("body json");
+    assert_eq!(body["probe"], "ready");
 }
 
 #[test]
