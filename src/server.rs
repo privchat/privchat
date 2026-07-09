@@ -747,9 +747,11 @@ impl ChatServer {
             )),
         );
 
-        // 创建上传 token 服务
-        let upload_token_service = Arc::new(crate::service::UploadTokenService::new());
-        info!("✅ 上传 token 服务初始化完成");
+        // 创建上传 token 服务（P0-10：Redis 后端，token 一次性消费跨实例成立）
+        let upload_token_service = Arc::new(crate::service::UploadTokenService::new_with_redis(
+            redis_client.clone(),
+        ));
+        info!("✅ 上传 token 服务初始化完成（Redis 后端）");
 
         // 创建表情包服务
         info!("🔧 初始化表情包服务...");

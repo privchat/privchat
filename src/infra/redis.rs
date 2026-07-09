@@ -159,6 +159,22 @@ impl RedisClient {
         .await
     }
 
+    /// GETDEL key —— 原子取值并删除（一次性 token 的跨实例消费语义，Redis 6.2+/KeyDB）。
+    pub async fn getdel(&self, key: &str) -> Result<Option<String>, crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let result: Option<String> = redis::cmd("GETDEL")
+                .arg(key)
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!("Redis GETDEL failed: {}", e))
+                })?;
+            Ok(result)
+        })
+        .await
+    }
+
     /// DEL key
     pub async fn del(&self, key: &str) -> Result<(), crate::error::ServerError> {
         self.with_timeout(async {

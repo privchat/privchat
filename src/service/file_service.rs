@@ -239,9 +239,56 @@ impl FileService {
         )))
     }
 
-    pub async fn upload_file(
+    /// P0-10 流式上传起点：确定类型/存储源/file_id/路径，打开流式 writer。
+    /// 数据不再一次性进内存——调用方循环 `write_chunk` 边收边写，超限即时中止。
+    /// `token_max_size` 与按类型的服务端上限取 min 作为硬顶。
+    pub async fn begin_streaming_upload(
         &self,
-        file_data: Vec<u8>,
+        mime_type: &str,
+        filename: &str,
+        token_max_size: i64,
+    ) -> Result<StreamingUpload> {
+        let file_type = self.detect_file_type(mime_type)?;
+        let type_limit = Self::max_size_for_type(&file_type) as u64;
+        let limit = type_limit.min(token_max_size.max(0) as u64);
+
+        let source = self.resolve_storage_source()?;
+        let source_id = source.id;
+        let op = self
+            .operators
+            .read()
+            .await
+            .get(&source_id)
+            .cloned()
+            .ok_or_else(|| {
+                ServerError::Internal(format!("未找到存储源 id={} 的 Operator", source_id))
+            })?;
+
+        let file_id = self.file_upload_repo.next_file_id().await?;
+        let file_path = self.generate_file_path(file_id, &file_type, filename);
+        let writer = op
+            .writer(&file_path)
+            .await
+            .map_err(|e| ServerError::Internal(format!("打开存储 writer 失败: {}", e)))?;
+
+        Ok(StreamingUpload {
+            file_id,
+            file_path,
+            source_id,
+            file_type,
+            op,
+            writer: Some(writer),
+            hasher: std::collections::hash_map::DefaultHasher::new(),
+            written: 0,
+            limit,
+        })
+    }
+
+    /// P0-10 流式上传收尾：关闭 writer、定稿 hash、落库返回元数据。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_streaming_upload(
+        &self,
+        mut upload: StreamingUpload,
         filename: String,
         mime_type: String,
         uploader_id: u64,
@@ -251,51 +298,38 @@ impl FileService {
         encryption_version: i32,
         cek: Option<String>,
     ) -> Result<FileMetadata> {
-        let file_type = self.detect_file_type(&mime_type)?;
-        self.validate_file_size(&file_data, &file_type)?;
+        use std::hash::Hasher as _;
 
-        let source = self.resolve_storage_source()?;
-        let op = self
-            .operators
-            .read()
+        let mut writer = upload
+            .writer
+            .take()
+            .ok_or_else(|| ServerError::Internal("上传流已关闭".to_string()))?;
+        writer
+            .close()
             .await
-            .get(&source.id)
-            .cloned()
-            .ok_or_else(|| {
-                ServerError::Internal(format!("未找到存储源 id={} 的 Operator", source.id))
-            })?;
-
-        let file_id = self.file_upload_repo.next_file_id().await?;
-        let file_path = self.generate_file_path(file_id, &file_type, &filename);
-        let file_hash = self.calculate_file_hash(&file_data).await?;
-        let file_size = file_data.len() as u64;
-
-        op.write(&file_path, file_data)
-            .await
-            .map_err(|e| ServerError::Internal(format!("存储写入失败: {}", e)))?;
+            .map_err(|e| ServerError::Internal(format!("存储写入收尾失败: {}", e)))?;
 
         let metadata = FileMetadata {
-            file_id,
+            file_id: upload.file_id,
             original_filename: filename,
-            file_size,
+            file_size: upload.written,
             original_size: None,
-            file_type,
+            file_type: upload.file_type.clone(),
             mime_type,
-            file_path: file_path.clone(),
-            storage_source_id: source.id,
+            file_path: upload.file_path.clone(),
+            storage_source_id: upload.source_id,
             uploader_id,
             uploader_ip,
             uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
             width: None,
             height: None,
-            file_hash: Some(file_hash),
+            file_hash: Some(format!("hash:{}", upload.hasher.finish())),
             business_type: Some(business_type),
             business_id,
             encryption_version,
             cek,
         };
         self.file_upload_repo.insert(&metadata).await?;
-
         Ok(metadata)
     }
 
@@ -371,22 +405,15 @@ impl FileService {
         }
     }
 
-    fn validate_file_size(&self, file_data: &[u8], file_type: &FileType) -> Result<()> {
-        let max_size = match file_type {
+    /// 按文件类型的服务端大小硬顶（流式路径在 write_chunk 中即时校验）。
+    fn max_size_for_type(file_type: &FileType) -> usize {
+        match file_type {
             FileType::Image => 10 * 1024 * 1024,
             FileType::Video => 100 * 1024 * 1024,
             FileType::Voice => 10 * 1024 * 1024,
             FileType::File => 50 * 1024 * 1024,
             FileType::Other => 10 * 1024 * 1024,
-        };
-        if file_data.len() > max_size {
-            return Err(ServerError::Validation(format!(
-                "文件大小超过限制: {} > {}",
-                file_data.len(),
-                max_size
-            )));
         }
-        Ok(())
     }
 
     fn generate_file_path(&self, file_id: u64, file_type: &FileType, filename: &str) -> String {
@@ -446,14 +473,6 @@ impl FileService {
         Ok(buf.to_vec())
     }
 
-    async fn calculate_file_hash(&self, file_data: &[u8]) -> Result<String> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        file_data.hash(&mut hasher);
-        Ok(format!("hash:{}", hasher.finish()))
-    }
-
     pub fn build_access_url(&self, file_path: &str, storage_source_id: u32) -> String {
         if let Some(src) = self.sources_by_id.get(&storage_source_id) {
             if let Some(base_url) = &src.base_url {
@@ -464,6 +483,65 @@ impl FileService {
             return format!("/{}", file_path);
         }
         format!("{{unsupported:storage_source_id={}}}", storage_source_id)
+    }
+}
+
+/// P0-10 流式上传句柄：由 `begin_streaming_upload` 创建，调用方按 chunk 喂数据，
+/// 全程只驻留单个 chunk 的内存。成功走 `commit_streaming_upload` 落库；
+/// 失败/校验不过必须调 `abort()` 清掉已写入的半文件。
+pub struct StreamingUpload {
+    pub file_id: u64,
+    pub file_path: String,
+    pub source_id: u32,
+    file_type: FileType,
+    op: Operator,
+    writer: Option<opendal::Writer>,
+    hasher: std::collections::hash_map::DefaultHasher,
+    written: u64,
+    limit: u64,
+}
+
+impl StreamingUpload {
+    /// 已写入字节数（加密结构等收尾校验用）。
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// 写入一个 chunk：先做累计大小硬顶校验（超限即时失败，不再继续收 body），
+    /// 同步推进增量 hash。
+    pub async fn write_chunk(&mut self, chunk: bytes::Bytes) -> Result<()> {
+        use std::hash::Hasher as _;
+
+        self.written = self.written.saturating_add(chunk.len() as u64);
+        if self.written > self.limit {
+            return Err(ServerError::Validation(format!(
+                "文件大小超过限制: {} > {} bytes",
+                self.written, self.limit
+            )));
+        }
+        self.hasher.write(&chunk);
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| ServerError::Internal("上传流已关闭".to_string()))?;
+        writer
+            .write(chunk)
+            .await
+            .map_err(|e| ServerError::Internal(format!("存储写入失败: {}", e)))
+    }
+
+    /// 中止上传：尽力关闭 writer 并删除已写入的半文件（不落库）。
+    pub async fn abort(mut self) {
+        if let Some(mut writer) = self.writer.take() {
+            let _ = writer.close().await;
+        }
+        if let Err(e) = self.op.delete(&self.file_path).await {
+            tracing::warn!(
+                "⚠️ 清理中止上传的半文件失败 path={}: {}",
+                self.file_path,
+                e
+            );
+        }
     }
 }
 
