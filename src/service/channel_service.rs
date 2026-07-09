@@ -2204,6 +2204,32 @@ impl ChannelService {
             sync_version: i64,
         }
 
+        // P0-12：since_version / cursor / hidden / LIMIT 全部下推到 SQL。
+        // 旧实现按 user_id 全量 fetch_all 再内存过滤分页——重连风暴下每一页都是
+        // O(用户全部 channel) 的查询、JOIN 与传输放大。增量 sync（since 命中 0~少数行）
+        // 现在只扫描并返回变化行。
+        //
+        // keyset 语义：ORDER BY (effective_version, channel_id)，游标沿用 wire 契约
+        // `scope="cursor:{last_channel_id}"`——先用子查询取游标行当前的 effective_version，
+        // 再做 row-value 比较。游标行已不存在/不可见时 COALESCE(-1) 退化为整个 since
+        // 窗口重扫（客户端 upsert 幂等，安全）。游标行版本在翻页间被并发抬升时的漂移
+        // 语义与旧内存分页一致（按当前排序重新定位），不劣化。
+        let limit = limit.min(200).max(1);
+        let since: Option<i64> = since_version.map(|v| v as i64);
+        let after_id: Option<i64> = scope
+            .and_then(|s| s.strip_prefix("cursor:"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|v| v as i64);
+        // hidden 是进程内状态，下推为排除数组；若 LIMIT 后再内存过滤会产生短页/空页。
+        let hidden_ids: Vec<i64> = {
+            let hidden_lock = self.hidden_channels.read().await;
+            hidden_lock
+                .iter()
+                .filter(|(uid, _)| *uid == user_id)
+                .map(|(_, cid)| *cid as i64)
+                .collect()
+        };
+
         let rows = sqlx::query_as::<_, ChannelSyncRow>(
             r#"
             SELECT
@@ -2233,47 +2259,38 @@ impl ChannelService {
             LEFT JOIN privchat_messages lm
                 ON lm.message_id = c.last_message_id
             WHERE uc.user_id = $1
+              AND ($2::BIGINT IS NULL OR c.sync_version > $2 OR uc.sync_version > $2)
+              AND (
+                $3::BIGINT IS NULL
+                OR (GREATEST(c.sync_version, uc.sync_version), c.channel_id) > (
+                    COALESCE(
+                        (
+                            SELECT GREATEST(c2.sync_version, uc2.sync_version)
+                            FROM privchat_user_channels uc2
+                            INNER JOIN privchat_channels c2
+                                ON c2.channel_id = uc2.channel_id
+                            WHERE uc2.user_id = $1 AND uc2.channel_id = $3
+                        ),
+                        -1
+                    ),
+                    $3
+                )
+              )
+              AND NOT (c.channel_id = ANY($4::BIGINT[]))
+            ORDER BY GREATEST(c.sync_version, uc.sync_version) ASC, c.channel_id ASC
+            LIMIT $5
             "#,
         )
         .bind(user_id as i64)
+        .bind(since)
+        .bind(after_id)
+        .bind(&hidden_ids)
+        .bind(limit as i64 + 1)
         .fetch_all(self.pool())
         .await
         .map_err(|e| ServerError::Database(format!("查询频道同步分页失败: {}", e)))?;
-        let hidden_lock = self.hidden_channels.read().await;
-        let mut channels: Vec<ChannelSyncRow> = rows
-            .into_iter()
-            .filter(|row| !hidden_lock.contains(&(user_id, row.channel_id as u64)))
-            .collect();
-        drop(hidden_lock);
 
-        if let Some(since) = since_version {
-            channels.retain(|row| (row.sync_version as u64) > since);
-        }
-        channels.sort_by(|a, b| {
-            a.sync_version
-                .cmp(&b.sync_version)
-                .then_with(|| a.channel_id.cmp(&b.channel_id))
-        });
-
-        let limit = limit.min(200).max(1);
-        let after_id: Option<u64> = scope
-            .and_then(|s| s.strip_prefix("cursor:"))
-            .and_then(|s| s.parse::<u64>().ok());
-
-        let start_idx = channel_cursor_start_index(
-            &channels
-                .iter()
-                .map(|row| row.channel_id as u64)
-                .collect::<Vec<_>>(),
-            after_id,
-        );
-        let page: Vec<&ChannelSyncRow> = channels
-            .iter()
-            .skip(start_idx)
-            .take(limit as usize)
-            .collect();
-        let total_consumed = start_idx + page.len();
-        let has_more = total_consumed < channels.len();
+        let (page, has_more) = take_sync_page(rows, limit as usize);
         let last_message_cache = self.last_message_cache.read().await;
 
         let items: Vec<SyncEntityItem> = page
@@ -3750,12 +3767,6 @@ where
     page.last().map(version_of).unwrap_or(since_version)
 }
 
-fn channel_cursor_start_index(channel_ids: &[u64], after_id: Option<u64>) -> usize {
-    after_id
-        .and_then(|aid| channel_ids.iter().position(|id| *id == aid).map(|i| i + 1))
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3781,15 +3792,6 @@ mod tests {
         let page = vec![3_u64, 7_u64, 9_u64];
         assert_eq!(next_version_from_page(&page, 2, |v| *v), 9);
         assert_eq!(next_version_from_page::<u64, _>(&[], 12, |v| *v), 12);
-    }
-
-    #[test]
-    fn channel_cursor_start_index_advances_after_matching_channel() {
-        let ids = vec![100, 200, 300];
-        assert_eq!(channel_cursor_start_index(&ids, None), 0);
-        assert_eq!(channel_cursor_start_index(&ids, Some(100)), 1);
-        assert_eq!(channel_cursor_start_index(&ids, Some(200)), 2);
-        assert_eq!(channel_cursor_start_index(&ids, Some(999)), 0);
     }
 
     async fn open_test_service() -> Option<ChannelService> {
@@ -4002,8 +4004,9 @@ mod tests {
             return;
         };
         let owner_id = 9_170_001_u64;
+        // 005 迁移统一 channel/group id 空间后，群会话必须 channel_id == group_id。
         let group_id = 9_170_101_u64;
-        let channel_id = 9_170_201_u64;
+        let channel_id = group_id;
 
         cleanup_channel(&service, channel_id).await;
         cleanup_group(&service, group_id).await;
@@ -4011,10 +4014,12 @@ mod tests {
 
         ensure_user(&service, owner_id, "channel_sync_unread_owner").await;
         ensure_group(&service, group_id, owner_id, "channel-sync-unread-group").await;
+        // DB 编码 channel_type：0=Direct、1=Group（wire 编码才是 1/2），
+        // 且 privchat_channels_check 要求群会话 group_id 非空、direct_user 为空。
         sqlx::query(
             r#"
             INSERT INTO privchat_channels (channel_id, channel_type, group_id)
-            VALUES ($1, 2, $2)
+            VALUES ($1, 1, $2)
             ON CONFLICT (channel_id) DO UPDATE
             SET group_id = EXCLUDED.group_id
             "#,
@@ -4097,6 +4102,45 @@ mod tests {
             .and_then(|v| v.as_i64())
             .unwrap_or(-1);
         assert_eq!(unread_after_clear, 0);
+
+        // P0-12 since_version 下推：since = 变更前版本 → 命中该 channel；
+        // since = 当前最新版本 → 增量为空（同一查询在 DB 层过滤，不再全量拉取）。
+        let latest_version = sqlx::query(
+            "SELECT GREATEST(uc.sync_version, c.sync_version) AS v
+             FROM privchat_user_channels uc
+             JOIN privchat_channels c ON c.channel_id = uc.channel_id
+             WHERE uc.user_id = $1 AND uc.channel_id = $2",
+        )
+        .bind(owner_id as i64)
+        .bind(channel_id as i64)
+        .fetch_one(service.pool())
+        .await
+        .expect("fetch latest effective version")
+        .get::<i64, _>("v");
+
+        let incremental = service
+            .sync_entities_page_for_channels(owner_id, Some(before_sync_version as u64), None, 20)
+            .await
+            .expect("incremental sync since before_version");
+        assert!(
+            incremental
+                .items
+                .iter()
+                .any(|item| item.entity_id == channel_id.to_string()),
+            "changed channel must appear when since_version predates the change"
+        );
+
+        let drained = service
+            .sync_entities_page_for_channels(owner_id, Some(latest_version as u64), None, 20)
+            .await
+            .expect("incremental sync at latest version");
+        assert!(
+            !drained
+                .items
+                .iter()
+                .any(|item| item.entity_id == channel_id.to_string()),
+            "channel must not reappear when since_version is already at its latest version"
+        );
 
         cleanup_channel(&service, channel_id).await;
         cleanup_group(&service, group_id).await;
