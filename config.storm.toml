@@ -1,0 +1,113 @@
+# P1-14 reconnect-storm 压测专用配置。
+# 与 config.toml 相同的 DB/Redis/JWT，但所有监听端口 +500，
+# 可与常驻 dev server(9001/9080/9090/9083)并存，压测进程独立起停。
+# 由 examples/reconnect_storm.rs 以 `--config-file config.storm.toml` 拉起。
+
+[database]
+max_connections = 20
+min_connections = 5
+acquire_timeout_seconds = 10
+idle_timeout_seconds = 600
+max_lifetime_seconds = 1800
+statement_timeout_ms = 5000
+
+[gateway]
+max_connections = 2000
+connection_timeout = 300
+heartbeat_interval = 60
+handler_max_inflight = 2000
+
+[account]
+mode = "BUILTIN"
+
+[[gateway.listeners]]
+protocol = "tcp"
+host = "0.0.0.0"
+port = 9501
+
+[[gateway.listeners]]
+protocol = "quic"
+host = "0.0.0.0"
+port = 9501
+
+[[gateway.listeners]]
+protocol = "websocket"
+host = "0.0.0.0"
+port = 9580
+path = "/gate"
+compression = true
+
+[cache]
+l1_max_memory_mb = 256
+l1_ttl_secs = 3600
+
+[cache.redis]
+url = "redis://127.0.0.1:6379"
+pool_size = 50
+min_idle = 10
+connection_timeout = 5
+command_timeout_ms = 5000
+idle_timeout = 300
+
+[cache.online_status]
+timeout_seconds = 300
+cleanup_interval_seconds = 60
+
+[admin]
+port = 9590
+
+[auth.jwt]
+algorithm        = "RS256"
+private_key_path = "./.local/keys/jwt/v1.pem"
+public_key_path  = "./.local/keys/jwt/v1.pub.pem"
+kid              = "v1"
+access_ttl_secs  = 3600
+refresh_ttl_secs = 2592000
+issuer           = "privchat-server"
+default_audience = ["privchat-application", "privchat-server"]
+
+[room]
+subscribe_history = true
+subscribe_history_limit = 30
+history_ttl_seconds = 86400
+max_subscriptions_per_session = 32
+max_channel_subscribers_online = 20000
+
+[file]
+default_storage_source_id = 0
+server_port = 9583
+server_api_base_url = "http://127.0.0.1:9583/api/app"
+
+[[file.storage_sources]]
+id = 0
+storage_type = "local"
+storage_root = "./storage/files"
+base_url = "http://127.0.0.1:8000"
+
+[push]
+enabled = false
+
+[server_event]
+application_url = "http://localhost:8080"
+application_master_key = "your_service_master_key_here"
+timeout_ms = 3000
+
+[room_ticket]
+secret = "dev-room-ticket-secret-please-rotate-in-prod"
+default_kid = "v1"
+leeway_secs = 30
+
+# debug 级：压测解析依赖 sqlx summary（rows_returned / elapsed）与 RPC 路由行。
+[logging]
+level = "debug"
+format = "compact"
+file = "./logs/storm-server.log"
+
+[system_message]
+enabled = true
+welcome_message = "storm harness welcome"
+auto_create_channel = true
+auto_send_welcome = true
+
+[message]
+recall_time_limit_secs = 0
