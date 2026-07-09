@@ -1992,6 +1992,77 @@ impl ChannelService {
                         .insert(participant.user_id, member);
                 }
 
+                // P1-16 hydration：恢复只带基础行 + 成员 role 时，群名/群策略/成员禁言
+                // 全部丢失——重启后禁言直接失效（安全语义破坏）。从各自 DB 真源补齐。
+                if conv_with_members.channel_type == ChannelType::Group {
+                    let group_id = conv_with_members.group_id.unwrap_or(channel_id);
+                    match sqlx::query_as::<_, (Option<String>, bool, i16, bool, bool, bool)>(
+                        "SELECT name, allow_search, join_policy, allow_member_invite, \
+                                allow_member_add_friend, all_muted \
+                         FROM privchat_groups WHERE group_id = $1",
+                    )
+                    .bind(group_id as i64)
+                    .fetch_optional(self.pool())
+                    .await
+                    {
+                        Ok(Some((
+                            name,
+                            allow_search,
+                            join_policy,
+                            allow_member_invite,
+                            allow_member_add_friend,
+                            all_muted,
+                        ))) => {
+                            if conv_with_members.metadata.name.is_none() {
+                                conv_with_members.metadata.name = name;
+                            }
+                            let settings = conv_with_members
+                                .settings
+                                .get_or_insert_with(crate::model::channel::ChannelSettings::default);
+                            settings.is_muted = all_muted;
+                            settings.allow_search = allow_search;
+                            settings.join_policy = join_policy.clamp(0, 2) as u8;
+                            settings.require_approval = join_policy == 1;
+                            settings.allow_member_invite = allow_member_invite;
+                            settings.allow_member_add_friend = allow_member_add_friend;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!("hydrate group policy failed: group_id={} err={}", group_id, e)
+                        }
+                    }
+                    // 成员禁言（privchat_group_members.mute_until，set_member_muted 的落库真源）。
+                    // 注：muted=true 且无期限时存 NULL，与「未禁言」同形——永久禁言跨重启
+                    // 无法区分，记任务板 P1-16 遗留（需要独立 is_muted 列）。
+                    match sqlx::query_as::<_, (i64, Option<i64>)>(
+                        "SELECT user_id, mute_until FROM privchat_group_members \
+                         WHERE group_id = $1 AND left_at IS NULL AND mute_until IS NOT NULL",
+                    )
+                    .bind(group_id as i64)
+                    .fetch_all(self.pool())
+                    .await
+                    {
+                        Ok(rows) => {
+                            let now = chrono::Utc::now();
+                            for (uid, mute_until_ms) in rows {
+                                if let Some(member) =
+                                    conv_with_members.members.get_mut(&(uid as u64))
+                                {
+                                    let until = mute_until_ms
+                                        .and_then(chrono::DateTime::from_timestamp_millis);
+                                    if crate::model::channel::mute_is_active(true, until, now) {
+                                        member.is_muted = true;
+                                        member.mute_until = until;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("hydrate member mutes failed: group_id={} err={}", group_id, e)
+                        }
+                    }
+                }
+
                 // 缓存到内存
                 let mut channels = self.channels.write().await;
                 channels.insert(channel_id, conv_with_members.clone());
@@ -2208,6 +2279,8 @@ impl ChannelService {
             channel_sync_version: i64,
             group_name: Option<String>,
             group_avatar_url: Option<String>,
+            peer_display_name: Option<String>,
+            peer_username: Option<String>,
             unread_count: i32,
             is_pinned: bool,
             is_muted: bool,
@@ -2257,6 +2330,8 @@ impl ChannelService {
                 c.sync_version AS channel_sync_version,
                 g.name AS group_name,
                 g.avatar_url AS group_avatar_url,
+                pu.display_name AS peer_display_name,
+                pu.username AS peer_username,
                 uc.unread_count,
                 uc.is_pinned,
                 uc.is_muted,
@@ -2266,6 +2341,12 @@ impl ChannelService {
                 ON c.channel_id = uc.channel_id
             LEFT JOIN privchat_groups g
                 ON g.group_id = c.group_id
+            LEFT JOIN privchat_users pu
+                ON c.channel_type = 0
+               AND pu.user_id = CASE
+                    WHEN c.direct_user1_id = $1 THEN c.direct_user2_id
+                    ELSE c.direct_user1_id
+                END
             LEFT JOIN privchat_messages lm
                 ON lm.message_id = c.last_message_id
             WHERE uc.user_id = $1
@@ -2323,7 +2404,14 @@ impl ChannelService {
                     None
                 };
                 let channel_name = if channel_type_enum == ChannelType::Direct {
-                    peer_user_id.map(|uid| uid.to_string()).unwrap_or_default()
+                    // DM 名下发对端显示名(display_name > username);两者皆空才回退
+                    // uid 字符串——否则新登录设备在 user 资料同步到达前会一直显示裸 id。
+                    row.peer_display_name
+                        .clone()
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| row.peer_username.clone().filter(|v| !v.is_empty()))
+                        .or_else(|| peer_user_id.map(|uid| uid.to_string()))
+                        .unwrap_or_default()
                 } else {
                     row.group_name.clone().unwrap_or_default()
                 };
