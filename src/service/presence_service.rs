@@ -433,6 +433,14 @@ mod tests {
         service.subscribe_manager.subscribe(SessionId::from(2_u64), 200).unwrap();
         service.subscribe_manager.subscribe(SessionId::from(3_u64), 300).unwrap();
 
+        // 推送里的 is_online/device_count 以 ConnectionManager 为权威（758f00d），
+        // 必须先注册 authenticated 连接，publish 的快照才会是在线 + 1 设备。
+        service
+            .connection_manager
+            .register_connection(42, "ios-42".to_string(), SessionId::from(42_u64))
+            .await
+            .unwrap();
+
         service.on_device_connected(42, "ios-42").await.unwrap();
 
         let published = service.take_test_published_events();

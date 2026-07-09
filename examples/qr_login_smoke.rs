@@ -135,10 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[smoke] connected, sending qr_login/create_scene");
 
-    // 发 RPC（protocol crate `RpcRequest` 和 server `RPCMessageRequest` 是同一 JSON 形态）
+    // 发 RPC（protocol crate `RpcRequest` 和 server `RPCMessageRequest` 是同一 JSON 形态；
+    // body 是不透明 JSON 字节，per-route 编码）
     let rpc_req = RpcRequest {
         route: routes::qr_login::CREATE_SCENE.to_string(),
-        body: serde_json::to_value(QrLoginCreateSceneRequest {
+        body: serde_json::to_vec(&QrLoginCreateSceneRequest {
             purpose: "login".to_string(),
             web_device_id: args.web_device_id.clone(),
             web_device_info: None,
@@ -168,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = resp
         .data
         .ok_or("create_scene response.data is empty")?;
-    let scene: QrLoginCreateSceneResponse = serde_json::from_value(data)?;
+    let scene: QrLoginCreateSceneResponse = serde_json::from_slice(&data)?;
 
     eprintln!("[smoke] scene created:");
     eprintln!("  scene_id   = {}", scene.scene_id);
