@@ -90,19 +90,32 @@ impl FileHttpServer {
         }
     }
 
-    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// P1-11：bind 与 serve 分离。bind 在启动路径同步执行——端口占用/权限问题
+    /// 直接阻断启动（fail-fast），不再在后台 task 里被吞成一行 error log。
+    pub async fn bind(
+        &self,
+    ) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error + Send + Sync>> {
+        let addr = format!("0.0.0.0:{}", self.port);
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        info!("🌐 HTTP 文件服务器已绑定 {}", addr);
+        Ok(listener)
+    }
+
+    pub async fn serve(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let app = Router::new()
             .merge(routes::create_file_routes())
             .layer(CorsLayer::permissive())
             .with_state(self.state.clone());
-
-        let addr = format!("0.0.0.0:{}", self.port);
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-        info!("🌐 HTTP 文件服务器启动在 {}", addr);
-
         axum::serve(listener, app).await?;
         Ok(())
+    }
+
+    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = self.bind().await?;
+        self.serve(listener).await
     }
 }
 
@@ -170,11 +183,36 @@ impl AdminHttpServer {
             .layer(CorsLayer::permissive())
             .with_state(self.state.clone());
 
+        let listener = self.bind().await?;
+        self.serve_on(listener, app).await
+    }
+
+    /// P1-11：bind 与 serve 分离（同 FileHttpServer，fail-fast + supervisor 重启）。
+    pub async fn bind(
+        &self,
+    ) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error + Send + Sync>> {
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
+        info!("🔒 管理 API 服务器已绑定端口 {}", self.port);
+        Ok(listener)
+    }
 
-        info!("🔒 管理 API 服务器启动在端口 {}", self.port);
+    pub async fn serve(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let app = Router::new()
+            .merge(routes::create_admin_routes())
+            .layer(CorsLayer::permissive())
+            .with_state(self.state.clone());
+        self.serve_on(listener, app).await
+    }
 
+    async fn serve_on(
+        &self,
+        listener: tokio::net::TcpListener,
+        app: Router,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),

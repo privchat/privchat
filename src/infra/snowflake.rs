@@ -50,10 +50,32 @@ fn init_generator() -> &'static Mutex<Snowflake> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1u8);
 
-        let machine_id = std::env::var("SNOWFLAKE_MACHINE_ID")
+        // P1-12：machine_id 未显式配置时按 pid+启动时间 hash 自动分散（best-effort，
+        // 5 位空间无法保证无碰撞），并大声警告——生产多实例部署必须显式配置。
+        let machine_id: u8 = match std::env::var("SNOWFLAKE_MACHINE_ID")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1u8);
+        {
+            Some(v) => v,
+            None => {
+                let seed = (std::process::id() as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0),
+                    );
+                let auto = (seed % 32) as u8;
+                tracing::warn!(
+                    "⚠️ SNOWFLAKE_MACHINE_ID 未配置，自动分配 machine_id={}（pid+time hash，\
+                     best-effort 防同机多实例碰撞）。生产多实例部署必须显式配置 \
+                     SNOWFLAKE_MACHINE_ID / SNOWFLAKE_DATA_CENTER_ID，否则消息 ID 可能冲突",
+                    auto
+                );
+                auto
+            }
+        };
 
         tracing::info!(
             "初始化 Snowflake ID 生成器: data_center_id={}, machine_id={}",
@@ -88,8 +110,35 @@ fn init_generator() -> &'static Mutex<Snowflake> {
 /// ```
 pub fn next_message_id() -> u64 {
     let generator = init_generator();
-    let guard = generator.lock().expect("Snowflake generator lock poisoned");
-    guard.next_id().expect("Failed to generate Snowflake ID")
+    // P1-12：锁污染不 panic——Snowflake 内部状态是原子的，持锁线程 panic 不会
+    // 破坏其一致性，恢复继续用。
+    let guard = match generator.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::warn!("Snowflake generator lock poisoned，恢复继续使用");
+            poisoned.into_inner()
+        }
+    };
+    // P1-12：时钟回拨不 panic——snowflake_me 在回拨时返回 Err，此前 expect 直接
+    // 崩掉消息路径。改为等待时钟追平（1ms 步进重试）；回拨期间该路径阻塞（正确：
+    // 时钟没追上任何实例都不能安全发号），每累计 1s 打一次 error 供告警。
+    let mut attempts: u64 = 0;
+    loop {
+        match guard.next_id() {
+            Ok(id) => return id,
+            Err(e) => {
+                attempts += 1;
+                if attempts % 1000 == 0 {
+                    tracing::error!(
+                        "Snowflake 时钟回拨持续 ~{}ms 仍未恢复: {}",
+                        attempts,
+                        e
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 /// 生成下一个频道ID
