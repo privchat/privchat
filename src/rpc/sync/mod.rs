@@ -168,6 +168,53 @@ async fn handle_submit_rpc(
     // 获取当前用户ID
     let sender_id = crate::rpc::get_current_user_id(&ctx)?;
 
+    // P1-16 安全补齐：sync/submit 是消息主路径之一，此前没有任何成员/禁言校验，
+    // 被禁言用户（乃至非成员）可以从这条路径绕过 wire SendMessageHandler 的全部
+    // 检查。语义与 wire 路径对齐：非成员拒绝；个人禁言拒绝（到期放行）；
+    // 群全员禁言以 DB(privchat_groups.all_muted) 为真源，群主/管理员豁免。
+    {
+        let channel = services
+            .channel_service
+            .get_channel_opt(channel_id)
+            .await
+            .ok_or_else(|| RpcError::validation(format!("频道不存在: {}", channel_id)))?;
+        let member = channel.members.get(&sender_id).ok_or_else(|| {
+            RpcError::forbidden(format!("用户 {} 不是频道 {} 成员", sender_id, channel_id))
+        })?;
+        let now = chrono::Utc::now();
+        if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now) {
+            return Err(RpcError::forbidden(
+                crate::model::channel::mute_reject_message(member.mute_until, now),
+            ));
+        }
+        if channel.channel_type == crate::model::channel::ChannelType::Group {
+            let is_privileged = matches!(
+                member.role,
+                crate::model::channel::MemberRole::Owner
+                    | crate::model::channel::MemberRole::Admin
+            );
+            if is_privileged {
+                // 群主/管理员不受全员禁言限制
+            } else {
+                let all_muted = if let Some(gid) = channel.group_id {
+                    services
+                        .channel_service
+                        .get_group_policy(gid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|p| p.all_muted)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if all_muted {
+                    return Err(RpcError::forbidden("群组全员禁言中".to_string()));
+                }
+            }
+        }
+    }
+
     // 使用 SyncService 处理客户端提交
     let response = services
         .sync_service
