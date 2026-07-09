@@ -202,8 +202,11 @@ impl ChannelRepository for PgChannelRepository {
             id
         } else {
             tracing::info!("🔧 [ChannelRepo] 使用指定ID: {}", channel_id);
-            // 如果指定了 channel_id，使用指定的值
-            sqlx::query(
+            // 指定 channel_id 的写入绝不覆盖已有行:历史上这里是
+            // ON CONFLICT DO UPDATE,群创建撞上已有 DM channel 时会把 DM
+            // 行改写成群(会话劫持)。现在冲突时只允许幂等命中
+            // (同 type 同 group_id 的重放),否则显式报错。
+            let res = sqlx::query(
                 r#"
                 INSERT INTO privchat_channels (
                     channel_id, channel_type, direct_user1_id, direct_user2_id,
@@ -211,15 +214,7 @@ impl ChannelRepository for PgChannelRepository {
                     created_at, updated_at
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ON CONFLICT (channel_id) DO UPDATE SET
-                    channel_type = EXCLUDED.channel_type,
-                    direct_user1_id = EXCLUDED.direct_user1_id,
-                    direct_user2_id = EXCLUDED.direct_user2_id,
-                    group_id = EXCLUDED.group_id,
-                    last_message_id = EXCLUDED.last_message_id,
-                    last_message_at = EXCLUDED.last_message_at,
-                    message_count = EXCLUDED.message_count,
-                    updated_at = EXCLUDED.updated_at
+                ON CONFLICT (channel_id) DO NOTHING
                 "#,
             )
             .bind(channel_id as i64)
@@ -235,6 +230,32 @@ impl ChannelRepository for PgChannelRepository {
             .execute(self.pool.as_ref())
             .await
             .map_err(|e| DatabaseError::Database(format!("Failed to create channel: {}", e)))?;
+
+            if res.rows_affected() == 0 {
+                let existing = self.find_by_id(channel_id as u64).await?;
+                match existing {
+                    Some(ch)
+                        if ch.channel_type == channel.channel_type
+                            && ch.group_id == channel.group_id =>
+                    {
+                        tracing::info!(
+                            "ℹ️ [ChannelRepo] channel {} 已存在且形态一致，幂等返回",
+                            channel_id
+                        );
+                        return Ok(ch);
+                    }
+                    _ => {
+                        tracing::error!(
+                            "❌ [ChannelRepo] channel_id {} 已被其他会话占用，拒绝覆盖",
+                            channel_id
+                        );
+                        return Err(DatabaseError::Database(format!(
+                            "channel_id {} already taken by another conversation",
+                            channel_id
+                        )));
+                    }
+                }
+            }
 
             channel_id as u64
         };
