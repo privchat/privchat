@@ -60,7 +60,6 @@ pub mod offline_queue_service;
 // 新增未读计数服务
 pub mod unread_count_service;
 // 新增消息去重服务
-pub mod message_dedup_service;
 // 新增 Reaction 服务
 pub mod reaction_service;
 // 新增 @提及服务
@@ -84,7 +83,6 @@ pub use file_service::{FileMetadata, FileService, FileType, FileUrlResponse};
 pub use friend_service::FriendService;
 pub use group_service::GroupService;
 pub use mention_service::MentionService;
-pub use message_dedup_service::MessageDedupService;
 pub use message_history_service::{
     ChannelMessageStats, MessageHistoryRecord, MessageHistoryService, MessageQueryParams,
     ReplyMessagePreview,

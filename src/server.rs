@@ -591,12 +591,6 @@ impl ChatServer {
             config.file_default_storage_source_id
         );
 
-        // 创建消息去重服务
-        info!("🔧 初始化消息去重服务...");
-        let message_dedup_service = Arc::new(crate::service::MessageDedupService::new());
-        message_dedup_service.start_cleanup_task(); // 启动定期清理任务
-        info!("✅ 消息去重服务初始化完成");
-
         // 创建 @提及服务
         info!("🔧 初始化 @提及服务...");
         let mention_service = Arc::new(crate::service::MentionService::new());
@@ -647,7 +641,6 @@ impl ChatServer {
             user_message_index.clone(),
             offline_queue_service.clone(),
             unread_count_service.clone(),
-            message_dedup_service.clone(),
             privacy_service.clone(),
             friend_service.clone(),
             mention_service.clone(),
