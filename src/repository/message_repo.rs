@@ -309,16 +309,26 @@ impl PgMessageRepository {
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
 
         for file_id in request.attachment_file_ids {
+            // P1-19 归属守卫：file_id 来自客户端可控的 metadata，必须校验
+            // ① 上传者就是发送者（不能引用他人的 file）
+            // ② 未绑定到其它业务（不能把已绑定的附件重绑劫持；同消息重绑幂等放行）
             let updated = sqlx::query(
                 r#"
                 UPDATE privchat_file_uploads
                 SET business_type = $1, business_id = $2
                 WHERE file_id = $3
+                  AND uploader_id = $4
+                  AND (
+                    business_type IS NULL
+                    OR business_type = ''
+                    OR (business_type = $1 AND business_id = $2)
+                  )
                 "#,
             )
             .bind("message")
             .bind(message.message_id.to_string())
             .bind(file_id as i64)
+            .bind(message.sender_id as i64)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -330,8 +340,9 @@ impl PgMessageRepository {
 
             if updated.rows_affected() == 0 {
                 return Err(DatabaseError::Database(format!(
-                    "attachment file_id={} not found while binding message_id={}",
-                    file_id, message.message_id
+                    "attachment file_id={} rejected while binding message_id={}: \
+                     not found, not uploaded by sender {}, or already bound to another business",
+                    file_id, message.message_id, message.sender_id
                 )));
             }
         }
