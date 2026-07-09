@@ -26,7 +26,7 @@ use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::{AtomicMessageCommitRequest, PgMessageRepository};
 use crate::service::message_history_service::{MessageHistoryRecord, MessageHistoryService};
 use crate::service::sync::get_global_sync_service;
-use crate::service::{MessageDedupService, OfflineQueueService, UnreadCountService};
+use crate::service::{OfflineQueueService, UnreadCountService};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use privchat_protocol::error_code::ErrorCode;
@@ -94,7 +94,6 @@ pub struct SendMessageHandler {
     /// ✨ 未读计数服务
     unread_count_service: Arc<UnreadCountService>,
     /// ✨ 消息去重服务
-    message_dedup_service: Arc<MessageDedupService>,
     /// ✨ 隐私服务（用于检查非好友消息权限）
     privacy_service: Arc<crate::service::PrivacyService>,
     /// ✨ 好友服务（用于检查好友关系）
@@ -161,7 +160,6 @@ impl SendMessageHandler {
         user_message_index: Arc<UserMessageIndex>,
         offline_queue_service: Arc<OfflineQueueService>,
         unread_count_service: Arc<UnreadCountService>,
-        message_dedup_service: Arc<MessageDedupService>,
         privacy_service: Arc<crate::service::PrivacyService>,
         friend_service: Arc<crate::service::FriendService>,
         mention_service: Arc<crate::service::MentionService>,
@@ -181,7 +179,6 @@ impl SendMessageHandler {
             user_message_index,
             offline_queue_service,
             unread_count_service,
-            message_dedup_service,
             privacy_service,
             friend_service,
             mention_service,
@@ -1653,11 +1650,6 @@ impl MessageHandler for SendMessageHandler {
         // 7. 先创建成功响应（不阻塞客户端）
         let response = self
             .create_success_response(&send_message_request, &message_record, pts as u64)
-            .await;
-
-        // 7.5. 标记消息为已处理（去重）
-        self.message_dedup_service
-            .mark_as_processed(from_uid, send_message_request.local_message_id)
             .await;
 
         crate::infra::metrics::record_message_sent();
