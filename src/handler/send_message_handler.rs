@@ -304,8 +304,11 @@ impl MessageHandler for SendMessageHandler {
         // from_uid 和 channel_id 现在已经是 u64 类型
         let from_uid = send_message_request.from_uid;
         let channel_id = send_message_request.channel_id;
-        let client_dedup_key =
-            Self::client_dedup_key(from_uid, send_message_request.local_message_id);
+        // local_message_id=0 视为「客户端未提供幂等键」（协议默认值），不参与 dedup。
+        // 否则所有 0 值请求共享 `client:{uid}:0`，第一条永久占坑，后续消息会被
+        // 静默判重并返回第一条的 message_id —— 等价于永久丢消息。
+        let client_dedup_key = (send_message_request.local_message_id != 0)
+            .then(|| Self::client_dedup_key(from_uid, send_message_request.local_message_id));
 
         // ✨ 1.4. 防御性检查：拒绝无效的 channel_id
         if channel_id == 0 {
@@ -322,13 +325,15 @@ impl MessageHandler for SendMessageHandler {
                 .await;
         }
 
-        // 1.5. DB 级幂等预查（server 重启后仍生效）。
-        if let Some(existing_message) = self
-            .message_repository
-            .find_message_by_dedup_key(&client_dedup_key)
-            .await
-            .map_err(|e| ServerError::Database(format!("查询消息幂等键失败: {}", e)))?
-        {
+        // 1.5. DB 级幂等预查（server 重启后仍生效）。local_message_id=0 无幂等键，跳过。
+        if let Some(existing_message) = match client_dedup_key.as_deref() {
+            Some(key) => self
+                .message_repository
+                .find_message_by_dedup_key(key)
+                .await
+                .map_err(|e| ServerError::Database(format!("查询消息幂等键失败: {}", e)))?,
+            None => None,
+        } {
             let existing_pts = existing_message.pts.unwrap_or(0).max(0) as u64;
             let existing_record = Self::message_to_history_record(&existing_message);
             info!(
@@ -1322,6 +1327,7 @@ impl MessageHandler for SendMessageHandler {
             .message_repository
             .create_message_and_commit_atomic(AtomicMessageCommitRequest {
                 message,
+                // None（local_message_id=0）时事务内不 claim dedup key，退化为无幂等发送。
                 dedup_key: client_dedup_key.clone(),
                 attachment_file_ids: bind_file_ids,
                 channel_type: channel_type_code as i16,
