@@ -135,6 +135,19 @@ impl SyncService {
         Ok(())
     }
 
+    /// DB 事务已经提交 commit 后，仅刷新本进程内存 pts 与 Redis sync cache。
+    ///
+    /// 普通发送链路会在同一个 DB transaction 内完成消息写入、pts 分配和 commit log 写入；
+    /// 这里不能再调用 `record_existing_commit`，否则会重复写 commit。
+    pub async fn cache_committed_commit(&self, commit: &ServerCommit) -> Result<()> {
+        self.pts_generator
+            .set_pts(commit.channel_id, commit.pts)
+            .await;
+        self.cache.cache_pts(commit.channel_id, commit.pts).await?;
+        self.cache.cache_commit(commit).await?;
+        Ok(())
+    }
+
     // ============================================================
     // RPC 处理方法
     // ============================================================

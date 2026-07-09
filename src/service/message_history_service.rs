@@ -542,6 +542,11 @@ impl MessageHistoryService {
 
         // 批量处理每个频道的消息
         for (channel_id, channel_records) in by_channel {
+            let max_seq = channel_records
+                .iter()
+                .map(|record| record.seq)
+                .max()
+                .unwrap_or(0);
             let mut messages = self
                 .channel_messages
                 .entry(channel_id.clone())
@@ -561,6 +566,12 @@ impl MessageHistoryService {
                     .insert(record.message_id.clone(), (channel_id.clone(), record.seq));
                 count += 1;
             }
+
+            let counter = self
+                .seq_generators
+                .entry(channel_id)
+                .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+            counter.fetch_max(max_seq, std::sync::atomic::Ordering::SeqCst);
         }
 
         Ok(count)
@@ -616,7 +627,8 @@ pub struct ChannelMessageStats {
 
 #[cfg(test)]
 mod tests {
-    use super::MessageHistoryService;
+    use super::{MessageHistoryRecord, MessageHistoryService};
+    use chrono::Utc;
 
     #[tokio::test]
     async fn revoke_message_marks_cached_message_revoked() {
@@ -626,14 +638,7 @@ mod tests {
         let revoker_id = 1002_u64;
 
         let record = service
-            .store_message(
-                &channel_id,
-                &sender_id,
-                "hello".to_string(),
-                1,
-                None,
-                None,
-            )
+            .store_message(&channel_id, &sender_id, "hello".to_string(), 1, None, None)
             .await
             .unwrap();
 
@@ -645,5 +650,40 @@ mod tests {
         assert!(revoked.is_revoked);
         assert_eq!(revoked.revoker_id, Some(revoker_id));
         assert_eq!(revoked.message_id, record.message_id);
+    }
+
+    #[tokio::test]
+    async fn batch_store_advances_sequence_counter() {
+        let service = MessageHistoryService::new(100);
+        let channel_id = 42_u64;
+        let now = Utc::now();
+
+        service
+            .store_messages_batch(vec![MessageHistoryRecord {
+                message_id: 9001,
+                channel_id,
+                sender_id: 1001,
+                content: "from-db".to_string(),
+                message_type: 1,
+                seq: 88,
+                created_at: now,
+                updated_at: now,
+                is_deleted: false,
+                deleted_at: None,
+                is_revoked: false,
+                revoked_at: None,
+                revoker_id: None,
+                reply_to_message_id: None,
+                metadata: None,
+            }])
+            .await
+            .unwrap();
+
+        let next = service
+            .store_message(&channel_id, &1002, "after".to_string(), 1, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(next.seq, 89);
     }
 }
