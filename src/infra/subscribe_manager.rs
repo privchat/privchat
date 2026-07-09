@@ -25,6 +25,7 @@
 use dashmap::DashMap;
 use msgtrans::SessionId;
 use std::collections::HashSet;
+use std::sync::Mutex;
 use tracing::{debug, info};
 
 pub struct SubscribeManager {
@@ -32,19 +33,41 @@ pub struct SubscribeManager {
     channel_routes: DashMap<u64, Vec<SessionId>>,
     /// session_id -> Set<channel_id>（一个 session 可订阅多个频道）
     session_channels: DashMap<SessionId, HashSet<u64>>,
+    /// 串行化双索引写入，避免 subscribe/unsubscribe/disconnect 并发交叉造成索引不一致。
+    write_lock: Mutex<()>,
+    max_subscriptions_per_session: usize,
+    max_channel_subscribers_online: usize,
 }
 
 impl SubscribeManager {
     pub fn new() -> Self {
+        Self::new_with_limits(
+            MAX_SUBSCRIPTIONS_PER_SESSION,
+            MAX_CHANNEL_SUBSCRIBERS_ONLINE,
+        )
+    }
+
+    pub fn new_with_limits(
+        max_subscriptions_per_session: usize,
+        max_channel_subscribers_online: usize,
+    ) -> Self {
         Self {
             channel_routes: DashMap::new(),
             session_channels: DashMap::new(),
+            write_lock: Mutex::new(()),
+            max_subscriptions_per_session: max_subscriptions_per_session.max(1),
+            max_channel_subscribers_online: max_channel_subscribers_online.max(1),
         }
     }
 
     /// 订阅频道
     /// 返回 Ok(()) 或 Err(reason) 如果频道已满或 session 订阅数超限
     pub fn subscribe(&self, session_id: SessionId, channel_id: u64) -> Result<(), &'static str> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // 检查是否已订阅该频道（幂等）
         if let Some(channels) = self.session_channels.get(&session_id) {
             if channels.contains(&channel_id) {
@@ -55,12 +78,12 @@ impl SubscribeManager {
                 return Ok(());
             }
             // 检查 session 订阅数上限（防止泄漏）
-            if channels.len() >= MAX_SUBSCRIPTIONS_PER_SESSION {
+            if channels.len() >= self.max_subscriptions_per_session {
                 info!(
                     "Session {} reached subscription limit ({}/{}), rejecting channel {}",
                     session_id,
                     channels.len(),
-                    MAX_SUBSCRIPTIONS_PER_SESSION,
+                    self.max_subscriptions_per_session,
                     channel_id
                 );
                 return Err("too many subscriptions");
@@ -71,21 +94,26 @@ impl SubscribeManager {
         let current_count = self
             .channel_routes
             .get(&channel_id)
-            .map(|s| s.len())
+            .map(|s| unique_session_count(s.value()))
             .unwrap_or(0);
-        if current_count >= MAX_CHANNEL_SUBSCRIBERS_ONLINE {
+        if current_count >= self.max_channel_subscribers_online {
             info!(
                 "Channel {} is full ({}/{}), rejecting session {}",
-                channel_id, current_count, MAX_CHANNEL_SUBSCRIBERS_ONLINE, session_id
+                channel_id, current_count, self.max_channel_subscribers_online, session_id
             );
             return Err("channel is full");
         }
 
         // 加入频道
-        self.channel_routes
-            .entry(channel_id)
-            .or_insert_with(Vec::new)
-            .push(session_id.clone());
+        {
+            let mut sessions = self
+                .channel_routes
+                .entry(channel_id)
+                .or_insert_with(Vec::new);
+            if !sessions.contains(&session_id) {
+                sessions.push(session_id);
+            }
+        }
 
         // 更新 session -> channels 映射
         self.session_channels
@@ -103,6 +131,11 @@ impl SubscribeManager {
 
     /// 取消订阅指定频道
     pub fn unsubscribe(&self, session_id: &SessionId, channel_id: u64) -> bool {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // 从 session_channels 中移除
         let mut removed = false;
         if let Some(mut channels) = self.session_channels.get_mut(session_id) {
@@ -138,6 +171,11 @@ impl SubscribeManager {
 
     /// 连接断开时清理所有订阅
     pub fn on_session_disconnect(&self, session_id: &SessionId) -> Vec<u64> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let channels = self
             .session_channels
             .remove(session_id)
@@ -162,7 +200,7 @@ impl SubscribeManager {
     pub fn get_channel_sessions(&self, channel_id: u64) -> Vec<SessionId> {
         self.channel_routes
             .get(&channel_id)
-            .map(|sessions| sessions.clone())
+            .map(|sessions| unique_sessions(sessions.value()))
             .unwrap_or_default()
     }
 
@@ -178,7 +216,7 @@ impl SubscribeManager {
     pub fn get_channel_online_count(&self, channel_id: u64) -> usize {
         self.channel_routes
             .get(&channel_id)
-            .map(|s| s.len())
+            .map(|s| unique_session_count(s.value()))
             .unwrap_or(0)
     }
 
@@ -196,9 +234,26 @@ impl SubscribeManager {
     pub fn get_all_channels(&self) -> Vec<(u64, usize)> {
         self.channel_routes
             .iter()
-            .map(|entry| (*entry.key(), entry.value().len()))
+            .map(|entry| (*entry.key(), unique_session_count(entry.value())))
             .collect()
     }
+}
+
+fn unique_sessions(sessions: &[SessionId]) -> Vec<SessionId> {
+    let mut seen = HashSet::with_capacity(sessions.len());
+    sessions
+        .iter()
+        .copied()
+        .filter(|session_id| seen.insert(*session_id))
+        .collect()
+}
+
+fn unique_session_count(sessions: &[SessionId]) -> usize {
+    let mut seen = HashSet::with_capacity(sessions.len());
+    sessions
+        .iter()
+        .filter(|session_id| seen.insert(**session_id))
+        .count()
 }
 
 /// 频道订阅相关常量
@@ -312,5 +367,34 @@ mod tests {
         let result = manager.subscribe(sid(999999), 100);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "channel is full");
+    }
+
+    #[test]
+    fn test_configured_limits_are_enforced() {
+        let manager = SubscribeManager::new_with_limits(2, 2);
+
+        manager.subscribe(sid(1), 100).unwrap();
+        manager.subscribe(sid(1), 200).unwrap();
+        assert_eq!(
+            manager.subscribe(sid(1), 300).unwrap_err(),
+            "too many subscriptions"
+        );
+
+        manager.subscribe(sid(2), 999).unwrap();
+        manager.subscribe(sid(3), 999).unwrap();
+        assert_eq!(
+            manager.subscribe(sid(4), 999).unwrap_err(),
+            "channel is full"
+        );
+    }
+
+    #[test]
+    fn test_channel_session_snapshot_is_deduplicated() {
+        let manager = SubscribeManager::new();
+        manager.channel_routes.insert(100, vec![sid(1), sid(1), sid(2)]);
+
+        let sessions = manager.get_channel_sessions(100);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(manager.get_channel_online_count(100), 2);
     }
 }

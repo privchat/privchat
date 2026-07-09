@@ -68,14 +68,13 @@ impl RoomHistoryService {
 
         let key = Self::history_key(channel_id);
         let limit = self.subscribe_history_limit();
-        self.redis.lpush(&key, &payload).await?;
         self.redis
-            .ltrim(&key, 0, limit.saturating_sub(1) as isize)
+            .lpush_ltrim_expire(&key, &payload, limit, self.config.history_ttl_seconds)
             .await?;
 
         debug!(
-            "📚 RoomHistory: appended channel_id={}, limit={}",
-            channel_id, limit
+            "📚 RoomHistory: appended channel_id={}, limit={}, ttl_seconds={}",
+            channel_id, limit, self.config.history_ttl_seconds
         );
         Ok(())
     }
@@ -113,6 +112,25 @@ impl RoomHistoryService {
     }
 
     fn history_key(channel_id: u64) -> String {
-        format!("room:history:{}", channel_id)
+        format!("room:{}:recent", channel_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_key_matches_room_channel_spec() {
+        assert_eq!(RoomHistoryService::history_key(42), "room:42:recent");
+    }
+
+    #[test]
+    fn default_room_history_config_matches_live_chat_default() {
+        let config = RoomConfig::default();
+
+        assert!(config.subscribe_history);
+        assert_eq!(config.subscribe_history_limit, 30);
+        assert_eq!(config.history_ttl_seconds, 86_400);
     }
 }

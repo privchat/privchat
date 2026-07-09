@@ -102,6 +102,21 @@ impl Default for SessionState {
     }
 }
 
+impl TryFrom<i16> for SessionState {
+    type Error = i16;
+
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SessionState::Active),
+            1 => Ok(SessionState::Kicked),
+            2 => Ok(SessionState::Frozen),
+            3 => Ok(SessionState::Revoked),
+            4 => Ok(SessionState::PendingVerify),
+            other => Err(other),
+        }
+    }
+}
+
 impl std::fmt::Display for SessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_string())

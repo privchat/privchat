@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables, dead_code, async_fn_in_trait, static_mut_refs)]
+#![allow(unused_variables, dead_code, async_fn_in_trait)]
 
 pub mod auth;
 pub mod channel_transfer; // Channel Transfer relay utilities (spec 02-server/CHANNEL_TRANSFER_SPEC v2.0).
@@ -37,8 +37,8 @@ pub mod repository;
 pub mod rpc; // 添加 RPC 模块
 pub mod security; // 安全模块
 pub mod server;
-pub mod service;
 pub mod server_event; // server → downstream 通用事件分发 (spec SERVER_EVENT_DISPATCH_SPEC)
+pub mod service;
 pub mod sync; // ✨ 新增：Push 模块
 
 pub use config::ServerConfig;

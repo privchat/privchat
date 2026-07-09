@@ -129,6 +129,15 @@ fn generate_config(path: &str) -> Result<()> {
 # Redis 配置（必填）
 # redis_url = "redis://127.0.0.1:6379"
 
+[database]
+# url = "postgres://user:password@localhost:5432/privchat"
+max_connections = 20
+min_connections = 5
+acquire_timeout_seconds = 10
+idle_timeout_seconds = 600
+max_lifetime_seconds = 1800
+statement_timeout_ms = 5000
+
 [gateway]
 max_connections = 100000
 connection_timeout = 300
@@ -165,6 +174,9 @@ master_key = "your-service-master-key"
 [room]
 subscribe_history = true
 subscribe_history_limit = 30
+history_ttl_seconds = 86400
+max_subscriptions_per_session = 32
+max_channel_subscribers_online = 20000
 
 [cache]
 l1_max_memory_mb = 256

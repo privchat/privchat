@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use privchat_protocol::error_code::ErrorCode;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -124,17 +124,29 @@ pub struct SendMessageHandler {
 
 // 临时全局 EventBus（MVP 阶段简化方案）
 // TODO: 未来应该通过依赖注入传递
-static mut GLOBAL_EVENT_BUS: Option<Arc<crate::infra::EventBus>> = None;
+static GLOBAL_EVENT_BUS: StdRwLock<Option<Arc<crate::infra::EventBus>>> = StdRwLock::new(None);
 
 pub fn set_global_event_bus(event_bus: Arc<crate::infra::EventBus>) {
-    unsafe {
-        GLOBAL_EVENT_BUS = Some(event_bus);
+    match GLOBAL_EVENT_BUS.write() {
+        Ok(mut guard) => {
+            *guard = Some(event_bus);
+        }
+        Err(poisoned) => {
+            warn!("⚠️ GLOBAL_EVENT_BUS lock poisoned during set; recovering");
+            *poisoned.into_inner() = Some(event_bus);
+        }
     }
 }
 
 /// 获取全局 EventBus（供其他模块使用）
 pub fn get_global_event_bus() -> Option<Arc<crate::infra::EventBus>> {
-    unsafe { GLOBAL_EVENT_BUS.clone() }
+    match GLOBAL_EVENT_BUS.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            warn!("⚠️ GLOBAL_EVENT_BUS lock poisoned during get; recovering");
+            poisoned.into_inner().clone()
+        }
+    }
 }
 
 impl SendMessageHandler {

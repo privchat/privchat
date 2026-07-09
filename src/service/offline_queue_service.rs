@@ -18,39 +18,37 @@
 /// 离线消息队列服务（使用 Redis List）
 ///
 /// 功能：
-/// - 推送离线消息（自动限制 5000 条）
+/// - 推送离线消息（默认自动限制 100 条）
 /// - 批量获取离线消息
 /// - 获取队列长度
 /// - 清空队列
 ///
 /// 数据结构：
 /// - Redis List: offline:{user_id}:messages
-/// - 上限: 5000 条（LTRIM 自动清理最旧的）
-/// - 过期: 7 天
+/// - 上限: 默认 100 条（LTRIM 自动清理最旧的）
+/// - 过期: 默认 24 小时
 use crate::error::ServerError;
+use crate::infra::redis::RedisClient;
 use privchat_protocol::protocol::PushMessageRequest;
-use redis::{AsyncCommands, Client as RedisClient};
+use std::sync::Arc;
 use tracing::info;
 
 /// 离线消息队列服务
 #[derive(Clone)]
 pub struct OfflineQueueService {
-    redis_client: RedisClient,
-    max_queue_size: usize, // 默认 5000
-    expire_seconds: i64,   // 默认 7 天
+    redis_client: Arc<RedisClient>,
+    max_queue_size: usize, // 默认 100
+    expire_seconds: usize, // 默认 24 小时
 }
 
 impl OfflineQueueService {
     /// 创建新的离线队列服务
-    pub fn new(redis_url: &str) -> Result<Self, ServerError> {
-        let redis_client = RedisClient::open(redis_url)
-            .map_err(|e| ServerError::Internal(format!("Redis 连接失败: {}", e)))?;
-
-        Ok(Self {
+    pub fn new(redis_client: Arc<RedisClient>) -> Self {
+        Self {
             redis_client,
             max_queue_size: 100,       // ⭐ 100 条（不是 5000）
             expire_seconds: 24 * 3600, // ⭐ 24 小时（不是 7 天）
-        })
+        }
     }
 
     /// 设置队列大小上限
@@ -61,7 +59,7 @@ impl OfflineQueueService {
 
     /// 设置过期时间（秒）
     pub fn with_expire_seconds(mut self, seconds: i64) -> Self {
-        self.expire_seconds = seconds;
+        self.expire_seconds = seconds.max(0) as usize;
         self
     }
 
@@ -71,25 +69,10 @@ impl OfflineQueueService {
         let value = serde_json::to_string(message)
             .map_err(|e| ServerError::Internal(format!("序列化消息失败: {}", e)))?;
 
-        let mut conn = self
-            .redis_client
-            .get_multiplexed_tokio_connection()
+        self.redis_client
+            .lpush_ltrim_expire(&key, &value, self.max_queue_size, self.expire_seconds)
             .await
-            .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
-
-        let max_index = (self.max_queue_size - 1) as isize;
-
-        // Pipeline: LPUSH + LTRIM + EXPIRE 合并为单次 RTT
-        redis::pipe()
-            .lpush(&key, &value)
-            .ignore()
-            .ltrim(&key, 0, max_index)
-            .ignore()
-            .expire(&key, self.expire_seconds)
-            .ignore()
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| ServerError::Internal(format!("Pipeline 执行失败: {}", e)))?;
+            .map_err(|e| ServerError::Internal(format!("离线队列写入失败: {}", e)))?;
 
         info!(
             "📥 推送离线消息: user={}, 队列上限={}",
@@ -118,25 +101,10 @@ impl OfflineQueueService {
 
         let values = values.map_err(|e| ServerError::Internal(format!("序列化消息失败: {}", e)))?;
 
-        let mut conn = self
-            .redis_client
-            .get_multiplexed_tokio_connection()
+        self.redis_client
+            .lpush_many_ltrim_expire(&key, &values, self.max_queue_size, self.expire_seconds)
             .await
-            .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
-
-        let max_index = (self.max_queue_size - 1) as isize;
-
-        // Pipeline: 所有 LPUSH + LTRIM + EXPIRE 合并为单次 RTT
-        let mut pipe = redis::pipe();
-        for value in &values {
-            pipe.lpush(&key, value).ignore();
-        }
-        pipe.ltrim(&key, 0, max_index).ignore();
-        pipe.expire(&key, self.expire_seconds).ignore();
-
-        pipe.query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| ServerError::Internal(format!("Pipeline 执行失败: {}", e)))?;
+            .map_err(|e| ServerError::Internal(format!("离线队列批量写入失败: {}", e)))?;
 
         info!(
             "📥 批量推送离线消息(pipeline): user={}, count={}, 队列上限={}",
@@ -161,25 +129,12 @@ impl OfflineQueueService {
         let value = serde_json::to_string(message)
             .map_err(|e| ServerError::Internal(format!("序列化消息失败: {}", e)))?;
 
-        let mut conn = self
-            .redis_client
-            .get_multiplexed_tokio_connection()
+        let keys: Vec<String> = user_ids.iter().map(|&user_id| Self::queue_key(user_id)).collect();
+
+        self.redis_client
+            .lpush_to_many_ltrim_expire(&keys, &value, self.max_queue_size, self.expire_seconds)
             .await
-            .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
-
-        let max_index = (self.max_queue_size - 1) as isize;
-
-        let mut pipe = redis::pipe();
-        for &user_id in user_ids {
-            let key = Self::queue_key(user_id);
-            pipe.lpush(key.clone(), value.clone()).ignore();
-            pipe.ltrim(key.clone(), 0, max_index).ignore();
-            pipe.expire(key, self.expire_seconds).ignore();
-        }
-
-        pipe.query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| ServerError::Internal(format!("Pipeline 执行失败: {}", e)))?;
+            .map_err(|e| ServerError::Internal(format!("离线队列多用户写入失败: {}", e)))?;
 
         info!(
             "📥 Pipeline 批量推送离线消息: users={}, 队列上限={}",
@@ -206,13 +161,8 @@ impl OfflineQueueService {
         end: isize,
     ) -> Result<Vec<PushMessageRequest>, ServerError> {
         let key = Self::queue_key(user_id);
-        let mut conn = self
+        let values = self
             .redis_client
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
-
-        let values: Vec<String> = conn
             .lrange(&key, start, end)
             .await
             .map_err(|e| ServerError::Internal(format!("LRANGE 失败: {}", e)))?;
@@ -259,13 +209,8 @@ impl OfflineQueueService {
     /// 获取队列长度
     pub async fn len(&self, user_id: u64) -> Result<usize, ServerError> {
         let key = Self::queue_key(user_id);
-        let mut conn = self
+        let len = self
             .redis_client
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
-
-        let len: usize = conn
             .llen(&key)
             .await
             .map_err(|e| ServerError::Internal(format!("LLEN 失败: {}", e)))?;
@@ -276,13 +221,8 @@ impl OfflineQueueService {
     /// 清空队列（推送完成后）
     pub async fn clear(&self, user_id: u64) -> Result<(), ServerError> {
         let key = Self::queue_key(user_id);
-        let mut conn = self
-            .redis_client
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
-
-        conn.del::<_, ()>(&key)
+        self.redis_client
+            .del(&key)
             .await
             .map_err(|e| ServerError::Internal(format!("DEL 失败: {}", e)))?;
 
@@ -306,14 +246,10 @@ impl OfflineQueueService {
         message_id: u64,
     ) -> Result<bool, ServerError> {
         let key = Self::queue_key(user_id);
-        let mut conn = self
-            .redis_client
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(|e| ServerError::Internal(format!("获取 Redis 连接失败: {}", e)))?;
 
         // 获取所有消息
-        let values: Vec<String> = conn
+        let values = self
+            .redis_client
             .lrange(&key, 0, -1)
             .await
             .map_err(|e| ServerError::Internal(format!("LRANGE 失败: {}", e)))?;
@@ -337,22 +273,15 @@ impl OfflineQueueService {
         }
 
         if found {
-            // Pipeline: DEL + 重建列表 + LTRIM + EXPIRE 合并为单次 RTT
-            let mut pipe = redis::pipe();
-            pipe.del(&key).ignore();
-
-            if !filtered_values.is_empty() {
-                for value in filtered_values.iter().rev() {
-                    pipe.lpush(&key, value).ignore();
-                }
-                let max_index = (self.max_queue_size - 1) as isize;
-                pipe.ltrim(&key, 0, max_index).ignore();
-                pipe.expire(&key, self.expire_seconds).ignore();
-            }
-
-            pipe.query_async::<()>(&mut conn)
+            self.redis_client
+                .replace_list_ltrim_expire(
+                    &key,
+                    &filtered_values,
+                    self.max_queue_size,
+                    self.expire_seconds,
+                )
                 .await
-                .map_err(|e| ServerError::Internal(format!("Pipeline 执行失败: {}", e)))?;
+                .map_err(|e| ServerError::Internal(format!("离线队列重建失败: {}", e)))?;
         }
 
         Ok(found)
@@ -367,6 +296,7 @@ impl OfflineQueueService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RedisConfig;
     use privchat_protocol::message::ContentMessageType;
     use privchat_protocol::protocol::MessageSetting;
 
@@ -396,13 +326,30 @@ mod tests {
         }
     }
 
+    async fn test_service() -> OfflineQueueService {
+        let redis_config = RedisConfig {
+            url: "redis://127.0.0.1:6379".to_string(),
+            pool_size: 10,
+            min_idle: 1,
+            connection_timeout_secs: 5,
+            command_timeout_ms: 5000,
+            idle_timeout_secs: 300,
+        };
+        let redis_client = Arc::new(
+            RedisClient::new(&redis_config)
+                .await
+                .expect("连接 Redis 失败"),
+        );
+        OfflineQueueService::new(redis_client)
+    }
+
     // 注意：这些测试需要 Redis 运行在 localhost:6379
     // 如果没有 Redis，测试会失败
 
     #[tokio::test]
     #[ignore] // 需要 Redis，默认忽略
     async fn test_push_and_get() {
-        let service = OfflineQueueService::new("redis://127.0.0.1:6379").expect("连接 Redis 失败");
+        let service = test_service().await;
 
         let user_id = 900001_u64;
 
@@ -428,9 +375,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_max_queue_size() {
-        let service = OfflineQueueService::new("redis://127.0.0.1:6379")
-            .expect("连接 Redis 失败")
-            .with_max_size(10); // 设置上限为 10
+        let service = test_service().await.with_max_size(10); // 设置上限为 10
 
         let user_id = 900002_u64;
         service.clear(user_id).await.expect("清空失败");

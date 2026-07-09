@@ -21,6 +21,7 @@
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
 use redis::AsyncCommands;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -196,7 +197,152 @@ impl RedisClient {
         .await
     }
 
-    /// KEYS pattern - 查找匹配的 key（用于查找用户的所有设备 presence）
+    // ============================================================
+    // Hash 操作
+    // ============================================================
+
+    /// HINCRBY key field delta
+    pub async fn hincrby(
+        &self,
+        key: &str,
+        field: &str,
+        delta: i64,
+    ) -> Result<i64, crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let result: i64 = redis::cmd("HINCRBY")
+                .arg(key)
+                .arg(field)
+                .arg(delta)
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!("Redis HINCRBY failed: {}", e))
+                })?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// 批量 HINCRBY，并可选刷新 key TTL。
+    pub async fn hincrby_many_expire(
+        &self,
+        key: &str,
+        increments: &[(String, i64)],
+        expire_seconds: usize,
+    ) -> Result<(), crate::error::ServerError> {
+        if increments.is_empty() {
+            return Ok(());
+        }
+
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let mut pipe = redis::pipe();
+            for (field, delta) in increments {
+                pipe.cmd("HINCRBY").arg(key).arg(field).arg(*delta).ignore();
+            }
+            if expire_seconds > 0 {
+                pipe.cmd("EXPIRE").arg(key).arg(expire_seconds).ignore();
+            }
+            pipe.query_async::<()>(&mut *conn).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!("Redis HINCRBY pipeline failed: {}", e))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// HGET key field
+    pub async fn hget_i64(
+        &self,
+        key: &str,
+        field: &str,
+    ) -> Result<Option<i64>, crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let result: Option<i64> = redis::cmd("HGET")
+                .arg(key)
+                .arg(field)
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!("Redis HGET failed: {}", e))
+                })?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// HGETALL key
+    pub async fn hgetall_i64(
+        &self,
+        key: &str,
+    ) -> Result<HashMap<String, i64>, crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let result: HashMap<String, i64> = redis::cmd("HGETALL")
+                .arg(key)
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!("Redis HGETALL failed: {}", e))
+                })?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// HSET key field value
+    pub async fn hset_i64(
+        &self,
+        key: &str,
+        field: &str,
+        value: i64,
+    ) -> Result<(), crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            redis::cmd("HSET")
+                .arg(key)
+                .arg(field)
+                .arg(value)
+                .query_async::<usize>(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!("Redis HSET failed: {}", e))
+                })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// HDEL key field [field ...]
+    pub async fn hdel_fields(
+        &self,
+        key: &str,
+        fields: &[String],
+    ) -> Result<(), crate::error::ServerError> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let mut cmd = redis::cmd("HDEL");
+            cmd.arg(key);
+            for field in fields {
+                cmd.arg(field);
+            }
+            cmd.query_async::<usize>(&mut *conn).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!("Redis HDEL failed: {}", e))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// KEYS pattern - 查找匹配的 key。
+    ///
+    /// 注意：不要在业务热路径使用；在线态判断应走 ConnectionManager 或 O(1) presence 索引。
     pub async fn keys(&self, pattern: &str) -> Result<Vec<String>, crate::error::ServerError> {
         self.with_timeout(async {
             let mut conn = self.get_conn().await?;
@@ -349,6 +495,146 @@ impl RedisClient {
         .await
     }
 
+    /// LPUSH + LTRIM + EXPIRE pipeline，用于固定长度 recent buffer。
+    pub async fn lpush_ltrim_expire(
+        &self,
+        key: &str,
+        value: &str,
+        limit: usize,
+        ttl_seconds: usize,
+    ) -> Result<(), crate::error::ServerError> {
+        if limit == 0 {
+            return Ok(());
+        }
+
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let stop = limit.saturating_sub(1) as isize;
+            let mut pipe = redis::pipe();
+            pipe.lpush(key, value).ignore();
+            pipe.ltrim(key, 0, stop).ignore();
+            if ttl_seconds > 0 {
+                pipe.expire(key, ttl_seconds as i64).ignore();
+            }
+
+            pipe.query_async::<()>(&mut *conn).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!(
+                    "Redis recent buffer pipeline failed: {}",
+                    e
+                ))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 多条 LPUSH + LTRIM + EXPIRE pipeline，用于单用户离线队列批量写入。
+    pub async fn lpush_many_ltrim_expire(
+        &self,
+        key: &str,
+        values: &[String],
+        limit: usize,
+        ttl_seconds: usize,
+    ) -> Result<(), crate::error::ServerError> {
+        if values.is_empty() || limit == 0 {
+            return Ok(());
+        }
+
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let stop = limit.saturating_sub(1) as isize;
+            let mut pipe = redis::pipe();
+            for value in values {
+                pipe.lpush(key, value).ignore();
+            }
+            pipe.ltrim(key, 0, stop).ignore();
+            if ttl_seconds > 0 {
+                pipe.expire(key, ttl_seconds as i64).ignore();
+            }
+
+            pipe.query_async::<()>(&mut *conn).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!(
+                    "Redis list batch pipeline failed: {}",
+                    e
+                ))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 对多个 key 写入同一条消息，并为每个 key 执行 LTRIM + EXPIRE。
+    pub async fn lpush_to_many_ltrim_expire(
+        &self,
+        keys: &[String],
+        value: &str,
+        limit: usize,
+        ttl_seconds: usize,
+    ) -> Result<(), crate::error::ServerError> {
+        if keys.is_empty() || limit == 0 {
+            return Ok(());
+        }
+
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let stop = limit.saturating_sub(1) as isize;
+            let mut pipe = redis::pipe();
+            for key in keys {
+                pipe.lpush(key, value).ignore();
+                pipe.ltrim(key, 0, stop).ignore();
+                if ttl_seconds > 0 {
+                    pipe.expire(key, ttl_seconds as i64).ignore();
+                }
+            }
+
+            pipe.query_async::<()>(&mut *conn).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!(
+                    "Redis multi-key list pipeline failed: {}",
+                    e
+                ))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 用给定列表替换 key，并重新应用 LTRIM + EXPIRE。
+    ///
+    /// values 约定为 Redis LRANGE 的顺序（最新 -> 最旧）。
+    pub async fn replace_list_ltrim_expire(
+        &self,
+        key: &str,
+        values: &[String],
+        limit: usize,
+        ttl_seconds: usize,
+    ) -> Result<(), crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let mut pipe = redis::pipe();
+            pipe.del(key).ignore();
+
+            if !values.is_empty() && limit > 0 {
+                for value in values.iter().rev() {
+                    pipe.lpush(key, value).ignore();
+                }
+                pipe.ltrim(key, 0, limit.saturating_sub(1) as isize)
+                    .ignore();
+                if ttl_seconds > 0 {
+                    pipe.expire(key, ttl_seconds as i64).ignore();
+                }
+            }
+
+            pipe.query_async::<()>(&mut *conn).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!(
+                    "Redis list replace pipeline failed: {}",
+                    e
+                ))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
     /// LRANGE key start stop
     pub async fn lrange(
         &self,
@@ -360,6 +646,18 @@ impl RedisClient {
             let mut conn = self.get_conn().await?;
             let result: Vec<String> = conn.lrange(key, start, stop).await.map_err(|e| {
                 crate::error::ServerError::Internal(format!("Redis LRANGE failed: {}", e))
+            })?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// LLEN key
+    pub async fn llen(&self, key: &str) -> Result<usize, crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let result: usize = conn.llen(key).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!("Redis LLEN failed: {}", e))
             })?;
             Ok(result)
         })

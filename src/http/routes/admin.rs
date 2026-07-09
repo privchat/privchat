@@ -49,11 +49,14 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};
+
+const ROOM_BROADCAST_MAX_CONCURRENCY: usize = 128;
 
 /// 创建管理 API 路由（返回相对路径 router，由 caller 决定前缀挂载点）
 pub fn create_route() -> Router<AdminServerState> {
@@ -938,7 +941,7 @@ async fn room_broadcast(
         topic: None,
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
         payload: message_content.into_bytes(),
         publisher,
@@ -976,39 +979,41 @@ async fn room_broadcast(
         return Err(ServerError::Internal("TransportServer 未就绪".to_string()));
     };
 
+    let server = server.clone();
+    drop(transport);
+
     let payload_bytes = privchat_protocol::encode_message(&publish_request)
         .map_err(|e| ServerError::Protocol(format!("编码消息失败: {}", e)))?;
 
-    // 并行广播：使用 tokio::spawn 并发发送，不逐个 await（非阻塞 fanout）
+    // 有界并发广播：避免在线人数过多时为每个 session spawn 一个 task。
     let payload_bytes = std::sync::Arc::new(payload_bytes);
-    let mut handles = Vec::with_capacity(sessions.len());
-
-    for sid in sessions {
-        let server_clone = server.clone();
-        let bytes = payload_bytes.clone();
-        handles.push(tokio::spawn(async move {
-            let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), (*bytes).clone());
-            packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
-            match server_clone.send_to_session(sid.clone(), packet).await {
-                Ok(()) => {
-                    debug!("📡 Room publish -> session {} 成功", sid);
-                    true
-                }
-                Err(e) => {
-                    warn!("📡 Room publish -> session {} 失败: {}", sid, e);
-                    false
+    let delivered = stream::iter(sessions)
+        .map(|sid| {
+            let server = server.clone();
+            let bytes = payload_bytes.clone();
+            async move {
+                let mut packet = msgtrans::packet::Packet::one_way(
+                    crate::infra::next_packet_id(),
+                    (*bytes).clone(),
+                );
+                packet.set_biz_type(
+                    privchat_protocol::protocol::MessageType::PublishRequest as u8,
+                );
+                match server.send_to_session(sid.clone(), packet).await {
+                    Ok(()) => {
+                        debug!("📡 Room publish -> session {} 成功", sid);
+                        true
+                    }
+                    Err(e) => {
+                        warn!("📡 Room publish -> session {} 失败: {}", sid, e);
+                        false
+                    }
                 }
             }
-        }));
-    }
-
-    // 等待所有发送完成
-    let mut delivered = 0usize;
-    for handle in handles {
-        if let Ok(true) = handle.await {
-            delivered += 1;
-        }
-    }
+        })
+        .buffer_unordered(ROOM_BROADCAST_MAX_CONCURRENCY)
+        .fold(0usize, |acc, ok| async move { acc + usize::from(ok) })
+        .await;
 
     info!(
         "📡 Admin: Room 广播 channel_id={}, 在线={}, 投递={}",
@@ -2921,4 +2926,3 @@ async fn push_qr_authorized(
         delivered: matches!(outcome, crate::service::PushOutcome::Delivered),
     }))
 }
-

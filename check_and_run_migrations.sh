@@ -3,9 +3,14 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 从 .env 文件读取数据库连接字符串
-if [ -f .env ]; then
-    export $(cat .env | grep -v '^#' | xargs)
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
 fi
 
 # 默认数据库连接字符串
@@ -20,17 +25,6 @@ if [ "$TABLE_EXISTS" = "t" ]; then
     echo "✅ 数据库表已存在，跳过迁移"
 else
     echo "📝 数据库表不存在，开始运行迁移..."
-    
-    # 运行迁移文件
-    for migration in migrations/002_create_privchat_tables.sql; do
-        if [ -f "$migration" ]; then
-            echo "📝 执行迁移: $migration"
-            psql "$DATABASE_URL" -f "$migration" || {
-                echo "❌ 迁移失败: $migration"
-                exit 1
-            }
-        fi
-    done
-    
+    "$SCRIPT_DIR/run_migrations.sh"
     echo "✅ 数据库迁移完成！"
 fi
