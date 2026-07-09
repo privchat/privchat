@@ -3581,6 +3581,18 @@ impl ChannelService {
 
     /// 设置频道全员禁言
     pub async fn set_channel_all_muted(&self, channel_id: &u64, muted: bool) -> Result<()> {
+        // 存在性校验（内存 miss 时顺带触发 hydration）
+        if self.get_channel_opt(*channel_id).await.is_none() {
+            return Err(ServerError::NotFound(format!(
+                "Channel not found: {}",
+                channel_id
+            )));
+        }
+        // P1-16：先落库（真源）。send 校验与重启恢复都读 privchat_groups.all_muted，
+        // 此前只写内存导致 mute-all 跨重启失效。channel_id == group_id（005 id 统一）。
+        self.update_group_policy(*channel_id, None, None, None, None, Some(muted))
+            .await?;
+        // 再刷内存缓存
         let mut channels = self.channels.write().await;
         if let Some(channel) = channels.get_mut(channel_id) {
             if channel.settings.is_none() {
@@ -3590,13 +3602,8 @@ impl ChannelService {
                 settings.is_muted = muted;
             }
             channel.updated_at = chrono::Utc::now();
-            Ok(())
-        } else {
-            Err(ServerError::NotFound(format!(
-                "Channel not found: {}",
-                channel_id
-            )))
         }
+        Ok(())
     }
 
     /// 设置频道加群审批
