@@ -2032,8 +2032,9 @@ impl ChannelService {
                         }
                     }
                     // 成员禁言（privchat_group_members.mute_until，set_member_muted 的落库真源）。
-                    // 注：muted=true 且无期限时存 NULL，与「未禁言」同形——永久禁言跨重启
-                    // 无法区分，记任务板 P1-16 遗留（需要独立 is_muted 列）。
+                    // 语义：NULL = 未禁言；「永久禁言」由 RPC 层编码为 now+100 年时间戳
+                    // （见 group/member/mute.rs 与 mute_reject_message 的 PERMANENT_THRESHOLD），
+                    // 故 mute_until 非 NULL 即禁言，无 NULL 二义。
                     match sqlx::query_as::<_, (i64, Option<i64>)>(
                         "SELECT user_id, mute_until FROM privchat_group_members \
                          WHERE group_id = $1 AND left_at IS NULL AND mute_until IS NOT NULL",
@@ -3502,6 +3503,16 @@ impl ChannelService {
         muted: bool,
         mute_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<()> {
+        // 存储约定：mute_until NULL = 未禁言；「永久」必须编码为远期时间戳
+        // （RPC 层用 now+100 年）。muted=true + None 会被存成 NULL、跨重启即失效——
+        // 拦下未来新调用方误用。
+        if muted && mute_until.is_none() {
+            warn!(
+                "set_member_muted(muted=true, mute_until=None) 会退化为未禁言，\
+                 永久禁言请传远期时间戳: channel={} user={}",
+                channel_id, user_id
+            );
+        }
         let mute_until_ms = if muted {
             mute_until.map(|ts| ts.timestamp_millis())
         } else {

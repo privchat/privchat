@@ -2444,14 +2444,38 @@ impl ChatServer {
             self.config.http_file_server_port,
         );
 
+        // P1-11：bind 在启动路径 fail-fast（端口占用/权限问题阻断启动，不再带着
+        // 残废的上传/下载面板“正常”运行）；serve 意外退出由 supervisor 退避重启自愈。
+        let file_listener = file_server.bind().await.map_err(|e| {
+            crate::error::ServerError::Internal(format!(
+                "HTTP 文件服务器 bind 失败（端口 {}）: {}",
+                self.config.http_file_server_port, e
+            ))
+        })?;
         tokio::spawn(async move {
-            if let Err(e) = file_server.start().await {
-                error!("❌ HTTP 文件服务器启动失败: {}", e);
+            let mut listener = Some(file_listener);
+            loop {
+                let l = match listener.take() {
+                    Some(l) => l,
+                    None => match file_server.bind().await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            error!("❌ HTTP 文件服务器重新 bind 失败: {}，5s 后重试", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    },
+                };
+                match file_server.serve(l).await {
+                    Ok(()) => warn!("⚠️ HTTP 文件服务器 serve 返回（异常），5s 后重启"),
+                    Err(e) => error!("❌ HTTP 文件服务器意外退出: {}，5s 后重启", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         });
 
         info!(
-            "✅ HTTP 文件服务器已在后台启动（端口 {}）",
+            "✅ HTTP 文件服务器已启动（端口 {}，bind fail-fast + supervisor）",
             self.config.http_file_server_port
         );
 
@@ -2481,14 +2505,37 @@ impl ChatServer {
             self.config.admin_api_port,
         );
 
+        // P1-11：同上——bind fail-fast + supervisor 自愈。
+        let admin_listener = admin_server.bind().await.map_err(|e| {
+            crate::error::ServerError::Internal(format!(
+                "管理 API 服务器 bind 失败（端口 {}）: {}",
+                self.config.admin_api_port, e
+            ))
+        })?;
         tokio::spawn(async move {
-            if let Err(e) = admin_server.start().await {
-                error!("❌ 管理 API 服务器启动失败: {}", e);
+            let mut listener = Some(admin_listener);
+            loop {
+                let l = match listener.take() {
+                    Some(l) => l,
+                    None => match admin_server.bind().await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            error!("❌ 管理 API 服务器重新 bind 失败: {}，5s 后重试", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    },
+                };
+                match admin_server.serve(l).await {
+                    Ok(()) => warn!("⚠️ 管理 API 服务器 serve 返回（异常），5s 后重启"),
+                    Err(e) => error!("❌ 管理 API 服务器意外退出: {}，5s 后重启", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         });
 
         info!(
-            "✅ 管理 API 服务器已在后台启动（端口 {}）",
+            "✅ 管理 API 服务器已启动（端口 {}，bind fail-fast + supervisor）",
             self.config.admin_api_port
         );
 
