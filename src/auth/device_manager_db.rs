@@ -87,8 +87,20 @@ impl DeviceManagerDb {
             }
         };
 
-        // 转换会话状态
-        let session_state: SessionState = unsafe { std::mem::transmute(device.session_state) };
+        // 转换会话状态：DB 中的非法 smallint 必须显式拒绝，不能 transmute 成 enum。
+        let session_state = match SessionState::try_from(device.session_state) {
+            Ok(state) => state,
+            Err(raw_state) => {
+                warn!(
+                    "设备会话状态非法: user={}, device={}, raw_state={}",
+                    user_id, device_id, raw_state
+                );
+                return Ok(SessionVerifyResult::SessionInactive {
+                    state: SessionState::Revoked,
+                    message: "设备会话状态异常，请重新登录".to_string(),
+                });
+            }
+        };
 
         // 检查会话状态
         if !session_state.is_usable() {

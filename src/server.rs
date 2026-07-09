@@ -27,6 +27,7 @@ use msgtrans::{
 };
 
 use privchat_protocol::protocol::MessageType;
+use serde_json::Value;
 
 use crate::auth::TokenAuth;
 use crate::config::ServerConfig;
@@ -39,7 +40,7 @@ use crate::handler::{
 use crate::infra::{database::Database, CacheManager, OnlineStatusManager, OnlineStatusStats};
 use crate::repository::{PgChannelRepository, PgMessageRepository, UserRepository};
 // ChannelService 现在从 channel_service 导出
-use crate::context::RequestContext;
+use crate::context::{ErrorResponseBuilder, RequestContext};
 use crate::service::message_history_service::MessageHistoryService;
 
 /// 聊天服务器统计信息
@@ -61,6 +62,109 @@ impl ServerStats {
             messages_received: 0,
             uptime_seconds: 0,
         }
+    }
+}
+
+const MAX_INBOUND_LOG_PAYLOAD_CHARS: usize = 512;
+
+fn sanitize_inbound_payload_for_log(payload: &str) -> String {
+    let sanitized = match serde_json::from_str::<Value>(payload) {
+        Ok(mut value) => {
+            redact_sensitive_log_fields(&mut value);
+            value.to_string()
+        }
+        Err(_) if looks_like_jwt(payload) => "<redacted jwt-like payload>".to_string(),
+        Err(_) => payload.to_string(),
+    };
+
+    truncate_for_log(sanitized, MAX_INBOUND_LOG_PAYLOAD_CHARS)
+}
+
+fn redact_sensitive_log_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_sensitive_log_key(key) {
+                    *child = Value::String("***".to_string());
+                } else {
+                    redact_sensitive_log_fields(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_log_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_log_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "param"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "qr_token"
+            | "confirm_token"
+            | "upload_token"
+            | "authorization"
+            | "password"
+            | "secret"
+            | "signature"
+            | "cek"
+            | "thumbnail_cek"
+    ) || key.ends_with("_token")
+        || key.contains("jwt")
+        || key.contains("secret")
+        || key.contains("password")
+}
+
+fn looks_like_jwt(payload: &str) -> bool {
+    let trimmed = payload.trim();
+    trimmed.matches('.').count() == 2 && trimmed.starts_with("eyJ")
+}
+
+fn truncate_for_log(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+
+    let cutoff = value
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len());
+    let total_chars = value.chars().count();
+    format!("{}...<truncated {} chars>", &value[..cutoff], total_chars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbound_log_payload_redacts_subscribe_param() {
+        let safe = sanitize_inbound_payload_for_log(
+            r#"{"channel_id":551023129149968384,"param":"eyJsecret.ticket","nested":{"access_token":"secret"}}"#,
+        );
+
+        assert!(safe.contains("\"param\":\"***\""));
+        assert!(safe.contains("\"access_token\":\"***\""));
+        assert!(!safe.contains("eyJsecret.ticket"));
+        assert!(!safe.contains("\"secret\""));
+    }
+
+    #[test]
+    fn inbound_log_payload_truncates_large_payload() {
+        let payload = "x".repeat(MAX_INBOUND_LOG_PAYLOAD_CHARS + 10);
+        let safe = sanitize_inbound_payload_for_log(&payload);
+
+        assert!(safe.contains("...<truncated"));
+        assert!(safe.len() < payload.len() + 20);
     }
 }
 
@@ -150,7 +254,7 @@ impl ChatServer {
 
         // 🔌 初始化数据库连接（必须在其他组件之前）
         info!("🔌 初始化数据库连接...");
-        let database = Database::new(&config.database_url)
+        let database = Database::new_with_config(&config.database_url, &config.database)
             .await
             .map_err(|e| ServerError::Internal(format!("数据库连接失败: {}", e)))?;
         let database = Arc::new(database);
@@ -274,8 +378,15 @@ impl ChatServer {
         info!("✅ 连接管理器初始化完成");
 
         // 3.4 创建 Room 管理器（用于发布订阅频道管理）
-        let subscribe_manager = Arc::new(crate::infra::SubscribeManager::new());
-        info!("✅ Room 管理器初始化完成");
+        let subscribe_manager = Arc::new(crate::infra::SubscribeManager::new_with_limits(
+            config.room.max_subscriptions_per_session,
+            config.room.max_channel_subscribers_online,
+        ));
+        info!(
+            "✅ Room 管理器初始化完成 (max_subscriptions_per_session={}, max_channel_subscribers_online={})",
+            config.room.max_subscriptions_per_session,
+            config.room.max_channel_subscribers_online
+        );
 
         // 4. 创建 Token 撤销服务
         let token_revocation_service = Arc::new(crate::auth::TokenRevocationService::new(
@@ -326,6 +437,30 @@ impl ChatServer {
         ));
         info!("✅ MessageRouter 创建完成");
 
+        // 创建统一 RedisClient（共享连接池 + command timeout）
+        let redis_config = config.cache.redis.clone().unwrap_or_else(|| {
+            let url = if !config.redis_url.trim().is_empty() {
+                config.redis_url.clone()
+            } else {
+                std::env::var("REDIS_URL")
+                    .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+            };
+            crate::config::RedisConfig {
+                url,
+                pool_size: 50,
+                min_idle: 10,
+                connection_timeout_secs: 5,
+                command_timeout_ms: 5000,
+                idle_timeout_secs: 300,
+            }
+        });
+        let redis_client = Arc::new(
+            crate::infra::redis::RedisClient::new(&redis_config)
+                .await
+                .map_err(|e| ServerError::Internal(format!("Redis 客户端初始化失败: {}", e)))?,
+        );
+        info!("✅ RedisClient 创建完成");
+
         // 🔧 初始化 pts 同步系统（需要在 OfflineMessageWorker 之前创建）
         info!("🔧 初始化 pts 同步系统...");
 
@@ -337,10 +472,11 @@ impl ChatServer {
         let user_message_index = Arc::new(crate::model::pts::UserMessageIndex::new());
         info!("✅ UserMessageIndex 创建完成");
 
-        // 2. 创建 OfflineQueueService（使用 Redis）
-        let offline_queue_service =
-            Arc::new(crate::service::OfflineQueueService::new(&config.redis_url)?);
-        info!("✅ OfflineQueueService 创建完成");
+        // 2. 创建 OfflineQueueService（复用统一 Redis 连接池）
+        let offline_queue_service = Arc::new(crate::service::OfflineQueueService::new(
+            redis_client.clone(),
+        ));
+        info!("✅ OfflineQueueService 创建完成（共享 Redis 连接池）");
 
         // 2.5 创建 DeliveryTracker（送达水位追踪）
         let delivery_tracker =
@@ -374,9 +510,11 @@ impl ChatServer {
 
         // 3. 创建 UnreadCountService（使用新的 cache::CacheManager）⭐
         let cache_for_unread = Arc::new(crate::infra::cache::CacheManager::new());
-        let unread_count_service =
-            Arc::new(crate::service::UnreadCountService::new(cache_for_unread));
-        info!("✅ UnreadCountService 创建完成");
+        let unread_count_service = Arc::new(crate::service::UnreadCountService::new_with_redis(
+            cache_for_unread,
+            redis_client.clone(),
+        ));
+        info!("✅ UnreadCountService 创建完成（Redis HINCRBY 原子计数）");
         info!("✅ pts 同步系统初始化完成");
 
         // 🎯 创建消息分发器，并注册处理器
@@ -645,35 +783,15 @@ impl ChatServer {
 
         // 初始化 SyncService（pts 同步机制）
         info!("🔧 初始化 SyncService...");
-        let redis_config = config.cache.redis.clone().unwrap_or_else(|| {
-            let url =
-                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-            crate::config::RedisConfig {
-                url,
-                pool_size: 50,
-                min_idle: 10,
-                connection_timeout_secs: 5,
-                command_timeout_ms: 5000,
-                idle_timeout_secs: 300,
-            }
-        });
-
-        // 创建 RedisClient
-        let redis_client = Arc::new(
-            crate::infra::redis::RedisClient::new(&redis_config)
-                .await
-                .map_err(|e| ServerError::Internal(format!("Redis 客户端初始化失败: {}", e)))?,
-        );
-        info!("✅ RedisClient 创建完成");
-
         let room_history_service = Arc::new(crate::service::RoomHistoryService::new(
             redis_client.clone(),
             config.room.clone(),
         ));
         info!(
-            "✅ RoomHistoryService 创建完成 (subscribe_history={}, subscribe_history_limit={})",
+            "✅ RoomHistoryService 创建完成 (subscribe_history={}, subscribe_history_limit={}, history_ttl_seconds={})",
             config.room.subscribe_history,
-            config.room.subscribe_history_limit
+            config.room.subscribe_history_limit,
+            config.room.history_ttl_seconds
         );
 
         message_dispatcher.register_handler(
@@ -720,10 +838,11 @@ impl ChatServer {
         // 4. 创建共享的 Intent 状态管理器（Phase 3）
         let intent_state = Arc::new(crate::push::IntentStateManager::new());
 
-        // 5. 创建 Push Planner（带 Redis 和状态管理器）
-        let push_planner = Arc::new(crate::push::PushPlanner::with_state_manager(
+        // 5. 创建 Push Planner（在线态走 ConnectionManager 真源，不走 Redis KEYS）
+        let push_planner = Arc::new(crate::push::PushPlanner::with_state_manager_and_connection_manager(
             Some(redis_client.clone()),
             Arc::clone(&intent_state),
+            connection_manager.clone(),
         ));
         let planner_event_bus = Arc::clone(&event_bus);
         let planner_tx = push_tx.clone();
@@ -732,7 +851,7 @@ impl ChatServer {
                 error!("❌ PushPlanner 启动失败: {}", e);
             }
         });
-        info!("✅ PushPlanner 后台任务已启动（带 Redis 在线检查 + 撤销/取消支持）");
+        info!("✅ PushPlanner 后台任务已启动（ConnectionManager 在线检查 + 撤销/取消支持）");
 
         // 6. 根据配置初始化 Push Provider
         let fcm_provider = if config.push.enabled && config.push.fcm.enabled {
@@ -1554,7 +1673,6 @@ impl ChatServer {
         info!("🎯 启动事件处理器...");
 
         let mut events = transport.subscribe_events();
-        let _transport_clone = transport.clone();
         let stats = self.stats.clone();
         let message_dispatcher = self.message_dispatcher.clone();
         let security_middleware = self.security_middleware.clone();
@@ -1569,17 +1687,32 @@ impl ChatServer {
         tokio::spawn(async move {
             info!("📡 事件处理器开始监听...");
 
-            while let Ok(event) = events.recv().await {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            "📡 事件处理器消费落后，跳过 {} 个 transport event；继续监听",
+                            skipped
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        warn!("📡 transport event channel 已关闭，事件处理器退出");
+                        break;
+                    }
+                };
+
                 match event {
                     ServerEvent::ConnectionEstablished { session_id, info } => {
                         info!("🔗 新连接建立: {} ({})", session_id, info.peer_addr);
+                        connection_manager.register_connecting(session_id);
 
                         // 🔐 安全检查：IP 连接层防护
                         let peer_ip = info.peer_addr.ip().to_string();
                         if let Err(e) = security_middleware.check_connection(&peer_ip).await {
                             warn!("🚫 连接被安全系统拒绝: {} - {:?}", peer_ip, e);
-                            // 注意：这里只记录，不主动断开（由传输层处理）
-                            // 如果需要主动断开，可以调用 transport.disconnect(session_id)
+                            connection_manager.force_close_session(session_id).await;
                             continue;
                         }
 
@@ -1645,7 +1778,7 @@ impl ChatServer {
                     } => {
                         // [FIX] Extract data before moving context into the async task
                         let msg_data = context.data.clone();
-                        let msg_text = context.as_text_lossy();
+                        let msg_text = sanitize_inbound_payload_for_log(&context.as_text_lossy());
                         let biz_type = context.biz_type;
                         let user_id = auth_session_manager.get_user_id(&session_id).await;
                         let msg_type = MessageType::from(biz_type);
@@ -1733,12 +1866,16 @@ impl ChatServer {
                                 });
                             }
                             Err(_) => {
-                                // 限流触发：handler 并发已满
-                                // Best-Effort: 丢弃 + 计数（Ping/Subscribe 等）
-                                // Must-Deliver (SendMessage): 客户端未收到 ACK 会重发
-                                // 不需要服务端慢路径 — 重发由客户端驱动
+                                // 限流触发：handler 并发已满。必须给客户端显式错误，
+                                // 否则调用方只能等超时，直播/弱网场景会放大重试风暴。
+                                let overload_response = ErrorResponseBuilder::build(
+                                    session_id.clone(),
+                                    "SERVER_BUSY",
+                                    "server handler is overloaded, please retry later",
+                                );
+                                context.respond(overload_response);
                                 warn!(
-                                    "🚫 Handler 限流触发，拒绝消息: session={}, biz_type={}",
+                                    "🚫 Handler 限流触发，已返回 SERVER_BUSY: session={}, biz_type={}",
                                     session_id, biz_type
                                 );
                             }

@@ -2,6 +2,15 @@
 # 此文件由 privchat-server --generate-config 生成
 # 网关：[gateway] 与 gateway.listeners；文件：[file] 含 server_port / server_api_base_url
 
+[database]
+# url = "postgres://user:password@localhost:5432/privchat"
+max_connections = 20
+min_connections = 5
+acquire_timeout_seconds = 10
+idle_timeout_seconds = 600
+max_lifetime_seconds = 1800
+statement_timeout_ms = 5000
+
 [gateway]
 max_connections = 2000
 connection_timeout = 300
@@ -73,6 +82,9 @@ default_audience = ["privchat-application", "privchat-server"]
 [room]
 subscribe_history = true
 subscribe_history_limit = 30
+history_ttl_seconds = 86400
+max_subscriptions_per_session = 32
+max_channel_subscribers_online = 20000
 
 [file]
 default_storage_source_id = 0

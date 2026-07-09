@@ -32,6 +32,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// 数据库连接字符串
     pub database_url: String,
+    /// 数据库连接池与查询超时配置
+    pub database: DatabaseConfig,
     /// 最大连接数
     pub max_connections: u32,
     /// 连接超时时间（秒）
@@ -309,6 +311,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 9001,
             database_url: String::new(),
+            database: DatabaseConfig::default(),
             max_connections: 1000,
             connection_timeout: 300,
             heartbeat_interval: 60,
@@ -431,6 +434,28 @@ impl ServerConfig {
         }
         if let Ok(db_url) = env::var("DATABASE_URL") {
             self.database_url = db_url;
+        }
+        if let Ok(value) = env::var("PRIVCHAT_DB_MAX_CONNECTIONS") {
+            self.database.max_connections = value.parse().unwrap_or(self.database.max_connections);
+        }
+        if let Ok(value) = env::var("PRIVCHAT_DB_MIN_CONNECTIONS") {
+            self.database.min_connections = value.parse().unwrap_or(self.database.min_connections);
+        }
+        if let Ok(value) = env::var("PRIVCHAT_DB_ACQUIRE_TIMEOUT_SECONDS") {
+            self.database.acquire_timeout_seconds =
+                value.parse().unwrap_or(self.database.acquire_timeout_seconds);
+        }
+        if let Ok(value) = env::var("PRIVCHAT_DB_IDLE_TIMEOUT_SECONDS") {
+            self.database.idle_timeout_seconds =
+                value.parse().unwrap_or(self.database.idle_timeout_seconds);
+        }
+        if let Ok(value) = env::var("PRIVCHAT_DB_MAX_LIFETIME_SECONDS") {
+            self.database.max_lifetime_seconds =
+                value.parse().unwrap_or(self.database.max_lifetime_seconds);
+        }
+        if let Ok(value) = env::var("PRIVCHAT_DB_STATEMENT_TIMEOUT_MS") {
+            self.database.statement_timeout_ms =
+                value.parse().unwrap_or(self.database.statement_timeout_ms);
         }
         if let Ok(max_conn) = env::var("PRIVCHAT_MAX_CONNECTIONS") {
             self.max_connections = max_conn.parse().unwrap_or(self.max_connections);
@@ -843,6 +868,20 @@ impl ServerConfig {
             );
         }
 
+        if self.database.max_connections == 0 {
+            anyhow::bail!("[database] max_connections 必须大于 0");
+        }
+        if self.database.min_connections > self.database.max_connections {
+            anyhow::bail!(
+                "[database] min_connections ({}) 不能大于 max_connections ({})",
+                self.database.min_connections,
+                self.database.max_connections
+            );
+        }
+        if self.database.acquire_timeout_seconds == 0 {
+            anyhow::bail!("[database] acquire_timeout_seconds 必须大于 0");
+        }
+
         // [auth.jwt] fail-fast 校验（算法 + 对应密钥）
         self.jwt
             .validate()
@@ -856,6 +895,7 @@ impl ServerConfig {
 #[derive(Debug, Deserialize)]
 struct TomlConfig {
     gateway: Option<TomlGatewayConfig>,
+    database: Option<TomlDatabaseConfig>,
     cache: Option<TomlCacheConfig>,
     room: Option<TomlRoomConfig>,
     file: Option<TomlFileConfig>,
@@ -1129,6 +1169,20 @@ struct TomlGatewayConfig {
     handler_max_inflight: Option<usize>,
 }
 
+/// TOML `[database]` 段。
+#[derive(Debug, Deserialize)]
+struct TomlDatabaseConfig {
+    /// 数据库连接字符串；也可继续通过 DATABASE_URL 环境变量覆盖。
+    url: Option<String>,
+    max_connections: Option<u32>,
+    min_connections: Option<u32>,
+    acquire_timeout_seconds: Option<u64>,
+    idle_timeout_seconds: Option<u64>,
+    max_lifetime_seconds: Option<u64>,
+    /// PostgreSQL statement_timeout，0 表示禁用。
+    statement_timeout_ms: Option<u64>,
+}
+
 /// TOML `[account]` 段。
 #[derive(Debug, Deserialize)]
 struct TomlAccountConfig {
@@ -1164,6 +1218,9 @@ struct TomlOnlineStatusConfig {
 struct TomlRoomConfig {
     subscribe_history: Option<bool>,
     subscribe_history_limit: Option<usize>,
+    history_ttl_seconds: Option<usize>,
+    max_subscriptions_per_session: Option<usize>,
+    max_channel_subscribers_online: Option<usize>,
 }
 
 /// 单个存储源（storage_source_id）配置：无 region 字段，按 default_storage_source_id 选择
@@ -1360,12 +1417,45 @@ impl From<TomlConfig> for ServerConfig {
             }
         }
 
+        if let Some(database) = toml.database {
+            if let Some(url) = database.url {
+                config.database_url = url;
+            }
+            if let Some(max_connections) = database.max_connections {
+                config.database.max_connections = max_connections;
+            }
+            if let Some(min_connections) = database.min_connections {
+                config.database.min_connections = min_connections;
+            }
+            if let Some(acquire_timeout_seconds) = database.acquire_timeout_seconds {
+                config.database.acquire_timeout_seconds = acquire_timeout_seconds;
+            }
+            if let Some(idle_timeout_seconds) = database.idle_timeout_seconds {
+                config.database.idle_timeout_seconds = idle_timeout_seconds;
+            }
+            if let Some(max_lifetime_seconds) = database.max_lifetime_seconds {
+                config.database.max_lifetime_seconds = max_lifetime_seconds;
+            }
+            if let Some(statement_timeout_ms) = database.statement_timeout_ms {
+                config.database.statement_timeout_ms = statement_timeout_ms;
+            }
+        }
+
         if let Some(room) = toml.room {
             if let Some(subscribe_history) = room.subscribe_history {
                 config.room.subscribe_history = subscribe_history;
             }
             if let Some(subscribe_history_limit) = room.subscribe_history_limit {
                 config.room.subscribe_history_limit = subscribe_history_limit;
+            }
+            if let Some(history_ttl_seconds) = room.history_ttl_seconds {
+                config.room.history_ttl_seconds = history_ttl_seconds;
+            }
+            if let Some(max_subscriptions_per_session) = room.max_subscriptions_per_session {
+                config.room.max_subscriptions_per_session = max_subscriptions_per_session;
+            }
+            if let Some(max_channel_subscribers_online) = room.max_channel_subscribers_online {
+                config.room.max_channel_subscribers_online = max_channel_subscribers_online;
             }
         }
 
@@ -1771,6 +1861,12 @@ pub struct RoomConfig {
     pub subscribe_history: bool,
     /// 新订阅时推送的历史条数上限
     pub subscribe_history_limit: usize,
+    /// Room recent buffer 的 Redis TTL（秒）；0 表示不设置 TTL。
+    pub history_ttl_seconds: usize,
+    /// 每个 session 最多同时订阅的频道数。
+    pub max_subscriptions_per_session: usize,
+    /// 单个 room/channel 最大在线订阅 session 数。
+    pub max_channel_subscribers_online: usize,
 }
 
 impl Default for RoomConfig {
@@ -1778,6 +1874,39 @@ impl Default for RoomConfig {
         Self {
             subscribe_history: true,
             subscribe_history_limit: 30,
+            history_ttl_seconds: 86_400,
+            max_subscriptions_per_session: 32,
+            max_channel_subscribers_online: 20_000,
+        }
+    }
+}
+
+/// 数据库连接池与查询保护配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    /// 连接池最大连接数
+    pub max_connections: u32,
+    /// 连接池最小连接数
+    pub min_connections: u32,
+    /// 从连接池获取连接的超时时间（秒）
+    pub acquire_timeout_seconds: u64,
+    /// 空闲连接回收时间（秒）
+    pub idle_timeout_seconds: u64,
+    /// 单连接最大生命周期（秒）
+    pub max_lifetime_seconds: u64,
+    /// PostgreSQL statement_timeout（毫秒）；0 表示禁用。
+    pub statement_timeout_ms: u64,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 20,
+            min_connections: 5,
+            acquire_timeout_seconds: 10,
+            idle_timeout_seconds: 600,
+            max_lifetime_seconds: 1800,
+            statement_timeout_ms: 5000,
         }
     }
 }

@@ -17,6 +17,7 @@
 
 use crate::domain::events::DomainEvent;
 use crate::error::Result;
+use crate::infra::connection_manager::ConnectionManager;
 use crate::infra::event_bus::EventBus;
 use crate::infra::redis::RedisClient;
 use crate::push::intent_state::IntentStateManager;
@@ -36,6 +37,7 @@ use uuid::Uuid;
 /// - 处理 MessageRevoked 和 UserOnline 事件（Phase 3）
 pub struct PushPlanner {
     redis: Option<Arc<RedisClient>>,
+    connection_manager: Option<Arc<ConnectionManager>>,
     intent_state: Arc<IntentStateManager>, // Phase 3: 共享状态管理器
 }
 
@@ -43,6 +45,7 @@ impl PushPlanner {
     pub fn new() -> Self {
         Self {
             redis: None,
+            connection_manager: None,
             intent_state: Arc::new(IntentStateManager::new()),
         }
     }
@@ -51,6 +54,7 @@ impl PushPlanner {
     pub fn with_redis(redis: Arc<RedisClient>) -> Self {
         Self {
             redis: Some(redis),
+            connection_manager: None,
             intent_state: Arc::new(IntentStateManager::new()),
         }
     }
@@ -62,6 +66,20 @@ impl PushPlanner {
     ) -> Self {
         Self {
             redis,
+            connection_manager: None,
+            intent_state,
+        }
+    }
+
+    /// 创建带共享状态管理器和连接真源的 Planner。
+    pub fn with_state_manager_and_connection_manager(
+        redis: Option<Arc<RedisClient>>,
+        intent_state: Arc<IntentStateManager>,
+        connection_manager: Arc<ConnectionManager>,
+    ) -> Self {
+        Self {
+            redis,
+            connection_manager: Some(connection_manager),
             intent_state,
         }
     }
@@ -212,7 +230,7 @@ impl PushPlanner {
             return Ok(());
         }
 
-        // 兼容旧逻辑：检查用户是否在线（查询 Redis Presence）
+        // 兼容旧逻辑：检查用户是否在线（ConnectionManager 为在线态真源）
         let is_online = self.check_user_online(recipient_id).await?;
 
         if is_online {
@@ -262,36 +280,34 @@ impl PushPlanner {
         Ok(())
     }
 
-    /// 检查用户是否在线（查询 Redis Presence）
+    /// 检查用户是否在线。
     ///
-    /// 查询逻辑：
-    /// - 查找 presence:{user_id}:* 的所有 key
-    /// - 如果存在任何 key，说明用户有在线设备
+    /// 在线态真源是 ConnectionManager；这里禁止 Redis KEYS 热路径。
     async fn check_user_online(&self, user_id: u64) -> Result<bool> {
-        let redis = match &self.redis {
-            Some(r) => r,
-            None => {
-                // 如果没有 Redis，默认返回 false（离线），需要推送
-                warn!("[PUSH PLANNER] Redis not configured, assuming user offline");
-                return Ok(false);
+        if let Some(connection_manager) = &self.connection_manager {
+            let connections = connection_manager.get_user_connections(user_id).await;
+            if !connections.is_empty() {
+                debug!(
+                    "[PUSH PLANNER] User {} has {} online connection(s)",
+                    user_id,
+                    connections.len()
+                );
+                return Ok(true);
             }
-        };
-
-        // 查找该用户的所有设备 presence key
-        let pattern = format!("presence:{}:*", user_id);
-        let keys = redis.keys(&pattern).await?;
-
-        // 如果存在任何 key，说明用户有在线设备
-        if !keys.is_empty() {
-            debug!(
-                "[PUSH PLANNER] User {} has {} online device(s)",
-                user_id,
-                keys.len()
-            );
-            return Ok(true);
+            return Ok(false);
         }
 
-        // 没有找到 presence key，用户离线
+        if self.redis.is_some() {
+            debug!(
+                "[PUSH PLANNER] Redis presence fallback is disabled to avoid KEYS; assuming user {} offline",
+                user_id
+            );
+        } else {
+            warn!(
+                "[PUSH PLANNER] ConnectionManager not configured, assuming user {} offline",
+                user_id
+            );
+        }
         Ok(false)
     }
 
@@ -410,5 +426,40 @@ impl PushPlanner {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::ConnectionManager;
+
+    fn planner_with_connection_manager(
+        connection_manager: Arc<ConnectionManager>,
+    ) -> PushPlanner {
+        PushPlanner::with_state_manager_and_connection_manager(
+            None,
+            Arc::new(IntentStateManager::new()),
+            connection_manager,
+        )
+    }
+
+    #[tokio::test]
+    async fn check_user_online_uses_connection_manager() {
+        let connection_manager = Arc::new(ConnectionManager::new());
+        let session_id = msgtrans::SessionId::from(1_u64);
+        connection_manager.register_connecting(session_id);
+        connection_manager.authenticate(session_id, 42, "ios-42".to_string());
+
+        let planner = planner_with_connection_manager(connection_manager);
+
+        assert!(planner.check_user_online(42).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_user_online_returns_false_without_connections() {
+        let planner = planner_with_connection_manager(Arc::new(ConnectionManager::new()));
+
+        assert!(!planner.check_user_online(42).await.unwrap());
     }
 }

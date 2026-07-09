@@ -17,7 +17,8 @@
 
 //! 数据库连接管理
 
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use crate::config::DatabaseConfig;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
 use tracing::{error, info};
 
@@ -32,23 +33,51 @@ impl Database {
     ///
     /// 如果连接失败，会返回错误，调用方应该直接退出程序
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
+        Self::new_with_config(database_url, &DatabaseConfig::default()).await
+    }
+
+    /// 使用显式配置创建新的数据库连接池。
+    ///
+    /// `statement_timeout_ms > 0` 时，会在每条连接建立后设置 PostgreSQL
+    /// `statement_timeout`，给散落在 repository/service 层的 SQL 一个统一超时保护。
+    pub async fn new_with_config(
+        database_url: &str,
+        config: &DatabaseConfig,
+    ) -> Result<Self, sqlx::Error> {
         info!(
-            "🔌 正在连接 PostgreSQL 数据库: {}",
-            mask_database_url(database_url)
+            "🔌 正在连接 PostgreSQL 数据库: {}, max_connections={}, min_connections={}, acquire_timeout={}s, statement_timeout={}ms",
+            mask_database_url(database_url),
+            config.max_connections,
+            config.min_connections,
+            config.acquire_timeout_seconds,
+            config.statement_timeout_ms,
         );
 
-        let pool = PgPoolOptions::new()
-            .max_connections(20)
-            .min_connections(5)
-            .acquire_timeout(Duration::from_secs(10))
-            .idle_timeout(Duration::from_secs(600))
-            .max_lifetime(Duration::from_secs(1800))
-            .connect(database_url)
-            .await
-            .map_err(|e| {
-                error!("错误详情: {}", e);
-                e
-            })?;
+        let mut options = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections)
+            .acquire_timeout(Duration::from_secs(config.acquire_timeout_seconds))
+            .idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
+            .max_lifetime(Duration::from_secs(config.max_lifetime_seconds));
+
+        if config.statement_timeout_ms > 0 {
+            let statement_timeout_ms = config.statement_timeout_ms;
+            options = options.after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    let timeout = format!("{}ms", statement_timeout_ms);
+                    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                        .bind(timeout)
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+
+        let pool = options.connect(database_url).await.map_err(|e| {
+            error!("错误详情: {}", e);
+            e
+        })?;
 
         // 测试连接
         sqlx::query("SELECT 1").execute(&pool).await.map_err(|e| {
