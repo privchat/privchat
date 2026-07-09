@@ -37,7 +37,7 @@ use crate::handler::{
     ConnectMessageHandler, DisconnectMessageHandler, PingMessageHandler, RPCMessageHandler,
     SendMessageHandler, SubscribeMessageHandler,
 };
-use crate::infra::{database::Database, CacheManager, OnlineStatusManager, OnlineStatusStats};
+use crate::infra::{database::Database, CacheManager};
 use crate::repository::{PgChannelRepository, PgMessageRepository, UserRepository};
 // ChannelService 现在从 channel_service 导出
 use crate::context::{ErrorResponseBuilder, RequestContext};
@@ -173,7 +173,6 @@ pub struct ChatServer {
     config: ServerConfig,
     token_auth: Arc<TokenAuth>,
     cache_manager: Arc<CacheManager>,
-    online_status_manager: Arc<OnlineStatusManager>,
     stats: Arc<tokio::sync::RwLock<ServerStats>>,
     transport: Option<Arc<msgtrans::transport::TransportServer>>,
     message_dispatcher: Arc<MessageDispatcher>,
@@ -333,8 +332,6 @@ impl ChatServer {
         let cache_manager = Arc::new(CacheManager::new(config.cache.clone()).await?);
 
         // 创建在线状态管理器
-        let online_status_manager =
-            Arc::new(OnlineStatusManager::new(config.cache.online_status.clone()));
 
         // ChannelService 将在下面创建
 
@@ -1495,7 +1492,6 @@ impl ChatServer {
             config,
             token_auth,
             cache_manager,
-            online_status_manager,
             stats,
             transport: None,
             message_dispatcher: Arc::new(message_dispatcher),
@@ -1915,7 +1911,7 @@ impl ChatServer {
         self.start_stats_updater().await;
 
         // 启动在线状态清理任务
-        self.start_online_status_cleaner().await;
+        self.start_presence_timeout_sweeper().await;
 
         // 启动缓存统计任务
         self.start_cache_stats_reporter().await;
@@ -2173,29 +2169,29 @@ impl ChatServer {
         });
     }
 
-    /// 启动在线状态清理任务
-    async fn start_online_status_cleaner(&self) {
-        let online_status_manager = self.online_status_manager.clone();
+    /// P1-13：presence 心跳超时兜底巡检。
+    ///
+    /// 旧实现绑在 OnlineStatusManager 的自维护 session 表上——该表在生产路径
+    /// 没有任何写入方（写入全是死掉的演示代码），过期列表恒空，等于没有超时
+    /// 兜底。收敛后：候选来自 PresenceStateStore 的真实心跳表，逐个向
+    /// ConnectionManager（在线唯一权威）校验后才触发 timeout；仍在线的做心跳
+    /// 校准回填。逻辑在 PresenceService::sweep_heartbeat_timeouts。
+    async fn start_presence_timeout_sweeper(&self) {
         let presence_service = self.presence_service.clone();
-        let cleanup_interval = self.config.cache.online_status.cleanup_interval_secs;
+        let interval_secs = self.config.cache.online_status.cleanup_interval_secs;
+        let threshold_secs = self.config.cache.online_status.offline_timeout_secs as i64;
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
-
-                // 清理过期会话，并获取过期的用户 ID 列表
-                let expired_users = online_status_manager.cleanup_expired_sessions();
-
-                if !expired_users.is_empty() {
-                    info!("🧹 清理过期会话: {} 个", expired_users.len());
-
-                    // 为每个过期用户触发 presence timeout，通知订阅者
-                    for user_id in &expired_users {
-                        if let Err(e) = presence_service.on_timeout(*user_id).await {
-                            warn!("Failed to publish presence timeout for user {}: {}", user_id, e);
-                        }
-                    }
+                let (timed_out, recalibrated) =
+                    presence_service.sweep_heartbeat_timeouts(threshold_secs).await;
+                if timed_out + recalibrated > 0 {
+                    info!(
+                        "🧹 presence 心跳巡检: 超时下线={} 校准回填={}（阈值 {}s）",
+                        timed_out, recalibrated, threshold_secs
+                    );
                 }
             }
         });
@@ -2250,168 +2246,10 @@ impl ChatServer {
         info!("✅ 安全系统清理任务已启动");
     }
 
-    /// 模拟服务器活动
-    async fn simulate_server_activity(&self) -> Result<(), ServerError> {
-        info!("🎭 开始模拟服务器活动...");
-
-        // 模拟用户上线
-        self.simulate_users_online().await;
-
-        // 模拟心跳更新
-        self.simulate_heartbeat_updates().await;
-
-        // 模拟用户活动
-        self.simulate_user_activity().await;
-
-        // 模拟部分用户下线
-        self.simulate_users_offline().await;
-
-        // 保持服务器运行
-        self.keep_server_running().await;
-
-        Ok(())
-    }
-
-    /// 模拟用户上线
-    async fn simulate_users_online(&self) {
-        info!("👥 模拟用户上线...");
-
-        for i in 1..=100 {
-            let session_id = format!("session_{}", i);
-            let user_id = format!("user_{}", (i - 1) % 50 + 1); // 50个用户
-            let device_id = format!("device_{}", i);
-            let device_type = match i % 4 {
-                0 => privchat_protocol::DeviceType::iOS,
-                1 => privchat_protocol::DeviceType::MacOS,
-                2 => privchat_protocol::DeviceType::Web,
-                _ => privchat_protocol::DeviceType::Android,
-            };
-            let ip_address = format!("192.168.1.{}", i % 255 + 1);
-
-            self.online_status_manager.simple_user_online(
-                session_id,
-                user_id,
-                device_id,
-                device_type,
-                ip_address,
-            );
-
-            // 更新统计
-            let mut stats = self.stats.write().await;
-            stats.total_connections += 1;
-        }
-
-        info!("✅ 100个用户上线完成");
-    }
-
-    /// 模拟心跳更新
-    async fn simulate_heartbeat_updates(&self) {
-        info!("💓 模拟心跳更新...");
-
-        for i in 1..=100 {
-            let session_id = format!("session_{}", i);
-            self.online_status_manager
-                .simple_update_heartbeat(&session_id);
-        }
-
-        info!("✅ 心跳更新完成");
-    }
-
-    /// 模拟用户活动
-    async fn simulate_user_activity(&self) {
-        info!("🎯 模拟用户活动...");
-
-        for round in 1..=3 {
-            info!("  - 活动轮次 {}", round);
-
-            // 模拟缓存操作
-            for i in 1..=20 {
-                let user_id = i as u64;
-                let cache_key = format!("user_profile:{}", user_id);
-
-                // 创建用户资料数据
-                let user_profile = crate::infra::CachedUserProfile {
-                    user_id: user_id.to_string(),
-                    username: format!("user_{}", i), // 账号
-                    nickname: format!("User {}", i), // 昵称
-                    avatar_url: None,
-                    user_type: 0, // 普通用户
-                    phone: None,
-                    email: None,
-                };
-
-                // 模拟缓存写入
-                if let Err(e) = self
-                    .cache_manager
-                    .set_user_profile(user_id, user_profile)
-                    .await
-                {
-                    warn!("缓存写入失败: {}", e);
-                }
-
-                // 模拟缓存读取
-                match self.cache_manager.get_user_profile(user_id).await {
-                    Ok(Some(_)) => debug!("缓存命中: {}", cache_key),
-                    Ok(None) => debug!("缓存未命中: {}", cache_key),
-                    Err(e) => warn!("缓存读取失败: {}", e),
-                }
-            }
-
-            // 等待一段时间
-            sleep(Duration::from_secs(2)).await;
-        }
-
-        info!("✅ 用户活动模拟完成");
-    }
-
-    /// 模拟部分用户下线
-    async fn simulate_users_offline(&self) {
-        info!("📤 模拟部分用户下线...");
-
-        for i in 1..=20 {
-            let session_id = format!("session_{}", i);
-            self.online_status_manager.simple_user_offline(&session_id);
-        }
-
-        info!("✅ 20个用户下线完成");
-    }
-
-    /// 保持服务器运行
-    async fn keep_server_running(&self) {
-        info!("🔄 服务器进入运行状态...");
-        info!("💡 提示: 按 Ctrl+C 停止服务器");
-
-        // 主循环
-        loop {
-            sleep(Duration::from_secs(30)).await;
-
-            // 显示当前状态
-            let stats = self.stats.read().await;
-            let online_stats = self.online_status_manager.get_stats();
-            let cache_stats = self.cache_manager.get_stats().await;
-
-            info!("🔍 服务器状态检查:");
-            info!("  - 在线用户: {}", online_stats.total_users);
-            info!("  - 活跃会话: {}", online_stats.total_sessions);
-            info!("  - 总连接数: {}", stats.total_connections);
-            info!("  - 运行时间: {}秒", stats.uptime_seconds);
-            info!(
-                "  - 缓存命中率: L1={:.1}%, L2={:.1}%",
-                cache_stats.l1_hit_rate * 100.0,
-                cache_stats.l2_hit_rate * 100.0
-            );
-        }
-    }
-
     /// 获取服务器统计信息
     pub async fn get_stats(&self) -> ServerStats {
         let stats = self.stats.read().await;
         stats.clone()
-    }
-
-    /// 获取在线状态统计
-    pub fn get_online_stats(&self) -> OnlineStatusStats {
-        self.online_status_manager.get_stats()
     }
 
     /// 停止服务器

@@ -36,6 +36,11 @@ pub struct PresenceTracker {
 }
 
 impl PresenceTracker {
+    /// P1-13：转发心跳超时巡检候选（见 PresenceStateStore::drain_timeout_candidates）。
+    pub fn drain_timeout_candidates(&self, threshold_secs: i64) -> Vec<u64> {
+        self.state_store.drain_timeout_candidates(threshold_secs)
+    }
+
     pub fn new(state_store: Arc<PresenceStateStore>) -> Self {
         Self {
             state_store,

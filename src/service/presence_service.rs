@@ -148,6 +148,41 @@ impl PresenceService {
         self.presence_tracker.on_heartbeat(user_id).await
     }
 
+    /// P1-13 心跳超时兜底巡检（真源收敛后的唯一 timeout 驱动）。
+    ///
+    /// 职责分工：
+    /// - **ConnectionManager**：在线与设备数的唯一权威（authenticated sessions）；
+    /// - **PresenceStateStore（经 PresenceTracker）**：心跳/last_seen/version 历史；
+    /// - 本方法：从 StateStore 取心跳超时候选，先向 ConnectionManager 校验——仍有
+    ///   authenticated 连接则视为活跃（回填心跳校准 StateStore，不发 timeout）；
+    ///   确无连接才触发 on_timeout（标记离线 + presence_changed push，push 内的
+    ///   online/device_count 亦以 ConnectionManager 为权威，语义自洽）。
+    ///
+    /// 返回 (超时下线数, 校准回填数)。
+    pub async fn sweep_heartbeat_timeouts(&self, threshold_secs: i64) -> (usize, usize) {
+        let candidates = self.presence_tracker.drain_timeout_candidates(threshold_secs);
+        let mut timed_out = 0usize;
+        let mut recalibrated = 0usize;
+        for user_id in candidates {
+            let conns = self.connection_manager.get_user_connections(user_id).await;
+            if conns.is_empty() {
+                if let Err(e) = self.on_timeout(user_id).await {
+                    tracing::warn!("presence timeout sweep: on_timeout({}) 失败: {}", user_id, e);
+                } else {
+                    timed_out += 1;
+                }
+            } else {
+                // 连接真源说在线（如心跳走了别的路径没喂 StateStore）→ 校准回填。
+                if let Err(e) = self.on_heartbeat(user_id).await {
+                    tracing::warn!("presence timeout sweep: 回填心跳({}) 失败: {}", user_id, e);
+                } else {
+                    recalibrated += 1;
+                }
+            }
+        }
+        (timed_out, recalibrated)
+    }
+
     pub async fn on_timeout(&self, user_id: u64) -> Result<(), ServerError> {
         let snapshot = self.presence_tracker.on_timeout(user_id).await?;
         self.publish_presence_changed(snapshot).await
@@ -454,6 +489,40 @@ mod tests {
         assert!(published
             .iter()
             .all(|(_, payload)| payload.snapshot.is_online && payload.snapshot.device_count == 1));
+    }
+
+    #[tokio::test]
+    async fn sweep_times_out_stale_and_recalibrates_connected() {
+        let service = test_service();
+        // A(7)：有心跳记录、无连接 → 应超时下线并 drain 出表
+        service
+            .presence_tracker
+            .on_device_connected(7, "d7")
+            .await
+            .unwrap();
+        // B(8)：有心跳记录、且有 authenticated 连接 → 应校准回填（不下线）
+        service
+            .presence_tracker
+            .on_device_connected(8, "d8")
+            .await
+            .unwrap();
+        service
+            .connection_manager
+            .register_connection(8, "d8".to_string(), SessionId::from(8_u64))
+            .await
+            .unwrap();
+
+        // publish 需要查用户关联会话；测试环境无 DB，用桩返回固定 channel。
+        service.set_test_presence_channels(7, vec![100]);
+        service.set_test_presence_channels(8, vec![100]);
+
+        // threshold=-1：所有 last_seen 条目立即成为候选
+        let (timed_out, recalibrated) = service.sweep_heartbeat_timeouts(-1).await;
+        assert_eq!((timed_out, recalibrated), (1, 1));
+
+        // A 已 drain；B 回填后重新入表 → 第二轮仍是候选且仍在线
+        let (t2, r2) = service.sweep_heartbeat_timeouts(-1).await;
+        assert_eq!((t2, r2), (0, 1));
     }
 
     #[tokio::test]

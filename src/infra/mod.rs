@@ -42,7 +42,6 @@ pub mod logger;
 pub mod message_router;
 pub mod metrics;
 pub mod offline_worker;
-pub mod online_status_manager;
 pub mod presence_manager_with_db;
 pub mod presence_tracker;
 pub mod redis;
@@ -74,7 +73,6 @@ pub use connection_manager::{ConnectionManager, DeviceConnection}; // ✨ 新增
 pub use event_bus::EventBus;
 pub use message_router::{MessageRouter, MessageRouterConfig, RouteResult};
 pub use offline_worker::{DeliveryStats, OfflineMessageWorker, OfflineWorkerConfig};
-pub use online_status_manager::{OnlineSession, OnlineStatusManager, OnlineStatusStats};
 pub use presence_manager_with_db::{
     PresenceConfig as PresenceStateStoreConfig,
     PresenceManagerWithDb as PresenceStateStore,

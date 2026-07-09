@@ -54,6 +54,6 @@ pub use handler::{
     ConnectMessageHandler, DisconnectMessageHandler, MessageHandler, PingMessageHandler,
     SendMessageHandler, SubscribeMessageHandler,
 };
-pub use infra::{CacheManager, OnlineStatusManager};
+pub use infra::CacheManager;
 pub use model::*;
 pub use server::ChatServer;
