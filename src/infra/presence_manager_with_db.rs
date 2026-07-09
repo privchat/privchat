@@ -223,6 +223,24 @@ impl PresenceManagerWithDb {
     }
 
     /// 用户上线
+    /// P1-13：心跳超时巡检候选——内存心跳表中超过 `threshold_secs` 未活跃的用户，
+    /// 取出即从表中移除（调用方据此触发 on_timeout；用户重新活跃时 user_online/
+    /// update_heartbeat 会重新入表，不会重复告警）。last_seen 查询不受影响：
+    /// 内存 miss 时回源 DB（privchat_user_last_seen）。
+    pub fn drain_timeout_candidates(&self, threshold_secs: i64) -> Vec<u64> {
+        let now = Utc::now().timestamp();
+        let expired: Vec<u64> = self
+            .last_seen
+            .iter()
+            .filter(|entry| now - *entry.value() > threshold_secs)
+            .map(|entry| *entry.key())
+            .collect();
+        for user_id in &expired {
+            self.last_seen.remove(user_id);
+        }
+        expired
+    }
+
     pub async fn user_online(&self, user_id: u64) -> Result<(), ServerError> {
         let now = Utc::now().timestamp();
 
@@ -292,8 +310,10 @@ impl PresenceManagerWithDb {
     pub async fn user_offline(&self, user_id: u64) -> Result<(), ServerError> {
         let now = Utc::now().timestamp();
 
-        // 更新内存
-        self.last_seen.insert(user_id, now);
+        // P1-13：离线 = 移出在线追踪表（last_seen DashMap 只追踪「可能在线」的
+        // 用户，供超时巡检 drain）。此前 insert 会把已离线用户留在表里，被巡检
+        // 每轮重复 timeout。查询侧不受影响：内存 miss 回源 DB（下面已持久化）。
+        self.last_seen.remove(&user_id);
 
         // 立即更新数据库（用户下线是重要事件，必须持久化）
         if let Some(ref db_repo) = self.db_repo {

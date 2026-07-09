@@ -499,8 +499,6 @@ impl<S: StorageBackend + Send + Sync + 'static, D: MessageDeliverer> OfflineSche
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::OnlineStatusConfig;
-    use crate::infra::OnlineStatusManager;
     use crate::offline::queue::create_memory_queue_manager;
     use bytes::Bytes;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -545,8 +543,6 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_basic_operations() {
         let queue_manager = Arc::new(create_memory_queue_manager(None).await.unwrap());
-        let online_status_manager =
-            Arc::new(OnlineStatusManager::new(OnlineStatusConfig::default()));
         let message_deliverer = Arc::new(DeterministicSuccessDeliverer);
         let config = SchedulerConfig::default();
         let user_id = 1001_u64;
@@ -556,15 +552,6 @@ mod tests {
         // 启动队列管理器和调度器
         queue_manager.start().await.unwrap();
         scheduler.start().await.unwrap();
-
-        // 模拟用户上线
-        online_status_manager.simple_user_online(
-            "session1".to_string(),
-            user_id.to_string(),
-            "device1".to_string(),
-            privchat_protocol::DeviceType::iOS,
-            "127.0.0.1".to_string(),
-        );
 
         // 添加离线消息
         let message_id = queue_manager
@@ -595,8 +582,6 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_with_failures() {
         let queue_manager = Arc::new(create_memory_queue_manager(None).await.unwrap());
-        let online_status_manager =
-            Arc::new(OnlineStatusManager::new(OnlineStatusConfig::default()));
         let message_deliverer = Arc::new(DeterministicFlakyDeliverer::default());
         let config = SchedulerConfig::default();
         let user_id = 1001_u64;
@@ -605,15 +590,6 @@ mod tests {
 
         queue_manager.start().await.unwrap();
         scheduler.start().await.unwrap();
-
-        // 模拟用户上线
-        online_status_manager.simple_user_online(
-            "session1".to_string(),
-            user_id.to_string(),
-            "device1".to_string(),
-            privchat_protocol::DeviceType::iOS,
-            "127.0.0.1".to_string(),
-        );
 
         // 添加多条消息
         for i in 1..=10 {
