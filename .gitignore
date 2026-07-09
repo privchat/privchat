@@ -1,4 +1,10 @@
+# P2-07 secrets & runtime artifacts —— 严禁进 repo。配置用 .env.example 作模板。
+.env
+.env.*
+!.env.example
+*.log
 logs/
+server.log
 /target
 Cargo.lock
 config.toml
