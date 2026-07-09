@@ -51,7 +51,7 @@ pub struct WebDeviceSnapshot {
     pub ip_address: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QrScene {
     pub scene_id: String,
     pub qr_token: String,
@@ -87,12 +87,25 @@ pub struct ScanResult {
 /// 状态机内存存储 + lazy expire；通过可选注入的 [`QrLoginPublisher`] 把 scan/reject/expire
 /// transition 实时推回创建该 scene 的 unauth 连接（spec §5）。`authorized` 不在本 service
 /// 推送 —— 那条事件需要 application 拼装好登录返回再显式 push（见 admin HTTP 路由）。
+/// P2-06 scene 存储：Redis（多实例共享真源）优先，无 Redis 回退进程内 DashMap（测试/
+/// 单实例）。scene 状态搬 Redis 后，create/scan/confirm/reject 状态机跨实例正确，
+/// GET 兜底查询（admin `GET /qr-login/scenes/{id}`）从任一实例读 Redis。
+///
+/// 亲和性说明：实时 RPC 推送（scanned/rejected/expired 事件推回 Web 的 unauth WS）
+/// 仍是**本地 best-effort**——Web 的 WS 物理固定在一个实例，publisher 绑定天然 per-instance。
+/// App 在别的实例推进状态时，那台实例的 publisher 无此 scene 绑定 → NoSubscriber，
+/// Web 降级到 GET 轮询拿到新状态（正常路径失败的兜底，spec §5 已允许）。跨实例即时
+/// 推送需 Redis pub/sub 推送总线，作为后续升级项。
 #[derive(Clone)]
 pub struct QrLoginService {
+    /// 无 Redis 时的进程内回退存储
     scenes: Arc<DashMap<String, QrScene>>,
+    redis: Option<Arc<crate::infra::redis::RedisClient>>,
     publisher: Option<Arc<QrLoginPublisher>>,
     connection_manager: Option<Arc<ConnectionManager>>,
 }
+
+const REDIS_KEY_PREFIX: &str = "qr_scene:";
 
 impl Default for QrLoginService {
     fn default() -> Self {
@@ -104,9 +117,64 @@ impl QrLoginService {
     pub fn new() -> Self {
         Self {
             scenes: Arc::new(DashMap::new()),
+            redis: None,
             publisher: None,
             connection_manager: None,
         }
+    }
+
+    /// 带 Redis 后端创建（生产多实例路径）：scene 状态跨实例共享。
+    pub fn new_with_redis(redis: Arc<crate::infra::redis::RedisClient>) -> Self {
+        Self {
+            scenes: Arc::new(DashMap::new()),
+            redis: Some(redis),
+            publisher: None,
+            connection_manager: None,
+        }
+    }
+
+    fn redis_key(scene_id: &str) -> String {
+        format!("{REDIS_KEY_PREFIX}{scene_id}")
+    }
+
+    fn ttl_secs_for(scene: &QrScene) -> usize {
+        let now = Utc::now().timestamp_millis();
+        (((scene.expires_at - now) / 1000).max(1)) as usize
+    }
+
+    /// 读 scene（Redis 主 / DashMap 回退）+ lazy expire。None = NotFound。
+    async fn load_scene(&self, scene_id: &str) -> Result<QrScene> {
+        if let Some(redis) = &self.redis {
+            let raw = redis.get(&Self::redis_key(scene_id)).await?;
+            let mut scene: QrScene = raw
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .ok_or_else(|| {
+                    ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id))
+                })?;
+            Self::expire_if_due(&mut scene);
+            return Ok(scene);
+        }
+        let mut entry = self
+            .scenes
+            .get_mut(scene_id)
+            .ok_or_else(|| ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id)))?;
+        Self::expire_if_due(&mut entry);
+        Ok(entry.clone())
+    }
+
+    /// 写回 scene（Redis SETEX 到 scene 剩余寿命 / DashMap upsert）。
+    async fn store_scene(&self, scene: &QrScene) -> Result<()> {
+        if let Some(redis) = &self.redis {
+            let payload = serde_json::to_string(scene).map_err(|e| {
+                ServerError::Internal(format!("序列化 qr scene 失败: {}", e))
+            })?;
+            redis
+                .setex(&Self::redis_key(&scene.scene_id), Self::ttl_secs_for(scene), &payload)
+                .await?;
+            return Ok(());
+        }
+        self.scenes.insert(scene.scene_id.clone(), scene.clone());
+        Ok(())
     }
 
     /// 注入 publisher + connection_manager，让状态转换自动推送事件给 unauth 连接。
@@ -122,7 +190,7 @@ impl QrLoginService {
     }
 
     /// 创建场景（state=created）。
-    pub fn create_scene(
+    pub async fn create_scene(
         &self,
         purpose: String,
         web_device_id: String,
@@ -152,22 +220,21 @@ impl QrLoginService {
             confirm_token: None,
             confirm_token_consumed: false,
         };
-        self.scenes.insert(scene_id, scene.clone());
+        // 存储失败（Redis 抖动）只 warn，返回 scene——create 不该因存储瞬时失败硬失败；
+        // 后续 scan 会 NotFound，Web 重新生成二维码。
+        if let Err(e) = self.store_scene(&scene).await {
+            tracing::warn!("qr create_scene 存储失败 scene_id={}: {}", scene.scene_id, e);
+        }
         scene
     }
 
     /// 查询场景；过期 lazy 标记为 expired。
-    pub fn get_scene(&self, scene_id: &str) -> Result<QrScene> {
-        let mut entry = self
-            .scenes
-            .get_mut(scene_id)
-            .ok_or_else(|| ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id)))?;
-        Self::expire_if_due(&mut entry);
-        Ok(entry.clone())
+    pub async fn get_scene(&self, scene_id: &str) -> Result<QrScene> {
+        self.load_scene(scene_id).await
     }
 
     /// App 扫码：state=created → scanned；颁发 confirm_token。
-    pub fn scan_scene(
+    pub async fn scan_scene(
         &self,
         scene_id: &str,
         scanner_uid: u64,
@@ -176,19 +243,15 @@ impl QrLoginService {
         scanner_avatar: Option<String>,
         scanner_display_name: Option<String>,
     ) -> Result<ScanResult> {
-        let mut entry = self
-            .scenes
-            .get_mut(scene_id)
-            .ok_or_else(|| ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id)))?;
-        Self::expire_if_due(&mut entry);
+        let mut scene = self.load_scene(scene_id).await?;
 
-        if entry.state != QrSceneState::Created {
+        if scene.state != QrSceneState::Created {
             return Err(ServerError::Duplicate(format!(
                 "QR_SCENE_STATE_INVALID: expected created, got {:?}",
-                entry.state
+                scene.state
             )));
         }
-        if entry.qr_token != qr_token {
+        if scene.qr_token != qr_token {
             return Err(ServerError::Validation(
                 "QR_TOKEN_MISMATCH: qr_token 与场景不匹配".to_string(),
             ));
@@ -197,21 +260,20 @@ impl QrLoginService {
         let now_ms = Utc::now().timestamp_millis();
         let confirm_token = format!("ct_{}", Uuid::new_v4().simple());
 
-        entry.state = QrSceneState::Scanned;
-        entry.scanned_at = Some(now_ms);
-        entry.scanner_uid = Some(scanner_uid);
-        entry.scanner_device_id = Some(scanner_device_id);
-        entry.scanner_avatar = scanner_avatar;
-        entry.scanner_display_name = scanner_display_name;
-        entry.confirm_token = Some(confirm_token.clone());
-        entry.confirm_token_consumed = false;
+        scene.state = QrSceneState::Scanned;
+        scene.scanned_at = Some(now_ms);
+        scene.scanner_uid = Some(scanner_uid);
+        scene.scanner_device_id = Some(scanner_device_id);
+        scene.scanner_avatar = scanner_avatar;
+        scene.scanner_display_name = scanner_display_name;
+        scene.confirm_token = Some(confirm_token.clone());
+        scene.confirm_token_consumed = false;
         // scanned 阶段重新计 expires_at（spec §3.3）
-        entry.expires_at = now_ms + SCANNED_TTL_SECS * 1000;
+        scene.expires_at = now_ms + SCANNED_TTL_SECS * 1000;
 
-        let scene_snapshot = entry.clone();
+        self.store_scene(&scene).await?;
+        let scene_snapshot = scene;
         let confirm_token_owned = confirm_token.clone();
-        // 释放 DashMap 行锁后再异步 push，避免 Send + 死锁
-        drop(entry);
         self.spawn_push(
             scene_snapshot.clone(),
             "qr_login.scanned",
@@ -231,53 +293,45 @@ impl QrLoginService {
     }
 
     /// App 确认：state=scanned → authorized；CAS 消费 confirm_token。
-    pub fn confirm_scene(
+    pub async fn confirm_scene(
         &self,
         scene_id: &str,
         scanner_uid: u64,
         scanner_device_id: &str,
         confirm_token: &str,
     ) -> Result<QrScene> {
-        let mut entry = self
-            .scenes
-            .get_mut(scene_id)
-            .ok_or_else(|| ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id)))?;
-        Self::expire_if_due(&mut entry);
-
-        Self::ensure_scanned_with_token(&entry, scanner_uid, scanner_device_id, confirm_token)?;
-        entry.state = QrSceneState::Authorized;
-        entry.confirm_token_consumed = true;
-        Ok(entry.clone())
+        let mut scene = self.load_scene(scene_id).await?;
+        Self::ensure_scanned_with_token(&scene, scanner_uid, scanner_device_id, confirm_token)?;
+        scene.state = QrSceneState::Authorized;
+        scene.confirm_token_consumed = true;
+        self.store_scene(&scene).await?;
+        Ok(scene)
     }
 
     /// App 拒绝：state=scanned → rejected。
-    pub fn reject_scene(
+    pub async fn reject_scene(
         &self,
         scene_id: &str,
         scanner_uid: u64,
         confirm_token: &str,
     ) -> Result<QrScene> {
-        let mut entry = self
-            .scenes
-            .get_mut(scene_id)
-            .ok_or_else(|| ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id)))?;
-        Self::expire_if_due(&mut entry);
+        let mut scene = self.load_scene(scene_id).await?;
 
-        if entry.state != QrSceneState::Scanned {
+        if scene.state != QrSceneState::Scanned {
             return Err(ServerError::Duplicate(format!(
                 "QR_SCENE_STATE_INVALID: expected scanned, got {:?}",
-                entry.state
+                scene.state
             )));
         }
-        if entry.scanner_uid != Some(scanner_uid) {
+        if scene.scanner_uid != Some(scanner_uid) {
             return Err(ServerError::PermissionDenied(
                 "QR_SCANNER_MISMATCH: scanner_uid 与扫码者不一致".to_string(),
             ));
         }
-        let valid_token = entry
+        let valid_token = scene
             .confirm_token
             .as_deref()
-            .map(|t| t == confirm_token && !entry.confirm_token_consumed)
+            .map(|t| t == confirm_token && !scene.confirm_token_consumed)
             .unwrap_or(false);
         if !valid_token {
             return Err(ServerError::Validation(
@@ -285,12 +339,11 @@ impl QrLoginService {
             ));
         }
 
-        entry.state = QrSceneState::Rejected;
-        entry.confirm_token_consumed = true;
-        let snapshot = entry.clone();
-        drop(entry);
-        self.spawn_push(snapshot.clone(), "qr_login.rejected", None, true);
-        Ok(snapshot)
+        scene.state = QrSceneState::Rejected;
+        scene.confirm_token_consumed = true;
+        self.store_scene(&scene).await?;
+        self.spawn_push(scene.clone(), "qr_login.rejected", None, true);
+        Ok(scene)
     }
 
     fn ensure_scanned_with_token(
@@ -344,20 +397,23 @@ impl QrLoginService {
     /// 标记 scene 为 authorized 并清掉 confirm_token，供 admin HTTP push 路径调用。
     /// 通常 confirm 已经把状态切为 authorized；这是 application 显式 push 之前的兜底，
     /// 用于 publisher 找不到状态时不至于推一个错误状态。
-    pub fn mark_authorized(&self, scene_id: &str) -> Result<QrScene> {
-        let mut entry = self
-            .scenes
-            .get_mut(scene_id)
-            .ok_or_else(|| ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id)))?;
-        entry.state = QrSceneState::Authorized;
-        entry.confirm_token_consumed = true;
-        Ok(entry.clone())
+    pub async fn mark_authorized(&self, scene_id: &str) -> Result<QrScene> {
+        let mut scene = self.load_scene(scene_id).await?;
+        scene.state = QrSceneState::Authorized;
+        scene.confirm_token_consumed = true;
+        self.store_scene(&scene).await?;
+        Ok(scene)
     }
 
-    /// 主动扫一遍内存里的 scene，把已经过期但状态仍是 created/scanned 的转成 expired，
-    /// 顺手把 `qr_login.expired` 推回 unauth 连接（spec §5）。
-    /// 调用方应该周期性触发（如每 5s）。
+    /// 主动扫一遍**内存回退**里的 scene，把已过期但仍是 created/scanned 的转成 expired，
+    /// 顺手把 `qr_login.expired` 推回 unauth 连接（spec §5）。周期性触发（如每 5s）。
+    ///
+    /// Redis 模式：scene 由 SETEX 自动过期，无法（也不应，见 P1-01 禁 KEYS 热路径）
+    /// 全库扫描；Web 端通过 GET 轮询发现 expired/NotFound。此处仅处理内存回退存储。
     pub async fn tick_expired(&self) {
+        if self.redis.is_some() {
+            return;
+        }
         let now = Utc::now().timestamp_millis();
         let mut to_publish: Vec<QrScene> = Vec::new();
         for mut entry in self.scenes.iter_mut() {
@@ -447,10 +503,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_then_scan_then_confirm() {
+    #[tokio::test]
+    async fn create_then_scan_then_confirm() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None);
+        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
         assert_eq!(scene.state, QrSceneState::Created);
 
         let r = svc
@@ -462,74 +518,133 @@ mod tests {
                 None,
                 Some("Alice".into()),
             )
+            .await
             .unwrap();
         assert_eq!(r.scene.state, QrSceneState::Scanned);
         assert_eq!(r.scene.scanner_uid, Some(100));
 
         let confirmed = svc
             .confirm_scene(&scene.scene_id, 100, "ios-1", &r.confirm_token)
+            .await
             .unwrap();
         assert_eq!(confirmed.state, QrSceneState::Authorized);
     }
 
-    #[test]
-    fn reject_after_scan() {
+    #[tokio::test]
+    async fn reject_after_scan() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None);
+        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
         let r = svc
             .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+            .await
             .unwrap();
         let rejected = svc
             .reject_scene(&scene.scene_id, 100, &r.confirm_token)
+            .await
             .unwrap();
         assert_eq!(rejected.state, QrSceneState::Rejected);
     }
 
-    #[test]
-    fn scan_with_wrong_qr_token_rejected() {
+    #[tokio::test]
+    async fn scan_with_wrong_qr_token_rejected() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None);
+        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
         let err = svc
             .scan_scene(&scene.scene_id, 100, "ios-1".into(), "wrong-token", None, None)
+            .await
             .unwrap_err();
         assert!(format!("{}", err).contains("QR_TOKEN_MISMATCH"));
     }
 
-    #[test]
-    fn confirm_by_different_scanner_rejected() {
+    #[tokio::test]
+    async fn confirm_by_different_scanner_rejected() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None);
+        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
         let r = svc
             .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+            .await
             .unwrap();
         let err = svc
             .confirm_scene(&scene.scene_id, 200, "ios-1", &r.confirm_token)
+            .await
             .unwrap_err();
         assert!(format!("{}", err).contains("QR_SCANNER_MISMATCH"));
     }
 
-    #[test]
-    fn confirm_token_single_use() {
+    #[tokio::test]
+    async fn confirm_token_single_use() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None);
+        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
         let r = svc
             .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+            .await
             .unwrap();
         svc.confirm_scene(&scene.scene_id, 100, "ios-1", &r.confirm_token)
+            .await
             .unwrap();
         // 第二次：state 已 authorized，应 STATE_INVALID
         let err = svc
             .confirm_scene(&scene.scene_id, 100, "ios-1", &r.confirm_token)
+            .await
             .unwrap_err();
         assert!(format!("{}", err).contains("QR_SCENE_STATE_INVALID"));
     }
 
-    #[test]
-    fn expired_after_ttl_marks_state() {
+    /// P2-06：跨实例真源。两个 QrLoginService 共享同一 Redis——A 建 scene，
+    /// B 扫码 + 确认，证明 scene 状态不再绑单进程内存。Redis 不可用则 skip。
+    #[tokio::test]
+    async fn redis_backed_scene_crosses_instances() {
+        let url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let cfg = crate::config::RedisConfig {
+            url,
+            pool_size: 4,
+            min_idle: 1,
+            connection_timeout_secs: 2,
+            command_timeout_ms: 2000,
+            idle_timeout_secs: 60,
+        };
+        let redis = match crate::infra::redis::RedisClient::new(&cfg).await {
+            Ok(r) => std::sync::Arc::new(r),
+            Err(_) => {
+                eprintln!("skip redis_backed_scene_crosses_instances: Redis 不可用");
+                return;
+            }
+        };
+        // 两个"实例"共享同一 Redis 后端
+        let inst_a = QrLoginService::new_with_redis(redis.clone());
+        let inst_b = QrLoginService::new_with_redis(redis.clone());
+
+        let scene = inst_a
+            .create_scene("login".into(), "web-x".into(), make_device(), Some(120))
+            .await;
+        // B 能看到 A 建的 scene
+        let seen = inst_b.get_scene(&scene.scene_id).await.unwrap();
+        assert_eq!(seen.state, QrSceneState::Created);
+        // B 扫码 → scanned
+        let r = inst_b
+            .scan_scene(&scene.scene_id, 777, "ios-x".into(), &scene.qr_token, None, None)
+            .await
+            .unwrap();
+        assert_eq!(r.scene.state, QrSceneState::Scanned);
+        // A 再读，看到 B 推进后的状态（真源在 Redis）
+        let after = inst_a.get_scene(&scene.scene_id).await.unwrap();
+        assert_eq!(after.state, QrSceneState::Scanned);
+        assert_eq!(after.scanner_uid, Some(777));
+        // B 确认 → authorized
+        let confirmed = inst_b
+            .confirm_scene(&scene.scene_id, 777, "ios-x", &r.confirm_token)
+            .await
+            .unwrap();
+        assert_eq!(confirmed.state, QrSceneState::Authorized);
+    }
+
+    #[tokio::test]
+    async fn expired_after_ttl_marks_state() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), Some(1));
+        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), Some(1)).await;
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let s = svc.get_scene(&scene.scene_id).unwrap();
+        let s = svc.get_scene(&scene.scene_id).await.unwrap();
         assert_eq!(s.state, QrSceneState::Expired);
     }
 }
