@@ -6,7 +6,11 @@
 -- injector inserts (dedup_key, message_id) in the same tx as the message, and
 -- ON CONFLICT DO NOTHING makes a repeated inject (consumer retry / multi-node)
 -- a no-op that resolves back to the existing message instead of a second card.
--- Ordinary chat messages never touch this table.
+--
+-- Update (P0-09, 2026-07-09): ordinary client sends now ALSO claim this table
+-- for durable idempotency, with keys namespaced client:{sender}:{local_msg_id}
+-- (money-message keys are caller-supplied by the application side). Rows are
+-- swept by the hourly retention task (see 008_message_dedup_retention.sql).
 CREATE TABLE IF NOT EXISTS privchat_message_dedup (
     dedup_key   TEXT   PRIMARY KEY,
     message_id  BIGINT NOT NULL,

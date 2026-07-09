@@ -1994,6 +1994,49 @@ impl ChatServer {
             }
         });
 
+        // P1-18：privchat_message_dedup retention。普通发送的 durable idempotency
+        // 每条消息写一行，客户端重试窗口是分钟级，保留 7 天绰绰有余。
+        // 每小时批量删（LIMIT 分批，避免大范围删除长时间持锁）。
+        let dedup_retention_db = self.database.clone();
+        tokio::spawn(async move {
+            const RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
+            const BATCH: i64 = 10_000;
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let cutoff = chrono::Utc::now().timestamp_millis() - RETENTION_MS;
+                let mut total: u64 = 0;
+                for _ in 0..20 {
+                    match sqlx::query(
+                        "DELETE FROM privchat_message_dedup WHERE dedup_key IN (
+                             SELECT dedup_key FROM privchat_message_dedup
+                             WHERE created_at < $1 LIMIT $2
+                         )",
+                    )
+                    .bind(cutoff)
+                    .bind(BATCH)
+                    .execute(dedup_retention_db.pool())
+                    .await
+                    {
+                        Ok(res) if res.rows_affected() > 0 => {
+                            total += res.rows_affected();
+                            if (res.rows_affected() as i64) < BATCH {
+                                break;
+                            }
+                        }
+                        Ok(_) => break,
+                        Err(e) => {
+                            warn!("⚠️ message_dedup retention sweep failed: {}", e);
+                            break;
+                        }
+                    }
+                }
+                if total > 0 {
+                    info!("🧹 message_dedup retention: removed {} expired keys", total);
+                }
+            }
+        });
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
