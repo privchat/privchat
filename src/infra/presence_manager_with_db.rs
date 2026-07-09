@@ -384,6 +384,12 @@ impl PresenceManagerWithDb {
         info!("🔄 Started batch update task (interval={}s)", interval_secs);
     }
 
+    /// P1-11：graceful shutdown 时把内存里待批的 last_seen 更新立刻刷库，
+    /// 避免停机丢掉最近 batch_update_interval 窗口内的活跃时间。
+    pub async fn flush_pending(&self) -> Result<(), ServerError> {
+        self.batch_update_db().await
+    }
+
     /// 批量更新数据库
     async fn batch_update_db(&self) -> Result<(), ServerError> {
         if self.db_repo.is_none() {

@@ -210,6 +210,8 @@ pub struct ChatServer {
     notification_service: Arc<crate::service::NotificationService>,
     /// Presence 服务（user_id 聚合 / user_ids 查询 / channelId 投递）
     presence_service: Arc<crate::service::PresenceService>,
+    /// P1-11 graceful shutdown：停机时 flush 待批 last_seen
+    presence_state_store: Arc<crate::infra::PresenceStateStore>,
     /// 消息路由器（维护 user/device/session 在线状态）
     message_router: Arc<crate::infra::MessageRouter>,
     /// 业务 Handler 并发限流器（STABILITY_SPEC 禁令 2）
@@ -1512,6 +1514,7 @@ impl ChatServer {
             connection_manager,   // ✨ 新增
             notification_service,
             presence_service,
+            presence_state_store,
             message_router,
             handler_limiter,
             event_bus,
@@ -1567,12 +1570,58 @@ impl ChatServer {
 
         // 启动传输层监听器
         info!("🔗 启动传输层监听器...");
-        transport
-            .serve()
-            .await
-            .map_err(|e| ServerError::Internal(format!("传输层启动失败: {}", e)))?;
+        // P1-11 graceful shutdown：serve() 常驻，与 SIGINT/SIGTERM 竞速。
+        // 收到信号 → 停 transport（停止 accept 新连接）→ flush presence 待批 →
+        // 退出。避免硬停丢掉内存里未落库的活跃时间。
+        let serve_transport = transport.clone();
+        let serve = async move {
+            serve_transport
+                .serve()
+                .await
+                .map_err(|e| ServerError::Internal(format!("传输层启动失败: {}", e)))
+        };
+
+        tokio::select! {
+            result = serve => {
+                result?;
+            }
+            signal = Self::wait_for_shutdown_signal() => {
+                info!("🛑 收到停机信号（{signal}），开始 graceful shutdown...");
+                transport.stop().await;
+                if let Err(e) = self.presence_state_store.flush_pending().await {
+                    warn!("graceful shutdown: flush presence 待批失败: {}", e);
+                } else {
+                    info!("✅ presence 待批 last_seen 已刷库");
+                }
+                info!("✅ graceful shutdown 完成");
+            }
+        }
 
         Ok(())
+    }
+
+    /// 等待 SIGINT（Ctrl-C）或 SIGTERM（容器/systemd 停机），返回触发的信号名。
+    async fn wait_for_shutdown_signal() -> &'static str {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut sigterm) => tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = sigterm.recv() => "SIGTERM",
+                },
+                Err(e) => {
+                    warn!("无法注册 SIGTERM handler: {}；仅监听 SIGINT", e);
+                    let _ = tokio::signal::ctrl_c().await;
+                    "SIGINT"
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
     }
 
     /// 显示配置信息
