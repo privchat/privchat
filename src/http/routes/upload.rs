@@ -78,38 +78,26 @@ pub fn create_route() -> Router<FileServerState> {
         .layer(DefaultBodyLimit::max(120 * 1024 * 1024))
 }
 
-/// 文件上传处理器
-async fn upload_file(
-    State(state): State<FileServerState>,
-    headers: axum::http::HeaderMap,
-    mut multipart: Multipart,
-) -> ApiResult<UploadResponse> {
-    // 提取 X-Upload-Token header
-    let upload_token = headers
-        .get("X-Upload-Token")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ServerError::Validation("缺少 X-Upload-Token header".to_string()))?;
-
-    tracing::info!("🔐 验证上传 token: {}", upload_token);
-
-    // 验证 token
-    let token_info = state
-        .upload_token_service
-        .validate_token(upload_token)
-        .await?;
-
-    // 标记 token 已使用
-    state
-        .upload_token_service
-        .mark_token_used(upload_token)
-        .await?;
-
-    tracing::info!("✅ Token 验证通过，用户: {}", token_info.user_id);
-
-    let file_service = &state.file_service;
-
-    // 上传服务只负责存储：不解析 compress/generate_thumbnail 等处理参数，客户端已在 token 请求时确定类型与限制
-    let mut file_data: Option<Vec<u8>> = None;
+/// 流式接收 multipart：file 字段按 chunk 直写存储（大小硬顶即时校验），
+/// 其余字段照常收集；收完后做加密结构校验。任何失败都会清理已写入的半文件。
+///
+/// 返回 (upload, filename, mime_type, business_id, encryption_version, cek)。
+async fn receive_streaming(
+    state: &FileServerState,
+    token_info: &crate::service::upload_token_service::UploadToken,
+    multipart: &mut Multipart,
+) -> Result<
+    (
+        crate::service::file_service::StreamingUpload,
+        String,
+        String,
+        Option<String>,
+        i32,
+        Option<String>,
+    ),
+    ServerError,
+> {
+    let mut upload: Option<crate::service::file_service::StreamingUpload> = None;
     let mut filename: Option<String> = None;
     let mut mime_type: Option<String> = None;
     let mut business_id: Option<String> = None;
@@ -117,21 +105,72 @@ async fn upload_file(
     let mut encryption_version: i32 = 0;
     let mut cek: Option<String> = None;
 
-    // 解析 multipart/form-data：file 必填；business_id / encryption_version / cek 可选
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ServerError::Validation(format!("解析 multipart 失败: {}", e)))?
-    {
-        let field_name = field.name().unwrap_or("");
-        match field_name {
+    // 失败路径统一清理半文件后返回错误。
+    macro_rules! fail {
+        ($upload:ident, $err:expr) => {{
+            if let Some(u) = $upload.take() {
+                u.abort().await;
+            }
+            return Err($err);
+        }};
+    }
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => fail!(
+                upload,
+                ServerError::Validation(format!("解析 multipart 失败: {}", e))
+            ),
+        };
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
             "file" => {
-                filename = field.file_name().map(|s| s.to_string());
-                mime_type = field.content_type().map(|s| s.to_string());
-                let data = field.bytes().await.map_err(|e| {
-                    crate::error::ServerError::Validation(format!("读取文件数据失败: {}", e))
-                })?;
-                file_data = Some(data.to_vec());
+                if upload.is_some() {
+                    fail!(
+                        upload,
+                        ServerError::Validation("重复的 file 字段".to_string())
+                    );
+                }
+                let fname = field
+                    .file_name()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "file.bin".to_string());
+                let mime = field
+                    .content_type()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let mut sink = match state
+                    .file_service
+                    .begin_streaming_upload(&mime, &fname, token_info.max_size)
+                    .await
+                {
+                    Ok(sink) => sink,
+                    Err(e) => fail!(upload, e),
+                };
+                let mut field = field;
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if let Err(e) = sink.write_chunk(chunk).await {
+                                sink.abort().await;
+                                fail!(upload, e);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            sink.abort().await;
+                            fail!(
+                                upload,
+                                ServerError::Validation(format!("读取文件数据失败: {}", e))
+                            );
+                        }
+                    }
+                }
+                filename = Some(fname);
+                mime_type = Some(mime);
+                upload = Some(sink);
             }
             "business_id" => {
                 if let Ok(s) = field.text().await {
@@ -158,70 +197,122 @@ async fn upload_file(
         }
     }
 
-    // 验证必需字段
-    let file_data = file_data.ok_or_else(|| ServerError::Validation("缺少文件数据".to_string()))?;
-    let filename = filename.ok_or_else(|| ServerError::Validation("缺少文件名".to_string()))?;
-    let mime_type =
-        mime_type.ok_or_else(|| ServerError::Validation("缺少 MIME 类型".to_string()))?;
-
-    // 从 token_info 获取 uploader_id
-    let uploader_id = token_info.user_id;
-
-    // 仅做 token 内约定的校验：文件大小不超过 token 签发时的 max_size
-    if file_data.len() as i64 > token_info.max_size {
-        return Err(ServerError::Validation(format!(
-            "文件大小 {} 超过限制 {} bytes",
-            file_data.len(),
-            token_info.max_size
-        )));
-    }
+    let Some(sink) = upload.take() else {
+        return Err(ServerError::Validation("缺少文件数据".to_string()));
+    };
+    let mut upload = Some(sink);
+    let filename = filename.unwrap_or_else(|| "file.bin".to_string());
+    let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
     // 附件加密结构校验（服务端不解密、不验 GCM tag，仅防脏数据入库；ATTACHMENT_ENCRYPTION_SPEC §3.2）。
     // 注意：cek 绝不进日志。
     match encryption_version {
         0 => {
             if cek.is_some() {
-                return Err(ServerError::Validation(
-                    "encryption_version=0 时不应携带 cek".to_string(),
-                ));
+                fail!(
+                    upload,
+                    ServerError::Validation("encryption_version=0 时不应携带 cek".to_string())
+                );
             }
         }
         1 => {
-            let cek_str = cek.as_deref().ok_or_else(|| {
-                ServerError::Validation("encryption_version=1 缺少 cek".to_string())
-            })?;
-            let decoded = URL_SAFE_NO_PAD
-                .decode(cek_str.as_bytes())
-                .map_err(|_| ServerError::Validation("cek 不是合法 base64url".to_string()))?;
+            let Some(cek_str) = cek.as_deref() else {
+                fail!(
+                    upload,
+                    ServerError::Validation("encryption_version=1 缺少 cek".to_string())
+                );
+            };
+            let decoded = match URL_SAFE_NO_PAD.decode(cek_str.as_bytes()) {
+                Ok(d) => d,
+                Err(_) => fail!(
+                    upload,
+                    ServerError::Validation("cek 不是合法 base64url".to_string())
+                ),
+            };
             if decoded.len() != 32 {
-                return Err(ServerError::Validation(format!(
-                    "cek 解码后必须为 32 字节，实际 {}",
-                    decoded.len()
-                )));
+                fail!(
+                    upload,
+                    ServerError::Validation(format!(
+                        "cek 解码后必须为 32 字节，实际 {}",
+                        decoded.len()
+                    ))
+                );
             }
             // blob = nonce(12) || ciphertext(>=0) || tag(16)，最少 28 字节
-            if file_data.len() < 28 {
-                return Err(ServerError::Validation(format!(
-                    "加密 blob 至少 28 字节（12 nonce + 16 tag），实际 {}",
-                    file_data.len()
-                )));
+            let written = upload.as_ref().map(|u| u.written()).unwrap_or(0);
+            if written < 28 {
+                fail!(
+                    upload,
+                    ServerError::Validation(format!(
+                        "加密 blob 至少 28 字节（12 nonce + 16 tag），实际 {}",
+                        written
+                    ))
+                );
             }
         }
         v => {
-            return Err(ServerError::Validation(format!(
-                "不支持的 encryption_version: {}",
-                v
-            )));
+            fail!(
+                upload,
+                ServerError::Validation(format!("不支持的 encryption_version: {}", v))
+            );
         }
     }
 
-    // 从请求头取客户端 IP（兼容反向代理：X-Forwarded-For 取第一个，否则 X-Real-IP）
+    let sink = upload.take().expect("upload present after validation");
+    Ok((
+        sink,
+        filename,
+        mime_type,
+        business_id,
+        encryption_version,
+        cek,
+    ))
+}
+
+/// 文件上传处理器
+async fn upload_file(
+    State(state): State<FileServerState>,
+    headers: axum::http::HeaderMap,
+    mut multipart: Multipart,
+) -> ApiResult<UploadResponse> {
+    // 提取 X-Upload-Token header
+    let upload_token = headers
+        .get("X-Upload-Token")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::Validation("缺少 X-Upload-Token header".to_string()))?;
+
+    // P0-10：token 不落明文日志，只留前缀定位。
+    tracing::info!(
+        "🔐 验证上传 token: {}…",
+        upload_token.chars().take(8).collect::<String>()
+    );
+
+    // 验证 token
+    let token_info = state
+        .upload_token_service
+        .validate_token(upload_token)
+        .await?;
+
+    // 标记 token 已使用（Redis 路径 GETDEL 原子消费，跨实例一次性）
+    state
+        .upload_token_service
+        .mark_token_used(upload_token)
+        .await?;
+
+    tracing::info!("✅ Token 验证通过，用户: {}", token_info.user_id);
+
+    // P0-10：流式接收——数据边收边写存储，任何失败清理半文件，不再全量进内存。
+    let (upload, filename, mime_type, business_id, encryption_version, cek) =
+        receive_streaming(&state, &token_info, &mut multipart).await?;
+
+    let uploader_id = token_info.user_id;
     let uploader_ip = client_ip_from_headers(&headers);
+    let file_service = &state.file_service;
 
     info!(
         "📤 上传文件: {} ({} bytes, {}) from 用户 {}, ip: {}",
         filename,
-        file_data.len(),
+        upload.written(),
         mime_type,
         uploader_id,
         uploader_ip.as_deref().unwrap_or("-")
@@ -229,8 +320,8 @@ async fn upload_file(
 
     // 只做存储；业务类型来自 token，business_id 可选（表单或后续 update_business 关联）
     let metadata = file_service
-        .upload_file(
-            file_data,
+        .commit_streaming_upload(
+            upload,
             filename,
             mime_type,
             uploader_id,

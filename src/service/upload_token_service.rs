@@ -89,17 +89,37 @@ impl UploadToken {
     }
 }
 
-/// 上传 Token 服务
-pub struct UploadTokenService {
-    /// Token 存储（token -> UploadToken）
-    tokens: Arc<RwLock<HashMap<String, UploadToken>>>,
+/// 日志用 token 脱敏：只保留前 8 位（P0-10：上传 token 不落明文日志）。
+fn redact(token: &str) -> String {
+    format!("{}…", token.chars().take(8).collect::<String>())
 }
 
+/// 上传 Token 服务
+///
+/// P0-10：优先走 Redis（key `upload_token:{token}`，SETEX 到期自灭，GETDEL 原子
+/// 消费保证一次性语义跨实例成立）；无 Redis 时回退进程内存（单实例/测试）。
+pub struct UploadTokenService {
+    /// 内存回退存储（token -> UploadToken）
+    tokens: Arc<RwLock<HashMap<String, UploadToken>>>,
+    redis: Option<Arc<crate::infra::redis::RedisClient>>,
+}
+
+const REDIS_KEY_PREFIX: &str = "upload_token:";
+
 impl UploadTokenService {
-    /// 创建新的 UploadTokenService
+    /// 创建新的 UploadTokenService（内存模式，测试/无 Redis 场景）
     pub fn new() -> Self {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
+            redis: None,
+        }
+    }
+
+    /// 带 Redis 后端创建（生产路径）：token 状态跨实例可见。
+    pub fn new_with_redis(redis: Arc<crate::infra::redis::RedisClient>) -> Self {
+        Self {
+            tokens: Arc::new(RwLock::new(HashMap::new())),
+            redis: Some(redis),
         }
     }
 
@@ -114,15 +134,23 @@ impl UploadTokenService {
     ) -> Result<UploadToken> {
         let token = UploadToken::new(user_id, file_type, max_size, business_type, filename);
 
-        // 存储 token
-        self.tokens
-            .write()
-            .await
-            .insert(token.token.clone(), token.clone());
+        if let Some(redis) = &self.redis {
+            let ttl = (token.expires_at - Utc::now()).num_seconds().max(1) as usize;
+            let payload = serde_json::to_string(&token)
+                .map_err(|e| ServerError::Internal(format!("序列化 upload token 失败: {}", e)))?;
+            redis
+                .setex(&format!("{REDIS_KEY_PREFIX}{}", token.token), ttl, &payload)
+                .await?;
+        } else {
+            self.tokens
+                .write()
+                .await
+                .insert(token.token.clone(), token.clone());
+        }
 
         info!(
             "🎫 生成上传 token: {} (用户: {}, 类型: {}, 最大: {} bytes, 业务: {})",
-            token.token,
+            redact(&token.token),
             token.user_id,
             token.file_type.as_str(),
             token.max_size,
@@ -134,17 +162,30 @@ impl UploadTokenService {
 
     /// 验证 token 有效性
     pub async fn validate_token(&self, token: &str) -> Result<UploadToken> {
-        let tokens = self.tokens.read().await;
+        if let Some(redis) = &self.redis {
+            let payload = redis.get(&format!("{REDIS_KEY_PREFIX}{token}")).await?;
+            return match payload.and_then(|p| serde_json::from_str::<UploadToken>(&p).ok()) {
+                Some(upload_token) if upload_token.is_valid() => {
+                    debug!("✅ Token 验证通过: {}", redact(token));
+                    Ok(upload_token)
+                }
+                _ => {
+                    warn!("❌ Token 不存在或已失效: {}", redact(token));
+                    Err(ServerError::InvalidToken)
+                }
+            };
+        }
 
+        let tokens = self.tokens.read().await;
         match tokens.get(token) {
             Some(upload_token) => {
                 if upload_token.is_valid() {
-                    debug!("✅ Token 验证通过: {}", token);
+                    debug!("✅ Token 验证通过: {}", redact(token));
                     Ok(upload_token.clone())
                 } else {
                     warn!(
                         "❌ Token 已失效: {} (已使用: {}, 过期: {})",
-                        token,
+                        redact(token),
                         upload_token.used,
                         Utc::now() >= upload_token.expires_at
                     );
@@ -152,21 +193,34 @@ impl UploadTokenService {
                 }
             }
             None => {
-                warn!("❌ Token 不存在: {}", token);
+                warn!("❌ Token 不存在: {}", redact(token));
                 Err(ServerError::InvalidToken)
             }
         }
     }
 
-    /// 标记 token 已使用
+    /// 标记 token 已使用（一次性消费）。
+    /// Redis 路径用 GETDEL 原子消费：并发/跨实例重复使用只有一个赢家。
     pub async fn mark_token_used(&self, token: &str) -> Result<()> {
-        let mut tokens = self.tokens.write().await;
+        if let Some(redis) = &self.redis {
+            return match redis.getdel(&format!("{REDIS_KEY_PREFIX}{token}")).await? {
+                Some(_) => {
+                    info!("✅ Token 已消费: {}", redact(token));
+                    Ok(())
+                }
+                None => {
+                    warn!("❌ Token 已被使用或过期: {}", redact(token));
+                    Err(ServerError::InvalidToken)
+                }
+            };
+        }
 
+        let mut tokens = self.tokens.write().await;
         match tokens.get_mut(token) {
             Some(upload_token) => {
                 if upload_token.is_valid() {
                     upload_token.mark_used();
-                    info!("✅ Token 标记为已使用: {}", token);
+                    info!("✅ Token 标记为已使用: {}", redact(token));
                     Ok(())
                 } else {
                     Err(ServerError::InvalidToken)
@@ -178,19 +232,25 @@ impl UploadTokenService {
 
     /// 删除 token（清理）
     pub async fn remove_token(&self, token: &str) -> Result<()> {
+        if let Some(redis) = &self.redis {
+            redis.del(&format!("{REDIS_KEY_PREFIX}{token}")).await?;
+            return Ok(());
+        }
         let mut tokens = self.tokens.write().await;
-
         match tokens.remove(token) {
             Some(_) => {
-                debug!("🗑️ Token 已删除: {}", token);
+                debug!("🗑️ Token 已删除: {}", redact(token));
                 Ok(())
             }
             None => Err(ServerError::InvalidToken),
         }
     }
 
-    /// 清理过期的 token（定期调用）
+    /// 清理过期的 token（定期调用）。Redis 路径由 SETEX TTL 自灭，无需清理。
     pub async fn cleanup_expired_tokens(&self) {
+        if self.redis.is_some() {
+            return;
+        }
         let mut tokens = self.tokens.write().await;
         let now = Utc::now();
 
