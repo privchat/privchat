@@ -735,8 +735,10 @@ impl ChannelService {
             where_clauses.push(format!("c.channel_type = {}", ct));
         }
         if user_id.is_some() {
+            // 成员表是 privchat_channel_participants（此前误写成不存在的
+            // privchat_channel_members，带 user_id 过滤的 admin 频道列表会直接 SQL 报错）。
             where_clauses.push(format!(
-                "c.channel_id IN (SELECT channel_id FROM privchat_channel_members WHERE user_id = {})",
+                "c.channel_id IN (SELECT channel_id FROM privchat_channel_participants WHERE user_id = {} AND left_at IS NULL)",
                 user_id.unwrap()
             ));
         }
