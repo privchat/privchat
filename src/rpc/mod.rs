@@ -318,3 +318,153 @@ pub fn parse_u64_param(value: &serde_json::Value, field_name: &str) -> RpcResult
         .and_then(|v| v.as_u64())
         .ok_or_else(|| RpcError::validation(format!("{} is required (must be u64)", field_name)))
 }
+
+/// 读路径频道可见性守卫（MESSAGE_HISTORY_AND_SEARCH spec §3 / §9#1）。
+///
+/// 校验 `user_id` 是 `channel_id` 的成员；频道不存在与非成员**统一**返回
+/// `ResourceNotFound`（消息文案也一致），不向非成员泄露频道是否存在。
+/// 写路径（sync/submit）保持既有 forbidden 语义不受影响。
+///
+/// 鉴权链路与 P1-16（sync/submit）一致：`get_channel_opt`（内存缓存 → DB 回源，
+/// members 由 privchat_channel_participants 加载）+ `members` 包含判断。
+pub async fn ensure_channel_visible(
+    channel_service: &crate::service::ChannelService,
+    channel_id: u64,
+    user_id: u64,
+) -> RpcResult<()> {
+    let channel = channel_service
+        .get_channel_opt(channel_id)
+        .await
+        .ok_or_else(|| RpcError::not_found(format!("频道不存在: {}", channel_id)))?;
+    if !channel.members.contains_key(&user_id) {
+        return Err(RpcError::not_found(format!("频道不存在: {}", channel_id)));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod channel_visibility_tests {
+    use crate::repository::PgChannelRepository;
+    use crate::service::ChannelService;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    // 测试专用固定 ID 段，避免与业务数据冲突；cleanup 幂等。
+    const CH: u64 = 987_654_321_001;
+    const MISSING_CH: u64 = 987_654_321_999;
+    const USER_A: u64 = 987_650_001; // 成员
+    const USER_B: u64 = 987_650_002; // 成员（direct 对端）
+    const USER_C: u64 = 987_650_003; // 非成员
+
+    async fn open_service() -> Option<ChannelService> {
+        let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()?;
+        let repo = Arc::new(PgChannelRepository::new(Arc::new(pool)));
+        Some(ChannelService::new_with_repository(repo))
+    }
+
+    async fn ensure_user(service: &ChannelService, user_id: u64) {
+        // privchat_users.qr_key NOT NULL（QR_CODE_SPEC v1.3）
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+            VALUES ($1, $2, $2, $3)
+            ON CONFLICT (user_id) DO NOTHING
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(format!("gt{}", user_id % 1_000_000)) // 列宽 varchar(16)，保持短名
+        .bind(format!("qg{}", user_id % 1_000_000))
+        .execute(service.pool())
+        .await
+        .expect("ensure user");
+    }
+
+    async fn cleanup(service: &ChannelService) {
+        let _ = sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = $1")
+            .bind(CH as i64)
+            .execute(service.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(CH as i64)
+            .execute(service.pool())
+            .await;
+    }
+
+    /// spec §3/§9#1：成员可见；非成员与频道不存在统一 not_found 且文案一致
+    /// （不向非成员泄露频道是否存在）。
+    #[tokio::test]
+    async fn ensure_channel_visible_gates_non_members_uniformly() {
+        let Some(service) = open_service().await else {
+            eprintln!("skip ensure_channel_visible_gates_non_members_uniformly: DATABASE_URL not configured");
+            return;
+        };
+        cleanup(&service).await;
+        ensure_user(&service, USER_A).await;
+        ensure_user(&service, USER_B).await;
+        ensure_user(&service, USER_C).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_channels (channel_id, channel_type, direct_user1_id, direct_user2_id)
+            VALUES ($1, 0, $2, $3)
+            "#,
+        )
+        .bind(CH as i64)
+        .bind(USER_A as i64)
+        .bind(USER_B as i64)
+        .execute(service.pool())
+        .await
+        .expect("insert channel");
+        for uid in [USER_A, USER_B] {
+            sqlx::query(
+                "INSERT INTO privchat_channel_participants (channel_id, user_id, role) VALUES ($1, $2, 2)",
+            )
+            .bind(CH as i64)
+            .bind(uid as i64)
+            .execute(service.pool())
+            .await
+            .expect("insert participant");
+        }
+
+        // 成员可见
+        super::ensure_channel_visible(&service, CH, USER_A)
+            .await
+            .expect("member must be visible");
+
+        // 非成员 → not_found
+        let non_member_err = super::ensure_channel_visible(&service, CH, USER_C)
+            .await
+            .expect_err("non-member must be rejected");
+        // 频道不存在 → not_found
+        let missing_err = super::ensure_channel_visible(&service, MISSING_CH, USER_A)
+            .await
+            .expect_err("missing channel must be rejected");
+
+        assert_eq!(
+            non_member_err.code_value(),
+            crate::rpc::RpcError::not_found("x").code_value(),
+            "non-member must map to ResourceNotFound"
+        );
+        assert_eq!(
+            non_member_err.code_value(),
+            missing_err.code_value(),
+            "non-member and missing channel must share the same error code (anti-oracle)"
+        );
+        // 文案除 channel_id 外必须一致：把 id 归一化后比对
+        let norm = |m: &str| m.replace(&CH.to_string(), "<id>").replace(&MISSING_CH.to_string(), "<id>");
+        assert_eq!(
+            norm(non_member_err.message()),
+            norm(missing_err.message()),
+            "error messages must not distinguish non-member from missing channel"
+        );
+
+        cleanup(&service).await;
+    }
+}

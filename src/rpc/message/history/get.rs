@@ -34,6 +34,13 @@ pub async fn handle(
         .and_then(|v| v.as_u64())
         .ok_or_else(|| RpcError::validation("channel_id is required (must be u64)".to_string()))?;
 
+    // MESSAGE_HISTORY_AND_SEARCH spec §3：读路径成员鉴权。此前 handler 拿到 ctx
+    // 但从未校验，任意登录用户可拉任意会话历史（P0 越权）。非成员/频道不存在
+    // 统一 not_found，不泄露频道存在性。
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
+    crate::rpc::ensure_channel_visible(services.channel_service.as_ref(), channel_id, user_id)
+        .await?;
+
     let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as i64;
 
     let before_message_id = body
