@@ -82,32 +82,11 @@ pub async fn handle(
     .await
     {
         Ok(messages) => {
-            let mut message_list: Vec<Value> = messages
-                .into_iter()
-                .map(|msg| {
-                    // 如果消息被撤回，清空内容（返回空字符串），客户端根据 revoked 字段显示占位符
-                    let content = if msg.revoked {
-                        String::new() // 清空内容，客户端根据语言显示占位符
-                    } else {
-                        msg.content
-                    };
-
-                    json!({
-                        "message_id": msg.message_id,
-                        "channel_id": msg.channel_id,  // channel_id 就是 channel_id
-                        "sender_id": msg.sender_id,
-                        "content": content,
-                        "message_type": msg.message_type.as_str(),
-                        "timestamp": msg.created_at.timestamp_millis(),
-                        "message_seq": msg.pts,  // per-channel pts; clients project read-by-peer (sent vs ✓✓) by comparing this to ChannelRecord.peer_read_pts. Field name mirrors SendMessageResponse.message_seq for cross-RPC consistency.
-                        "reply_to_message_id": msg.reply_to_message_id,
-                        "metadata": msg.metadata,
-                        "revoked": msg.revoked,  // 客户端根据此字段和语言设置显示占位符
-                        "revoked_at": msg.revoked_at.map(|dt| dt.timestamp_millis()),
-                        "revoked_by": msg.revoked_by
-                    })
-                })
-                .collect();
+            // 统一 JSON 视图（与 around 共用，见 history/mod.rs::message_view_json）。
+            // message_seq = per-channel pts；clients project read-by-peer (sent vs ✓✓)
+            // by comparing it to ChannelRecord.peer_read_pts.
+            let mut message_list: Vec<Value> =
+                messages.iter().map(super::message_view_json).collect();
             message_list.reverse();
 
             tracing::debug!(

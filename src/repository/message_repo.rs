@@ -1474,3 +1474,476 @@ impl MessageRepository for PgMessageRepository {
         Ok((messages, total as u32))
     }
 }
+
+// ============================================================================
+// 客户端消息搜索与 around 上下文（MESSAGE_HISTORY_AND_SEARCH spec §4/§5）
+//
+// 与上面 admin `search_messages`（全库、X-Service-Key、offset 分页）完全独立：
+// 这里的一切查询都以"当前用户可见范围"为边界，禁止复用 admin 路径给客户端。
+// ============================================================================
+
+/// search 命中投影（spec §4：只回 snippet 所需字段，不是完整消息——
+/// 命中结果不允许回填本地 message 表，完整消息走 get/around）。
+#[derive(Debug, sqlx::FromRow)]
+pub struct MessageSearchHit {
+    pub message_id: i64,
+    pub channel_id: i64,
+    pub sender_id: i64,
+    pub message_type: i16,
+    pub content: String,
+    pub created_at: i64,
+}
+
+impl PgMessageRepository {
+    /// 把原始 query 交给库内 `privchat_search_tokens`（011）分词并拼成 AND tsquery 串。
+    /// 分词逻辑只存在于该 SQL 函数一处（写入索引与查询共用），避免 Rust 侧
+    /// 重复实现造成漂移。返回空串 = 分不出 token（调用方直接回空结果）。
+    pub async fn search_tokens_tsquery(&self, raw_query: &str) -> Result<String, DatabaseError> {
+        let row: (Option<String>,) = sqlx::query_as(
+            "SELECT array_to_string(tsvector_to_array(privchat_search_tokens($1)), ' & ')",
+        )
+        .bind(raw_query)
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("tokenize query failed: {}", e)))?;
+        Ok(row.0.unwrap_or_default())
+    }
+
+    /// 用户可见范围内的消息搜索（spec §4）：
+    /// - GLOBAL（scope_channel=None）：成员过滤压在 SQL 内的 EXISTS semi-join
+    ///   （privchat_channel_participants + left_at IS NULL），禁止应用层拼 IN 列表；
+    /// - CHANNEL：调用方已过 ensure_channel_visible，这里只加 channel_id 等值；
+    /// - 可见性：revoked=false AND deleted=false——撤回正文库内并未物理清除，
+    ///   不过滤会经 snippet 泄露（spec §0.1-3）；
+    /// - keyset：created_at DESC, message_id DESC（cursor 同方向解释）；
+    /// - 语义：GIN bigram tsquery 先缩候选集，content ILIKE recheck 保证精确子串；
+    /// - 兜底：事务内 SET LOCAL statement_timeout 防慢查询拖死连接。
+    pub async fn search_visible(
+        &self,
+        user_id: u64,
+        scope_channel: Option<u64>,
+        tsquery: &str,
+        ilike_pattern: &str,
+        cursor: Option<(i64, i64)>,
+        limit: i64,
+    ) -> Result<Vec<MessageSearchHit>, DatabaseError> {
+        let mut sql = String::from(
+            r#"
+            SELECT message_id, channel_id, sender_id, message_type, content, created_at
+            FROM privchat_messages m
+            WHERE privchat_search_tokens(m.content) @@ to_tsquery('simple', $1)
+              AND m.content ILIKE $2 ESCAPE '\'
+              AND m.revoked = false
+              AND m.deleted = false
+            "#,
+        );
+        // $1=tsquery $2=ilike；$3=scope（channel_id 或 user_id）；cursor 追加 $4/$5
+        if scope_channel.is_some() {
+            sql.push_str(" AND m.channel_id = $3");
+        } else {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM privchat_channel_participants p \
+                 WHERE p.channel_id = m.channel_id AND p.user_id = $3 AND p.left_at IS NULL)",
+            );
+        }
+        if cursor.is_some() {
+            sql.push_str(
+                " AND (m.created_at < $4 OR (m.created_at = $4 AND m.message_id < $5))",
+            );
+        }
+        sql.push_str(&format!(
+            " ORDER BY m.created_at DESC, m.message_id DESC LIMIT {}",
+            limit.clamp(1, 50)
+        ));
+
+        let mut query = sqlx::query_as::<_, MessageSearchHit>(&sql)
+            .bind(tsquery)
+            .bind(ilike_pattern);
+        query = match scope_channel {
+            Some(cid) => query.bind(cid as i64),
+            None => query.bind(user_id as i64),
+        };
+        if let Some((ts, id)) = cursor {
+            query = query.bind(ts).bind(id);
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("search begin tx failed: {}", e)))?;
+        sqlx::query("SET LOCAL statement_timeout = 4000")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::Database(format!("search set timeout failed: {}", e)))?;
+        let rows = query
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::Database(format!("search query failed: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("search commit failed: {}", e)))?;
+        Ok(rows)
+    }
+
+    /// around：anchor 之前（更旧）的一页。严格 (created_at, message_id) 元组 keyset，
+    /// DESC 取出，调用方反转为 ASC 展示。软删过滤；撤回保留占位（响应层清 content），
+    /// 与 message/history/get 的语义一致——上下文里撤回消息必须占位而不是消失。
+    pub async fn list_context_before(
+        &self,
+        channel_id: u64,
+        anchor_created_at: i64,
+        anchor_message_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Message>, DatabaseError> {
+        self.list_context(channel_id, anchor_created_at, anchor_message_id, limit, true)
+            .await
+    }
+
+    /// around：anchor 之后（更新）的一页，ASC 自然序。
+    pub async fn list_context_after(
+        &self,
+        channel_id: u64,
+        anchor_created_at: i64,
+        anchor_message_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Message>, DatabaseError> {
+        self.list_context(channel_id, anchor_created_at, anchor_message_id, limit, false)
+            .await
+    }
+
+    async fn list_context(
+        &self,
+        channel_id: u64,
+        anchor_created_at: i64,
+        anchor_message_id: i64,
+        limit: i64,
+        before: bool,
+    ) -> Result<Vec<Message>, DatabaseError> {
+        #[derive(sqlx::FromRow)]
+        struct ContextRow {
+            message_id: i64,
+            channel_id: i64,
+            sender_id: i64,
+            pts: i64,
+            local_message_id: Option<i64>,
+            content: String,
+            message_type: i16,
+            metadata: Option<serde_json::Value>,
+            reply_to_message_id: Option<i64>,
+            created_at: i64,
+            updated_at: i64,
+            deleted: bool,
+            deleted_at: Option<i64>,
+            revoked: bool,
+            revoked_at: Option<i64>,
+            revoked_by: Option<i64>,
+        }
+
+        let sql = if before {
+            r#"
+            SELECT message_id, channel_id, sender_id, pts, local_message_id, content,
+                   message_type, metadata, reply_to_message_id, created_at, updated_at,
+                   deleted, deleted_at, revoked, revoked_at, revoked_by
+            FROM privchat_messages
+            WHERE channel_id = $1 AND deleted = false
+              AND (created_at < $2 OR (created_at = $2 AND message_id < $3))
+            ORDER BY created_at DESC, message_id DESC
+            LIMIT $4
+            "#
+        } else {
+            r#"
+            SELECT message_id, channel_id, sender_id, pts, local_message_id, content,
+                   message_type, metadata, reply_to_message_id, created_at, updated_at,
+                   deleted, deleted_at, revoked, revoked_at, revoked_by
+            FROM privchat_messages
+            WHERE channel_id = $1 AND deleted = false
+              AND (created_at > $2 OR (created_at = $2 AND message_id > $3))
+            ORDER BY created_at ASC, message_id ASC
+            LIMIT $4
+            "#
+        };
+
+        let rows = sqlx::query_as::<_, ContextRow>(sql)
+            .bind(channel_id as i64)
+            .bind(anchor_created_at)
+            .bind(anchor_message_id)
+            .bind(limit.clamp(1, 50))
+            .fetch_all(self.pool.as_ref())
+            .await
+            .map_err(|e| DatabaseError::Database(format!("list context failed: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                Message::from_db_row(
+                    r.message_id,
+                    r.channel_id,
+                    r.sender_id,
+                    r.pts,
+                    r.local_message_id.map(|n| n as u64),
+                    r.content,
+                    r.message_type,
+                    r.metadata
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                    r.reply_to_message_id,
+                    r.created_at,
+                    r.updated_at,
+                    r.deleted,
+                    r.deleted_at,
+                    r.revoked,
+                    r.revoked_at,
+                    r.revoked_by,
+                )
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod client_search_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    // 测试专用 ID 段（与 rpc guard 测试的 987_65x 区分开）
+    const CH_MINE: u64 = 987_660_001; // user A 是成员
+    const CH_OTHER: u64 = 987_660_002; // user A 非成员
+    const CH_AROUND: u64 = 987_660_011; // around 测试独立频道（并行防撞）
+    const USER_A: u64 = 987_661_001;
+    const USER_B: u64 = 987_661_002;
+    const USER_C: u64 = 987_661_003;
+    const USER_D: u64 = 987_661_011;
+    const USER_E: u64 = 987_661_012;
+    const MSG_BASE: i64 = 987_662_000;
+    const KW: &str = "biggram红包雨测试";
+
+    async fn open_repo() -> Option<PgMessageRepository> {
+        let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()?;
+        Some(PgMessageRepository::new(Arc::new(pool)))
+    }
+
+    async fn cleanup(repo: &PgMessageRepository) {
+        for ch in [CH_MINE, CH_OTHER] {
+            let _ = sqlx::query("DELETE FROM privchat_messages WHERE channel_id = $1")
+                .bind(ch as i64)
+                .execute(repo.pool.as_ref())
+                .await;
+            let _ =
+                sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = $1")
+                    .bind(ch as i64)
+                    .execute(repo.pool.as_ref())
+                    .await;
+            let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+                .bind(ch as i64)
+                .execute(repo.pool.as_ref())
+                .await;
+        }
+    }
+
+    async fn ensure_user(repo: &PgMessageRepository, user_id: u64) {
+        // privchat_users.qr_key NOT NULL 且 username varchar(16)
+        let _ = sqlx::query(
+            "INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+             VALUES ($1, $2, $2, $3) ON CONFLICT (user_id) DO NOTHING",
+        )
+        .bind(user_id as i64)
+        .bind(format!("st{}", user_id % 1_000_000))
+        .bind(format!("qs{}", user_id % 1_000_000))
+        .execute(repo.pool.as_ref())
+        .await
+        .expect("ensure user");
+    }
+
+    /// 建 direct 频道 + 双方 participants（满足 FK；user A 只进 CH_MINE）
+    async fn ensure_channel(repo: &PgMessageRepository, channel_id: u64, u1: u64, u2: u64) {
+        ensure_user(repo, u1).await;
+        ensure_user(repo, u2).await;
+        sqlx::query(
+            "INSERT INTO privchat_channels (channel_id, channel_type, direct_user1_id, direct_user2_id)
+             VALUES ($1, 0, $2, $3) ON CONFLICT (channel_id) DO NOTHING",
+        )
+        .bind(channel_id as i64)
+        .bind(u1 as i64)
+        .bind(u2 as i64)
+        .execute(repo.pool.as_ref())
+        .await
+        .expect("insert channel");
+        for uid in [u1, u2] {
+            sqlx::query(
+                "INSERT INTO privchat_channel_participants (channel_id, user_id, role)
+                 VALUES ($1, $2, 2)
+                 ON CONFLICT (channel_id, user_id) DO UPDATE SET left_at = NULL",
+            )
+            .bind(channel_id as i64)
+            .bind(uid as i64)
+            .execute(repo.pool.as_ref())
+            .await
+            .expect("insert participant");
+        }
+    }
+
+    async fn insert_msg(
+        repo: &PgMessageRepository,
+        message_id: i64,
+        channel_id: u64,
+        content: &str,
+        created_at: i64,
+        revoked: bool,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_messages
+                (message_id, channel_id, sender_id, pts, message_type, content, created_at, revoked)
+            VALUES ($1, $2, $3, 1, 0, $4, $5, $6)
+            "#,
+        )
+        .bind(message_id)
+        .bind(channel_id as i64)
+        .bind(USER_B as i64)
+        .bind(content)
+        .bind(created_at)
+        .bind(revoked)
+        .execute(repo.pool.as_ref())
+        .await
+        .expect("insert message");
+    }
+
+    async fn setup(repo: &PgMessageRepository) -> (String, String) {
+        cleanup(repo).await;
+        // CH_MINE = A↔B（A 是成员）；CH_OTHER = B↔C（A 非成员）
+        ensure_channel(repo, CH_MINE, USER_A, USER_B).await;
+        ensure_channel(repo, CH_OTHER, USER_B, USER_C).await;
+
+        let t0 = 1_780_000_000_000_i64; // 固定基准时间（default 分区）
+        insert_msg(repo, MSG_BASE + 1, CH_MINE, &format!("早一条 {} A", KW), t0 + 1000, false).await;
+        insert_msg(repo, MSG_BASE + 2, CH_MINE, &format!("晚一条 {} B", KW), t0 + 2000, false).await;
+        insert_msg(repo, MSG_BASE + 3, CH_MINE, &format!("已撤回 {} C", KW), t0 + 3000, true).await;
+        insert_msg(repo, MSG_BASE + 4, CH_OTHER, &format!("别人频道 {} D", KW), t0 + 4000, false)
+            .await;
+
+        let tq = repo.search_tokens_tsquery(KW).await.expect("tokenize");
+        assert!(!tq.is_empty(), "tokenizer must produce tokens (migration 011 applied?)");
+        (tq, format!("%{}%", KW))
+    }
+
+    /// spec §4：GLOBAL 只见成员频道；撤回/他频道不可见；keyset 稳定翻页。
+    #[tokio::test]
+    async fn search_visible_scopes_and_paginates() {
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip search_visible_scopes_and_paginates: DATABASE_URL not configured");
+            return;
+        };
+        let (tq, pattern) = setup(&repo).await;
+
+        // GLOBAL：只命中 CH_MINE 的两条未撤回（新→旧）
+        let hits = repo
+            .search_visible(USER_A, None, &tq, &pattern, None, 10)
+            .await
+            .expect("global search");
+        assert_eq!(hits.len(), 2, "revoked + non-member channel must be invisible");
+        assert_eq!(hits[0].message_id, MSG_BASE + 2, "DESC: newest first");
+        assert_eq!(hits[1].message_id, MSG_BASE + 1);
+        assert!(hits.iter().all(|h| h.channel_id == CH_MINE as i64));
+
+        // keyset：limit=1 翻两页无重复无丢失
+        let page1 = repo
+            .search_visible(USER_A, None, &tq, &pattern, None, 1)
+            .await
+            .expect("page1");
+        assert_eq!(page1.len(), 1);
+        let cursor = (page1[0].created_at, page1[0].message_id);
+        let page2 = repo
+            .search_visible(USER_A, None, &tq, &pattern, Some(cursor), 1)
+            .await
+            .expect("page2");
+        assert_eq!(page2.len(), 1);
+        assert_ne!(page1[0].message_id, page2[0].message_id);
+
+        // CHANNEL scope：等值过滤
+        let scoped = repo
+            .search_visible(USER_A, Some(CH_MINE), &tq, &pattern, None, 10)
+            .await
+            .expect("channel search");
+        assert_eq!(scoped.len(), 2);
+
+        // 退群成员不可见：置 left_at 后 GLOBAL 无命中
+        sqlx::query(
+            "UPDATE privchat_channel_participants SET left_at = 1 WHERE channel_id = $1 AND user_id = $2",
+        )
+        .bind(CH_MINE as i64)
+        .bind(USER_A as i64)
+        .execute(repo.pool.as_ref())
+        .await
+        .expect("mark left");
+        let after_leave = repo
+            .search_visible(USER_A, None, &tq, &pattern, None, 10)
+            .await
+            .expect("search after leave");
+        assert!(after_leave.is_empty(), "left members must lose search visibility");
+
+        cleanup(&repo).await;
+    }
+
+    async fn cleanup_around(repo: &PgMessageRepository) {
+        let _ = sqlx::query("DELETE FROM privchat_messages WHERE channel_id = $1")
+            .bind(CH_AROUND as i64)
+            .execute(repo.pool.as_ref())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = $1")
+            .bind(CH_AROUND as i64)
+            .execute(repo.pool.as_ref())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(CH_AROUND as i64)
+            .execute(repo.pool.as_ref())
+            .await;
+    }
+
+    /// spec §5：around 两侧元组 keyset；软删过滤由 SQL 保证（撤回占位在响应层）。
+    #[tokio::test]
+    async fn around_context_windows() {
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip around_context_windows: DATABASE_URL not configured");
+            return;
+        };
+        cleanup_around(&repo).await;
+        ensure_channel(&repo, CH_AROUND, USER_D, USER_E).await;
+        let t0 = 1_780_100_000_000_i64;
+        // 五条按时间排开 + 一条与 anchor 同毫秒但 id 更大（验证 tie-break）
+        for (i, dt) in [(1, 1000), (2, 2000), (3, 3000), (4, 4000), (5, 5000)] {
+            insert_msg(&repo, MSG_BASE + 10 + i, CH_AROUND, &format!("ctx-{}", i), t0 + dt, false)
+                .await;
+        }
+        insert_msg(&repo, MSG_BASE + 19, CH_AROUND, "ctx-tie", t0 + 3000, false).await;
+
+        let anchor_id = MSG_BASE + 13; // ctx-3
+        let before = repo
+            .list_context_before(CH_AROUND, t0 + 3000, anchor_id, 10)
+            .await
+            .expect("before");
+        // DESC：ctx-2, ctx-1（同毫秒 id 更大的 ctx-tie 不属于 before）
+        assert_eq!(
+            before.iter().map(|m| m.message_id as i64).collect::<Vec<_>>(),
+            vec![MSG_BASE + 12, MSG_BASE + 11]
+        );
+
+        let after = repo
+            .list_context_after(CH_AROUND, t0 + 3000, anchor_id, 10)
+            .await
+            .expect("after");
+        // ASC：同毫秒但 id 更大的 ctx-tie 先于 ctx-4/ctx-5
+        assert_eq!(
+            after.iter().map(|m| m.message_id as i64).collect::<Vec<_>>(),
+            vec![MSG_BASE + 19, MSG_BASE + 14, MSG_BASE + 15]
+        );
+
+        cleanup_around(&repo).await;
+    }
+}
