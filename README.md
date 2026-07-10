@@ -76,66 +76,83 @@ PrivChat aims to build a **secure, high-performance, feature-complete** modern i
 # Install Rust (if needed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Clone and build
+# Clone and build (the produced binary is named `privchat`)
 git clone <repository-url>
-cd privchat-server
-cargo build --release
+cd privchat
+cargo build --release          # → ./target/release/privchat
 ```
+
+> **Migrations are embedded into the binary at build time.** `build.rs`
+> scans `migrations/*.sql` (skipping `000_`-prefixed reset scripts), sorts
+> them by filename, and bakes them into a `MIGRATIONS` constant. Adding a
+> new migration therefore requires a rebuild before `privchat migrate` can
+> apply it — there is no runtime SQL-directory read.
 
 ### 2. Configure .env
 
-Create `.env` in the project root (used by server and `sqlx migrate`):
+Copy the template and fill in real values (`.env` is git-ignored; see
+[`SECRETS.md`](SECRETS.md) for the full key list and rotation rules):
 
 ```bash
-echo 'DATABASE_URL=postgres://user:password@localhost:5432/privchat' > .env
+cp .env.example .env
+# edit .env: DATABASE_URL, PRIVCHAT_JWT_SECRET, SERVICE_MASTER_KEY, REDIS_URL
 ```
 
-> ⚠️ Add `.env` to `.gitignore`: `echo ".env" >> .gitignore`
+Hard-required (startup aborts if any is empty — see `Config::validate`):
+`DATABASE_URL`, `SERVICE_MASTER_KEY`, `REDIS_URL`. JWT signing config is also
+needed for auth — `PRIVCHAT_JWT_SECRET` for HS256, or
+`PRIVCHAT_JWT_PRIVATE_KEY_PATH` / `PRIVCHAT_JWT_PUBLIC_KEY_PATH` for RS256
+(production uses RS256 + JWKS).
 
 ### 3. Initialize database
 
-Use [sqlx-cli](https://github.com/launchbadge/sqlx/tree/main/sqlx-cli) (install: `cargo install sqlx-cli --no-default-features --features postgres`):
+Schema changes run through the binary's own `migrate` subcommand — **not**
+sqlx-cli. It connects with `DATABASE_URL`, creates a `privchat_migrations`
+tracking table, and applies every embedded migration not yet recorded:
 
 ```bash
-sqlx database create
-sqlx migrate run
+./target/release/privchat migrate
 ```
 
-**Optional – full reset (dev)**:
+This is the **only** supported path for schema changes; never apply SQL by
+hand in production.
+
+**Optional – full reset (dev only)**:
 
 ```bash
-psql "$DATABASE_URL" -f migrations/000_drop_all_tables.sql
-psql "$DATABASE_URL" -c "TRUNCATE _sqlx_migrations;"
-sqlx migrate run
+set -a && source .env && set +a                              # load DATABASE_URL for psql
+psql "$DATABASE_URL" -f migrations/000_drop_all_tables.sql   # 000_ is skipped by migrate; dev reset only
+psql "$DATABASE_URL" -c "DROP TABLE IF EXISTS privchat_migrations;"
+./target/release/privchat migrate
 ```
-
-> 💡 Load `.env` before `psql` (e.g. `set -a && source .env && set +a`).
 
 ### 4. Start server
 
 ```bash
-./target/release/privchat-server
-./target/release/privchat-server --dev
-./target/release/privchat-server --config-file /etc/privchat/config.toml
-./target/release/privchat-server --config-file production.toml
+./target/release/privchat                                      # default config.toml
+./target/release/privchat --dev
+./target/release/privchat --config-file /etc/privchat/config.toml
 ```
+
+Graceful shutdown: `SIGINT` (Ctrl-C) or `SIGTERM` stops accepting new
+connections, flushes pending presence writes, then exits cleanly (P1-11).
 
 ## 📋 CLI
 
 ### Basic
 
 ```bash
-privchat-server --help
-privchat-server --version
-privchat-server --config-file config.toml
+privchat --help
+privchat --version
+privchat --config-file config.toml
 ```
 
 ### Common
 
 ```bash
-privchat-server --config-file config.toml
-privchat-server --dev
-privchat-server --quiet
+privchat --config-file config.toml
+privchat --dev
+privchat --quiet
 ```
 
 > 💡 Prefer config file or env for ports, DB, logs. See [Configuration](#-configuration) and [Environment variables](#-environment-variables).
@@ -143,9 +160,9 @@ privchat-server --quiet
 ### Utilities
 
 ```bash
-privchat-server generate-config config.toml
-privchat-server validate-config config.toml
-privchat-server show-config
+privchat generate-config config.toml
+privchat validate-config config.toml
+privchat show-config
 ```
 
 ## 📝 Configuration
@@ -153,7 +170,7 @@ privchat-server show-config
 ### Create config
 
 ```bash
-privchat-server generate-config config.toml
+privchat generate-config config.toml
 # or
 cp config.example.toml config.toml
 ```
@@ -250,7 +267,7 @@ PRIVCHAT_JWT_SECRET=your-super-secret-key-minimum-64-chars
 3. Precedence: env > config > defaults
 4. `.env` is loaded automatically when present
 
-> 💡 Commit config (no secrets); add `.env` to `.gitignore`. Run `privchat-server generate-config config.toml` for full example. Real config also includes `[system_message]`, `[security]`, etc.; see `config.example.toml`.
+> 💡 Commit config (no secrets); add `.env` to `.gitignore`. Run `privchat generate-config config.toml` for full example. Real config also includes `[system_message]`, `[security]`, etc.; see `config.example.toml`.
 
 ### Config precedence
 
@@ -290,7 +307,7 @@ export PRIVCHAT_JWT_SECRET="your-super-secret-key-minimum-64-chars"
 ## 🔧 Dev mode
 
 ```bash
-privchat-server --dev
+privchat --dev
 ```
 
 - Log level: `debug`
@@ -334,10 +351,10 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates
-COPY --from=builder /app/target/release/privchat-server /usr/local/bin/
+COPY --from=builder /app/target/release/privchat /usr/local/bin/
 COPY config.example.toml /etc/privchat/config.toml
 EXPOSE 9001 9080 9083
-CMD ["privchat-server", "--config-file", "/etc/privchat/config.toml"]
+CMD ["privchat", "--config-file", "/etc/privchat/config.toml"]
 ```
 
 ### Docker Compose
@@ -345,7 +362,7 @@ CMD ["privchat-server", "--config-file", "/etc/privchat/config.toml"]
 ```yaml
 version: '3.8'
 services:
-  privchat-server:
+  privchat:
     build: .
     ports:
       - "9001:9001"   # TCP/QUIC Gateway
@@ -378,15 +395,15 @@ services:
 ## 🚨 Troubleshooting
 
 - **Port in use**: `lsof -i :9001` (or `:9080`); use `--tcp-port` / `--ws-port` to change.
-- **Config errors**: `privchat-server validate-config config.toml` and `privchat-server show-config`.
-- **Debug**: `privchat-server --log-level trace --log-format pretty` or `--dev -vv`.
+- **Config errors**: `privchat validate-config config.toml` and `privchat show-config`.
+- **Debug**: `privchat --log-level trace --log-format pretty` or `--dev -vv`.
 
 ## 🏗️ Modules
 
 Modular layout:
 
 ```
-privchat-server/
+privchat/
 ├── 🔐 auth         - JWT, device management, token revocation
 ├── 💬 message      - send, receive, route, store
 ├── 👥 contact      - friends, requests, blacklist
@@ -626,7 +643,7 @@ kept conservative and reflects the current server code rather than the older
 
 ## 📚 Docs
 
-Design docs live under **privchat-docs** or **privchat-server/docs**; see repo layout.
+Design docs live under **privchat-docs** or **privchat/docs**; see repo layout.
 
 - [OFFLINE_SPEC.md](../privchat-docs/spec/02-server/OFFLINE_SPEC.md)
 - [SEARCH_SPEC.md](../privchat-docs/spec/05-feature/SEARCH_SPEC.md)
