@@ -65,9 +65,9 @@ pub async fn register_routes(services: RpcServiceContext) {
     // sync/get_difference - 获取差异
     let services_clone = services.clone();
     GLOBAL_RPC_ROUTER
-        .register(routes::sync::GET_DIFFERENCE, move |body, _ctx| {
+        .register(routes::sync::GET_DIFFERENCE, move |body, ctx| {
             let services = services_clone.clone();
-            async move { handle_get_difference_rpc(body, services).await }
+            async move { handle_get_difference_rpc(body, services, ctx).await }
         })
         .await;
 
@@ -122,11 +122,27 @@ async fn handle_get_channel_pts_rpc(body: Value, services: RpcServiceContext) ->
 }
 
 /// RPC 处理函数：获取差异
-async fn handle_get_difference_rpc(body: Value, services: RpcServiceContext) -> RpcResult<Value> {
+async fn handle_get_difference_rpc(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
     use privchat_protocol::rpc::sync::GetDifferenceRequest;
 
     let request: GetDifferenceRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
+
+    // MESSAGE_HISTORY_AND_SEARCH spec §3：get_difference 是消息内容主通道，此前
+    // 注册时直接丢弃 ctx、零鉴权（与 message/history/get 同类 P0 越权）。读路径
+    // 成员校验：非成员/频道不存在统一 not_found（被踢用户的 stale resume 会在
+    // 此处正确终止该频道的同步）。
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
+    crate::rpc::ensure_channel_visible(
+        services.channel_service.as_ref(),
+        request.channel_id,
+        user_id,
+    )
+    .await?;
 
     tracing::debug!(
         "收到差异拉取请求: channel_id={}, channel_type={}, last_pts={}, limit={:?}",
