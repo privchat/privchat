@@ -194,16 +194,26 @@ async fn handle_submit_rpc(
             .get_channel_opt(channel_id)
             .await
             .ok_or_else(|| RpcError::validation(format!("频道不存在: {}", channel_id)))?;
-        let member = channel.members.get(&sender_id).ok_or_else(|| {
-            RpcError::forbidden(format!("用户 {} 不是频道 {} 成员", sender_id, channel_id))
-        })?;
-        let now = chrono::Utc::now();
-        if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now) {
-            return Err(RpcError::forbidden(
-                crate::model::channel::mute_reject_message(member.mute_until, now),
-            ));
+        // 成员权威判定：Direct 认 direct_user1/2（脏数据 participants 缺行不误拒），
+        // 群/房间认 members（CHANNEL_SPEC / Channel::is_member）。
+        if !channel.is_member(sender_id) {
+            return Err(RpcError::forbidden(format!(
+                "用户 {} 不是频道 {} 成员",
+                sender_id, channel_id
+            )));
         }
+        let now = chrono::Utc::now();
+        // 禁言/全员禁言仅群会话有语义。Direct 无禁言且 members 可能缺行——按 is_member
+        // 放行。群成员 participants 完整，members.get 命中；理论上不该 None，None 时保守放行。
+        // 群成员 participants 完整，members.get 通常命中；None 时（异常）不判禁言、
+        // 保守放行（成员身份已由 is_member 通过）。用 if let 包裹，避免误退整个 handler。
         if channel.channel_type == crate::model::channel::ChannelType::Group {
+            if let Some(member) = channel.members.get(&sender_id) {
+            if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now) {
+                return Err(RpcError::forbidden(
+                    crate::model::channel::mute_reject_message(member.mute_until, now),
+                ));
+            }
             let is_privileged = matches!(
                 member.role,
                 crate::model::channel::MemberRole::Owner
@@ -228,6 +238,7 @@ async fn handle_submit_rpc(
                     return Err(RpcError::forbidden("群组全员禁言中".to_string()));
                 }
             }
+            } // if let Some(member)
         }
     }
 
@@ -457,11 +468,8 @@ async fn project_submit_to_message_views(
             if channel.channel_type != crate::model::channel::ChannelType::Direct {
                 return;
             }
-            let peer_id_opt = channel
-                .get_member_ids()
-                .into_iter()
-                .find(|&id| id != sender_id);
-            let Some(peer_id) = peer_id_opt else {
+            // 权威对端识别（direct_user1/2，不依赖 participants）。
+            let Some(peer_id) = channel.direct_peer(sender_id) else {
                 return;
             };
             let sender_t = match crate::rpc::helpers::lookup_user_type(

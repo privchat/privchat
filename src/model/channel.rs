@@ -867,14 +867,31 @@ impl Channel {
     }
 
     /// 获取所有在线成员ID
+    /// 权威成员列表。Direct 会话以 direct_user1_id/direct_user2_id 为权威源
+    /// （CHANNEL_SPEC；participants 对 Direct 不保证完整），members 里的额外项合并去重；
+    /// 群/房间仍只认 members。投递 / 对端识别 / 未读 / system-user event 等通用路径统一
+    /// 靠它，避免历史 Direct 会话 participants 缺行导致漏人。
     pub fn get_member_ids(&self) -> Vec<u64> {
-        self.members.keys().cloned().collect()
+        if self.channel_type == ChannelType::Direct {
+            let mut ids: Vec<u64> = [self.direct_user1_id, self.direct_user2_id]
+                .into_iter()
+                .flatten()
+                .collect();
+            for k in self.members.keys() {
+                if !ids.contains(k) {
+                    ids.push(*k);
+                }
+            }
+            ids
+        } else {
+            self.members.keys().cloned().collect()
+        }
     }
 
     /// 权威成员判定（CHANNEL_SPEC：Direct 会话成员权威源是 direct_user1_id/
     /// direct_user2_id，participants 表对 Direct 不保证完整；群/房间认 members）。
-    /// 读路径鉴权（ensure_channel_visible / message-history search·around）统一用它，
-    /// 避免历史 Direct 会话 participants 缺行导致误拒。
+    /// 读路径鉴权（ensure_channel_visible / message-history search·around）与发送
+    /// 权限（sync/submit）统一用它，避免历史 Direct 会话 participants 缺行导致误拒。
     pub fn is_member(&self, user_id: u64) -> bool {
         if self.channel_type == ChannelType::Direct {
             if self.direct_user1_id == Some(user_id) || self.direct_user2_id == Some(user_id) {
@@ -882,6 +899,19 @@ impl Channel {
             }
         }
         self.members.contains_key(&user_id)
+    }
+
+    /// Direct 会话中 `user_id` 的对端（权威源 direct_user1/2，不依赖 participants）。
+    /// 非 Direct、或 `user_id` 不属于该会话时返回 None。
+    pub fn direct_peer(&self, user_id: u64) -> Option<u64> {
+        if self.channel_type != ChannelType::Direct {
+            return None;
+        }
+        match (self.direct_user1_id, self.direct_user2_id) {
+            (Some(a), Some(b)) if a == user_id => Some(b),
+            (Some(a), Some(b)) if b == user_id => Some(a),
+            _ => None,
+        }
     }
 
     /// 更新最后消息信息
@@ -1287,6 +1317,29 @@ mod tests {
         ch.members.insert(10, ChannelMember::new(10, MemberRole::Owner));
         assert!(ch.is_member(10), "group member via members map");
         assert!(!ch.is_member(99), "group non-member rejected (no direct fallback)");
+    }
+
+    /// get_member_ids / direct_peer 对 Direct 会话必须靠 direct_user1/2（脏数据
+    /// members 缺行时投递/对端识别不能漏人）。
+    #[test]
+    fn direct_member_ids_and_peer_without_participants() {
+        let mut ch = Channel::new_direct(123, 1, 2);
+        ch.members.clear(); // participants 缺行
+        let ids = ch.get_member_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&1) && ids.contains(&2));
+        assert_eq!(ch.direct_peer(1), Some(2));
+        assert_eq!(ch.direct_peer(2), Some(1));
+        assert_eq!(ch.direct_peer(3), None, "non-member has no peer");
+    }
+
+    #[test]
+    fn direct_peer_none_for_group() {
+        let ch = Channel::new_group(200, 10, Some("g".to_string()));
+        assert_eq!(ch.direct_peer(10), None, "group channels have no direct peer");
+        // 群 get_member_ids 仍只认 members（new_group 是否含 creator 取决于实现，
+        // 关键是不引入 direct fallback）
+        assert!(ch.direct_user1_id.is_none());
     }
 
     #[test]
