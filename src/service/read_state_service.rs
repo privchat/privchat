@@ -443,7 +443,8 @@ impl ReadStateService {
         .await?;
 
         if matches!(channel_kind, ChannelKind::PrivateChat) {
-            if let Some(peer_id) = channel.members.keys().find(|id| **id != reader_id).copied() {
+            // Direct 对端权威识别（direct_user1/2，不靠 members——脏数据/缺行都对）。
+            if let Some(peer_id) = channel.direct_peer(reader_id) {
                 self.send_read_cursor_event(
                     peer_id,
                     "peer_read_pts_updated",

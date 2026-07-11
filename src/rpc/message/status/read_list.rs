@@ -54,8 +54,9 @@ pub async fn handle(
         .await
         .map_err(|e| RpcError::not_found(format!("频道不存在: {}", e)))?;
 
-    let total_members = channel.members.len() as u32;
-    let member_ids: Vec<u64> = channel.members.keys().copied().collect();
+    // 权威成员列表（Direct 严格认 direct_user1/2，群认 members）。
+    let member_ids: Vec<u64> = channel.get_member_ids();
+    let total_members = member_ids.len() as u32;
 
     let message = services
         .message_repository
