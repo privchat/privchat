@@ -871,6 +871,19 @@ impl Channel {
         self.members.keys().cloned().collect()
     }
 
+    /// 权威成员判定（CHANNEL_SPEC：Direct 会话成员权威源是 direct_user1_id/
+    /// direct_user2_id，participants 表对 Direct 不保证完整；群/房间认 members）。
+    /// 读路径鉴权（ensure_channel_visible / message-history search·around）统一用它，
+    /// 避免历史 Direct 会话 participants 缺行导致误拒。
+    pub fn is_member(&self, user_id: u64) -> bool {
+        if self.channel_type == ChannelType::Direct {
+            if self.direct_user1_id == Some(user_id) || self.direct_user2_id == Some(user_id) {
+                return true;
+            }
+        }
+        self.members.contains_key(&user_id)
+    }
+
     /// 更新最后消息信息
     pub fn update_last_message(&mut self, message_id: u64) {
         self.last_message_id = Some(message_id);
@@ -1253,6 +1266,27 @@ mod tests {
         assert_eq!(conv.members.len(), 2);
         assert!(conv.members.contains_key(&1));
         assert!(conv.members.contains_key(&2));
+    }
+
+    /// CHANNEL_SPEC：Direct 会话成员权威源是 direct_user1/2_id。模拟 DB 加载后
+    /// participants 缺行（members 空）——is_member 仍必须靠 direct_user1/2 认可，
+    /// 否则历史 Direct 会话的 history/search/around 会被误拒。
+    #[test]
+    fn is_member_direct_authoritative_without_participants() {
+        let mut ch = Channel::new_direct(123, 1, 2);
+        ch.members.clear(); // 脏数据：participants 未写两条
+        assert!(ch.is_member(1), "direct_user1 must be a member even with empty members");
+        assert!(ch.is_member(2), "direct_user2 must be a member");
+        assert!(!ch.is_member(3), "outsider must not be a member");
+    }
+
+    #[test]
+    fn is_member_group_uses_members_not_direct_fields() {
+        let mut ch = Channel::new_group(200, 10, Some("g".to_string()));
+        ch.members.clear();
+        ch.members.insert(10, ChannelMember::new(10, MemberRole::Owner));
+        assert!(ch.is_member(10), "group member via members map");
+        assert!(!ch.is_member(99), "group non-member rejected (no direct fallback)");
     }
 
     #[test]

@@ -1541,9 +1541,14 @@ impl PgMessageRepository {
         if scope_channel.is_some() {
             sql.push_str(" AND m.channel_id = $3");
         } else {
+            // GLOBAL 成员可见 = participants 有我（群/房间权威）OR 我是该 Direct 会话的
+            // direct_user1/2（Direct 权威，CHANNEL_SPEC；participants 对 Direct 不保证完整）。
             sql.push_str(
-                " AND EXISTS (SELECT 1 FROM privchat_channel_participants p \
-                 WHERE p.channel_id = m.channel_id AND p.user_id = $3 AND p.left_at IS NULL)",
+                " AND (EXISTS (SELECT 1 FROM privchat_channel_participants p \
+                   WHERE p.channel_id = m.channel_id AND p.user_id = $3 AND p.left_at IS NULL) \
+                 OR EXISTS (SELECT 1 FROM privchat_channels c \
+                   WHERE c.channel_id = m.channel_id AND c.channel_type = 0 \
+                     AND (c.direct_user1_id = $3 OR c.direct_user2_id = $3)))",
             );
         }
         if cursor.is_some() {
@@ -1789,6 +1794,55 @@ mod client_search_tests {
         }
     }
 
+    /// P1 Direct 权威源修复回归：Direct 会话只有 channels 行（direct_user1/2），
+    /// participants 缺行（历史脏数据）——GLOBAL 搜索仍必须靠 direct_user1/2 认可命中，
+    /// 否则该 Direct 会话的消息对本人不可见（误拒）。
+    #[tokio::test]
+    async fn search_visible_direct_without_participants() {
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip search_visible_direct_without_participants: DATABASE_URL not configured");
+            return;
+        };
+        const CH_DIRECT: u64 = 987_660_051;
+        const DU1: u64 = 987_661_021;
+        const DU2: u64 = 987_661_022;
+        const DOUT: u64 = 987_661_023;
+        clean_channel(&repo, CH_DIRECT).await;
+        ensure_user(&repo, DU1).await;
+        ensure_user(&repo, DU2).await;
+        ensure_user(&repo, DOUT).await;
+        // 只建 channels（direct_user1=A, direct_user2=B），故意不写 participants
+        sqlx::query(
+            "INSERT INTO privchat_channels (channel_id, channel_type, direct_user1_id, direct_user2_id)              VALUES ($1, 0, $2, $3)")
+            .bind(CH_DIRECT as i64).bind(DU1 as i64).bind(DU2 as i64)
+            .execute(repo.pool.as_ref()).await.expect("insert channel");
+        let kw = "directauthfix测试标记";
+        insert_msg(&repo, MSG_BASE + 51, CH_DIRECT, &format!("你好 {} 收到", kw), 1_780_200_000_000, false).await;
+
+        let tq = repo.search_tokens_tsquery(kw).await.expect("tokenize");
+        let hits = repo.search_visible(DU1, None, &tq, &format!("%{}%", kw), None, 10)
+            .await.expect("global search");
+        assert_eq!(hits.len(), 1, "direct_user1 must see the message despite missing participants");
+        assert_eq!(hits[0].channel_id, CH_DIRECT as i64);
+
+        // 非成员 charlie(USER_C) 不可见
+        let outsider = repo.search_visible(DOUT, None, &tq, &format!("%{}%", kw), None, 10)
+            .await.expect("outsider search");
+        assert!(outsider.iter().all(|h| h.channel_id != CH_DIRECT as i64),
+            "non-participant of the direct channel must not see it");
+
+        clean_channel(&repo, CH_DIRECT).await;
+    }
+
+    async fn clean_channel(repo: &PgMessageRepository, ch: u64) {
+        for tbl in ["privchat_messages", "privchat_channel_participants", "privchat_channels"] {
+            let _ = sqlx::query(&format!("DELETE FROM {} WHERE channel_id = $1", tbl))
+                .bind(ch as i64)
+                .execute(repo.pool.as_ref())
+                .await;
+        }
+    }
+
     async fn insert_msg(
         repo: &PgMessageRepository,
         message_id: i64,
@@ -1873,21 +1927,45 @@ mod client_search_tests {
             .expect("channel search");
         assert_eq!(scoped.len(), 2);
 
-        // 退群成员不可见：置 left_at 后 GLOBAL 无命中
-        sqlx::query(
-            "UPDATE privchat_channel_participants SET left_at = 1 WHERE channel_id = $1 AND user_id = $2",
-        )
-        .bind(CH_MINE as i64)
-        .bind(USER_A as i64)
-        .execute(repo.pool.as_ref())
-        .await
-        .expect("mark left");
-        let after_leave = repo
-            .search_visible(USER_A, None, &tq, &pattern, None, 10)
-            .await
-            .expect("search after leave");
-        assert!(after_leave.is_empty(), "left members must lose search visibility");
+        // 退群成员不可见（群语义：left_at 使 EXISTS participants 不认可）。
+        // 注意：必须用群会话验证——Direct 会话权威是 direct_user1/2，left_at 对其无效，
+        // 那正是 search_visible_direct_without_participants / is_member_direct_* 覆盖的语义。
+        const CH_GROUP: u64 = 987_660_061;
+        const GID: u64 = 987_663_001;
+        clean_channel(&repo, CH_GROUP).await;
+        let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
+            .bind(GID as i64).execute(repo.pool.as_ref()).await;
+        sqlx::query("INSERT INTO privchat_groups (group_id, name, owner_id, qr_key) VALUES ($1, 'g', $2, $3)")
+            .bind(GID as i64).bind(USER_B as i64).bind(format!("qg{}", GID % 1_000_000))
+            .execute(repo.pool.as_ref()).await.expect("insert group");
+        sqlx::query("INSERT INTO privchat_channels (channel_id, channel_type, group_id) VALUES ($1, 1, $2)")
+            .bind(CH_GROUP as i64).bind(GID as i64)
+            .execute(repo.pool.as_ref()).await.expect("insert group channel");
+        sqlx::query("INSERT INTO privchat_channel_participants (channel_id, user_id, role) VALUES ($1, $2, 2)")
+            .bind(CH_GROUP as i64).bind(USER_A as i64)
+            .execute(repo.pool.as_ref()).await.expect("insert group participant");
+        // 群退群不可见只在 GLOBAL(EXISTS participants left_at) 生效——CHANNEL scope 不做
+        // 成员过滤(信任调用方已过 ensure_channel_visible)。用独立 marker 避免撞 CH_MINE 的 KW。
+        let gkw = "groupleavemark测试标记";
+        insert_msg(&repo, MSG_BASE + 61, CH_GROUP, &format!("群里 {} B", gkw), 1_780_300_000_000, false).await;
+        let gtq = repo.search_tokens_tsquery(gkw).await.expect("tokenize group kw");
+        let gpat = format!("%{}%", gkw);
 
+        let in_group = repo.search_visible(USER_A, None, &gtq, &gpat, None, 10)
+            .await.expect("group search");
+        assert_eq!(in_group.len(), 1, "active group member must see the message");
+        assert_eq!(in_group[0].channel_id, CH_GROUP as i64);
+        // 退群(left_at=1) → GLOBAL 不可见(群认 participants，无 direct 兜底)
+        sqlx::query("UPDATE privchat_channel_participants SET left_at = 1 WHERE channel_id = $1 AND user_id = $2")
+            .bind(CH_GROUP as i64).bind(USER_A as i64)
+            .execute(repo.pool.as_ref()).await.expect("mark left");
+        let after_leave = repo.search_visible(USER_A, None, &gtq, &gpat, None, 10)
+            .await.expect("search after leave");
+        assert!(after_leave.is_empty(), "left group member must lose search visibility");
+
+        clean_channel(&repo, CH_GROUP).await;
+        let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
+            .bind(GID as i64).execute(repo.pool.as_ref()).await;
         cleanup(&repo).await;
     }
 
