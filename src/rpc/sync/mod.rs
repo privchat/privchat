@@ -217,42 +217,41 @@ async fn handle_submit_rpc(
             )));
         }
         let now = chrono::Utc::now();
-        // 禁言/全员禁言仅群会话有语义。Direct 无禁言且 members 可能缺行——按 is_member
-        // 放行。群成员 participants 完整，members.get 命中；理论上不该 None，None 时保守放行。
-        // 群成员 participants 完整，members.get 通常命中；None 时（异常）不判禁言、
-        // 保守放行（成员身份已由 is_member 通过）。用 if let 包裹，避免误退整个 handler。
+        // 禁言/全员禁言仅群会话有语义（Direct 无禁言，成员身份已由 is_member 通过）。
+        // 群成员 participants 完整，members.get 通常命中；None（异常）时不判禁言、保守
+        // 放行——用 if let 包裹，避免误退整个 handler。
         if channel.channel_type == crate::model::channel::ChannelType::Group {
             if let Some(member) = channel.members.get(&sender_id) {
-            if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now) {
-                return Err(RpcError::forbidden(
-                    crate::model::channel::mute_reject_message(member.mute_until, now),
-                ));
-            }
-            let is_privileged = matches!(
-                member.role,
-                crate::model::channel::MemberRole::Owner
-                    | crate::model::channel::MemberRole::Admin
-            );
-            if is_privileged {
-                // 群主/管理员不受全员禁言限制
-            } else {
-                let all_muted = if let Some(gid) = channel.group_id {
-                    services
-                        .channel_service
-                        .get_group_policy(gid)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|p| p.all_muted)
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                if all_muted {
-                    return Err(RpcError::forbidden("群组全员禁言中".to_string()));
+                if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now)
+                {
+                    return Err(RpcError::forbidden(
+                        crate::model::channel::mute_reject_message(member.mute_until, now),
+                    ));
+                }
+                let is_privileged = matches!(
+                    member.role,
+                    crate::model::channel::MemberRole::Owner
+                        | crate::model::channel::MemberRole::Admin
+                );
+                if !is_privileged {
+                    // 群主/管理员不受全员禁言限制
+                    let all_muted = if let Some(gid) = channel.group_id {
+                        services
+                            .channel_service
+                            .get_group_policy(gid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|p| p.all_muted)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if all_muted {
+                        return Err(RpcError::forbidden("群组全员禁言中".to_string()));
+                    }
                 }
             }
-            } // if let Some(member)
         }
     }
 
