@@ -873,13 +873,16 @@ impl Channel {
     /// 靠它，避免历史 Direct 会话 participants 缺行导致漏人。
     pub fn get_member_ids(&self) -> Vec<u64> {
         if self.channel_type == ChannelType::Direct {
-            let mut ids: Vec<u64> = [self.direct_user1_id, self.direct_user2_id]
+            // 严格权威：Direct 成员**只**是 direct_user1/2（CHECK NOT NULL 保证有值）。
+            // participants 对 Direct 是冗余，不作旁路——多余 participant 行不获成员资格，
+            // 避免脏数据泄露 Direct 的可见性/投递资格。
+            let mut ids: Vec<u64> = Vec::with_capacity(2);
+            for id in [self.direct_user1_id, self.direct_user2_id]
                 .into_iter()
                 .flatten()
-                .collect();
-            for k in self.members.keys() {
-                if !ids.contains(k) {
-                    ids.push(*k);
+            {
+                if !ids.contains(&id) {
+                    ids.push(id);
                 }
             }
             ids
@@ -888,15 +891,15 @@ impl Channel {
         }
     }
 
-    /// 权威成员判定（CHANNEL_SPEC：Direct 会话成员权威源是 direct_user1_id/
-    /// direct_user2_id，participants 表对 Direct 不保证完整；群/房间认 members）。
+    /// 权威成员判定（CHANNEL_SPEC：Direct 会话成员权威源**只**是 direct_user1_id/
+    /// direct_user2_id，participants 对 Direct 是冗余不作旁路；群/房间认 members）。
     /// 读路径鉴权（ensure_channel_visible / message-history search·around）与发送
-    /// 权限（sync/submit）统一用它，避免历史 Direct 会话 participants 缺行导致误拒。
+    /// 权限（sync/submit）统一用它，Direct 严格模式既不因 participants 缺行误拒、
+    /// 也不因多余 participant 行误放行。
     pub fn is_member(&self, user_id: u64) -> bool {
         if self.channel_type == ChannelType::Direct {
-            if self.direct_user1_id == Some(user_id) || self.direct_user2_id == Some(user_id) {
-                return true;
-            }
+            return self.direct_user1_id == Some(user_id)
+                || self.direct_user2_id == Some(user_id);
         }
         self.members.contains_key(&user_id)
     }
@@ -1331,6 +1334,20 @@ mod tests {
         assert_eq!(ch.direct_peer(1), Some(2));
         assert_eq!(ch.direct_peer(2), Some(1));
         assert_eq!(ch.direct_peer(3), None, "non-member has no peer");
+    }
+
+    /// 严格权威：Direct 会话即便有脏的多余 participant 行，也不获成员资格——
+    /// participants 不是 Direct 的旁路（否则历史脏数据会泄露 Direct 可见性/投递）。
+    #[test]
+    fn direct_strict_ignores_stray_participants() {
+        let mut ch = Channel::new_direct(123, 1, 2);
+        ch.members.insert(99, ChannelMember::new(99, MemberRole::Member)); // 脏：多余成员
+        assert!(!ch.is_member(99), "stray participant is NOT a direct member (strict)");
+        assert!(ch.is_member(1) && ch.is_member(2));
+        let ids = ch.get_member_ids();
+        assert_eq!(ids.len(), 2, "get_member_ids returns only direct_user1/2, no stray");
+        assert!(ids.contains(&1) && ids.contains(&2) && !ids.contains(&99));
+        assert_eq!(ch.direct_peer(1), Some(2));
     }
 
     #[test]
