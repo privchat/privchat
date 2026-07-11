@@ -336,7 +336,8 @@ pub async fn ensure_channel_visible(
         .get_channel_opt(channel_id)
         .await
         .ok_or_else(|| RpcError::not_found(format!("频道不存在: {}", channel_id)))?;
-    if !channel.members.contains_key(&user_id) {
+    // is_member：Direct 认 direct_user1/2_id（权威），群/房间认 members（CHANNEL_SPEC）。
+    if !channel.is_member(user_id) {
         return Err(RpcError::not_found(format!("频道不存在: {}", channel_id)));
     }
     Ok(())
