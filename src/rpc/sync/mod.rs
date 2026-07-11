@@ -56,9 +56,9 @@ pub async fn register_routes(services: RpcServiceContext) {
     // sync/get_channel_pts - 获取频道 pts
     let services_clone = services.clone();
     GLOBAL_RPC_ROUTER
-        .register(routes::sync::GET_CHANNEL_PTS, move |body, _ctx| {
+        .register(routes::sync::GET_CHANNEL_PTS, move |body, ctx| {
             let services = services_clone.clone();
-            async move { handle_get_channel_pts_rpc(body, services).await }
+            async move { handle_get_channel_pts_rpc(body, services, ctx).await }
         })
         .await;
 
@@ -83,9 +83,9 @@ pub async fn register_routes(services: RpcServiceContext) {
     // sync/batch_get_channel_pts - 批量获取频道 pts
     let services_clone = services.clone();
     GLOBAL_RPC_ROUTER
-        .register(routes::sync::BATCH_GET_CHANNEL_PTS, move |body, _ctx| {
+        .register(routes::sync::BATCH_GET_CHANNEL_PTS, move |body, ctx| {
             let services = services_clone.clone();
-            async move { handle_batch_get_channel_pts_rpc(body, services).await }
+            async move { handle_batch_get_channel_pts_rpc(body, services, ctx).await }
         })
         .await;
 
@@ -102,11 +102,25 @@ pub async fn register_routes(services: RpcServiceContext) {
 }
 
 /// RPC 处理函数：获取频道 pts
-async fn handle_get_channel_pts_rpc(body: Value, services: RpcServiceContext) -> RpcResult<Value> {
+async fn handle_get_channel_pts_rpc(
+    body: Value,
+    services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
+) -> RpcResult<Value> {
     use privchat_protocol::rpc::sync::GetChannelPtsRequest;
 
     let request: GetChannelPtsRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
+
+    // 成员鉴权：pts 水位也是会话内信息，非成员不得查（与 get_difference 一致，
+    // 非成员/频道不存在统一 not_found）。
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
+    crate::rpc::ensure_channel_visible(
+        services.channel_service.as_ref(),
+        request.channel_id,
+        user_id,
+    )
+    .await?;
 
     let response = services
         .sync_service
@@ -278,11 +292,30 @@ async fn handle_submit_rpc(
 async fn handle_batch_get_channel_pts_rpc(
     body: Value,
     services: RpcServiceContext,
+    ctx: crate::rpc::RpcContext,
 ) -> RpcResult<Value> {
     use privchat_protocol::rpc::sync::BatchGetChannelPtsRequest;
 
-    let request: BatchGetChannelPtsRequest = serde_json::from_value(body)
+    let mut request: BatchGetChannelPtsRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
+
+    // 成员鉴权：批量语义下逐个过滤（只返回用户有权访问的频道的 pts），而非整体拒绝——
+    // 混合成员/非成员时成员频道正常返回，非成员/不存在的频道静默剔除，不泄露 pts 水位。
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
+    let mut allowed = Vec::with_capacity(request.channels.len());
+    for ch in request.channels.drain(..) {
+        if crate::rpc::ensure_channel_visible(
+            services.channel_service.as_ref(),
+            ch.channel_id,
+            user_id,
+        )
+        .await
+        .is_ok()
+        {
+            allowed.push(ch);
+        }
+    }
+    request.channels = allowed;
 
     // 使用 SyncService 处理批量获取 pts
     let response = services
