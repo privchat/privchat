@@ -866,11 +866,11 @@ impl Channel {
             .unwrap_or(false)
     }
 
-    /// 获取所有在线成员ID
-    /// 权威成员列表。Direct 会话以 direct_user1_id/direct_user2_id 为权威源
-    /// （CHANNEL_SPEC；participants 对 Direct 不保证完整），members 里的额外项合并去重；
-    /// 群/房间仍只认 members。投递 / 对端识别 / 未读 / system-user event 等通用路径统一
-    /// 靠它，避免历史 Direct 会话 participants 缺行导致漏人。
+    /// 权威成员列表。Direct 会话**严格**只返回 direct_user1_id/direct_user2_id
+    /// （CHANNEL_SPEC 权威源，CHECK NOT NULL 保证有值）——忽略 members 中的额外项，
+    /// participants 对 Direct 不作旁路；群/房间只认 members。投递 / 对端识别 / 未读 /
+    /// system-user event 等通用路径统一靠它，Direct 既不漏（participants 缺行）也不多
+    /// （脏 participant 泄露）。
     pub fn get_member_ids(&self) -> Vec<u64> {
         if self.channel_type == ChannelType::Direct {
             // 严格权威：Direct 成员**只**是 direct_user1/2（CHECK NOT NULL 保证有值）。
