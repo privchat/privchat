@@ -1541,14 +1541,16 @@ impl PgMessageRepository {
         if scope_channel.is_some() {
             sql.push_str(" AND m.channel_id = $3");
         } else {
-            // GLOBAL 成员可见 = participants 有我（群/房间权威）OR 我是该 Direct 会话的
-            // direct_user1/2（Direct 权威，CHANNEL_SPEC；participants 对 Direct 不保证完整）。
+            // GLOBAL 成员可见严格按 channel_type：Direct 只认 direct_user1/2（权威源，
+            // 冗余 participant 不作旁路）；群/房间只认 participants(left_at IS NULL)。
             sql.push_str(
-                " AND (EXISTS (SELECT 1 FROM privchat_channel_participants p \
-                   WHERE p.channel_id = m.channel_id AND p.user_id = $3 AND p.left_at IS NULL) \
-                 OR EXISTS (SELECT 1 FROM privchat_channels c \
-                   WHERE c.channel_id = m.channel_id AND c.channel_type = 0 \
-                     AND (c.direct_user1_id = $3 OR c.direct_user2_id = $3)))",
+                " AND EXISTS (SELECT 1 FROM privchat_channels c \
+                   WHERE c.channel_id = m.channel_id AND ( \
+                     (c.channel_type = 0 AND (c.direct_user1_id = $3 OR c.direct_user2_id = $3)) \
+                     OR (c.channel_type <> 0 AND EXISTS ( \
+                         SELECT 1 FROM privchat_channel_participants p \
+                         WHERE p.channel_id = m.channel_id AND p.user_id = $3 AND p.left_at IS NULL)) \
+                   ))",
             );
         }
         if cursor.is_some() {
@@ -1825,11 +1827,23 @@ mod client_search_tests {
         assert_eq!(hits.len(), 1, "direct_user1 must see the message despite missing participants");
         assert_eq!(hits[0].channel_id, CH_DIRECT as i64);
 
-        // 非成员 charlie(USER_C) 不可见
+        // 非成员不可见
         let outsider = repo.search_visible(DOUT, None, &tq, &format!("%{}%", kw), None, 10)
             .await.expect("outsider search");
         assert!(outsider.iter().all(|h| h.channel_id != CH_DIRECT as i64),
             "non-participant of the direct channel must not see it");
+
+        // 严格模式：给该 Direct 会话插一个脏 participant(非 direct_user1/2)，它不该获得
+        // 可见性(participants 对 Direct 不作旁路)。
+        const DSTRAY: u64 = 987_661_024;
+        ensure_user(&repo, DSTRAY).await;
+        sqlx::query("INSERT INTO privchat_channel_participants (channel_id, user_id, role) VALUES ($1, $2, 2)")
+            .bind(CH_DIRECT as i64).bind(DSTRAY as i64)
+            .execute(repo.pool.as_ref()).await.expect("insert stray participant");
+        let stray = repo.search_visible(DSTRAY, None, &tq, &format!("%{}%", kw), None, 10)
+            .await.expect("stray search");
+        assert!(stray.iter().all(|h| h.channel_id != CH_DIRECT as i64),
+            "strict: a stray participant of a direct channel must NOT see it");
 
         clean_channel(&repo, CH_DIRECT).await;
     }
