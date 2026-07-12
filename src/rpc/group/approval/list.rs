@@ -19,6 +19,16 @@ use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use serde_json::{json, Value};
 
+/// 读取 numeric id（u64）。**标准 = JSON number**（`as_u64`，与 typed 协议结构体 / settings-get /
+/// approval-handle 一致）；为向后兼容旧请求，同时容忍 string 形态（`parse`）。
+/// 硬规则：user_id / operator_id / group_id / channel_id 等 uid 类 id 全局 u64；
+/// 只有真正的 opaque id（如 approval `request_id` 是 UUID）才用 String。
+fn read_u64_id(body: &Value, key: &str) -> RpcResult<u64> {
+    body.get(key)
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse::<u64>().ok()))
+        .ok_or_else(|| RpcError::validation(format!("{} is required (u64)", key)))
+}
+
 /// 处理 获取加群审批列表 请求
 ///
 /// RPC: group/approval/list
@@ -57,22 +67,10 @@ pub async fn handle(
 ) -> RpcResult<Value> {
     tracing::debug!("🔧 处理 获取加群审批列表 请求: {:?}", body);
 
-    // 解析参数
-    let group_id_str = body
-        .get("group_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("group_id is required".to_string()))?;
-    let group_id = group_id_str
-        .parse::<u64>()
-        .map_err(|_| RpcError::validation(format!("Invalid group_id: {}", group_id_str)))?;
-
-    let operator_id_str = body
-        .get("operator_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("operator_id is required".to_string()))?;
-    let operator_id = operator_id_str
-        .parse::<u64>()
-        .map_err(|_| RpcError::validation(format!("Invalid operator_id: {}", operator_id_str)))?;
+    // 解析参数（标准 u64 number；string 向后兼容）。此前按 as_str 读，与协议/其他 handler 不一致，
+    // 导致 typed FFI / TS SDK 送的 number id 命中不到 → list 运行期失败（已修）。
+    let group_id = read_u64_id(&body, "group_id")?;
+    let operator_id = read_u64_id(&body, "operator_id")?;
 
     // 1. 获取群组
     let channel = services
@@ -132,8 +130,35 @@ pub async fn handle(
     );
 
     Ok(json!({
-        "group_id": group_id_str,
+        "group_id": group_id.to_string(),
         "requests": requests_json,
         "total": requests.len()
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn read_u64_id_accepts_number_standard() {
+        let body = json!({ "group_id": 1234567890123u64, "operator_id": 42 });
+        assert_eq!(read_u64_id(&body, "group_id").unwrap(), 1234567890123u64);
+        assert_eq!(read_u64_id(&body, "operator_id").unwrap(), 42);
+    }
+
+    #[test]
+    fn read_u64_id_tolerates_string_for_backward_compat() {
+        let body = json!({ "group_id": "1234567890123", "operator_id": "42" });
+        assert_eq!(read_u64_id(&body, "group_id").unwrap(), 1234567890123u64);
+        assert_eq!(read_u64_id(&body, "operator_id").unwrap(), 42);
+    }
+
+    #[test]
+    fn read_u64_id_missing_or_invalid_is_error() {
+        let body = json!({ "group_id": "not-a-number" });
+        assert!(read_u64_id(&body, "group_id").is_err());
+        assert!(read_u64_id(&body, "operator_id").is_err());
+    }
 }
