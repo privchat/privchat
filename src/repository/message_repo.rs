@@ -321,6 +321,12 @@ impl PgMessageRepository {
                   AND (
                     business_type IS NULL
                     OR business_type = ''
+                    -- 上传 token 会预设 business_type='message'（业务分类），但此时
+                    -- business_id 仍为空 —— 文件还没附着到任何具体消息，可以绑定。
+                    -- 归属守卫真正要防的是「已指向其它 business_id」的劫持，判据应看
+                    -- business_id 是否已落到具体实体，而非 business_type 是否已分类。
+                    OR business_id IS NULL
+                    OR business_id = ''
                     OR (business_type = $1 AND business_id = $2)
                   )
                 "#,
