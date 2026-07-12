@@ -534,9 +534,16 @@ impl ChatServer {
         let qrcode_service = Arc::new(crate::service::QRCodeService::new());
         info!("✅ 二维码服务初始化完成");
 
-        // 创建审批服务
-        let approval_service = Arc::new(crate::service::ApprovalService::new());
-        info!("✅ 审批服务初始化完成");
+        // 创建审批服务（#72A：pending 申请持久化到 DB，重启不丢）
+        let approval_repo =
+            Arc::new(crate::repository::ApprovalRepository::new(pool.clone()));
+        let approval_service =
+            Arc::new(crate::service::ApprovalService::new(approval_repo));
+        // 启动从 DB 恢复所有 pending 申请进缓存；失败不阻塞启动（降级为空缓存）。
+        match approval_service.load_pending().await {
+            Ok(n) => info!("✅ 审批服务初始化完成（恢复 {} 条 pending）", n),
+            Err(e) => warn!("⚠️ 群审批 pending 恢复失败（不阻塞启动）: {}", e),
+        }
 
         // 创建会话服务（需要在其他服务之前创建，因为其他服务可能依赖它）
         info!("🔧 初始化会话服务...");
