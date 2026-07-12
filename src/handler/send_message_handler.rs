@@ -1721,12 +1721,13 @@ impl SendMessageHandler {
                 }
             };
 
-        // content: 如果为空，用整个 payload 作为字符串
-        let content = if parsed.content.is_empty() {
-            String::from_utf8_lossy(payload).to_string()
-        } else {
-            parsed.content
-        };
+        // content: envelope 已成功解码，以 parsed.content 为准。媒体消息（图片/语音/
+        // 视频/文件）无 caption 时 content 就是空串，媒体信息全在 metadata 里 —— 绝不能
+        // 把整个 FlatBuffers 二进制 payload 当字符串塞进 content：payload 里的 0x00 会让
+        // Postgres 的 UTF8 text 列直接拒绝（invalid byte sequence for encoding "UTF8": 0x00），
+        // 导致无 caption 的图片消息 100% 保存失败。纯文本（非 envelope）走上面 decode 失败分支。
+        // 顺带剥掉任何 NUL：text 列无法存储 0x00。
+        let content = parsed.content.replace('\u{0}', "");
 
         // metadata: 把 typed 枚举转回 inner JSON shape（不带 type 标签）
         let metadata = parsed.metadata.as_ref().map(|m| {
