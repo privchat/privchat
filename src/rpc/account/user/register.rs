@@ -83,7 +83,11 @@ pub async fn handle(
     }
 
     // 2. 加密密码
-    let password_hash = hash_password(&request.password)
+    // bcrypt 同步 CPU 运算，放 spawn_blocking，避免阻塞 tokio worker（与 login 验证同理）。
+    let password_owned = request.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || hash_password(&password_owned))
+        .await
+        .map_err(|e| RpcError::internal(format!("密码加密任务调度失败: {}", e)))?
         .map_err(|e| RpcError::internal(format!("密码加密失败: {}", e)))?;
 
     // 3. 创建用户对象
