@@ -85,6 +85,11 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/groups", get(list_groups))
         .route("/groups/{group_id}", get(get_group))
         .route("/groups/{group_id}", delete(dissolve_group))
+        // 资金授权用:判定 user 是否为 channel 成员(#84)
+        .route(
+            "/channels/{channel_id}/members/{user_id}",
+            get(check_channel_member),
+        )
         // Room 频道管理
         .route("/room", post(create_room_channel))
         .route("/room", get(list_room_channels))
@@ -772,6 +777,28 @@ async fn list_groups(
 /// 获取群组详情
 ///
 /// GET /api/service/groups/:group_id
+/// GET /api/service/channels/{channel_id}/members/{user_id}
+/// 内部资金授权(#84):判定 user 是否为 channel 成员(DM 双方 / 群成员)。X-Service-Key 鉴权。
+/// channel 不存在或非成员 → is_member=false(不泄露存在性,授权层按 false 拒绝)。
+async fn check_channel_member(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path((channel_id, user_id)): Path<(u64, u64)>,
+) -> ApiResult<Value> {
+    verify_service_key(&headers, &state).await?;
+    let is_member = state
+        .channel_service
+        .get_channel_opt(channel_id)
+        .await
+        .map(|c| c.is_member(user_id))
+        .unwrap_or(false);
+    Ok(ApiEnvelope::ok(serde_json::json!({
+        "channel_id": channel_id.to_string(),
+        "user_id": user_id.to_string(),
+        "is_member": is_member,
+    })))
+}
+
 async fn get_group(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
