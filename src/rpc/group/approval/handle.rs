@@ -119,26 +119,37 @@ pub async fn handle(
 
     // 5. 根据 action 执行审批
     if action == "approve" {
-        // 5.1. 同意申请
-        let updated_request = services
-            .approval_service
-            .approve_request(request_id, operator_id)
-            .await
-            .map_err(|e| RpcError::internal(format!("审批失败: {}", e)))?;
-
-        // 5.2. 添加用户到群组
-        services
+        // 5.1. #72A.1 原子审批：CAS 置 approved + 同事务加群成员（消除「approved 但非成员」孤儿，
+        //      并发/重复审批由 DB CAS 裁决，多实例安全）。
+        let now = chrono::Utc::now();
+        let approved = services
             .channel_service
-            .join_channel(
+            .approve_join_request_in_tx(
+                request_id,
                 request.group_id,
                 request.user_id,
-                Some(crate::model::channel::MemberRole::Member),
+                operator_id,
+                now,
             )
             .await
-            .map_err(|e| RpcError::internal(format!("添加用户到群组失败: {}", e)))?;
+            .map_err(|e| RpcError::internal(format!("审批入群失败: {}", e)))?;
+
+        // 无论 CAS 输赢都从 DB 回灌 ApprovalService 缓存，保持 pending list 一致。
+        services
+            .approval_service
+            .reload_request(request_id)
+            .await
+            .map_err(|e| RpcError::internal(format!("刷新审批缓存失败: {}", e)))?;
+
+        if !approved {
+            // CAS loser：申请已被并发/重复审批处理，未做任何改动。
+            return Err(RpcError::validation(
+                "加群申请已被处理（并发或重复审批）".to_string(),
+            ));
+        }
 
         tracing::debug!(
-            "✅ 同意加群申请: request_id={}, user_id={}, group_id={}",
+            "✅ 同意加群申请(原子): request_id={}, user_id={}, group_id={}",
             request_id,
             request.user_id,
             request.group_id
@@ -150,8 +161,8 @@ pub async fn handle(
             "success": true,
             "request_id": request_id,
             "action": "approved",
-            "group_id": updated_request.group_id,
-            "user_id": updated_request.user_id,
+            "group_id": request.group_id,
+            "user_id": request.user_id,
             "message": "已同意加群申请",
             "handled_at": chrono::Utc::now().timestamp_millis()
         }))
