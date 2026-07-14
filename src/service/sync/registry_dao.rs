@@ -36,12 +36,19 @@ impl ClientMsgRegistryDao {
 
     /// 检查是否重复提交
     ///
-    /// SELECT * FROM privchat_client_msg_registry WHERE local_message_id = ?
+    /// CODEX-8：幂等命名空间 = (sender_id, device_id, local_message_id)。sender/device 来自认证
+    /// 会话（服务端权威）。此前按 local_message_id 单列全局判重 —— 客户端雪花 worker 位空间小，
+    /// 跨用户/跨设备碰撞会把后到的消息静默判重成前者（丢消息）。
     pub async fn check_duplicate(
         &self,
+        sender_id: u64,
+        device_id: &str,
         local_message_id: u64,
     ) -> Result<Option<ClientSubmitResponse>> {
-        debug!("检查重复提交: local_message_id={}", local_message_id);
+        debug!(
+            "检查重复提交: sender_id={}, device_id={}, local_message_id={}",
+            sender_id, device_id, local_message_id
+        );
 
         #[derive(sqlx::FromRow)]
         struct RegistryRow {
@@ -55,20 +62,22 @@ impl ClientMsgRegistryDao {
 
         let row = sqlx::query_as::<_, RegistryRow>(
             r#"
-            SELECT 
-                server_msg_id, pts, channel_id, channel_type, 
+            SELECT
+                server_msg_id, pts, channel_id, channel_type,
                 decision, created_at
             FROM privchat_client_msg_registry
-            WHERE local_message_id = $1
+            WHERE sender_id = $1 AND device_id = $2 AND local_message_id = $3
             "#,
         )
+        .bind(sender_id as i64)
+        .bind(device_id)
         .bind(local_message_id as i64)
         .fetch_optional(self.db.pool())
         .await
         .map_err(|e| {
             error!(
-                "检查重复提交失败: local_message_id={}, error={}",
-                local_message_id, e
+                "检查重复提交失败: sender_id={}, local_message_id={}, error={}",
+                sender_id, local_message_id, e
             );
             crate::error::ServerError::Database(format!("Failed to check duplicate: {}", e))
         })?;
@@ -100,9 +109,7 @@ impl ClientMsgRegistryDao {
         Ok(None)
     }
 
-    /// 注册 local_message_id
-    ///
-    /// INSERT INTO privchat_client_msg_registry (...)
+    /// 注册 local_message_id（幂等占位，命名空间 = sender+device+lmid，见 [check_duplicate]）。
     pub async fn register(
         &self,
         local_message_id: u64,
@@ -111,31 +118,33 @@ impl ClientMsgRegistryDao {
         channel_id: u64,
         channel_type: u8,
         sender_id: u64,
+        device_id: &str,
         decision: &str, // "accepted" | "transformed" | "rejected"
     ) -> Result<()> {
         debug!(
-            "注册 local_message_id: local_message_id={}, server_msg_id={}, pts={}",
-            local_message_id, server_msg_id, pts
+            "注册 local_message_id: sender_id={}, device_id={}, local_message_id={}, server_msg_id={}, pts={}",
+            sender_id, device_id, local_message_id, server_msg_id, pts
         );
 
         let now = chrono::Utc::now().timestamp_millis();
 
-        sqlx::query!(
+        sqlx::query(
             r#"
-            INSERT INTO privchat_client_msg_registry 
-            (local_message_id, server_msg_id, pts, channel_id, channel_type, sender_id, decision, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (local_message_id) DO NOTHING
+            INSERT INTO privchat_client_msg_registry
+            (local_message_id, server_msg_id, pts, channel_id, channel_type, sender_id, device_id, decision, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (sender_id, device_id, local_message_id) DO NOTHING
             "#,
-            local_message_id as i64,
-            server_msg_id as i64,
-            pts as i64,
-            channel_id as i64,
-            channel_type as i16,
-            sender_id as i64,
-            decision,
-            now
         )
+        .bind(local_message_id as i64)
+        .bind(server_msg_id as i64)
+        .bind(pts as i64)
+        .bind(channel_id as i64)
+        .bind(channel_type as i16)
+        .bind(sender_id as i64)
+        .bind(device_id)
+        .bind(decision)
+        .bind(now)
         .execute(self.db.pool())
         .await
         .map_err(|e| {
@@ -171,9 +180,11 @@ impl ClientMsgRegistryDao {
         Ok(deleted)
     }
 
-    /// 批量检查是否重复
+    /// 批量检查是否重复（同 [check_duplicate] 的 sender+device 命名空间）
     pub async fn batch_check_duplicate(
         &self,
+        sender_id: u64,
+        device_id: &str,
         local_message_ids: Vec<u64>,
     ) -> Result<Vec<(u64, bool)>> {
         if local_message_ids.is_empty() {
@@ -188,8 +199,11 @@ impl ClientMsgRegistryDao {
         }
 
         let rows = sqlx::query_as::<_, RegistryRow>(
-            "SELECT local_message_id FROM privchat_client_msg_registry WHERE local_message_id = ANY($1)"
+            "SELECT local_message_id FROM privchat_client_msg_registry \
+             WHERE sender_id = $1 AND device_id = $2 AND local_message_id = ANY($3)",
         )
+        .bind(sender_id as i64)
+        .bind(device_id)
         .bind(&ids)
         .fetch_all(self.db.pool())
         .await

@@ -255,10 +255,12 @@ async fn handle_submit_rpc(
         }
     }
 
-    // 使用 SyncService 处理客户端提交
+    // 使用 SyncService 处理客户端提交。device_id 来自认证会话（CODEX-8 幂等命名空间维度，
+    // 服务端权威）；缺失（认证连接理论必有 device）时回退 '' 沿用旧语义。
+    let device_id = ctx.device_id.clone().unwrap_or_default();
     let response = services
         .sync_service
-        .handle_client_submit(request, sender_id)
+        .handle_client_submit(request, sender_id, &device_id)
         .await
         .map_err(|e| {
             error!("SyncService.handle_client_submit 失败: {}", e);
