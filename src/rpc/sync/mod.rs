@@ -51,6 +51,15 @@ fn sync_authenticated_user_id(ctx: &crate::rpc::RpcContext) -> RpcResult<u64> {
     })
 }
 
+/// CODEX-8：sync/submit 幂等命名空间的 device 维度取自认证会话（服务端权威，不信 payload）。缺失/空
+/// device = 异常会话 —— fail closed 拒绝（否则所有异常会话落入同一空 device 命名空间，跨设备互相判重
+/// 静默丢消息）。纯函数便于单测（对齐 [sync_authenticated_user_id]，防未来绕过守卫）。
+fn resolve_session_device_id(device_id: Option<String>) -> RpcResult<String> {
+    device_id
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| RpcError::unauthorized("会话缺少 device_id".to_string()))
+}
+
 /// 注册同步系统的所有路由
 pub async fn register_routes(services: RpcServiceContext) {
     // sync/get_channel_pts - 获取频道 pts
@@ -257,10 +266,7 @@ async fn handle_submit_rpc(
 
     // device_id 来自认证会话（CODEX-8 幂等命名空间维度，服务端权威）。认证的 sync/submit 必然带
     // device；缺失即异常会话 —— fail closed 拒绝（否则所有异常会话落入同一空 device 命名空间）。
-    let device_id = match ctx.device_id.clone().filter(|d| !d.is_empty()) {
-        Some(d) => d,
-        None => return Err(RpcError::unauthorized("会话缺少 device_id".to_string())),
-    };
+    let device_id = resolve_session_device_id(ctx.device_id.clone())?;
     let response = services
         .sync_service
         .handle_client_submit(request, sender_id, &device_id)
@@ -417,6 +423,27 @@ mod tests {
         assert_eq!(
             err.code,
             privchat_protocol::ErrorCode::SyncFullRebuildRequired
+        );
+    }
+
+    // CODEX-8 复审#3 P2：sync/submit 缺 device 的 RPC 层守卫回归（防未来绕过 helper）。
+    #[test]
+    fn submit_missing_device_id_rejected() {
+        let err = resolve_session_device_id(None).expect_err("missing device");
+        assert_eq!(err.code, privchat_protocol::ErrorCode::AuthRequired);
+    }
+
+    #[test]
+    fn submit_empty_device_id_rejected() {
+        let err = resolve_session_device_id(Some(String::new())).expect_err("empty device");
+        assert_eq!(err.code, privchat_protocol::ErrorCode::AuthRequired);
+    }
+
+    #[test]
+    fn submit_valid_device_id_accepted() {
+        assert_eq!(
+            resolve_session_device_id(Some("dev-abc".to_string())).unwrap(),
+            "dev-abc"
         );
     }
 }
