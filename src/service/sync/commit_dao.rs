@@ -173,6 +173,106 @@ impl CommitLogDao {
         Ok(())
     }
 
+    /// CODEX-8 复审(P0）：**原子** exactly-once 提交 —— 同一 DB 事务内 分配 pts + 落 commit_log +
+    /// claim 幂等 registry(sender, device, local_message_id)。
+    ///
+    /// 返回 `true` = 本次真正提交（调用方继续 fanout/未读）；`false` = 幂等冲突（并发/重试撞车），
+    /// 事务已回滚（pts 分配 + commit_log 均撤销，无空洞、无重复落库），调用方**读既有 registry 返回、
+    /// 绝不 fanout**。`local_message_id == 0`（协议约定「无幂等键」）时跳过 registry claim，恒 `true`。
+    pub async fn allocate_commit_and_claim(
+        &self,
+        commit: &mut ServerCommit,
+        sender_id: u64,
+        device_id: &str,
+        local_message_id: u64,
+        decision: &str,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let sender_username = commit.sender_info.as_ref().map(|s| s.username.as_str());
+
+        let mut tx = self.db.pool().begin().await.map_err(|e| {
+            crate::error::ServerError::Database(format!("Failed to begin submit transaction: {}", e))
+        })?;
+
+        // 1) 分配 pts（行锁串行化并发提交）。
+        let pts_row = sqlx::query(
+            r#"
+            INSERT INTO privchat_channel_pts (channel_id, current_pts, created_at, updated_at)
+            VALUES ($1, 1, $2, $2)
+            ON CONFLICT (channel_id) DO UPDATE
+            SET current_pts = privchat_channel_pts.current_pts + 1, updated_at = $2
+            RETURNING current_pts
+            "#,
+        )
+        .bind(commit.channel_id as i64)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::error::ServerError::Database(format!("allocate pts failed: {}", e)))?;
+        let new_pts = pts_row.get::<i64, _>("current_pts") as u64;
+        commit.pts = new_pts;
+
+        // 2) 落 commit_log。
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_commit_log
+            (pts, server_msg_id, local_message_id, channel_id, channel_type,
+             message_type, content, server_timestamp, sender_id, sender_username, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(commit.pts as i64)
+        .bind(commit.server_msg_id as i64)
+        .bind(commit.local_message_id.map(|v| v as i64))
+        .bind(commit.channel_id as i64)
+        .bind(commit.channel_type as i16)
+        .bind(commit.message_type.as_str())
+        .bind(commit.content.clone())
+        .bind(commit.server_timestamp)
+        .bind(commit.sender_id as i64)
+        .bind(sender_username)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| crate::error::ServerError::Database(format!("save commit failed: {}", e)))?;
+
+        // 3) claim 幂等 registry（lmid=0 无幂等键，跳过）。冲突 = 并发/重试撞车 → 回滚整个事务。
+        if local_message_id != 0 {
+            let claimed = sqlx::query(
+                r#"
+                INSERT INTO privchat_client_msg_registry
+                (local_message_id, server_msg_id, pts, channel_id, channel_type, sender_id, device_id, decision, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (sender_id, device_id, local_message_id) DO NOTHING
+                "#,
+            )
+            .bind(local_message_id as i64)
+            .bind(commit.server_msg_id as i64)
+            .bind(new_pts as i64)
+            .bind(commit.channel_id as i64)
+            .bind(commit.channel_type as i16)
+            .bind(sender_id as i64)
+            .bind(device_id)
+            .bind(decision)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| crate::error::ServerError::Database(format!("claim registry failed: {}", e)))?;
+
+            if claimed.rows_affected() == 0 {
+                // 幂等冲突：回滚本次 pts 分配 + commit_log（drop 未 commit 的 tx = ROLLBACK），
+                // pts 归还无空洞；调用方读既有 registry 返回，不 fanout。
+                drop(tx);
+                return Ok(false);
+            }
+        }
+
+        tx.commit().await.map_err(|e| {
+            crate::error::ServerError::Database(format!("Failed to commit submit transaction: {}", e))
+        })?;
+        Ok(true)
+    }
+
     /// 查询 Commits（pts > last_pts）
     ///
     /// SELECT * FROM privchat_commit_log

@@ -301,19 +301,50 @@ impl MessageHandler for SendMessageHandler {
             send_message_request.payload.len()
         );
 
-        // from_uid 和 channel_id 现在已经是 u64 类型
-        let from_uid = send_message_request.from_uid;
+        // CODEX-8 复审 P0#3/P1#4：**sender 与 device 一律取自认证会话，不信 payload**。
+        // 认证会话必然带 uid+device；缺失即异常会话 —— fail closed 拒绝（否则可冒充 sender、
+        // 或所有异常会话落入同一空 device 幂等命名空间）。
+        let session = self
+            .auth_session_manager
+            .get_session_info(&context.session_id)
+            .await;
+        let (from_uid, sender_device_id) = match session {
+            Some(s) => match (s.user_id.parse::<u64>().ok(), s.device_id) {
+                (Some(uid), dev) if !dev.is_empty() => (uid, dev),
+                _ => {
+                    return self
+                        .create_error_response(
+                            &send_message_request,
+                            ErrorCode::AuthRequired,
+                            "会话缺少认证身份（uid/device）",
+                        )
+                        .await;
+                }
+            },
+            None => {
+                return self
+                    .create_error_response(
+                        &send_message_request,
+                        ErrorCode::AuthRequired,
+                        "未认证会话",
+                    )
+                    .await;
+            }
+        };
+        // payload.from_uid 若非 0 且与认证 uid 不一致 → 拒绝（防发送者冒充；不静默改写）。
+        if send_message_request.from_uid != 0 && send_message_request.from_uid != from_uid {
+            return self
+                .create_error_response(
+                    &send_message_request,
+                    ErrorCode::PermissionDenied,
+                    "from_uid 与认证用户不一致",
+                )
+                .await;
+        }
         let channel_id = send_message_request.channel_id;
         // local_message_id=0 视为「客户端未提供幂等键」（协议默认值），不参与 dedup。
         // 否则所有 0 值请求共享 `client:{uid}:{device}:0`，第一条永久占坑，后续消息会被
         // 静默判重并返回第一条的 message_id —— 等价于永久丢消息。
-        // CODEX-8：键含 device（认证会话权威）；会话查不到（理论不发生）回退 '' 保持可用。
-        let sender_device_id = self
-            .auth_session_manager
-            .get_session_info(&context.session_id)
-            .await
-            .map(|s| s.device_id)
-            .unwrap_or_default();
         let client_dedup_key = (send_message_request.local_message_id != 0).then(|| {
             Self::client_dedup_key(
                 from_uid,
