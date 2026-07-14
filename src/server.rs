@@ -1924,6 +1924,7 @@ impl ChatServer {
                             Err(_) => {
                                 // 限流触发：handler 并发已满。必须给客户端显式错误，
                                 // 否则调用方只能等超时，直播/弱网场景会放大重试风暴。
+                                crate::infra::metrics::record_handler_result("busy");
                                 let overload_response = ErrorResponseBuilder::build(
                                     session_id.clone(),
                                     "SERVER_BUSY",
