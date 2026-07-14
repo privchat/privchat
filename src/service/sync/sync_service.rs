@@ -180,15 +180,19 @@ impl SyncService {
             req.local_message_id, req.channel_id, req.channel_type
         );
 
-        // 1. 幂等性检查（CODEX-8：(sender, device, local_message_id) 三元组 ——
-        //    此前按 lmid 单列全局判重，跨用户/跨设备雪花碰撞会被误判重 → 静默丢消息）⭐
-        if let Some(existing) = self
-            .registry_dao
-            .check_duplicate(sender_id, device_id, req.local_message_id)
-            .await?
-        {
-            info!("检测到重复提交: local_message_id={}", req.local_message_id);
-            return Ok(existing);
+        // 1. 幂等性快路径检查（CODEX-8：(sender, device, local_message_id) 三元组）。
+        //    local_message_id=0 = 协议约定「无幂等键」，不参与 dedup（否则同 sender+device 的所有 0
+        //    值请求共享一行 → 第一条后全部被误判重、静默丢消息）。真正的 exactly-once 由下方
+        //    commit_dao.allocate_commit_and_claim 的**事务内 claim** 保证（并发/崩溃兜底）。
+        if req.local_message_id != 0 {
+            if let Some(existing) = self
+                .registry_dao
+                .check_duplicate(sender_id, device_id, req.local_message_id)
+                .await?
+            {
+                info!("检测到重复提交: local_message_id={}", req.local_message_id);
+                return Ok(existing);
+            }
         }
 
         // 2. 权限验证
@@ -239,10 +243,33 @@ impl SyncService {
             sender_info: self.get_sender_info(sender_id).await.ok(),
         };
 
-        // 8. 事务内分配 pts + 保存 Commit（避免 pts 空洞）⭐
-        self.commit_dao
-            .allocate_pts_and_save_commit(&mut commit)
+        // 8. 原子提交（CODEX-8 复审 P0）：同一事务内 分配 pts + 落 commit_log + claim 幂等 registry。
+        //    committed=false = 事务内 claim 撞到并发/重试冲突（事务已回滚，无重复落库、无 pts 空洞）→
+        //    读既有 registry 返回、**绝不 fanout**（exactly-once）。lmid=0 恒 committed。
+        let committed = self
+            .commit_dao
+            .allocate_commit_and_claim(
+                &mut commit,
+                sender_id,
+                device_id,
+                req.local_message_id,
+                "accepted",
+            )
             .await?;
+        if !committed {
+            info!("并发/重试幂等冲突（tx claim）: local_message_id={}", req.local_message_id);
+            if let Some(existing) = self
+                .registry_dao
+                .check_duplicate(sender_id, device_id, req.local_message_id)
+                .await?
+            {
+                return Ok(existing);
+            }
+            // 理论不达：claim 冲突则 registry 必存在。保守返回错误而非重复 fanout。
+            return Err(crate::error::ServerError::Database(
+                "idempotency conflict but no existing registry row".to_string(),
+            ));
+        }
         let new_pts = commit.pts;
 
         // 同步到内存 PtsGenerator（可选，提高性能）
@@ -322,19 +349,8 @@ impl SyncService {
             }
         }
 
-        // 11. 注册 local_message_id（防止重复；sender+device 命名空间）⭐
-        self.registry_dao
-            .register(
-                req.local_message_id,
-                server_msg_id,
-                new_pts,
-                req.channel_id,
-                req.channel_type,
-                sender_id,
-                device_id,
-                "accepted", // decision
-            )
-            .await?;
+        // (registry 已在步骤 8 的原子事务内 claim —— 不再单独 register，杜绝「commit 后 register 前
+        //  崩溃 → 重试产生重复消息」的窗口。)
 
         // 12. 返回响应 ⭐
         let response = ClientSubmitResponse {

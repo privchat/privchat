@@ -255,9 +255,12 @@ async fn handle_submit_rpc(
         }
     }
 
-    // 使用 SyncService 处理客户端提交。device_id 来自认证会话（CODEX-8 幂等命名空间维度，
-    // 服务端权威）；缺失（认证连接理论必有 device）时回退 '' 沿用旧语义。
-    let device_id = ctx.device_id.clone().unwrap_or_default();
+    // device_id 来自认证会话（CODEX-8 幂等命名空间维度，服务端权威）。认证的 sync/submit 必然带
+    // device；缺失即异常会话 —— fail closed 拒绝（否则所有异常会话落入同一空 device 命名空间）。
+    let device_id = match ctx.device_id.clone().filter(|d| !d.is_empty()) {
+        Some(d) => d,
+        None => return Err(RpcError::unauthorized("会话缺少 device_id".to_string())),
+    };
     let response = services
         .sync_service
         .handle_client_submit(request, sender_id, &device_id)
