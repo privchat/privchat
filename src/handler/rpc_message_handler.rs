@@ -137,6 +137,8 @@ impl MessageHandler for RPCMessageHandler {
         let rpc_response = handle_rpc_request(rpc_request.clone(), rpc_context).await;
         let elapsed = start.elapsed().as_secs_f64();
         crate::infra::metrics::record_rpc(&rpc_request.route, elapsed);
+        // 真实 handler 结果（ErrorCode::Ok=0=ok，否则 error）；供 G10 §3.1 handler 错误率。
+        crate::infra::metrics::record_handler_result(if rpc_response.code == 0 { "ok" } else { "error" });
 
         info!(
             "✅ RPC 调用完成: route={}, code={}, message={}",

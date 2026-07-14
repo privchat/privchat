@@ -110,6 +110,12 @@ pub fn record_connection_count(count: u64) {
     metrics::gauge!(GAUGE_CONNECTIONS).set(count as f64);
 }
 
+/// handler 请求结果计数（低基数 result label：ok|error|busy）。供 G10 soak 判真实
+/// handler 错误率（§3.1）——覆盖普通/认证/同步/业务错误，非仅限流拒绝。
+pub fn record_handler_result(result: &str) {
+    metrics::counter!("privchat_handler_requests_total", "result" => result.to_string()).increment(1);
+}
+
 /// tokio 存活 task 数（Gauge）。供 G10 soak 判 task 泄漏（§3.1）。
 /// `num_alive_tasks` 自 tokio 1.38 稳定，无需 tokio_unstable。
 pub fn record_tokio_alive_tasks(count: u64) {
