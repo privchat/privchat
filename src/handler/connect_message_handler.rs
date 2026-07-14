@@ -116,6 +116,10 @@ impl ConnectMessageHandler {
 #[async_trait]
 impl MessageHandler for ConnectMessageHandler {
     async fn handle(&self, context: RequestContext) -> Result<Option<Vec<u8>>> {
+        // server 侧认证耗时（G8 归因）：守卫在任何 return/`?` 时统一计时。
+        let _auth_timer = crate::infra::metrics::DurationRecorder::new(
+            crate::infra::metrics::record_authenticate_duration,
+        );
         info!(
             "🔗 ConnectMessageHandler: 处理来自会话 {} 的连接请求",
             context.session_id

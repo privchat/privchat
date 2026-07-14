@@ -28,6 +28,11 @@ static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 const GAUGE_CONNECTIONS: &str = "privchat_connections_current";
 const COUNTER_RPC_TOTAL: &str = "privchat_rpc_total";
 const HISTOGRAM_RPC_DURATION: &str = "privchat_rpc_duration_seconds";
+/// 建连/认证 server 侧耗时直方图（G8 归因，见 LOAD_GATE_EXECUTION_SPEC §7）。无高基数 label。
+const HISTOGRAM_CONNECT_DURATION: &str = "privchat_connect_duration_seconds";
+const HISTOGRAM_AUTHENTICATE_DURATION: &str = "privchat_authenticate_duration_seconds";
+/// 建连/认证延迟 bucket：覆盖 10ms→10s。
+const CONN_AUTH_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 const COUNTER_MESSAGES_SENT: &str = "privchat_messages_sent_total";
 const GAUGE_HANDLER_INFLIGHT: &str = "privchat_handler_inflight";
 const COUNTER_HANDLER_REJECTED: &str = "privchat_handler_rejected_total";
@@ -67,7 +72,20 @@ const COUNTER_DELIVERY_FILTERED: &str = "privchat_delivery_filtered_total";
 /// 初始化 Prometheus 指标（安装全局 Recorder，返回 Handle 用于 HTTP 暴露）。
 /// 仅需在进程内调用一次；重复调用会返回 Err。
 pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let handle = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+    use metrics_exporter_prometheus::Matcher;
+    // 为建连/认证直方图配显式 bucket（10ms→10s）；其它指标保持默认。
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(HISTOGRAM_CONNECT_DURATION.to_string()),
+            CONN_AUTH_BUCKETS,
+        )
+        .map_err(|e| format!("connect bucket config: {e}"))?
+        .set_buckets_for_metric(
+            Matcher::Full(HISTOGRAM_AUTHENTICATE_DURATION.to_string()),
+            CONN_AUTH_BUCKETS,
+        )
+        .map_err(|e| format!("authenticate bucket config: {e}"))?
+        .install_recorder()?;
     HANDLE
         .set(handle)
         .map_err(|_| "metrics already initialized")?;
@@ -93,6 +111,38 @@ pub fn record_connection_count(count: u64) {
 pub fn record_rpc(route: &str, duration_secs: f64) {
     metrics::counter!(COUNTER_RPC_TOTAL, "route" => route.to_string()).increment(1);
     metrics::histogram!(HISTOGRAM_RPC_DURATION, "route" => route.to_string()).record(duration_secs);
+}
+
+/// 记录 server 侧连接建立耗时（无 label）。见 LOAD_GATE_EXECUTION_SPEC §7。
+pub fn record_connect_duration(duration_secs: f64) {
+    metrics::histogram!(HISTOGRAM_CONNECT_DURATION).record(duration_secs);
+}
+
+/// 记录 server 侧认证（AuthorizationRequest 处理）耗时（无 label）。见 LOAD_GATE_EXECUTION_SPEC §7。
+pub fn record_authenticate_duration(duration_secs: f64) {
+    metrics::histogram!(HISTOGRAM_AUTHENTICATE_DURATION).record(duration_secs);
+}
+
+/// 计时守卫：drop 时把耗时记入给定 record 函数。用于包裹含多处 early-return 的路径
+/// （如 ConnectMessageHandler：任何 `?`/return 都会在 drop 时统一计时）。
+pub struct DurationRecorder {
+    start: std::time::Instant,
+    record: fn(f64),
+}
+
+impl DurationRecorder {
+    pub fn new(record: fn(f64)) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            record,
+        }
+    }
+}
+
+impl Drop for DurationRecorder {
+    fn drop(&mut self) {
+        (self.record)(self.start.elapsed().as_secs_f64());
+    }
 }
 
 /// 记录发送消息数 +1。
