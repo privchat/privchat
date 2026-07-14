@@ -2328,6 +2328,8 @@ impl ChatServer {
             // 已初始化或重复调用，忽略
         } else {
             info!("📊 Prometheus 指标已启用，GET /metrics 可用");
+            // G10 soak 需要：每 5s 采一次 tokio 存活 task 数写入 gauge。
+            crate::infra::metrics::spawn_tokio_task_sampler(5);
         }
 
         // ---- 文件服务（对外） ----
