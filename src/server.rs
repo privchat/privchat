@@ -1922,9 +1922,8 @@ impl ChatServer {
                                 });
                             }
                             Err(_) => {
-                                // 限流触发：handler 并发已满。必须给客户端显式错误，
-                                // 否则调用方只能等超时，直播/弱网场景会放大重试风暴。
-                                crate::infra::metrics::record_handler_result("busy");
+                                // 限流触发：handler 并发已满（busy 单独由 privchat_handler_rejected_total
+                                // 计，不并入 rpc_requests_total 以免分子分母作用域不一致）。
                                 let overload_response = ErrorResponseBuilder::build(
                                     session_id.clone(),
                                     "SERVER_BUSY",

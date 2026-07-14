@@ -92,6 +92,7 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     HANDLE
         .set(handle)
         .map_err(|_| "metrics already initialized")?;
+    preregister_rpc_result();
     Ok(())
 }
 
@@ -110,10 +111,17 @@ pub fn record_connection_count(count: u64) {
     metrics::gauge!(GAUGE_CONNECTIONS).set(count as f64);
 }
 
-/// handler 请求结果计数（低基数 result label：ok|error|busy）。供 G10 soak 判真实
-/// handler 错误率（§3.1）——覆盖普通/认证/同步/业务错误，非仅限流拒绝。
-pub fn record_handler_result(result: &str) {
-    metrics::counter!("privchat_handler_requests_total", "result" => result.to_string()).increment(1);
+/// RPC 请求结果计数（低基数 result label：ok|error）。供 G10 soak 判 **RPC** 错误率（§3.1）。
+/// 作用域仅 RPC dispatch（覆盖 login/submit/sync 等所有 RPC route，code!=0 计 error）；
+/// 限流拒绝(busy)不在此计（单独 `privchat_handler_rejected_total`），避免分子分母作用域不一致。
+pub fn record_rpc_result(result: &str) {
+    metrics::counter!("privchat_rpc_requests_total", "result" => result.to_string()).increment(1);
+}
+
+/// 预注册 rpc_requests_total{ok,error}=0（进程启动即可见，避免干净 server 上「缺 metric family」）。
+fn preregister_rpc_result() {
+    metrics::counter!("privchat_rpc_requests_total", "result" => "ok").increment(0);
+    metrics::counter!("privchat_rpc_requests_total", "result" => "error").increment(0);
 }
 
 /// tokio 存活 task 数（Gauge）。供 G10 soak 判 task 泄漏（§3.1）。
