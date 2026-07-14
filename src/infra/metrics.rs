@@ -110,6 +110,25 @@ pub fn record_connection_count(count: u64) {
     metrics::gauge!(GAUGE_CONNECTIONS).set(count as f64);
 }
 
+/// tokio 存活 task 数（Gauge）。供 G10 soak 判 task 泄漏（§3.1）。
+/// `num_alive_tasks` 自 tokio 1.38 稳定，无需 tokio_unstable。
+pub fn record_tokio_alive_tasks(count: u64) {
+    metrics::gauge!("privchat_tokio_alive_tasks").set(count as f64);
+}
+
+/// 启动后台 sampler：每 `interval_secs` 采一次 tokio 存活 task 数写入 gauge。
+/// 在进程 runtime 内调用一次即可。
+pub fn spawn_tokio_task_sampler(interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+        loop {
+            tick.tick().await;
+            let n = tokio::runtime::Handle::current().metrics().num_alive_tasks() as u64;
+            record_tokio_alive_tasks(n);
+        }
+    });
+}
+
 /// 记录一次 RPC 调用：总次数 + 耗时直方图。
 pub fn record_rpc(route: &str, duration_secs: f64) {
     metrics::counter!(COUNTER_RPC_TOTAL, "route" => route.to_string()).increment(1);
