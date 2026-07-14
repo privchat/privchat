@@ -172,17 +172,19 @@ impl SyncService {
     pub async fn handle_client_submit(
         &self,
         req: ClientSubmitRequest,
-        sender_id: u64, // 从 JWT token 中提取
+        sender_id: u64,  // 从 JWT token 中提取
+        device_id: &str, // 从认证会话提取（CODEX-8：幂等命名空间的 device 维度，服务端权威）
     ) -> Result<ClientSubmitResponse> {
         info!(
             "收到客户端提交: local_message_id={}, channel_id={}, channel_type={}",
             req.local_message_id, req.channel_id, req.channel_type
         );
 
-        // 1. 幂等性检查（local_message_id 去重）⭐
+        // 1. 幂等性检查（CODEX-8：(sender, device, local_message_id) 三元组 ——
+        //    此前按 lmid 单列全局判重，跨用户/跨设备雪花碰撞会被误判重 → 静默丢消息）⭐
         if let Some(existing) = self
             .registry_dao
-            .check_duplicate(req.local_message_id)
+            .check_duplicate(sender_id, device_id, req.local_message_id)
             .await?
         {
             info!("检测到重复提交: local_message_id={}", req.local_message_id);
@@ -320,7 +322,7 @@ impl SyncService {
             }
         }
 
-        // 11. 注册 local_message_id（防止重复）⭐
+        // 11. 注册 local_message_id（防止重复；sender+device 命名空间）⭐
         self.registry_dao
             .register(
                 req.local_message_id,
@@ -329,6 +331,7 @@ impl SyncService {
                 req.channel_id,
                 req.channel_type,
                 sender_id,
+                device_id,
                 "accepted", // decision
             )
             .await?;

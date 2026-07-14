@@ -223,8 +223,11 @@ impl SendMessageHandler {
         *self.transport.write().await = Some(transport);
     }
 
-    fn client_dedup_key(sender_id: u64, local_message_id: u64) -> String {
-        format!("client:{}:{}", sender_id, local_message_id)
+    /// CODEX-8：客户端幂等键 = (uid, device, local_message_id) 三元组。device 来自认证会话
+    /// （服务端权威，不信 payload）—— 同账号多设备 / 不同用户的雪花 local_message_id 碰撞
+    /// 不再互相判重（此前 `client:{uid}:{lmid}` 缺 device 维度）。
+    fn client_dedup_key(sender_id: u64, device_id: &str, local_message_id: u64) -> String {
+        format!("client:{}:{}:{}", sender_id, device_id, local_message_id)
     }
 
     fn message_to_history_record(message: &crate::model::message::Message) -> MessageHistoryRecord {
@@ -302,10 +305,22 @@ impl MessageHandler for SendMessageHandler {
         let from_uid = send_message_request.from_uid;
         let channel_id = send_message_request.channel_id;
         // local_message_id=0 视为「客户端未提供幂等键」（协议默认值），不参与 dedup。
-        // 否则所有 0 值请求共享 `client:{uid}:0`，第一条永久占坑，后续消息会被
+        // 否则所有 0 值请求共享 `client:{uid}:{device}:0`，第一条永久占坑，后续消息会被
         // 静默判重并返回第一条的 message_id —— 等价于永久丢消息。
-        let client_dedup_key = (send_message_request.local_message_id != 0)
-            .then(|| Self::client_dedup_key(from_uid, send_message_request.local_message_id));
+        // CODEX-8：键含 device（认证会话权威）；会话查不到（理论不发生）回退 '' 保持可用。
+        let sender_device_id = self
+            .auth_session_manager
+            .get_session_info(&context.session_id)
+            .await
+            .map(|s| s.device_id)
+            .unwrap_or_default();
+        let client_dedup_key = (send_message_request.local_message_id != 0).then(|| {
+            Self::client_dedup_key(
+                from_uid,
+                &sender_device_id,
+                send_message_request.local_message_id,
+            )
+        });
 
         // ✨ 1.4. 防御性检查：拒绝无效的 channel_id
         if channel_id == 0 {
