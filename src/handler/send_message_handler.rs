@@ -230,6 +230,26 @@ impl SendMessageHandler {
         format!("client:{}:{}:{}", sender_id, device_id, local_message_id)
     }
 
+    /// CODEX-8 复审 P0#3/P1#4：从认证会话解析权威 (sender_uid, device_id)。纯函数便于单测。
+    /// `session` = 会话的 (user_id_str, device_id)（None = 无会话）。`payload_from_uid` = 客户端
+    /// 声明的发送者（协议默认 0 = 未提供）。返回 Err(ErrorCode) 应直接拒绝：
+    ///   - 无会话 / uid 非法 / device 为空 → [ErrorCode::AuthRequired]（fail closed）
+    ///   - payload_from_uid != 0 且 != 认证 uid → [ErrorCode::PermissionDenied]（防冒充）
+    fn resolve_authenticated_sender(
+        session: Option<(String, String)>,
+        payload_from_uid: u64,
+    ) -> std::result::Result<(u64, String), ErrorCode> {
+        let (uid_str, device) = session.ok_or(ErrorCode::AuthRequired)?;
+        let uid = uid_str.parse::<u64>().map_err(|_| ErrorCode::AuthRequired)?;
+        if device.is_empty() {
+            return Err(ErrorCode::AuthRequired);
+        }
+        if payload_from_uid != 0 && payload_from_uid != uid {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        Ok((uid, device))
+    }
+
     fn message_to_history_record(message: &crate::model::message::Message) -> MessageHistoryRecord {
         MessageHistoryRecord {
             message_id: message.message_id,
@@ -307,40 +327,22 @@ impl MessageHandler for SendMessageHandler {
         let session = self
             .auth_session_manager
             .get_session_info(&context.session_id)
-            .await;
-        let (from_uid, sender_device_id) = match session {
-            Some(s) => match (s.user_id.parse::<u64>().ok(), s.device_id) {
-                (Some(uid), dev) if !dev.is_empty() => (uid, dev),
-                _ => {
+            .await
+            .map(|s| (s.user_id, s.device_id));
+        let (from_uid, sender_device_id) =
+            match Self::resolve_authenticated_sender(session, send_message_request.from_uid) {
+                Ok(v) => v,
+                Err(code) => {
+                    let msg = if code == ErrorCode::PermissionDenied {
+                        "from_uid 与认证用户不一致"
+                    } else {
+                        "会话缺少认证身份（uid/device）"
+                    };
                     return self
-                        .create_error_response(
-                            &send_message_request,
-                            ErrorCode::AuthRequired,
-                            "会话缺少认证身份（uid/device）",
-                        )
+                        .create_error_response(&send_message_request, code, msg)
                         .await;
                 }
-            },
-            None => {
-                return self
-                    .create_error_response(
-                        &send_message_request,
-                        ErrorCode::AuthRequired,
-                        "未认证会话",
-                    )
-                    .await;
-            }
-        };
-        // payload.from_uid 若非 0 且与认证 uid 不一致 → 拒绝（防发送者冒充；不静默改写）。
-        if send_message_request.from_uid != 0 && send_message_request.from_uid != from_uid {
-            return self
-                .create_error_response(
-                    &send_message_request,
-                    ErrorCode::PermissionDenied,
-                    "from_uid 与认证用户不一致",
-                )
-                .await;
-        }
+            };
         let channel_id = send_message_request.channel_id;
         // local_message_id=0 视为「客户端未提供幂等键」（协议默认值），不参与 dedup。
         // 否则所有 0 值请求共享 `client:{uid}:{device}:0`，第一条永久占坑，后续消息会被
@@ -2628,6 +2630,58 @@ mod attachment_bind_tests {
         assert_eq!(
             SendMessageHandler::extract_attachment_file_ids(&meta),
             vec![5]
+        );
+    }
+
+    // CODEX-8 复审 P0#3/P1#4：sender/device 认证权威 + 冒充/缺失拒绝（纯函数回归）。
+    use privchat_protocol::error_code::ErrorCode;
+    fn sess(uid: &str, dev: &str) -> Option<(String, String)> {
+        Some((uid.to_string(), dev.to_string()))
+    }
+
+    #[test]
+    fn sender_valid_uses_session_identity() {
+        // payload from_uid=0（未提供）→ 用认证 uid+device
+        assert_eq!(
+            SendMessageHandler::resolve_authenticated_sender(sess("42", "devA"), 0),
+            Ok((42, "devA".to_string()))
+        );
+        // payload from_uid 与认证一致 → 通过
+        assert_eq!(
+            SendMessageHandler::resolve_authenticated_sender(sess("42", "devA"), 42),
+            Ok((42, "devA".to_string()))
+        );
+    }
+
+    #[test]
+    fn sender_from_uid_mismatch_rejected() {
+        assert_eq!(
+            SendMessageHandler::resolve_authenticated_sender(sess("42", "devA"), 99),
+            Err(ErrorCode::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn sender_missing_session_rejected() {
+        assert_eq!(
+            SendMessageHandler::resolve_authenticated_sender(None, 42),
+            Err(ErrorCode::AuthRequired)
+        );
+    }
+
+    #[test]
+    fn sender_empty_device_rejected() {
+        assert_eq!(
+            SendMessageHandler::resolve_authenticated_sender(sess("42", ""), 0),
+            Err(ErrorCode::AuthRequired)
+        );
+    }
+
+    #[test]
+    fn sender_unparseable_uid_rejected() {
+        assert_eq!(
+            SendMessageHandler::resolve_authenticated_sender(sess("not-a-number", "devA"), 0),
+            Err(ErrorCode::AuthRequired)
         );
     }
 }
