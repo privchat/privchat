@@ -1756,6 +1756,10 @@ impl ChatServer {
 
                 match event {
                     ServerEvent::ConnectionEstablished { session_id, info } => {
+                        // server 侧连接建立耗时（G8 归因）：守卫覆盖安全拒绝 continue 与正常结束两条路径。
+                        let _connect_timer = crate::infra::metrics::DurationRecorder::new(
+                            crate::infra::metrics::record_connect_duration,
+                        );
                         info!("🔗 新连接建立: {} ({})", session_id, info.peer_addr);
                         connection_manager.register_connecting(session_id);
 
