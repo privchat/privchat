@@ -2729,6 +2729,80 @@ impl ChannelService {
         Ok(true)
     }
 
+    /// #72A.1 群审批原子提交：CAS 把 pending 申请置 approved + **同一 DB 事务内**加群成员 + 重算 member_count。
+    ///
+    /// 并发/多实例安全（不依赖内存锁）：
+    ///   - CAS `WHERE status = 0` 让并发/重复审批中至多一个成功（DB 裁决）；
+    ///   - approve 与加成员同事务：加成员失败整体回滚，绝不产生「approved 但非群成员」孤儿；
+    ///   - upsert_one_member_in_tx 幂等（ON CONFLICT），重复不产生重复成员。
+    ///
+    /// 返回 Ok(true)=本次批准成功并已入群；Ok(false)=申请已被处理（并发/重复 loser），未改任何状态。
+    pub async fn approve_join_request_in_tx(
+        &self,
+        request_id: &str,
+        group_id: u64,
+        user_id: u64,
+        handler_id: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let now_ms = now.timestamp_millis();
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启审批事务失败: {}", e)))?;
+
+        // CAS：仅当申请仍是 pending(0) 才置 approved(1)；命中 0 行 = 已被并发/重复处理。
+        let updated = sqlx::query(
+            r#"
+            UPDATE privchat_group_join_requests
+            SET status = 1, handler_id = $2, updated_at = $3
+            WHERE request_id = $1 AND status = 0
+            "#,
+        )
+        .bind(request_id)
+        .bind(handler_id as i64)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("审批 CAS 失败: {}", e)))?;
+
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+
+        // 同事务加成员（幂等）+ 重算成员数。任一失败 → 整体回滚，status 保持 pending。
+        Self::upsert_one_member_in_tx(&mut tx, group_id, user_id, MemberRole::Member, now_ms).await?;
+        Self::recompute_group_member_count_in_tx(&mut tx, group_id, now_ms).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交审批事务失败: {}", e)))?;
+
+        // 提交后同步内存缓存（DB 已是真相；缓存失败不破坏一致性，reconnect/sync 会重建）。
+        {
+            let mut channels = self.channels.write().await;
+            if let Some(channel) = channels.get_mut(&group_id) {
+                let _ = channel.add_member(user_id, Some(MemberRole::Member));
+            }
+        }
+        self.ensure_user_channel_rows(group_id, &[user_id]).await?;
+        {
+            let mut user_channels = self.user_channels.write().await;
+            let list = user_channels.entry(user_id).or_insert_with(Vec::new);
+            if !list.contains(&group_id) {
+                list.push(group_id);
+            }
+        }
+
+        info!(
+            "✅ 审批入群(原子): request_id={}, user_id={}, group_id={}",
+            request_id, user_id, group_id
+        );
+        Ok(true)
+    }
+
     /// 离开会话
     pub async fn leave_channel(&self, channel_id: u64, user_id: u64) -> Result<bool> {
         let mut channels = self.channels.write().await;

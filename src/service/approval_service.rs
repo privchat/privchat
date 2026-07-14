@@ -112,6 +112,23 @@ impl ApprovalService {
         message: Option<String>,
         expire_hours: Option<i64>,
     ) -> Result<JoinRequest> {
+        // #72A.1 幂等去重：同群同人已有 pending 申请 → 直接返回它，不重复建。
+        // 快路径查内存缓存；并发竞态由 DB 偏唯一约束 uq_pgjr_active_pending 兜底（第二条 insert 报错）。
+        {
+            let guard = self.join_requests.read().await;
+            if let Some(existing) = guard.values().find(|r| {
+                r.group_id == group_id
+                    && r.user_id == user_id
+                    && r.status == JoinRequestStatus::Pending
+            }) {
+                info!(
+                    "↩ 已有待审批申请，去重返回: request_id={}, group_id={}, user_id={}",
+                    existing.request_id, group_id, user_id
+                );
+                return Ok(existing.clone());
+            }
+        }
+
         let request_id = Uuid::new_v4().to_string();
         let created_at = Utc::now();
         let expires_at = expire_hours.map(|hours| created_at + Duration::hours(hours));
@@ -160,6 +177,22 @@ impl ApprovalService {
         );
 
         Ok(request)
+    }
+
+    /// #72A.1：从 DB 回灌单条申请到内存缓存。approve 的 DB 状态变更在 channel_service 的原子事务内
+    /// 完成（CAS + 入群同事务），本方法把最新状态同步回 ApprovalService 缓存，保持 list 一致。
+    pub async fn reload_request(&self, request_id: &str) -> Result<Option<JoinRequest>> {
+        let fresh = self.repo.get(request_id).await?;
+        let mut guard = self.join_requests.write().await;
+        match &fresh {
+            Some(r) => {
+                guard.insert(request_id.to_string(), r.clone());
+            }
+            None => {
+                guard.remove(request_id);
+            }
+        }
+        Ok(fresh)
     }
 
     /// 获取单个加群请求
@@ -298,21 +331,15 @@ impl ApprovalService {
     ) -> Result<JoinRequest> {
         let mut requests_guard = self.join_requests.write().await;
 
-        let cur_status = match requests_guard.get(request_id) {
-            Some(r) => r.status,
-            None => return Err(ServerError::NotFound("加群请求不存在".to_string())),
-        };
-        if cur_status != JoinRequestStatus::Pending {
-            return Err(ServerError::Validation(format!(
-                "请求状态不是待审批: {:?}",
-                cur_status
-            )));
+        if requests_guard.get(request_id).is_none() {
+            return Err(ServerError::NotFound("加群请求不存在".to_string()));
         }
 
         let now = Utc::now();
-        // #72A：DB-first —— 先落库 rejected（含 reason），成功再改缓存。
-        self.repo
-            .update_status(
+        // #72A.1：DB CAS 裁决（WHERE status=0）—— 并发/重复 reject 中至多一个成功，多实例安全。
+        let won = self
+            .repo
+            .update_status_cas_pending(
                 request_id,
                 JoinRequestStatus::Rejected,
                 Some(handler_id),
@@ -320,6 +347,15 @@ impl ApprovalService {
                 now,
             )
             .await?;
+        if !won {
+            // 已被并发/重复处理：从 DB 回灌缓存后返回明确错误。
+            if let Ok(Some(fresh)) = self.repo.get(request_id).await {
+                requests_guard.insert(request_id.to_string(), fresh);
+            }
+            return Err(ServerError::Validation(
+                "加群申请已被处理（并发或重复审批）".to_string(),
+            ));
+        }
 
         let request = requests_guard
             .get_mut(request_id)

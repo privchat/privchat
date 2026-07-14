@@ -163,6 +163,34 @@ impl ApprovalRepository {
         Ok(())
     }
 
+    /// #72A.1 CAS：仅当当前 status=pending(0) 才更新为 [status]；返回是否命中（false = 0 行 = 已被并发/重复处理）。
+    /// DB 层裁决，多实例安全 —— 不依赖内存锁。
+    pub async fn update_status_cas_pending(
+        &self,
+        request_id: &str,
+        status: JoinRequestStatus,
+        handler_id: Option<u64>,
+        reject_reason: Option<&str>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            r#"
+            UPDATE privchat_group_join_requests
+            SET status = $2, handler_id = $3, reject_reason = $4, updated_at = $5
+            WHERE request_id = $1 AND status = 0
+            "#,
+        )
+        .bind(request_id)
+        .bind(status_to_i16(status))
+        .bind(handler_id.map(|v| v as i64))
+        .bind(reject_reason)
+        .bind(updated_at)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("CAS update join request 失败: {}", e)))?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// 读单条。
     pub async fn get(&self, request_id: &str) -> Result<Option<JoinRequest>> {
         let row = sqlx::query_as::<_, JoinRequestRow>(
