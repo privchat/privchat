@@ -29,7 +29,10 @@ const GAUGE_CONNECTIONS: &str = "privchat_connections_current";
 const COUNTER_RPC_TOTAL: &str = "privchat_rpc_total";
 const HISTOGRAM_RPC_DURATION: &str = "privchat_rpc_duration_seconds";
 /// 建连/认证 server 侧耗时直方图（G8 归因，见 LOAD_GATE_EXECUTION_SPEC §7）。无高基数 label。
-const HISTOGRAM_CONNECT_DURATION: &str = "privchat_connect_duration_seconds";
+/// 注意：**只覆盖 server app 层收到 `ConnectionEstablished` transport event 后的处理耗时**
+/// （register_connecting + IP 安全检查 + stats），**不含** TCP/QUIC 握手本身（那在 msgtrans）。
+const HISTOGRAM_CONN_ESTABLISHED_HANDLING: &str =
+    "privchat_connection_established_handling_seconds";
 const HISTOGRAM_AUTHENTICATE_DURATION: &str = "privchat_authenticate_duration_seconds";
 /// 建连/认证延迟 bucket：覆盖 10ms→10s。
 const CONN_AUTH_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
@@ -76,7 +79,7 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 为建连/认证直方图配显式 bucket（10ms→10s）；其它指标保持默认。
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets_for_metric(
-            Matcher::Full(HISTOGRAM_CONNECT_DURATION.to_string()),
+            Matcher::Full(HISTOGRAM_CONN_ESTABLISHED_HANDLING.to_string()),
             CONN_AUTH_BUCKETS,
         )
         .map_err(|e| format!("connect bucket config: {e}"))?
@@ -113,9 +116,10 @@ pub fn record_rpc(route: &str, duration_secs: f64) {
     metrics::histogram!(HISTOGRAM_RPC_DURATION, "route" => route.to_string()).record(duration_secs);
 }
 
-/// 记录 server 侧连接建立耗时（无 label）。见 LOAD_GATE_EXECUTION_SPEC §7。
-pub fn record_connect_duration(duration_secs: f64) {
-    metrics::histogram!(HISTOGRAM_CONNECT_DURATION).record(duration_secs);
+/// 记录 server 侧 `ConnectionEstablished` 事件处理耗时（无 label；不含 transport 握手）。
+/// 见 LOAD_GATE_EXECUTION_SPEC §7。
+pub fn record_connection_established_handling(duration_secs: f64) {
+    metrics::histogram!(HISTOGRAM_CONN_ESTABLISHED_HANDLING).record(duration_secs);
 }
 
 /// 记录 server 侧认证（AuthorizationRequest 处理）耗时（无 label）。见 LOAD_GATE_EXECUTION_SPEC §7。
