@@ -47,6 +47,7 @@ pub mod presence_tracker;
 pub mod redis;
 pub mod session_manager;
 pub mod snowflake;
+pub mod single_instance_guard;
 pub mod subscribe_manager; // 频道事件订阅管理
 pub mod typing_rate_limiter; // typing 限频器 // ✨ 新增：事件总线
                              // pub mod redis_cache;
@@ -82,6 +83,7 @@ pub use presence_manager_with_db::{
 };
 pub use presence_tracker::PresenceTracker;
 pub use session_manager::{SessionInfo, SessionManager}; // ✨ 新增
+pub use single_instance_guard::{SingleInstanceGuard, SingleInstanceGuardError};
 pub use subscribe_manager::{
     SubscribeManager, MAX_CHANNEL_SUBSCRIBERS_ONLINE, MAX_SUBSCRIPTIONS_PER_SESSION,
 };
