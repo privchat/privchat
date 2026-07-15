@@ -170,6 +170,9 @@ mod tests {
 /// 聊天服务器
 pub struct ChatServer {
     config: ServerConfig,
+    /// Dedicated PostgreSQL session lock required by the single-instance
+    /// CODEX-9 dispatch boundary.
+    _single_instance_guard: crate::infra::SingleInstanceGuard,
     token_auth: Arc<TokenAuth>,
     cache_manager: Arc<CacheManager>,
     stats: Arc<tokio::sync::RwLock<ServerStats>>,
@@ -243,6 +246,13 @@ impl ChatServer {
     /// 创建新的聊天服务器
     pub async fn new(config: ServerConfig) -> Result<Self, ServerError> {
         info!("🔧 初始化聊天服务器组件...");
+
+        let single_instance_guard = crate::infra::SingleInstanceGuard::acquire(
+            &config.database_url,
+        )
+        .await
+        .map_err(|error| ServerError::Internal(format!("单实例门禁失败: {error}")))?;
+        info!("✅ 单实例 PostgreSQL advisory lock 已获取");
 
         // 🤖 初始化系统用户列表（必须在最开始）
         info!("🤖 初始化系统用户列表...");
@@ -1512,6 +1522,7 @@ impl ChatServer {
 
         Ok(Self {
             config,
+            _single_instance_guard: single_instance_guard,
             token_auth,
             cache_manager,
             stats,
