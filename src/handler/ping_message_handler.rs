@@ -65,7 +65,9 @@ impl MessageHandler for PingMessageHandler {
             if let Err(e) = self.presence_service.on_heartbeat(connection.user_id).await {
                 trace!(
                     "⚠️ PingMessageHandler: 更新 Presence 心跳失败 session={} user={} error={}",
-                    context.session_id, connection.user_id, e
+                    context.session_id,
+                    connection.user_id,
+                    e
                 );
             }
         }

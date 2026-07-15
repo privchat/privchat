@@ -100,11 +100,9 @@ impl fmt::Display for NormalizeQrBaseUrlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "qr_base_url is empty"),
-            Self::InvalidScheme(s) => write!(
-                f,
-                "qr_base_url scheme must be http or https, got: {:?}",
-                s
-            ),
+            Self::InvalidScheme(s) => {
+                write!(f, "qr_base_url scheme must be http or https, got: {:?}", s)
+            }
             Self::MissingHost => write!(f, "qr_base_url has no host"),
             Self::AlreadyContainsProtocolPrefix => write!(
                 f,
@@ -172,8 +170,7 @@ pub fn normalize_qr_base_url(
     // 拒绝已包含 protocol 前缀（path 等于或以 /privchat:protocol 起头）
     // 用 path() 判断更稳，避免误判 host 里包含的字符串
     let path = parsed.path(); // 已经 percent-decoded 过的标准化形式
-    if path == QR_PROTOCOL_PATH_PREFIX
-        || path.starts_with(&format!("{}/", QR_PROTOCOL_PATH_PREFIX))
+    if path == QR_PROTOCOL_PATH_PREFIX || path.starts_with(&format!("{}/", QR_PROTOCOL_PATH_PREFIX))
     {
         return Err(NormalizeQrBaseUrlError::AlreadyContainsProtocolPrefix);
     }
@@ -428,12 +425,12 @@ mod tests {
         let base = normalize_qr_base_url("https://privchat.app", true).unwrap();
         let out = build_qr_url(&base, QrEntity::User, QrAction::Get, "a b/c?d&e=f");
         // 期望尾段是 percent-encoded 后的 qr_key，紧贴 /get/ 后面
-        assert!(
-            out.ends_with("/get/a%20b%2Fc%3Fd%26e%3Df"),
-            "got: {out}"
-        );
+        assert!(out.ends_with("/get/a%20b%2Fc%3Fd%26e%3Df"), "got: {out}");
         // 不应混进任何 query string
-        assert!(!out.contains('?'), "v1.4 must not generate query string: {out}");
+        assert!(
+            !out.contains('?'),
+            "v1.4 must not generate query string: {out}"
+        );
     }
 
     #[test]

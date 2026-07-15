@@ -210,11 +210,7 @@ mod tests {
         // 同一 session 重新绑定到新 scene
         pub_.bind("scene_new".to_string(), sid(1));
 
-        assert_eq!(
-            pub_.binding_count(),
-            1,
-            "重复 bind 应替换不应累计"
-        );
+        assert_eq!(pub_.binding_count(), 1, "重复 bind 应替换不应累计");
         assert_eq!(
             pub_.lookup_session("scene_old"),
             None,
@@ -328,7 +324,13 @@ mod tests {
             data: None,
         };
         // 连续推两次相同事件，行为应一致。
-        assert_eq!(pub_.push_event(&cm, event.clone(), true).await, PushOutcome::NoSubscriber);
-        assert_eq!(pub_.push_event(&cm, event, true).await, PushOutcome::NoSubscriber);
+        assert_eq!(
+            pub_.push_event(&cm, event.clone(), true).await,
+            PushOutcome::NoSubscriber
+        );
+        assert_eq!(
+            pub_.push_event(&cm, event, true).await,
+            PushOutcome::NoSubscriber
+        );
     }
 }

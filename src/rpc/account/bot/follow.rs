@@ -124,13 +124,7 @@ pub async fn handle(
         created,
     };
 
-    tracing::info!(
-        user_id,
-        bot_user_id,
-        channel_id,
-        created,
-        "bot follow ok"
-    );
+    tracing::info!(user_id, bot_user_id, channel_id, created, "bot follow ok");
 
     Ok(json!(response))
 }

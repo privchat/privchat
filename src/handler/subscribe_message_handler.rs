@@ -114,7 +114,8 @@ impl SubscribeMessageHandler {
                 }
             };
 
-            let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload_bytes);
+            let mut packet =
+                msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload_bytes);
             packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
 
             let send_ok = match server.send_to_session(session_id.clone(), packet).await {
@@ -297,10 +298,8 @@ impl MessageHandler for SubscribeMessageHandler {
                             // 当前 presence 快照推给**本会话**（初始态），后续变化由广播跟进。
                             // 这样「订阅即拿到 presence」，不依赖客户端单独 presence/status/get。
                             if channel_type == 0 || channel_type == 1 {
-                                let self_uid = context
-                                    .user_id
-                                    .as_ref()
-                                    .and_then(|s| s.parse::<u64>().ok());
+                                let self_uid =
+                                    context.user_id.as_ref().and_then(|s| s.parse::<u64>().ok());
                                 if let Ok(members) =
                                     self.channel_service.get_channel_members(&channel_id).await
                                 {

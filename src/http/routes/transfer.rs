@@ -175,12 +175,7 @@ pub trait TransferSendBackend: Send + Sync {
     /// implementations wrap it in a `msgtrans::packet::Packet` with
     /// `biz_type = MessageType::TransferRequest as u8` (= 19) and call the
     /// transport server.
-    async fn deliver(
-        &self,
-        target_user_id: u64,
-        channel_id: u64,
-        encoded_packet: &[u8],
-    ) -> usize;
+    async fn deliver(&self, target_user_id: u64, channel_id: u64, encoded_packet: &[u8]) -> usize;
 }
 
 // =====================================================================
@@ -241,12 +236,7 @@ impl TransferSendBackend for DefaultTransferSendBackend {
         true
     }
 
-    async fn deliver(
-        &self,
-        target_user_id: u64,
-        channel_id: u64,
-        encoded_packet: &[u8],
-    ) -> usize {
+    async fn deliver(&self, target_user_id: u64, channel_id: u64, encoded_packet: &[u8]) -> usize {
         let conns = self
             .connection_manager
             .get_user_connections(target_user_id)

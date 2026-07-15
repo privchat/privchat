@@ -13,8 +13,7 @@ use crate::service::OfflineQueueService;
 use futures::stream::{self, StreamExt};
 use privchat_protocol::{
     CanonicalTimelineEvent, ContentMessageType, FlatBufferMessage, MessageSetting,
-    PushMessageRequest, CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
-    CANONICAL_TIMELINE_PUSH_TOPIC_V1,
+    PushMessageRequest, CANONICAL_TIMELINE_EVENT_SCHEMA_V1, CANONICAL_TIMELINE_PUSH_TOPIC_V1,
 };
 use sqlx::{FromRow, PgPool};
 use std::sync::Arc;
@@ -27,6 +26,10 @@ const LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_CHUNK_SIZE: i64 = 100;
 const PER_BATCH_CONCURRENCY: usize = 50;
 const WORKER_IDLE_DELAY: Duration = Duration::from_millis(100);
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const RETENTION_BATCH_SIZE: i64 = 1_000;
+const DISPATCHED_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
+const DEAD_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ClaimedDispatchRecipient {
@@ -239,6 +242,18 @@ impl DispatchOutboxStore {
             return Ok(RecipientDeliveryOutcome::Fenced);
         }
 
+        // Recipient completions for one event run concurrently. Serialize the
+        // parent aggregation so the last committer observes every preceding
+        // terminal recipient instead of leaving the parent pending forever
+        // because of READ COMMITTED snapshots taken during parallel commits.
+        sqlx::query(
+            "SELECT event_id FROM privchat_message_dispatch_outbox WHERE event_id = $1 FOR UPDATE",
+        )
+        .bind(claim.event_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("lock dispatch outbox failed: {e}")))?;
+
         sqlx::query(
             r#"
             UPDATE privchat_message_dispatch_outbox o
@@ -269,6 +284,69 @@ impl DispatchOutboxStore {
             ServerError::Database(format!("commit dispatch completion failed: {e}"))
         })?;
         Ok(outcome)
+    }
+
+    pub async fn reconcile_terminal_parents(&self, limit: i64) -> Result<u64> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            r#"
+            WITH candidates AS (
+                SELECT o.event_id
+                FROM privchat_message_dispatch_outbox o
+                WHERE o.status = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM privchat_message_dispatch_recipient r
+                      WHERE r.event_id = o.event_id AND r.state = 0
+                  )
+                ORDER BY o.event_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE privchat_message_dispatch_outbox o
+            SET status = CASE WHEN EXISTS (
+                    SELECT 1 FROM privchat_message_dispatch_recipient r
+                    WHERE r.event_id = o.event_id AND r.state = 3
+                ) THEN 2 ELSE 1 END,
+                dispatched_at = CASE WHEN NOT EXISTS (
+                    SELECT 1 FROM privchat_message_dispatch_recipient r
+                    WHERE r.event_id = o.event_id AND r.state = 3
+                ) THEN COALESCE(o.dispatched_at, $2) ELSE o.dispatched_at END
+            FROM candidates c
+            WHERE o.event_id = c.event_id
+            "#,
+        )
+        .bind(limit.clamp(1, 1_000))
+        .bind(now)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("reconcile dispatch parents failed: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn cleanup_retained(&self, now_ms: i64, limit: i64) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            WITH expired AS (
+                SELECT event_id
+                FROM privchat_message_dispatch_outbox
+                WHERE (status = 1 AND created_at < $1)
+                   OR (status = 2 AND created_at < $2)
+                ORDER BY created_at, event_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT $3
+            )
+            DELETE FROM privchat_message_dispatch_outbox o
+            USING expired e
+            WHERE o.event_id = e.event_id
+            "#,
+        )
+        .bind(now_ms - DISPATCHED_RETENTION_MS)
+        .bind(now_ms - DEAD_RETENTION_MS)
+        .bind(limit.clamp(1, 10_000))
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("cleanup dispatch outbox failed: {e}")))?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -307,6 +385,9 @@ impl CommittedTimelineDeliveryService {
     }
 
     pub async fn process_once(&self) -> Result<Vec<DispatchOutcome>> {
+        self.store
+            .reconcile_terminal_parents(DEFAULT_CHUNK_SIZE)
+            .await?;
         let claims = self
             .store
             .claim_pending(&self.worker_id, DEFAULT_CHUNK_SIZE)
@@ -316,7 +397,22 @@ impl CommittedTimelineDeliveryService {
 
     pub async fn start(&self) -> Result<()> {
         info!(worker_id = %self.worker_id, "CommittedTimelineDeliveryService started");
+        let mut last_retention_sweep = tokio::time::Instant::now() - RETENTION_SWEEP_INTERVAL;
         loop {
+            if last_retention_sweep.elapsed() >= RETENTION_SWEEP_INTERVAL {
+                match self
+                    .store
+                    .cleanup_retained(chrono::Utc::now().timestamp_millis(), RETENTION_BATCH_SIZE)
+                    .await
+                {
+                    Ok(removed) if removed > 0 => {
+                        info!(removed, "dispatch outbox retention sweep completed")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "dispatch outbox retention sweep failed"),
+                }
+                last_retention_sweep = tokio::time::Instant::now();
+            }
             match self.process_once().await {
                 Ok(outcomes) if outcomes.is_empty() => tokio::time::sleep(WORKER_IDLE_DELAY).await,
                 Ok(_) => {}
@@ -418,14 +514,13 @@ impl CommittedTimelineDeliveryService {
             return Ok(());
         };
 
-        let notification =
-            privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
-                receipt.channel_id,
-                1,
-                receipt.server_message_id,
-                receipt.recipient_user_id,
-                receipt.delivered_at,
-            );
+        let notification = privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
+            receipt.channel_id,
+            1,
+            receipt.server_message_id,
+            receipt.recipient_user_id,
+            receipt.delivered_at,
+        );
         let payload = serde_json::to_vec(&notification).map_err(|error| {
             ServerError::Protocol(format!(
                 "encode delivered receipt for message {} failed: {error}",
@@ -548,39 +643,39 @@ fn push_from_claim(claim: &ClaimedDispatchRecipient) -> Result<PushMessageReques
     .ok_or_else(|| ServerError::Protocol("commit has no mappable timeline event".to_string()))?;
 
     let is_new_message = matches!(event, CanonicalTimelineEvent::NewMessage(_));
-    let (server_message_id, local_message_id, message_type, topic, from_uid, payload) =
-        match &event {
-            CanonicalTimelineEvent::NewMessage(message) => (
-                claim.server_msg_id as u64,
-                claim.local_message_id.unwrap_or(0) as u64,
-                message.message_type.as_u32(),
-                String::new(),
-                claim.sender_id as u64,
-                privchat_protocol::encode_message(&message.payload).map_err(|e| {
-                    ServerError::Protocol(format!("encode message payload failed: {e}"))
-                })?,
-            ),
-            CanonicalTimelineEvent::Revoke(revoke) => (
-                claim.event_id as u64,
-                0,
-                ContentMessageType::System.as_u32(),
-                CANONICAL_TIMELINE_PUSH_TOPIC_V1.to_string(),
-                revoke.revoked_by,
-                event.encode_fb().map_err(|e| {
-                    ServerError::Protocol(format!("encode revoke event failed: {e}"))
-                })?,
-            ),
-            CanonicalTimelineEvent::ReactionChange(reaction) => (
-                claim.event_id as u64,
-                0,
-                ContentMessageType::System.as_u32(),
-                CANONICAL_TIMELINE_PUSH_TOPIC_V1.to_string(),
-                reaction.actor_id,
-                event.encode_fb().map_err(|e| {
-                    ServerError::Protocol(format!("encode reaction event failed: {e}"))
-                })?,
-            ),
-        };
+    let (server_message_id, local_message_id, message_type, topic, from_uid, payload) = match &event
+    {
+        CanonicalTimelineEvent::NewMessage(message) => (
+            claim.server_msg_id as u64,
+            claim.local_message_id.unwrap_or(0) as u64,
+            message.message_type.as_u32(),
+            String::new(),
+            claim.sender_id as u64,
+            privchat_protocol::encode_message(&message.payload).map_err(|e| {
+                ServerError::Protocol(format!("encode message payload failed: {e}"))
+            })?,
+        ),
+        CanonicalTimelineEvent::Revoke(revoke) => (
+            claim.event_id as u64,
+            0,
+            ContentMessageType::System.as_u32(),
+            CANONICAL_TIMELINE_PUSH_TOPIC_V1.to_string(),
+            revoke.revoked_by,
+            event
+                .encode_fb()
+                .map_err(|e| ServerError::Protocol(format!("encode revoke event failed: {e}")))?,
+        ),
+        CanonicalTimelineEvent::ReactionChange(reaction) => (
+            claim.event_id as u64,
+            0,
+            ContentMessageType::System.as_u32(),
+            CANONICAL_TIMELINE_PUSH_TOPIC_V1.to_string(),
+            reaction.actor_id,
+            event
+                .encode_fb()
+                .map_err(|e| ServerError::Protocol(format!("encode reaction event failed: {e}")))?,
+        ),
+    };
     Ok(PushMessageRequest {
         setting: MessageSetting {
             need_receipt: claim.channel_type == 1 && is_new_message,
@@ -677,7 +772,10 @@ mod tests {
         assert_eq!(push.server_message_id, claim.event_id as u64);
         assert_eq!(push.from_uid, 88);
         assert!(!push.setting.need_receipt);
-        assert_eq!(CanonicalTimelineEvent::decode_fb(&push.payload).unwrap(), event);
+        assert_eq!(
+            CanonicalTimelineEvent::decode_fb(&push.payload).unwrap(),
+            event
+        );
     }
 
     #[test]
@@ -891,6 +989,229 @@ mod tests {
         .unwrap();
         assert_eq!(parent.0, 1);
         assert!(parent.1.is_some());
+        cleanup(&store).await;
+    }
+
+    #[tokio::test]
+    async fn expired_lease_is_reclaimed_after_worker_crash() {
+        let Some(store) = open_store().await else {
+            eprintln!("skip outbox crash-recovery test: DATABASE_URL not configured");
+            return;
+        };
+        seed_outbox(&store).await;
+
+        let abandoned = store
+            .claim_event("crashed-worker", EVENT_ID as u64)
+            .await
+            .unwrap();
+        assert_eq!(abandoned.len(), 2);
+        assert!(store
+            .claim_event("replacement-worker", EVENT_ID as u64)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Simulate the crashed worker's 30-second lease expiring without a
+        // completion writeback. The replacement must receive fresh fencing
+        // tokens, while the crashed worker can no longer mutate the rows.
+        sqlx::query(
+            "UPDATE privchat_message_dispatch_recipient SET lease_until = 0 WHERE event_id = $1",
+        )
+        .bind(EVENT_ID)
+        .execute(store.pool.as_ref())
+        .await
+        .unwrap();
+        let recovered = store
+            .claim_event("replacement-worker", EVENT_ID as u64)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered
+            .iter()
+            .all(|claim| claim.attempts == 2 && claim.lease_token != abandoned[0].lease_token));
+        assert_eq!(
+            store
+                .complete(
+                    &abandoned[0],
+                    Some(DispatchRecipientState::OnlineSent),
+                    None,
+                )
+                .await
+                .unwrap(),
+            RecipientDeliveryOutcome::Fenced
+        );
+        for claim in &recovered {
+            store
+                .complete(claim, Some(DispatchRecipientState::OfflineQueued), None)
+                .await
+                .unwrap();
+        }
+        let status: i16 = sqlx::query_scalar(
+            "SELECT status FROM privchat_message_dispatch_outbox WHERE event_id = $1",
+        )
+        .bind(EVENT_ID)
+        .fetch_one(store.pool.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(status, 1);
+        cleanup(&store).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_offline_queue_failure_reaches_dead_after_bounded_attempts() {
+        let Some(store) = open_store().await else {
+            eprintln!("skip outbox persistent-failure test: DATABASE_URL not configured");
+            return;
+        };
+        seed_outbox(&store).await;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let claims = store
+                .claim_event("redis-failure-worker", EVENT_ID as u64)
+                .await
+                .unwrap();
+            assert_eq!(
+                claims.len(),
+                2,
+                "attempt {attempt} must claim both recipients"
+            );
+            for claim in &claims {
+                let outcome = store
+                    .complete(claim, None, Some("injected Redis timeout"))
+                    .await
+                    .unwrap();
+                if attempt < MAX_ATTEMPTS {
+                    assert!(matches!(
+                        outcome,
+                        RecipientDeliveryOutcome::RetryScheduled { .. }
+                    ));
+                } else {
+                    assert!(matches!(outcome, RecipientDeliveryOutcome::Dead { .. }));
+                }
+            }
+            if attempt < MAX_ATTEMPTS {
+                sqlx::query(
+                    "UPDATE privchat_message_dispatch_recipient SET next_attempt_at = 0 WHERE event_id = $1 AND state = 0",
+                )
+                .bind(EVENT_ID)
+                .execute(store.pool.as_ref())
+                .await
+                .unwrap();
+            }
+        }
+
+        let parent_status: i16 = sqlx::query_scalar(
+            "SELECT status FROM privchat_message_dispatch_outbox WHERE event_id = $1",
+        )
+        .bind(EVENT_ID)
+        .fetch_one(store.pool.as_ref())
+        .await
+        .unwrap();
+        let dead_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM privchat_message_dispatch_recipient WHERE event_id = $1 AND state = 3",
+        )
+        .bind(EVENT_ID)
+        .fetch_one(store.pool.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(parent_status, 2);
+        assert_eq!(dead_count, 2);
+        cleanup(&store).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_recipient_completions_finalize_parent() {
+        let Some(store) = open_store().await else {
+            eprintln!("skip concurrent parent aggregation test: DATABASE_URL not configured");
+            return;
+        };
+        seed_outbox(&store).await;
+        let claims = store
+            .claim_event("parallel-worker", EVENT_ID as u64)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+
+        let left_store = store.clone();
+        let left = claims[0].clone();
+        let right_store = store.clone();
+        let right = claims[1].clone();
+        let (left_result, right_result) = tokio::join!(
+            async move {
+                left_store
+                    .complete(&left, Some(DispatchRecipientState::OnlineSent), None)
+                    .await
+            },
+            async move {
+                right_store
+                    .complete(&right, Some(DispatchRecipientState::OnlineSent), None)
+                    .await
+            }
+        );
+        left_result.unwrap();
+        right_result.unwrap();
+
+        let status: i16 = sqlx::query_scalar(
+            "SELECT status FROM privchat_message_dispatch_outbox WHERE event_id = $1",
+        )
+        .bind(EVENT_ID)
+        .fetch_one(store.pool.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(status, 1);
+        cleanup(&store).await;
+    }
+
+    #[tokio::test]
+    async fn retention_uses_distinct_dispatched_and_dead_windows() {
+        let Some(store) = open_store().await else {
+            eprintln!("skip outbox retention test: DATABASE_URL not configured");
+            return;
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+
+        seed_outbox(&store).await;
+        sqlx::query(
+            "UPDATE privchat_message_dispatch_outbox SET status = 1, created_at = $2 WHERE event_id = $1",
+        )
+        .bind(EVENT_ID)
+        .bind(now - DISPATCHED_RETENTION_MS - 1)
+        .execute(store.pool.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(store.cleanup_retained(now, 10).await.unwrap(), 1);
+        let recipient_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM privchat_message_dispatch_recipient WHERE event_id = $1",
+        )
+        .bind(EVENT_ID)
+        .fetch_one(store.pool.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(recipient_count, 0, "recipient rows must cascade-delete");
+
+        seed_outbox(&store).await;
+        sqlx::query(
+            "UPDATE privchat_message_dispatch_outbox SET status = 2, created_at = $2 WHERE event_id = $1",
+        )
+        .bind(EVENT_ID)
+        .bind(now - DISPATCHED_RETENTION_MS - 1)
+        .execute(store.pool.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(
+            store.cleanup_retained(now, 10).await.unwrap(),
+            0,
+            "DEAD rows must survive the shorter DISPATCHED window"
+        );
+        sqlx::query(
+            "UPDATE privchat_message_dispatch_outbox SET created_at = $2 WHERE event_id = $1",
+        )
+        .bind(EVENT_ID)
+        .bind(now - DEAD_RETENTION_MS - 1)
+        .execute(store.pool.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(store.cleanup_retained(now, 10).await.unwrap(), 1);
         cleanup(&store).await;
     }
 }

@@ -27,5 +27,7 @@
 pub mod key;
 pub mod url;
 
-pub use key::{generate_qr_key, is_qr_key_unique_violation, QR_KEY_LEN, QR_KEY_MAX_GENERATION_RETRIES};
-pub use url::{build_qr_url, normalize_qr_base_url, NormalizeQrBaseUrlError, QrEntity, QrAction};
+pub use key::{
+    generate_qr_key, is_qr_key_unique_violation, QR_KEY_LEN, QR_KEY_MAX_GENERATION_RETRIES,
+};
+pub use url::{build_qr_url, normalize_qr_base_url, NormalizeQrBaseUrlError, QrAction, QrEntity};

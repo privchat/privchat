@@ -129,11 +129,7 @@ pub fn next_message_id() -> u64 {
             Err(e) => {
                 attempts += 1;
                 if attempts % 1000 == 0 {
-                    tracing::error!(
-                        "Snowflake 时钟回拨持续 ~{}ms 仍未恢复: {}",
-                        attempts,
-                        e
-                    );
+                    tracing::error!("Snowflake 时钟回拨持续 ~{}ms 仍未恢复: {}", attempts, e);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }

@@ -17,9 +17,9 @@
 
 use crate::auth::device_manager::DeviceManager;
 use crate::auth::device_manager_db::DeviceManagerDb;
-use crate::auth::TokenService;
 use crate::auth::models::{Device, DeviceType, IssueTokenRequest, IssueTokenResponse};
 use crate::auth::service_key_manager::ServiceKeyManager;
+use crate::auth::TokenService;
 use crate::error::{Result, ServerError};
 use chrono::Utc;
 use std::sync::Arc;

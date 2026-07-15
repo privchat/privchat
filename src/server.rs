@@ -247,11 +247,10 @@ impl ChatServer {
     pub async fn new(config: ServerConfig) -> Result<Self, ServerError> {
         info!("🔧 初始化聊天服务器组件...");
 
-        let single_instance_guard = crate::infra::SingleInstanceGuard::acquire(
-            &config.database_url,
-        )
-        .await
-        .map_err(|error| ServerError::Internal(format!("单实例门禁失败: {error}")))?;
+        let single_instance_guard =
+            crate::infra::SingleInstanceGuard::acquire(&config.database_url)
+                .await
+                .map_err(|error| ServerError::Internal(format!("单实例门禁失败: {error}")))?;
         info!("✅ 单实例 PostgreSQL advisory lock 已获取");
 
         // 🤖 初始化系统用户列表（必须在最开始）
@@ -487,16 +486,15 @@ impl ChatServer {
         ));
         info!("✅ OfflineQueueService 创建完成（共享 Redis 连接池）");
 
-        let committed_delivery_service = Arc::new(
-            crate::service::CommittedTimelineDeliveryService::new(
+        let committed_delivery_service =
+            Arc::new(crate::service::CommittedTimelineDeliveryService::new(
                 pool.clone(),
                 message_router.clone(),
                 message_repository.clone(),
                 offline_queue_service.clone(),
                 Arc::new(tokio::sync::Semaphore::new(2_000)),
                 format!("dispatch-{}", std::process::id()),
-            ),
-        );
+            ));
         let dispatch_worker = committed_delivery_service.clone();
         tokio::spawn(async move {
             if let Err(error) = dispatch_worker.start().await {

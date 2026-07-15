@@ -56,7 +56,9 @@ async fn scan_transition_pushes_scanned_without_unbind() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
+    let scene = service
+        .create_scene("login".into(), "web-1".into(), make_device(), Some(60))
+        .await;
     let session = SessionId::new(101);
     publisher.bind(scene.scene_id.clone(), session);
     assert_eq!(publisher.binding_count(), 1);
@@ -97,13 +99,22 @@ async fn reject_transition_pushes_rejected_and_unbinds() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
+    let scene = service
+        .create_scene("login".into(), "web-1".into(), make_device(), Some(60))
+        .await;
     let session = SessionId::new(202);
     publisher.bind(scene.scene_id.clone(), session);
 
     // 必须先 scan 才能 reject
     let scan = service
-        .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+        .scan_scene(
+            &scene.scene_id,
+            100,
+            "ios-1".into(),
+            &scene.qr_token,
+            None,
+            None,
+        )
         .await
         .expect("scan");
     settle().await;
@@ -144,7 +155,9 @@ async fn tick_expired_pushes_expired_and_unbinds() {
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
     // ttl=1s，到期最快
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(1)).await;
+    let scene = service
+        .create_scene("login".into(), "web-1".into(), make_device(), Some(1))
+        .await;
     let session = SessionId::new(303);
     publisher.bind(scene.scene_id.clone(), session);
 
@@ -175,10 +188,19 @@ async fn reject_failure_does_not_touch_publisher() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
+    let scene = service
+        .create_scene("login".into(), "web-1".into(), make_device(), Some(60))
+        .await;
     publisher.bind(scene.scene_id.clone(), SessionId::new(404));
     let _scan = service
-        .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+        .scan_scene(
+            &scene.scene_id,
+            100,
+            "ios-1".into(),
+            &scene.qr_token,
+            None,
+            None,
+        )
         .await
         .expect("scan");
     settle().await;
@@ -215,12 +237,21 @@ async fn no_subscriber_does_not_rollback_state_machine() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let scene = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
+    let scene = service
+        .create_scene("login".into(), "web-1".into(), make_device(), Some(60))
+        .await;
     // 故意不 bind —— Web 还没建连接
     assert_eq!(publisher.binding_count(), 0);
 
     let r = service
-        .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+        .scan_scene(
+            &scene.scene_id,
+            100,
+            "ios-1".into(),
+            &scene.qr_token,
+            None,
+            None,
+        )
         .await
         .expect("scan_scene 必须成功，即便没有订阅者");
     settle().await;
@@ -249,8 +280,12 @@ async fn concurrent_scenes_unbind_is_isolated() {
     let cm = Arc::new(ConnectionManager::new());
     let service = QrLoginService::new().with_publisher(publisher.clone(), cm);
 
-    let s1 = service.create_scene("login".into(), "web-1".into(), make_device(), Some(60)).await;
-    let s2 = service.create_scene("login".into(), "web-2".into(), make_device(), Some(60)).await;
+    let s1 = service
+        .create_scene("login".into(), "web-1".into(), make_device(), Some(60))
+        .await;
+    let s2 = service
+        .create_scene("login".into(), "web-2".into(), make_device(), Some(60))
+        .await;
     publisher.bind(s1.scene_id.clone(), SessionId::new(501));
     publisher.bind(s2.scene_id.clone(), SessionId::new(502));
     assert_eq!(publisher.binding_count(), 2);

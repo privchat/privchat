@@ -129,7 +129,10 @@ impl OfflineQueueService {
         let value = serde_json::to_string(message)
             .map_err(|e| ServerError::Internal(format!("序列化消息失败: {}", e)))?;
 
-        let keys: Vec<String> = user_ids.iter().map(|&user_id| Self::queue_key(user_id)).collect();
+        let keys: Vec<String> = user_ids
+            .iter()
+            .map(|&user_id| Self::queue_key(user_id))
+            .collect();
 
         self.redis_client
             .lpush_to_many_ltrim_expire(&keys, &value, self.max_queue_size, self.expire_seconds)

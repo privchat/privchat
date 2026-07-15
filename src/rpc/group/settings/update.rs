@@ -263,6 +263,5 @@ pub async fn handle(
         updated_at: chrono::Utc::now().timestamp_millis() as u64,
     };
 
-    serde_json::to_value(response)
-        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+    serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }

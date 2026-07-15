@@ -43,7 +43,8 @@ pub async fn handle(
     if !services.config.account.is_builtin() {
         tracing::warn!("❌ account.mode=PLATFORM，server 内置 refresh 已禁用");
         return Err(RpcError::forbidden(
-            "account.mode=PLATFORM：server 内置 refresh 已禁用，请向 platform 申请新 token。".to_string(),
+            "account.mode=PLATFORM：server 内置 refresh 已禁用，请向 platform 申请新 token。"
+                .to_string(),
         ));
     }
 
@@ -60,7 +61,10 @@ pub async fn handle(
     }
 
     // 1. 校验 refresh token（签名、typ、过期）
-    let claims = match services.jwt_service.verify_refresh_token(&request.refresh_token) {
+    let claims = match services
+        .jwt_service
+        .verify_refresh_token(&request.refresh_token)
+    {
         Ok(claims) => claims,
         Err(ServerError::TokenExpired) => {
             tracing::info!("❌ refresh token 已过期: device={}", request.device_id);
@@ -130,10 +134,7 @@ pub async fn handle(
                 device_id,
                 state
             );
-            return Err(RpcError::from_code(
-                ErrorCode::RefreshTokenRevoked,
-                message,
-            ));
+            return Err(RpcError::from_code(ErrorCode::RefreshTokenRevoked, message));
         }
         SessionVerifyResult::VersionMismatch {
             token_version,
@@ -167,8 +168,7 @@ pub async fn handle(
         .map_err(|e| RpcError::internal(format!("签发 access token 失败: {}", e)))?;
 
     let token_ttl = services.jwt_service.default_ttl();
-    let expires_at =
-        (chrono::Utc::now() + chrono::Duration::seconds(token_ttl)).timestamp_millis();
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(token_ttl)).timestamp_millis();
     let expires_at_u64 = expires_at.max(0) as u64;
 
     tracing::debug!(

@@ -76,7 +76,12 @@ pub async fn handle(
     let repo = services.message_repository.as_ref();
 
     let (before, after) = tokio::try_join!(
-        repo.list_context_before(channel_id, anchor_ts, anchor.message_id as i64, before_limit),
+        repo.list_context_before(
+            channel_id,
+            anchor_ts,
+            anchor.message_id as i64,
+            before_limit
+        ),
         repo.list_context_after(channel_id, anchor_ts, anchor.message_id as i64, after_limit),
     )
     .map_err(|e| RpcError::internal(format!("load context failed: {}", e)))?;
@@ -85,11 +90,7 @@ pub async fn handle(
     let has_more_after = after.len() as i64 == after_limit && after_limit > 0;
 
     // before 由 DESC 反转为 ASC，整体时间线 = before(ASC) + anchor + after(ASC)
-    let before_views: Vec<Value> = before
-        .iter()
-        .rev()
-        .map(super::message_view_json)
-        .collect();
+    let before_views: Vec<Value> = before.iter().rev().map(super::message_view_json).collect();
     let after_views: Vec<Value> = after.iter().map(super::message_view_json).collect();
 
     tracing::debug!(

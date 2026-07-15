@@ -32,9 +32,7 @@ use crate::repository::{
     AtomicMessageCommitRequest, AtomicTimelineEventRequest, ClientRegistryClaim,
     PgMessageRepository,
 };
-use crate::service::{
-    ChannelService, CommittedTimelineDeliveryService, UnreadCountService,
-};
+use crate::service::{ChannelService, CommittedTimelineDeliveryService, UnreadCountService};
 
 // 重新导出协议类型
 use privchat_protocol::rpc::sync::{
@@ -105,14 +103,19 @@ impl SyncService {
         event: CanonicalTimelineEvent,
         sender_id: u64,
     ) -> Result<ServerCommit> {
-        let commit = self.message_repository
+        let commit = self
+            .message_repository
             .append_timeline_event_atomic(AtomicTimelineEventRequest {
                 server_msg_id: self.generate_msg_id().await,
                 channel_id,
                 channel_type,
                 event,
                 sender_id,
-                sender_username: self.get_sender_info(sender_id).await.ok().map(|v| v.username),
+                sender_username: self
+                    .get_sender_info(sender_id)
+                    .await
+                    .ok()
+                    .map(|v| v.username),
                 server_timestamp: chrono::Utc::now().timestamp_millis(),
             })
             .await

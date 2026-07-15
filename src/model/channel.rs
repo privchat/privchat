@@ -329,7 +329,11 @@ pub fn can_moderate_mute(
 /// 禁言是否仍然生效（发送拦截的最终判定，MEMBER_MUTE 规则）：
 /// is_muted=false → 未禁言；mute_until=None → 永久（兼容旧缓存快照）；
 /// mute_until>now → 禁言中；mute_until<=now → 已过期，视为未禁言（调用方懒清理）。
-pub fn mute_is_active(is_muted: bool, mute_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+pub fn mute_is_active(
+    is_muted: bool,
+    mute_until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
     is_muted && mute_until.map_or(true, |u| u > now)
 }
 
@@ -898,8 +902,7 @@ impl Channel {
     /// 也不因多余 participant 行误放行。
     pub fn is_member(&self, user_id: u64) -> bool {
         if self.channel_type == ChannelType::Direct {
-            return self.direct_user1_id == Some(user_id)
-                || self.direct_user2_id == Some(user_id);
+            return self.direct_user1_id == Some(user_id) || self.direct_user2_id == Some(user_id);
         }
         self.members.contains_key(&user_id)
     }
@@ -1308,7 +1311,10 @@ mod tests {
     fn is_member_direct_authoritative_without_participants() {
         let mut ch = Channel::new_direct(123, 1, 2);
         ch.members.clear(); // 脏数据：participants 未写两条
-        assert!(ch.is_member(1), "direct_user1 must be a member even with empty members");
+        assert!(
+            ch.is_member(1),
+            "direct_user1 must be a member even with empty members"
+        );
         assert!(ch.is_member(2), "direct_user2 must be a member");
         assert!(!ch.is_member(3), "outsider must not be a member");
     }
@@ -1317,9 +1323,13 @@ mod tests {
     fn is_member_group_uses_members_not_direct_fields() {
         let mut ch = Channel::new_group(200, 10, Some("g".to_string()));
         ch.members.clear();
-        ch.members.insert(10, ChannelMember::new(10, MemberRole::Owner));
+        ch.members
+            .insert(10, ChannelMember::new(10, MemberRole::Owner));
         assert!(ch.is_member(10), "group member via members map");
-        assert!(!ch.is_member(99), "group non-member rejected (no direct fallback)");
+        assert!(
+            !ch.is_member(99),
+            "group non-member rejected (no direct fallback)"
+        );
     }
 
     /// get_member_ids / direct_peer 对 Direct 会话必须靠 direct_user1/2（脏数据
@@ -1341,11 +1351,19 @@ mod tests {
     #[test]
     fn direct_strict_ignores_stray_participants() {
         let mut ch = Channel::new_direct(123, 1, 2);
-        ch.members.insert(99, ChannelMember::new(99, MemberRole::Member)); // 脏：多余成员
-        assert!(!ch.is_member(99), "stray participant is NOT a direct member (strict)");
+        ch.members
+            .insert(99, ChannelMember::new(99, MemberRole::Member)); // 脏：多余成员
+        assert!(
+            !ch.is_member(99),
+            "stray participant is NOT a direct member (strict)"
+        );
         assert!(ch.is_member(1) && ch.is_member(2));
         let ids = ch.get_member_ids();
-        assert_eq!(ids.len(), 2, "get_member_ids returns only direct_user1/2, no stray");
+        assert_eq!(
+            ids.len(),
+            2,
+            "get_member_ids returns only direct_user1/2, no stray"
+        );
         assert!(ids.contains(&1) && ids.contains(&2) && !ids.contains(&99));
         assert_eq!(ch.direct_peer(1), Some(2));
     }
@@ -1353,7 +1371,11 @@ mod tests {
     #[test]
     fn direct_peer_none_for_group() {
         let ch = Channel::new_group(200, 10, Some("g".to_string()));
-        assert_eq!(ch.direct_peer(10), None, "group channels have no direct peer");
+        assert_eq!(
+            ch.direct_peer(10),
+            None,
+            "group channels have no direct peer"
+        );
         // 群 get_member_ids 仍只认 members（new_group 是否含 creator 取决于实现，
         // 关键是不引入 direct fallback）
         assert!(ch.direct_user1_id.is_none());
@@ -1404,7 +1426,11 @@ mod mute_tests {
     fn not_muted_can_send() {
         let now = Utc::now();
         assert!(!mute_is_active(false, None, now));
-        assert!(!mute_is_active(false, Some(now + Duration::minutes(10)), now));
+        assert!(!mute_is_active(
+            false,
+            Some(now + Duration::minutes(10)),
+            now
+        ));
     }
 
     #[test]
@@ -1412,7 +1438,11 @@ mod mute_tests {
         let now = Utc::now();
         // 禁言 10 分钟,now+5min 时仍在禁言
         let until = now + Duration::minutes(10);
-        assert!(mute_is_active(true, Some(until), now + Duration::minutes(5)));
+        assert!(mute_is_active(
+            true,
+            Some(until),
+            now + Duration::minutes(5)
+        ));
     }
 
     #[test]
@@ -1420,7 +1450,11 @@ mod mute_tests {
         let now = Utc::now();
         // 禁言 10 分钟,now+11min 时已过期 → 可发言
         let until = now + Duration::minutes(10);
-        assert!(!mute_is_active(true, Some(until), now + Duration::minutes(11)));
+        assert!(!mute_is_active(
+            true,
+            Some(until),
+            now + Duration::minutes(11)
+        ));
         assert!(!mute_is_active(true, Some(until), until)); // 恰好到期(<=now)也放行
     }
 
@@ -1430,7 +1464,11 @@ mod mute_tests {
         // 旧缓存快照(None)按永久保守处理
         assert!(mute_is_active(true, None, now));
         // rpc 层「永久」= now+100 年
-        assert!(mute_is_active(true, Some(now + Duration::days(365 * 100)), now + Duration::days(365)));
+        assert!(mute_is_active(
+            true,
+            Some(now + Duration::days(365 * 100)),
+            now + Duration::days(365)
+        ));
     }
 
     #[test]
@@ -1461,11 +1499,26 @@ mod mute_tests {
     fn reject_message_wording() {
         let now = Utc::now();
         assert_eq!(mute_reject_message(None, now), "您已被永久禁言");
-        assert_eq!(mute_reject_message(Some(now + Duration::days(365 * 100)), now), "您已被永久禁言");
-        assert_eq!(mute_reject_message(Some(now + Duration::minutes(9)), now), "您已被禁言，剩余 9 分钟");
-        assert_eq!(mute_reject_message(Some(now + Duration::minutes(80)), now), "您已被禁言，剩余 2 小时");
-        assert_eq!(mute_reject_message(Some(now + Duration::days(3)), now), "您已被禁言，剩余 3 天");
+        assert_eq!(
+            mute_reject_message(Some(now + Duration::days(365 * 100)), now),
+            "您已被永久禁言"
+        );
+        assert_eq!(
+            mute_reject_message(Some(now + Duration::minutes(9)), now),
+            "您已被禁言，剩余 9 分钟"
+        );
+        assert_eq!(
+            mute_reject_message(Some(now + Duration::minutes(80)), now),
+            "您已被禁言，剩余 2 小时"
+        );
+        assert_eq!(
+            mute_reject_message(Some(now + Duration::days(3)), now),
+            "您已被禁言，剩余 3 天"
+        );
         // 已过期不应出现在拒绝路径,但函数本身不 panic
-        assert_eq!(mute_reject_message(Some(now - Duration::minutes(1)), now), "您已被禁言，剩余 1 分钟");
+        assert_eq!(
+            mute_reject_message(Some(now - Duration::minutes(1)), now),
+            "您已被禁言，剩余 1 分钟"
+        );
     }
 }

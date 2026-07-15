@@ -58,14 +58,13 @@ pub async fn handle(
     }
 
     // 2. 取旧 qr_key（仅用于响应回显，让客户端知道哪一张失效了）
-    let old_qr_key: String = sqlx::query_scalar::<_, String>(
-        "SELECT qr_key FROM privchat_groups WHERE group_id = $1",
-    )
-    .bind(group_id as i64)
-    .fetch_optional(services.channel_service.pool())
-    .await
-    .map_err(|e| RpcError::internal(format!("读取旧 qr_key 失败: {}", e)))?
-    .ok_or_else(|| RpcError::not_found("群组不存在".to_string()))?;
+    let old_qr_key: String =
+        sqlx::query_scalar::<_, String>("SELECT qr_key FROM privchat_groups WHERE group_id = $1")
+            .bind(group_id as i64)
+            .fetch_optional(services.channel_service.pool())
+            .await
+            .map_err(|e| RpcError::internal(format!("读取旧 qr_key 失败: {}", e)))?
+            .ok_or_else(|| RpcError::not_found("群组不存在".to_string()))?;
 
     // 3. UPDATE 新 qr_key，带 UNIQUE 冲突重试
     let mut last_err: Option<sqlx::Error> = None;
@@ -91,10 +90,7 @@ pub async fn handle(
                 continue;
             }
             Err(e) => {
-                return Err(RpcError::internal(format!(
-                    "UPDATE qr_key failed: {}",
-                    e
-                )));
+                return Err(RpcError::internal(format!("UPDATE qr_key failed: {}", e)));
             }
         }
     }

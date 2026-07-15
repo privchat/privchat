@@ -18,7 +18,7 @@
 //! 数据库连接管理
 
 use crate::config::DatabaseConfig;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
 use tracing::{error, info};
 

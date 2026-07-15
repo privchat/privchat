@@ -47,8 +47,8 @@ use crate::dispatcher::MessageDispatcher;
 use crate::error::{Result, ServerError};
 use crate::handler::MessageHandler;
 use crate::infra::{ConnectionManager, SubscribeManager};
-use crate::server_event::{ServerEvent, ServerEventClient, ServerEventError};
 use crate::server_event::types::TransferResponsePayload;
+use crate::server_event::{ServerEvent, ServerEventClient, ServerEventError};
 
 // =====================================================================
 // Wire codes — subset of `protocol::ErrorCode` actually used by the
@@ -348,22 +348,22 @@ pub async fn process_transfer_request(
                     );
                 }
             };
-            let transfer_resp: TransferResponsePayload = match serde_json::from_slice(&payload_bytes)
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(
-                        "ChannelTransferHandler: response_payload JSON parse failed: {e}"
-                    );
-                    return encode_response(
-                        &req.request_id,
-                        req.channel_id,
-                        CODE_INTERNAL_ERROR,
-                        "response_payload parse failed",
-                        &[],
-                    );
-                }
-            };
+            let transfer_resp: TransferResponsePayload =
+                match serde_json::from_slice(&payload_bytes) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            "ChannelTransferHandler: response_payload JSON parse failed: {e}"
+                        );
+                        return encode_response(
+                            &req.request_id,
+                            req.channel_id,
+                            CODE_INTERNAL_ERROR,
+                            "response_payload parse failed",
+                            &[],
+                        );
+                    }
+                };
 
             // request_id / channel_id 防御性兜底：downstream 通常按原值透传，
             // 偶尔会漏（如它构造默认值），fall back 到请求里的原值。
@@ -472,11 +472,10 @@ pub fn try_register_channel_transfer_handler(
         return Ok(false);
     };
 
-    let lookups: Arc<dyn ChannelTransferLookups> =
-        Arc::new(DefaultChannelTransferLookups::new(
-            connection_manager,
-            subscribe_manager,
-        ));
+    let lookups: Arc<dyn ChannelTransferLookups> = Arc::new(DefaultChannelTransferLookups::new(
+        connection_manager,
+        subscribe_manager,
+    ));
     dispatcher.register_handler(
         MessageType::TransferRequest,
         Box::new(ChannelTransferHandler::new(lookups, client.clone())),

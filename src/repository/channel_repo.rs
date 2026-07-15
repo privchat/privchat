@@ -375,7 +375,10 @@ impl ChannelRepository for PgChannelRepository {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| {
-                    DatabaseError::Database(format!("Failed to re-query channel after conflict: {}", e))
+                    DatabaseError::Database(format!(
+                        "Failed to re-query channel after conflict: {}",
+                        e
+                    ))
                 })?;
 
                 match existing {
@@ -384,13 +387,16 @@ impl ChannelRepository for PgChannelRepository {
                             DatabaseError::Database(format!("Failed to commit tx: {}", e))
                         })?;
                         let ch = self.find_by_id(id as u64).await.and_then(|opt| {
-                            opt.ok_or_else(|| DatabaseError::NotFound("Channel not found".to_string()))
+                            opt.ok_or_else(|| {
+                                DatabaseError::NotFound("Channel not found".to_string())
+                            })
                         })?;
                         return Ok((ch, false));
                     }
                     None => {
                         return Err(DatabaseError::Database(
-                            "INSERT returned no row but no existing direct channel found".to_string(),
+                            "INSERT returned no row but no existing direct channel found"
+                                .to_string(),
                         ));
                     }
                 }

@@ -434,9 +434,7 @@ mod tests {
     use super::*;
     use crate::infra::ConnectionManager;
 
-    fn planner_with_connection_manager(
-        connection_manager: Arc<ConnectionManager>,
-    ) -> PushPlanner {
+    fn planner_with_connection_manager(connection_manager: Arc<ConnectionManager>) -> PushPlanner {
         PushPlanner::with_state_manager_and_connection_manager(
             None,
             Arc::new(IntentStateManager::new()),

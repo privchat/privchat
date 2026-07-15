@@ -241,12 +241,8 @@ pub async fn handle(
                         message,
                     )
                     .await;
-                    push_helpers::push_friend_request_sent(
-                        &services,
-                        from_user_id,
-                        target_user_id,
-                    )
-                    .await;
+                    push_helpers::push_friend_request_sent(&services, from_user_id, target_user_id)
+                        .await;
 
                     Ok(json!({
                         // 协议约定 user_id 必须是 u64 数字，不是字符串

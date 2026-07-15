@@ -94,8 +94,7 @@ pub async fn request_upload_token(
         max_size: Some(token.max_size),
     };
 
-    serde_json::to_value(response)
-        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+    serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
 
 /// 根据文件类型获取最大文件大小限制

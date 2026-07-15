@@ -262,7 +262,6 @@ impl SendMessageHandler {
             crate::model::channel::ChannelType::Room => 3,
         }
     }
-
 }
 
 #[async_trait]
@@ -1331,20 +1330,19 @@ impl MessageHandler for SendMessageHandler {
         // get_url 能按 channel 成员授权访问/拿 CEK。绑定、消息、commit 在同一 DB tx 内提交。
         let bind_file_ids = Self::extract_attachment_file_ids(&message.metadata);
         let channel_type_code = Self::channel_type_code(channel.channel_type);
-        let mut canonical_payload =
-            privchat_protocol::decode_message::<MessagePayloadEnvelope>(
-                &send_message_request.payload,
-            )
-            .unwrap_or_else(|_| MessagePayloadEnvelope {
-                content: content.clone(),
-                metadata: privchat_protocol::MessageMetadata::from_json_value(
-                    content_message_type,
-                    &metadata_value,
-                ),
-                reply_to_message_id: reply_to_id,
-                mentioned_user_ids: mentioned_user_ids.clone(),
-                message_source: None,
-            });
+        let mut canonical_payload = privchat_protocol::decode_message::<MessagePayloadEnvelope>(
+            &send_message_request.payload,
+        )
+        .unwrap_or_else(|_| MessagePayloadEnvelope {
+            content: content.clone(),
+            metadata: privchat_protocol::MessageMetadata::from_json_value(
+                content_message_type,
+                &metadata_value,
+            ),
+            reply_to_message_id: reply_to_id,
+            mentioned_user_ids: mentioned_user_ids.clone(),
+            message_source: None,
+        });
         canonical_payload.content = content.clone();
         let canonical_event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
             message_type: content_message_type,
@@ -1352,9 +1350,7 @@ impl MessageHandler for SendMessageHandler {
         });
         let (_, commit_content) = canonical_event
             .to_legacy_commit(channel_id, channel_type_code)
-            .map_err(|error| {
-                ServerError::Protocol(format!("构造兼容消息投影失败: {error}"))
-            })?;
+            .map_err(|error| ServerError::Protocol(format!("构造兼容消息投影失败: {error}")))?;
         let tx_result = match self
             .message_repository
             .create_message_and_commit_atomic(AtomicMessageCommitRequest {
@@ -2094,7 +2090,6 @@ impl SendMessageHandler {
 
         Ok(())
     }
-
 
     /// 创建成功响应
     async fn create_success_response(

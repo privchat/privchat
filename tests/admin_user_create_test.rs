@@ -80,7 +80,11 @@ struct EnvelopeResp {
 
 impl EnvelopeResp {
     fn ok_data(&self) -> &Value {
-        assert_eq!(self.code, 0, "expected envelope.code=0, got {} (msg: {})", self.code, self.message);
+        assert_eq!(
+            self.code, 0,
+            "expected envelope.code=0, got {} (msg: {})",
+            self.code, self.message
+        );
         &self.data
     }
 }
@@ -96,10 +100,17 @@ async fn post_create_user(client: &Client, path: &str, body: Value) -> EnvelopeR
         .expect("HTTP request failed");
     let status = resp.status();
     let json: Value = resp.json().await.expect("response JSON parse failed");
-    let code = json["code"].as_u64().expect("envelope.code missing or not number") as u32;
+    let code = json["code"]
+        .as_u64()
+        .expect("envelope.code missing or not number") as u32;
     let message = json["message"].as_str().unwrap_or("").to_string();
     let data = json.get("data").cloned().unwrap_or(Value::Null);
-    EnvelopeResp { status, code, message, data }
+    EnvelopeResp {
+        status,
+        code,
+        message,
+        data,
+    }
 }
 
 async fn post_admin(client: &Client, body: Value) -> EnvelopeResp {
@@ -236,7 +247,10 @@ async fn t7_phone_only_username_null() {
     let r = post_service(&client, json!({"phone": phone})).await;
     assert_eq!(r.status, StatusCode::OK);
     let b = r.ok_data();
-    assert!(b["username"].is_null(), "phone-only 创建 username 应为 null");
+    assert!(
+        b["username"].is_null(),
+        "phone-only 创建 username 应为 null"
+    );
 }
 
 // =====================================================
@@ -301,7 +315,10 @@ async fn t10_concurrent_same_phone_single_uid() {
     }
 
     let first = uids[0];
-    assert!(uids.iter().all(|u| *u == first), "所有并发请求 uid 必须一致");
+    assert!(
+        uids.iter().all(|u| *u == first),
+        "所有并发请求 uid 必须一致"
+    );
     assert_eq!(created_count, 1, "exactly 1 created=true");
     assert_eq!(existing_count, 4, "exactly 4 created=false");
 }
@@ -356,7 +373,11 @@ async fn t12_existing_hit_does_not_overwrite() {
     let b2 = r2.ok_data();
     assert_eq!(b1["user_id"], b2["user_id"]);
     assert_eq!(b2["created"], json!(false));
-    assert_eq!(b2["display_name"], json!("first"), "display_name 不应被覆盖");
+    assert_eq!(
+        b2["display_name"],
+        json!("first"),
+        "display_name 不应被覆盖"
+    );
     assert_eq!(
         b2["business_system_id"],
         json!("first_system"),
@@ -379,11 +400,7 @@ async fn t13_identity_conflict_phone_vs_email() {
     let uid_b = rb.ok_data()["user_id"].as_u64().unwrap();
     assert_ne!(uid_a, uid_b, "setup: A 和 B 必须是不同的 uid");
 
-    let r = post_service(
-        &client,
-        json!({"phone": phone_a, "email": email_b}),
-    )
-    .await;
+    let r = post_service(&client, json!({"phone": phone_a, "email": email_b})).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
     assert_eq!(r.code, 10205, "OperationConflict = 10205");
     assert!(
@@ -393,8 +410,7 @@ async fn t13_identity_conflict_phone_vs_email() {
     );
     // message 里应能看到两个冲突的 uid
     assert!(
-        r.message.contains(&uid_a.to_string())
-            && r.message.contains(&uid_b.to_string()),
+        r.message.contains(&uid_a.to_string()) && r.message.contains(&uid_b.to_string()),
         "message 应列出冲突的 uid {} 和 {}, got: {}",
         uid_a,
         uid_b,
@@ -414,8 +430,7 @@ async fn t14_partial_match_returns_existing() {
     let uid_a = r1.ok_data()["user_id"].as_u64().unwrap();
 
     let new_username = unique_username();
-    let r =
-        post_service(&client, json!({"phone": phone, "username": new_username})).await;
+    let r = post_service(&client, json!({"phone": phone, "username": new_username})).await;
     assert_eq!(r.status, StatusCode::OK);
     let b = r.ok_data();
     assert_eq!(b["created"], json!(false));

@@ -259,9 +259,7 @@ impl UserService {
             .filter(|val| !val.is_empty());
 
         // 2. identity-required：三者必须至少一个非空
-        if normalized_phone.is_none()
-            && normalized_email.is_none()
-            && normalized_username.is_none()
+        if normalized_phone.is_none() && normalized_email.is_none() && normalized_username.is_none()
         {
             return Err(ServerError::Validation(
                 "INVALID_USER_IDENTITY: at least one of phone / email / username must be provided"
@@ -324,10 +322,7 @@ impl UserService {
                     )
                     .await?
                 {
-                    info!(
-                        "ℹ️ 并发兜底命中: user_id={}",
-                        outcome.user().id
-                    );
+                    info!("ℹ️ 并发兜底命中: user_id={}", outcome.user().id);
                     return Ok(CreateUserOutcome::Existing(outcome.into_user()));
                 }
                 Err(ServerError::Validation(msg))

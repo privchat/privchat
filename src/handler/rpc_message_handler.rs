@@ -118,7 +118,8 @@ impl MessageHandler for RPCMessageHandler {
                     "❌ RPC 认证失败，将断开 session: route={}, session={}, error={}",
                     rpc_request.route, context.session_id, error_code
                 );
-                let response_bytes = encode_rpc_error(error_code.code() as i32, error_code.message())?;
+                let response_bytes =
+                    encode_rpc_error(error_code.code() as i32, error_code.message())?;
 
                 // 等错误响应发出后再断开（~50ms 足够 transport 把帧刷到网络）。
                 let cm = self.connection_manager.clone();
@@ -138,7 +139,11 @@ impl MessageHandler for RPCMessageHandler {
         let elapsed = start.elapsed().as_secs_f64();
         crate::infra::metrics::record_rpc(&rpc_request.route, elapsed);
         // RPC 结果（ErrorCode::Ok=0=ok，否则 error）；供 G10 §3.1 RPC 错误率（作用域=RPC dispatch）。
-        crate::infra::metrics::record_rpc_result(if rpc_response.code == 0 { "ok" } else { "error" });
+        crate::infra::metrics::record_rpc_result(if rpc_response.code == 0 {
+            "ok"
+        } else {
+            "error"
+        });
 
         info!(
             "✅ RPC 调用完成: route={}, code={}, message={}",
@@ -151,7 +156,11 @@ impl MessageHandler for RPCMessageHandler {
         let data_bytes = match &rpc_response.data {
             Some(v) => {
                 let bytes = serde_json::to_vec(v)?;
-                if bytes.is_empty() { None } else { Some(bytes) }
+                if bytes.is_empty() {
+                    None
+                } else {
+                    Some(bytes)
+                }
             }
             None => None,
         };
@@ -160,8 +169,9 @@ impl MessageHandler for RPCMessageHandler {
             message: rpc_response.message.clone(),
             data: data_bytes,
         };
-        let response_bytes = privchat_protocol::encode_message(&fb_response)
-            .map_err(|e| crate::error::ServerError::Internal(format!("encode rpc response: {e}")))?;
+        let response_bytes = privchat_protocol::encode_message(&fb_response).map_err(|e| {
+            crate::error::ServerError::Internal(format!("encode rpc response: {e}"))
+        })?;
         Ok(Some(response_bytes))
     }
 

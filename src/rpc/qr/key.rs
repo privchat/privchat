@@ -103,7 +103,9 @@ mod tests {
         let b = generate_qr_key();
         assert_ne!(a, b);
         // 前 4 位的取值多样性（健康度量；不严格断言但保证不是常量）
-        let prefixes: HashSet<_> = (0..64).map(|_| generate_qr_key()[..4].to_string()).collect();
+        let prefixes: HashSet<_> = (0..64)
+            .map(|_| generate_qr_key()[..4].to_string())
+            .collect();
         assert!(prefixes.len() > 32, "qr_key prefix entropy too low");
     }
 }

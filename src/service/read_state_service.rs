@@ -151,7 +151,8 @@ impl ReadStateService {
         channel_id: ChannelId,
         read_pts: u64,
     ) -> Result<ReadPtsUpdateResult> {
-        self.mark_read_pts_with_visible(reader_id, channel_id, read_pts, None).await
+        self.mark_read_pts_with_visible(reader_id, channel_id, read_pts, None)
+            .await
     }
 
     /// 双重水位裁剪版 mark_read_pts
@@ -470,9 +471,7 @@ impl ReadStateService {
     ) -> Result<()> {
         // 已读游标事件必须带非零序列，避免客户端把该事件当作无效/旧版本丢弃。
         // 这里使用 read_pts 作为单调序列来源（同频道内只增不减）。
-        let seq_u32 = u32::try_from(last_read_pts)
-            .unwrap_or(u32::MAX)
-            .max(1);
+        let seq_u32 = u32::try_from(last_read_pts).unwrap_or(u32::MAX).max(1);
         let server_message_id = u64::from(seq_u32);
         let payload = ChannelReadCursorNotification::new(
             channel_id,

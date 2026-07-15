@@ -46,8 +46,8 @@ pub mod presence_manager_with_db;
 pub mod presence_tracker;
 pub mod redis;
 pub mod session_manager;
-pub mod snowflake;
 pub mod single_instance_guard;
+pub mod snowflake;
 pub mod subscribe_manager; // 频道事件订阅管理
 pub mod typing_rate_limiter; // typing 限频器 // ✨ 新增：事件总线
                              // pub mod redis_cache;

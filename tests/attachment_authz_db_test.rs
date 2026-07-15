@@ -176,8 +176,12 @@ async fn resolve_get_url(
         None => None,
     };
 
-    let authorized =
-        authorize_file_access(user_id, meta.uploader_id, bound_message_id, member_of_message_channel);
+    let authorized = authorize_file_access(
+        user_id,
+        meta.uploader_id,
+        bound_message_id,
+        member_of_message_channel,
+    );
     let cek = if authorized { meta.cek.clone() } else { None };
     (authorized, cek, meta.encryption_version)
 }
@@ -233,25 +237,55 @@ async fn attachment_get_url_authz_rc_gate() {
 
     // 绑定到 channel 内 message 的文件：v1（带 cek）、v0（legacy）、缩略图（v1）。
     file_repo
-        .insert(&file_meta(FILE_V1_BOUND, UPLOADER_UID, 1, Some("cek-v1-main"), Some(MESSAGE_ID)))
+        .insert(&file_meta(
+            FILE_V1_BOUND,
+            UPLOADER_UID,
+            1,
+            Some("cek-v1-main"),
+            Some(MESSAGE_ID),
+        ))
         .await
         .expect("insert v1 bound");
     file_repo
-        .insert(&file_meta(FILE_V0_BOUND, UPLOADER_UID, 0, None, Some(MESSAGE_ID)))
+        .insert(&file_meta(
+            FILE_V0_BOUND,
+            UPLOADER_UID,
+            0,
+            None,
+            Some(MESSAGE_ID),
+        ))
         .await
         .expect("insert v0 bound");
     file_repo
-        .insert(&file_meta(FILE_THUMB_BOUND, UPLOADER_UID, 1, Some("cek-v1-thumb"), Some(MESSAGE_ID)))
+        .insert(&file_meta(
+            FILE_THUMB_BOUND,
+            UPLOADER_UID,
+            1,
+            Some("cek-v1-thumb"),
+            Some(MESSAGE_ID),
+        ))
         .await
         .expect("insert thumb bound");
     // pending：无 business 绑定。
     file_repo
-        .insert(&file_meta(FILE_PENDING, UPLOADER_UID, 1, Some("cek-pending"), None))
+        .insert(&file_meta(
+            FILE_PENDING,
+            UPLOADER_UID,
+            1,
+            Some("cek-pending"),
+            None,
+        ))
         .await
         .expect("insert pending");
     // broken：business_id 指向不存在的 message。
     file_repo
-        .insert(&file_meta(FILE_BROKEN, UPLOADER_UID, 1, Some("cek-broken"), Some(MISSING_MESSAGE_ID)))
+        .insert(&file_meta(
+            FILE_BROKEN,
+            UPLOADER_UID,
+            1,
+            Some("cek-broken"),
+            Some(MISSING_MESSAGE_ID),
+        ))
         .await
         .expect("insert broken");
 
@@ -265,7 +299,11 @@ async fn attachment_get_url_authz_rc_gate() {
     // 3) channel member 调 get_url 成功，返回 cek。
     let (ok, cek, ver) = resolve!(FILE_V1_BOUND, MEMBER_UID);
     assert!(ok, "case3: member must be authorized");
-    assert_eq!(cek.as_deref(), Some("cek-v1-main"), "case3: member gets cek");
+    assert_eq!(
+        cek.as_deref(),
+        Some("cek-v1-main"),
+        "case3: member gets cek"
+    );
     assert_eq!(ver, 1);
 
     // 4) 非 channel member forbidden（拿不到 cek）。
@@ -309,7 +347,9 @@ async fn attachment_get_url_authz_rc_gate() {
 #[tokio::test]
 async fn attachment_file_and_thumbnail_bind_to_message() {
     let Some(pool) = open_test_pool().await else {
-        eprintln!("skip attachment_file_and_thumbnail_bind_to_message: DATABASE_URL not configured");
+        eprintln!(
+            "skip attachment_file_and_thumbnail_bind_to_message: DATABASE_URL not configured"
+        );
         return;
     };
     let file_repo = FileUploadRepository::new(pool.clone());
@@ -319,11 +359,23 @@ async fn attachment_file_and_thumbnail_bind_to_message() {
 
     // 模拟发送：先是 pending（无 business），随后 send_message_handler 绑定到 message。
     file_repo
-        .insert(&file_meta(FILE_BIND_MAIN, UPLOADER_UID, 1, Some("cek-main"), None))
+        .insert(&file_meta(
+            FILE_BIND_MAIN,
+            UPLOADER_UID,
+            1,
+            Some("cek-main"),
+            None,
+        ))
         .await
         .expect("insert main pending");
     file_repo
-        .insert(&file_meta(FILE_BIND_THUMB, UPLOADER_UID, 1, Some("cek-thumb"), None))
+        .insert(&file_meta(
+            FILE_BIND_THUMB,
+            UPLOADER_UID,
+            1,
+            Some("cek-thumb"),
+            None,
+        ))
         .await
         .expect("insert thumb pending");
 
@@ -344,7 +396,11 @@ async fn attachment_file_and_thumbnail_bind_to_message() {
             .await
             .expect("query")
             .expect("exists");
-        assert_eq!(meta.business_type.as_deref(), Some("message"), "file {fid} business_type");
+        assert_eq!(
+            meta.business_type.as_deref(),
+            Some("message"),
+            "file {fid} business_type"
+        );
         assert_eq!(
             meta.business_id.as_deref(),
             Some(MESSAGE_ID.to_string().as_str()),

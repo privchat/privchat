@@ -18,9 +18,9 @@
 use msgtrans::{packet::Packet, SessionId};
 #[cfg(test)]
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Arc;
 #[cfg(test)]
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 use tracing::{debug, warn};
@@ -109,7 +109,10 @@ impl PresenceService {
         // 不再决定 online —— 否则与投递路径 split-brain（能发图/typing 却显示离线）。
         // is_online = 存在 Authenticated 且未 superseded 的有效 session；device_count 同源。
         for item in items.iter_mut() {
-            let conns = self.connection_manager.get_user_connections(item.user_id).await;
+            let conns = self
+                .connection_manager
+                .get_user_connections(item.user_id)
+                .await;
             item.is_online = !conns.is_empty();
             item.device_count = conns.len() as u32;
         }
@@ -160,14 +163,20 @@ impl PresenceService {
     ///
     /// 返回 (超时下线数, 校准回填数)。
     pub async fn sweep_heartbeat_timeouts(&self, threshold_secs: i64) -> (usize, usize) {
-        let candidates = self.presence_tracker.drain_timeout_candidates(threshold_secs);
+        let candidates = self
+            .presence_tracker
+            .drain_timeout_candidates(threshold_secs);
         let mut timed_out = 0usize;
         let mut recalibrated = 0usize;
         for user_id in candidates {
             let conns = self.connection_manager.get_user_connections(user_id).await;
             if conns.is_empty() {
                 if let Err(e) = self.on_timeout(user_id).await {
-                    tracing::warn!("presence timeout sweep: on_timeout({}) 失败: {}", user_id, e);
+                    tracing::warn!(
+                        "presence timeout sweep: on_timeout({}) 失败: {}",
+                        user_id,
+                        e
+                    );
                 } else {
                     timed_out += 1;
                 }
@@ -338,7 +347,10 @@ impl PresenceService {
     }
 
     pub async fn on_heartbeat_by_session(&self, session_id: &SessionId) -> Result<(), ServerError> {
-        if let Some(connection) = self.connection_manager.get_connection_by_session(session_id).await
+        if let Some(connection) = self
+            .connection_manager
+            .get_connection_by_session(session_id)
+            .await
         {
             self.on_heartbeat(connection.user_id).await?;
         }
@@ -374,7 +386,9 @@ impl PresenceService {
             return Ok(channels);
         }
 
-        self.channel_service.list_presence_channels_for_user(user_id).await
+        self.channel_service
+            .list_presence_channels_for_user(user_id)
+            .await
     }
 
     #[cfg(test)]
@@ -441,7 +455,11 @@ mod tests {
 
         let response = service.batch_get_status(7, vec![7, 8, 9, 0]).await;
 
-        let item_user_ids = response.items.iter().map(|item| item.user_id).collect::<Vec<_>>();
+        let item_user_ids = response
+            .items
+            .iter()
+            .map(|item| item.user_id)
+            .collect::<Vec<_>>();
         assert_eq!(item_user_ids, vec![7, 8]);
         assert_eq!(response.denied_user_ids, vec![9]);
     }
@@ -464,9 +482,18 @@ mod tests {
         let service = test_service();
 
         service.set_test_presence_channels(42, vec![100, 200]);
-        service.subscribe_manager.subscribe(SessionId::from(1_u64), 100).unwrap();
-        service.subscribe_manager.subscribe(SessionId::from(2_u64), 200).unwrap();
-        service.subscribe_manager.subscribe(SessionId::from(3_u64), 300).unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(1_u64), 100)
+            .unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(2_u64), 200)
+            .unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(3_u64), 300)
+            .unwrap();
 
         // 推送里的 is_online/device_count 以 ConnectionManager 为权威（758f00d），
         // 必须先注册 authenticated 连接，publish 的快照才会是在线 + 1 设备。
@@ -530,7 +557,10 @@ mod tests {
         let service = test_service();
 
         service.set_test_presence_channels(66, vec![888]);
-        service.subscribe_manager.subscribe(SessionId::from(4_u64), 888).unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(4_u64), 888)
+            .unwrap();
 
         service.on_device_connected(66, "ios-66").await.unwrap();
         let _ = service.take_test_published_events();
@@ -546,8 +576,14 @@ mod tests {
         let service = test_service();
 
         service.set_test_presence_channels(77, vec![901, 902]);
-        service.subscribe_manager.subscribe(SessionId::from(11_u64), 901).unwrap();
-        service.subscribe_manager.subscribe(SessionId::from(12_u64), 902).unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(11_u64), 901)
+            .unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(12_u64), 902)
+            .unwrap();
 
         service.on_device_connected(77, "ios-77").await.unwrap();
         let _ = service.take_test_published_events();
@@ -568,7 +604,10 @@ mod tests {
 
         service.set_test_visibility(5, 88, true);
         service.set_test_presence_channels(88, vec![555]);
-        service.subscribe_manager.subscribe(SessionId::from(9_u64), 555).unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(9_u64), 555)
+            .unwrap();
 
         service.on_device_connected(88, "ios-88").await.unwrap();
 
@@ -592,10 +631,16 @@ mod tests {
         // 设置用户 100 的订阅者
         service.set_test_visibility(200, 100, true);
         service.set_test_presence_channels(100, vec![3001]);
-        service.subscribe_manager.subscribe(SessionId::from(200_u64), 3001).unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(200_u64), 3001)
+            .unwrap();
 
         // 用户 100 上线
-        service.on_device_connected(100, "device-100").await.unwrap();
+        service
+            .on_device_connected(100, "device-100")
+            .await
+            .unwrap();
         let _ = service.take_test_published_events(); // 清除上线事件
 
         // 模拟会话超时清理（这应该是服务器清理过期会话时调用的路径）
@@ -622,14 +667,23 @@ mod tests {
         // 设置用户 200 的订阅者（用户 300 在关注 200 的状态）
         service.set_test_visibility(300, 200, true);
         service.set_test_presence_channels(200, vec![4001]);
-        service.subscribe_manager.subscribe(SessionId::from(300_u64), 4001).unwrap();
+        service
+            .subscribe_manager
+            .subscribe(SessionId::from(300_u64), 4001)
+            .unwrap();
 
         // 用户 200 上线（模拟登录成功）
-        service.on_device_connected(200, "device-200").await.unwrap();
+        service
+            .on_device_connected(200, "device-200")
+            .await
+            .unwrap();
         let _ = service.take_test_published_events(); // 清除上线事件
 
         // 用户点击登出（调用 on_device_disconnected，与 transport close 路径相同）
-        service.on_device_disconnected(200, "device-200").await.unwrap();
+        service
+            .on_device_disconnected(200, "device-200")
+            .await
+            .unwrap();
 
         // 验证订阅者收到了离线状态更新
         let published = service.take_test_published_events();
@@ -638,8 +692,14 @@ mod tests {
         let (channel_id, notification) = &published[0];
         assert_eq!(*channel_id, 4001);
         assert_eq!(notification.user_id, 200);
-        assert!(!notification.snapshot.is_online, "登出后用户应该被标记为离线");
-        assert_eq!(notification.snapshot.device_count, 0, "登出后设备数应该为 0");
+        assert!(
+            !notification.snapshot.is_online,
+            "登出后用户应该被标记为离线"
+        );
+        assert_eq!(
+            notification.snapshot.device_count, 0,
+            "登出后设备数应该为 0"
+        );
         assert!(notification.version > 1, "登出后 version 应该递增");
     }
 }

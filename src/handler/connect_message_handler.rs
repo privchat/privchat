@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use crate::auth::{
-    DeviceManager, DeviceManagerDb, TokenService, SessionVerifyResult, TokenRevocationService,
+    DeviceManager, DeviceManagerDb, SessionVerifyResult, TokenRevocationService, TokenService,
 };
 use crate::context::RequestContext;
 use crate::handler::MessageHandler;
@@ -171,7 +171,8 @@ impl MessageHandler for ConnectMessageHandler {
                 "❌ ConnectMessageHandler: Token 已被撤销 (jti: {})",
                 claims.jti
             );
-            return self.create_error_response(ErrorCode::TokenRevoked, "Token 已被撤销，请重新登录");
+            return self
+                .create_error_response(ErrorCode::TokenRevoked, "Token 已被撤销，请重新登录");
         }
 
         // 4. 提取用户信息
@@ -316,10 +317,7 @@ impl MessageHandler for ConnectMessageHandler {
             let presence_service = self.presence_service.clone();
             let dev_id = device_id.clone();
             tokio::spawn(async move {
-                if let Err(e) = presence_service
-                    .on_device_connected(user_id, dev_id)
-                    .await
-                {
+                if let Err(e) = presence_service.on_device_connected(user_id, dev_id).await {
                     warn!("⚠️ ConnectMessageHandler: 更新 Presence 上线失败: {}", e);
                 }
             });

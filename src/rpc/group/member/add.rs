@@ -24,10 +24,7 @@ use serde_json::{json, Value};
 const USER_TYPE_SYSTEM: i16 = 1;
 
 /// 查 user 的显示名（display_name → username → fallback uid 字符串）
-async fn resolve_display_name(
-    services: &RpcServiceContext,
-    user_id: u64,
-) -> String {
+async fn resolve_display_name(services: &RpcServiceContext, user_id: u64) -> String {
     services
         .user_service
         .find_by_id(user_id)
@@ -66,12 +63,8 @@ pub async fn handle(
 
     // System User (user_type=1) 禁止入群——spec 07-application/SYSTEM_USER_SPEC §4
     // + 02-server/CHANNEL_SPEC §10.5。
-    match helpers::lookup_user_type(
-        user_id,
-        &services.user_repository,
-        &services.cache_manager,
-    )
-    .await
+    match helpers::lookup_user_type(user_id, &services.user_repository, &services.cache_manager)
+        .await
     {
         Ok(Some(t)) if t == USER_TYPE_SYSTEM => {
             return Err(RpcError::from_code(
@@ -81,11 +74,7 @@ pub async fn handle(
         }
         Ok(_) => {}
         Err(e) => {
-            tracing::error!(
-                "校验被邀请人 user_type 失败 user_id={}: {}",
-                user_id,
-                e
-            );
+            tracing::error!("校验被邀请人 user_type 失败 user_id={}: {}", user_id, e);
             return Err(RpcError::internal("校验成员身份失败".to_string()));
         }
     }

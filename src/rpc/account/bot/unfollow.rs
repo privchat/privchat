@@ -72,13 +72,7 @@ pub async fn handle(
     // Emit server event `bot.unfollowed` — best-effort fire-and-forget
     // (spec SERVER_EVENT_DISPATCH_SPEC §6)。
     if let Some(client) = services.server_event_client.clone() {
-        match ServerEvent::bot_unfollowed(
-            user_id,
-            bot_user_id,
-            channel_id,
-            USER_TYPE_BOT,
-            now_ms,
-        ) {
+        match ServerEvent::bot_unfollowed(user_id, bot_user_id, channel_id, USER_TYPE_BOT, now_ms) {
             Ok(event) => {
                 tokio::spawn(async move {
                     if let Err(e) = client.send(&event).await {

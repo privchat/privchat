@@ -36,7 +36,12 @@ pub async fn handle(
 
     let result = services
         .read_state_service
-        .mark_read_pts_with_visible(user_id, req.channel_id, req.read_pts, req.client_visible_pts)
+        .mark_read_pts_with_visible(
+            user_id,
+            req.channel_id,
+            req.read_pts,
+            req.client_visible_pts,
+        )
         .await
         .map_err(|e| RpcError::internal(format!("更新已读 pts 失败: {}", e)))?;
     serde_json::to_value(MessageStatusReadPtsResponse {
@@ -46,7 +51,11 @@ pub async fn handle(
         last_read_pts: result.last_read_pts,
         last_read_message_id: req.last_read_message_id,
         accepted_read_pts: Some(result.last_read_pts),
-        server_delivered_pts: if server_delivered_pts < u64::MAX { Some(server_delivered_pts) } else { None },
+        server_delivered_pts: if server_delivered_pts < u64::MAX {
+            Some(server_delivered_pts)
+        } else {
+            None
+        },
     })
     .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }

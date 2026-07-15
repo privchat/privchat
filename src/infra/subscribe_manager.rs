@@ -391,7 +391,9 @@ mod tests {
     #[test]
     fn test_channel_session_snapshot_is_deduplicated() {
         let manager = SubscribeManager::new();
-        manager.channel_routes.insert(100, vec![sid(1), sid(1), sid(2)]);
+        manager
+            .channel_routes
+            .insert(100, vec![sid(1), sid(1), sid(2)]);
 
         let sessions = manager.get_channel_sessions(100);
         assert_eq!(sessions.len(), 2);

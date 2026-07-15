@@ -118,23 +118,16 @@ impl RefreshTokenRepository {
 
     /// 标记 refresh 已使用（`last_used_at = now_ms`）；非 rotation 路径下用。
     pub async fn touch_last_used(&self, jti: &str, now_ms: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE privchat_refresh_tokens SET last_used_at = $1 WHERE jti = $2",
-        )
-        .bind(now_ms)
-        .bind(jti)
-        .execute(self.pool.as_ref())
-        .await?;
+        sqlx::query("UPDATE privchat_refresh_tokens SET last_used_at = $1 WHERE jti = $2")
+            .bind(now_ms)
+            .bind(jti)
+            .execute(self.pool.as_ref())
+            .await?;
         Ok(())
     }
 
     /// 按 `jti` revoke。返回受影响行数（0 = miss / 已 revoke 不重复改）。
-    pub async fn revoke_by_jti(
-        &self,
-        jti: &str,
-        reason: &str,
-        now_ms: i64,
-    ) -> Result<u64> {
+    pub async fn revoke_by_jti(&self, jti: &str, reason: &str, now_ms: i64) -> Result<u64> {
         let res = sqlx::query(
             r#"
             UPDATE privchat_refresh_tokens
@@ -197,12 +190,7 @@ impl RefreshTokenRepository {
     }
 
     /// 按 `user_id` revoke 全部活跃 refresh 记录（配合 `bumpSessions` 用）。
-    pub async fn revoke_by_user(
-        &self,
-        user_id: u64,
-        reason: &str,
-        now_ms: i64,
-    ) -> Result<u64> {
+    pub async fn revoke_by_user(&self, user_id: u64, reason: &str, now_ms: i64) -> Result<u64> {
         let res = sqlx::query(
             r#"
             UPDATE privchat_refresh_tokens

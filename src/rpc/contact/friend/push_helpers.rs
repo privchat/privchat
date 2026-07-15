@@ -30,8 +30,7 @@
 use crate::rpc::RpcServiceContext;
 use privchat_protocol::inbox_event::{
     payloads::{
-        FriendRequestReceivedPayload, FriendRequestSentPayload,
-        FriendRequestStatusChangedPayload,
+        FriendRequestReceivedPayload, FriendRequestSentPayload, FriendRequestStatusChangedPayload,
     },
     topics, UserInboxEventEnvelope,
 };

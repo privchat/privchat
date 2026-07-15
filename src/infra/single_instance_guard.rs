@@ -107,5 +107,14 @@ mod tests {
         let second = SingleInstanceGuard::acquire_with_key(&database_url, key).await;
         assert!(matches!(second, Err(SingleInstanceGuardError::AlreadyHeld)));
         drop(first);
+
+        let replacement = tokio::time::timeout(
+            Duration::from_secs(2),
+            SingleInstanceGuard::acquire_with_key(&database_url, key),
+        )
+        .await
+        .expect("replacement acquisition must not hang")
+        .expect("replacement acquires the lock after the first process exits");
+        drop(replacement);
     }
 }

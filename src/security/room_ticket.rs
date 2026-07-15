@@ -125,7 +125,11 @@ impl std::fmt::Display for VerifyError {
 ///
 /// Errors: only when the `kid` is not configured. Encoding itself does not
 /// fail for valid HS256 inputs.
-pub fn sign(cfg: &RoomTicketConfig, kid: &str, claims: &RoomTicketClaims) -> Result<String, &'static str> {
+pub fn sign(
+    cfg: &RoomTicketConfig,
+    kid: &str,
+    claims: &RoomTicketClaims,
+) -> Result<String, &'static str> {
     let secret = cfg.resolve_secret(Some(kid)).ok_or("unknown kid")?;
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some(kid.to_string());
@@ -134,7 +138,10 @@ pub fn sign(cfg: &RoomTicketConfig, kid: &str, claims: &RoomTicketClaims) -> Res
 }
 
 /// Convenience: sign with config's `default_kid`.
-pub fn sign_default(cfg: &RoomTicketConfig, claims: &RoomTicketClaims) -> Result<String, &'static str> {
+pub fn sign_default(
+    cfg: &RoomTicketConfig,
+    claims: &RoomTicketClaims,
+) -> Result<String, &'static str> {
     let kid = cfg.default_kid.clone();
     sign(cfg, &kid, claims)
 }

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{IntrospectResult, IssueParams, IssueResult, RevokeRequest};
 use crate::error::ServerError;
-use crate::http::{ApiEnvelope, ApiResult, AdminServerState};
+use crate::http::{AdminServerState, ApiEnvelope, ApiResult};
 
 use super::admin::{extract_service_key, verify_service_key};
 
@@ -146,9 +146,7 @@ async fn refresh_handler(
         ));
     }
     if request.device_id.trim().is_empty() {
-        return Err(ServerError::Validation(
-            "device_id 不能为空".to_string(),
-        ));
+        return Err(ServerError::Validation("device_id 不能为空".to_string()));
     }
 
     let result = svc
@@ -252,9 +250,9 @@ async fn revoke_handler(
 
     let req = match (request.jti, request.refresh_token) {
         (Some(jti), None) if !jti.trim().is_empty() => RevokeRequest::ByJti { jti },
-        (None, Some(rt)) if !rt.trim().is_empty() => RevokeRequest::ByRefreshToken {
-            refresh_token: rt,
-        },
+        (None, Some(rt)) if !rt.trim().is_empty() => {
+            RevokeRequest::ByRefreshToken { refresh_token: rt }
+        }
         (Some(_), Some(_)) => {
             return Err(ServerError::Validation(
                 "jti 与 refresh_token 互斥，只能传其一".to_string(),

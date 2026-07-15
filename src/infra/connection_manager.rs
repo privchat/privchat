@@ -1886,6 +1886,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_successful_device_prevents_false_offline_classification() {
+        let manager = ConnectionManager::new_with_node_id("node-a");
+        let successful = SessionId::new(8371);
+        let half_open = SessionId::new(8372);
+        manager
+            .register_connection(837, "device-a".to_string(), successful)
+            .await
+            .unwrap();
+        manager
+            .register_connection(837, "device-b".to_string(), half_open)
+            .await
+            .unwrap();
+
+        let owners = HashMap::from([
+            (successful, "node-a".to_string()),
+            (half_open, "node-a".to_string()),
+        ]);
+        let attempts = vec![
+            (
+                successful,
+                SessionAttemptOutcome::Success {
+                    acknowledged: false,
+                },
+            ),
+            (
+                half_open,
+                SessionAttemptOutcome::Failure {
+                    classification: DeliveryFailureClassification::RouteTimeout,
+                    detail: "injected half-open timeout".to_string(),
+                },
+            ),
+        ];
+        let mut report = DeliveryReport {
+            attempted: 2,
+            ..DeliveryReport::default()
+        };
+        manager
+            .apply_delivery_attempts(837, 789, &owners, attempts, &mut report)
+            .await;
+
+        assert_eq!(report.successful_sessions, vec![successful]);
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(
+            report.failed_sessions[0].classification,
+            DeliveryFailureClassification::RouteTimeout
+        );
+        assert_eq!(report.successful_count(), 1);
+        assert!(manager.is_device_online(837, "device-b").await);
+    }
+
+    #[tokio::test]
+    async fn remote_owner_is_classified_for_codex11_router_seam() {
+        let manager = ConnectionManager::new_with_node_id("node-a");
+        let session_id = SessionId::new(8381);
+        manager
+            .register_connection(838, "device-remote".to_string(), session_id)
+            .await
+            .unwrap();
+        manager
+            .index_b
+            .get_mut(&session_id)
+            .expect("session exists")
+            .owner_node_id = "node-b".to_string();
+
+        let report = manager
+            .send_push_to_user(838, &push_fixture())
+            .await
+            .unwrap();
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.successful_count(), 0);
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(
+            report.failed_sessions[0].classification,
+            DeliveryFailureClassification::RemoteOwnerUnsupported
+        );
+        assert_eq!(report.failed_sessions[0].owner_node_id, "node-b");
+        assert!(!report.failed_sessions[0].cleaned_up);
+    }
+
+    #[tokio::test]
     async fn no_transport_returns_classified_report_with_owner_node() {
         let manager = ConnectionManager::new_with_node_id("node-a");
         let session_id = SessionId::new(8401);

@@ -80,10 +80,11 @@ pub async fn handle(
     // 否则高并发登录会占满 tokio worker 线程，连带饿死同一 runtime 上其他连接的握手/状态/认证，
     // 使所有阶段延迟齐涨（G8 峰值建连根因之一）。
     let password_owned = password.to_string();
-    let valid = tokio::task::spawn_blocking(move || verify_password(&password_owned, &password_hash))
-        .await
-        .map_err(|e| RpcError::internal(format!("密码验证任务调度失败: {}", e)))?
-        .map_err(|e| RpcError::internal(format!("密码验证失败: {}", e)))?;
+    let valid =
+        tokio::task::spawn_blocking(move || verify_password(&password_owned, &password_hash))
+            .await
+            .map_err(|e| RpcError::internal(format!("密码验证任务调度失败: {}", e)))?
+            .map_err(|e| RpcError::internal(format!("密码验证失败: {}", e)))?;
 
     if !valid {
         tracing::warn!("❌ 密码验证失败: account={}", account);

@@ -47,12 +47,7 @@ impl DeliveryTracker {
     ///
     /// 仅当 pts == current + 1 时才推进，返回 true。
     /// 否则返回 false（有间隔，不推进）。
-    pub async fn try_advance(
-        &self,
-        user_id: UserId,
-        channel_id: ChannelId,
-        pts: u64,
-    ) -> bool {
+    pub async fn try_advance(&self, user_id: UserId, channel_id: ChannelId, pts: u64) -> bool {
         let key = Self::hash_key(user_id);
         let field = channel_id.to_string();
 
@@ -180,11 +175,7 @@ impl DeliveryTracker {
     }
 
     /// 查询当前连续送达水位
-    pub async fn get_delivered_pts(
-        &self,
-        user_id: UserId,
-        channel_id: ChannelId,
-    ) -> u64 {
+    pub async fn get_delivered_pts(&self, user_id: UserId, channel_id: ChannelId) -> u64 {
         let key = Self::hash_key(user_id);
         let field = channel_id.to_string();
 
@@ -207,12 +198,7 @@ impl DeliveryTracker {
     }
 
     /// 强制设置水位（用于数据修复 / 初始化迁移）
-    pub async fn force_set(
-        &self,
-        user_id: UserId,
-        channel_id: ChannelId,
-        pts: u64,
-    ) {
+    pub async fn force_set(&self, user_id: UserId, channel_id: ChannelId, pts: u64) {
         let key = Self::hash_key(user_id);
         let field = channel_id.to_string();
 

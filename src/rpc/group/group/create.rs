@@ -50,12 +50,8 @@ pub async fn handle(
             if uid == creator_id {
                 continue;
             }
-            match helpers::lookup_user_type(
-                uid,
-                &services.user_repository,
-                &services.cache_manager,
-            )
-            .await
+            match helpers::lookup_user_type(uid, &services.user_repository, &services.cache_manager)
+                .await
             {
                 Ok(Some(t)) if t == USER_TYPE_SYSTEM => {
                     return Err(RpcError::from_code(
