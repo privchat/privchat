@@ -19,6 +19,7 @@
 pub mod admin_service;
 pub mod auth_service;
 pub mod channel_service; // ChannelService 在这里
+pub mod committed_timeline_delivery_service;
 pub mod friend_service;
 pub mod group_service;
 pub mod message_service;
@@ -79,6 +80,11 @@ pub use channel_service::{
     ChannelService, ChannelServiceConfig, ChannelServiceStats, EnhancedChannelItem,
     EnhancedChannelListResponse, LastMessagePreview,
 };
+pub use committed_timeline_delivery_service::{
+    ClaimedDispatchRecipient, CommittedTimelineDeliveryService, DispatchOutboxStore,
+    DispatchOutcome, DispatchRecipientState, RecipientDeliveryOutcome,
+};
+pub use delivery_tracker::DeliveryTracker;
 pub use file_service::{FileMetadata, FileService, FileType, FileUrlResponse};
 pub use friend_service::FriendService;
 pub use group_service::GroupService;
@@ -108,4 +114,3 @@ pub use user_service::{
     validate_phone_e164, CreateUserAdminParams, CreateUserOutcome, UpdateUserAdminParams,
     UserService,
 };
-pub use delivery_tracker::DeliveryTracker;
