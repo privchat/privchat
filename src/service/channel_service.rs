@@ -1429,11 +1429,10 @@ impl ChannelService {
 
                 let target_user_id = request.member_ids[0];
 
-                // Direct 频道统一走 create_or_get_direct_channel
-                // （smaller/larger 规范化 + advisory lock + ON CONFLICT 兜底）。
-                let (channel, created) = match self
-                    .channel_repository
-                    .create_or_get_direct_channel(creator_id, target_user_id, None, None)
+                // Direct 频道统一走完整业务入口，避免仓储创建路径漏掉缓存、用户频道行
+                // 或隐藏状态恢复等副作用。
+                let (channel_id, _) = match self
+                    .get_or_create_direct_channel(creator_id, target_user_id, None, None)
                     .await
                 {
                     Ok(v) => v,
@@ -1447,28 +1446,11 @@ impl ChannelService {
                     }
                 };
 
-                let channel_id = channel.id;
-
-                if created {
-                    if let Err(e) = self
-                        .create_private_chat_with_id(creator_id, target_user_id, channel_id)
-                        .await
-                    {
-                        warn!("⚠️ 同步私聊频道到缓存失败: {}", e);
-                    }
-                    if let Err(e) = self
-                        .ensure_user_channel_rows(channel_id, &[creator_id, target_user_id])
-                        .await
-                    {
-                        warn!("⚠️ ensure_user_channel_rows 失败: {}", e);
-                    }
-                }
-
                 // 从缓存读回带成员的 Channel；若缓存未命中则返回 DB 版本
                 let final_channel = self
                     .get_channel_opt(channel_id)
                     .await
-                    .unwrap_or(channel);
+                    .unwrap_or_else(|| Channel::new_direct(channel_id, creator_id, target_user_id));
 
                 return Ok(ChannelResponse {
                     channel: final_channel,
@@ -1779,7 +1761,8 @@ impl ChannelService {
                     channel: Channel::new_direct(0, 0, 0),
                     success: false,
                     error: Some(
-                        "Direct channels must be created via get_or_create_direct_channel".to_string(),
+                        "Direct channels must be created via get_or_create_direct_channel"
+                            .to_string(),
                     ),
                 });
             }
@@ -2018,9 +2001,9 @@ impl ChannelService {
                             if conv_with_members.metadata.name.is_none() {
                                 conv_with_members.metadata.name = name;
                             }
-                            let settings = conv_with_members
-                                .settings
-                                .get_or_insert_with(crate::model::channel::ChannelSettings::default);
+                            let settings = conv_with_members.settings.get_or_insert_with(
+                                crate::model::channel::ChannelSettings::default,
+                            );
                             settings.is_muted = all_muted;
                             settings.allow_search = allow_search;
                             settings.join_policy = join_policy.clamp(0, 2) as u8;
@@ -2030,7 +2013,10 @@ impl ChannelService {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            warn!("hydrate group policy failed: group_id={} err={}", group_id, e)
+                            warn!(
+                                "hydrate group policy failed: group_id={} err={}",
+                                group_id, e
+                            )
                         }
                     }
                     // 成员禁言（privchat_group_members.mute_until，set_member_muted 的落库真源）。
@@ -2061,7 +2047,10 @@ impl ChannelService {
                             }
                         }
                         Err(e) => {
-                            warn!("hydrate member mutes failed: group_id={} err={}", group_id, e)
+                            warn!(
+                                "hydrate member mutes failed: group_id={} err={}",
+                                group_id, e
+                            )
                         }
                     }
                 }
@@ -2280,10 +2269,8 @@ impl ChannelService {
         {
             let mut channels = self.channels.write().await;
             if channels.len() > max_channels {
-                let mut by_age: Vec<(u64, chrono::DateTime<chrono::Utc>)> = channels
-                    .iter()
-                    .map(|(id, c)| (*id, c.updated_at))
-                    .collect();
+                let mut by_age: Vec<(u64, chrono::DateTime<chrono::Utc>)> =
+                    channels.iter().map(|(id, c)| (*id, c.updated_at)).collect();
                 by_age.sort_by_key(|(_, t)| *t);
                 let overflow = channels.len() - max_channels;
                 for (id, _) in by_age.into_iter().take(overflow) {
@@ -2296,10 +2283,8 @@ impl ChannelService {
         {
             let mut cache = self.last_message_cache.write().await;
             if cache.len() > max_previews {
-                let mut by_age: Vec<(u64, chrono::DateTime<chrono::Utc>)> = cache
-                    .iter()
-                    .map(|(id, p)| (*id, p.timestamp))
-                    .collect();
+                let mut by_age: Vec<(u64, chrono::DateTime<chrono::Utc>)> =
+                    cache.iter().map(|(id, p)| (*id, p.timestamp)).collect();
                 by_age.sort_by_key(|(_, t)| *t);
                 let overflow = cache.len() - max_previews;
                 for (id, _) in by_age.into_iter().take(overflow) {
@@ -2700,9 +2685,11 @@ impl ChannelService {
         // 群聊：把成员真实落到 privchat_group_members + 刷 member_count，事务保证一致。
         if channel_type == ChannelType::Group {
             let now = chrono::Utc::now().timestamp_millis();
-            let mut tx = self.pool().begin().await.map_err(|e| {
-                ServerError::Database(format!("开启加群事务失败: {}", e))
-            })?;
+            let mut tx = self
+                .pool()
+                .begin()
+                .await
+                .map_err(|e| ServerError::Database(format!("开启加群事务失败: {}", e)))?;
             Self::upsert_one_member_in_tx(
                 &mut tx,
                 channel_id,
@@ -2717,7 +2704,8 @@ impl ChannelService {
                 .map_err(|e| ServerError::Database(format!("提交加群事务失败: {}", e)))?;
         }
 
-        self.ensure_user_channel_rows(channel_id, &[user_id]).await?;
+        self.ensure_user_channel_rows(channel_id, &[user_id])
+            .await?;
 
         let mut user_channels = self.user_channels.write().await;
         user_channels
@@ -2773,7 +2761,8 @@ impl ChannelService {
         }
 
         // 同事务加成员（幂等）+ 重算成员数。任一失败 → 整体回滚，status 保持 pending。
-        Self::upsert_one_member_in_tx(&mut tx, group_id, user_id, MemberRole::Member, now_ms).await?;
+        Self::upsert_one_member_in_tx(&mut tx, group_id, user_id, MemberRole::Member, now_ms)
+            .await?;
         Self::recompute_group_member_count_in_tx(&mut tx, group_id, now_ms).await?;
 
         tx.commit()
@@ -2824,9 +2813,11 @@ impl ChannelService {
 
         if channel_type == ChannelType::Group {
             let now = chrono::Utc::now().timestamp_millis();
-            let mut tx = self.pool().begin().await.map_err(|e| {
-                ServerError::Database(format!("开启退群事务失败: {}", e))
-            })?;
+            let mut tx = self
+                .pool()
+                .begin()
+                .await
+                .map_err(|e| ServerError::Database(format!("开启退群事务失败: {}", e)))?;
             let actually_left =
                 Self::mark_one_member_left_in_tx(&mut tx, channel_id, user_id, now).await?;
             if actually_left {
@@ -3446,6 +3437,12 @@ impl ChannelService {
                 .await?;
         }
 
+        // DB hydration and already-cached paths must converge on the same direct lookup index.
+        self.direct_channel_index
+            .write()
+            .await
+            .insert(Self::make_direct_key(user_id, target_user_id), channel_id);
+
         // 如果该频道之前被用户隐藏过，自动取消隐藏
         if self.is_channel_hidden(user_id, channel_id).await {
             if let Err(e) = self.hide_channel(user_id, channel_id, false).await {
@@ -3468,8 +3465,14 @@ impl ChannelService {
         user2: u64,
         channel_id: u64,
     ) -> Result<()> {
+        let direct_key = Self::make_direct_key(user1, user2);
+
         // 检查会话是否已存在
         if self.get_channel_opt(channel_id).await.is_some() {
+            self.direct_channel_index
+                .write()
+                .await
+                .insert(direct_key, channel_id);
             return Ok(()); // 已存在，直接返回成功
         }
 
@@ -3484,6 +3487,10 @@ impl ChannelService {
 
         // 更新用户会话索引
         self.update_user_channel_index(&channel).await;
+        self.direct_channel_index
+            .write()
+            .await
+            .insert(direct_key, channel_id);
 
         Ok(())
     }
@@ -3883,7 +3890,13 @@ impl ChannelService {
         .map_err(|e| ServerError::Database(format!("查询群设置失败: {}", e)))?;
 
         Ok(row.map(
-            |(allow_search, join_policy, allow_member_invite, allow_member_add_friend, all_muted)| {
+            |(
+                allow_search,
+                join_policy,
+                allow_member_invite,
+                allow_member_add_friend,
+                all_muted,
+            )| {
                 crate::model::channel::GroupPolicy {
                     allow_search,
                     join_policy,
@@ -4050,9 +4063,8 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
             .expect("lazy pool");
-        let service = ChannelService::new_with_repository(Arc::new(PgChannelRepository::new(
-            Arc::new(pool),
-        )));
+        let service =
+            ChannelService::new_with_repository(Arc::new(PgChannelRepository::new(Arc::new(pool))));
         {
             let mut channels = service.channels.write().await;
             for (i, id) in [901u64, 902, 903].iter().enumerate() {
@@ -4160,6 +4172,8 @@ mod tests {
         };
         let creator_id = 910001_u64;
         let peer_id = 910002_u64;
+        ensure_user(&service, creator_id, "channel_test_direct_creator").await;
+        ensure_user(&service, peer_id, "channel_test_direct_peer").await;
 
         let request = CreateChannelRequest {
             channel_type: ChannelType::Direct,
@@ -4171,10 +4185,12 @@ mod tests {
         };
 
         let response = service.create_channel(creator_id, request).await.unwrap();
-        assert!(response.success);
+        assert!(response.success, "{:?}", response.error);
         assert_eq!(response.channel.channel_type, ChannelType::Direct);
         assert_eq!(response.channel.members.len(), 2);
         cleanup_channel(&service, response.channel.id).await;
+        cleanup_user(&service, peer_id).await;
+        cleanup_user(&service, creator_id).await;
     }
 
     #[tokio::test]
@@ -4184,21 +4200,36 @@ mod tests {
             return;
         };
         let creator_id = 920001_u64;
+        let initial_members = [920002_u64, 920003_u64];
+        ensure_user(&service, creator_id, "channel_test_group_creator").await;
+        for (index, member_id) in initial_members.iter().enumerate() {
+            ensure_user(
+                &service,
+                *member_id,
+                &format!("channel_test_group_member_{index}"),
+            )
+            .await;
+        }
 
         let request = CreateChannelRequest {
             channel_type: ChannelType::Group,
             name: Some("Test Group".to_string()),
             description: Some("A test group".to_string()),
-            member_ids: vec![920002, 920003],
+            member_ids: initial_members.to_vec(),
             is_public: Some(false),
             max_members: Some(10),
         };
 
         let response = service.create_channel(creator_id, request).await.unwrap();
-        assert!(response.success);
+        assert!(response.success, "{:?}", response.error);
         assert_eq!(response.channel.channel_type, ChannelType::Group);
         assert_eq!(response.channel.members.len(), 3); // creator + 2 members
         cleanup_channel(&service, response.channel.id).await;
+        cleanup_group(&service, response.channel.id).await;
+        for member_id in initial_members {
+            cleanup_user(&service, member_id).await;
+        }
+        cleanup_user(&service, creator_id).await;
     }
 
     #[tokio::test]
@@ -4209,6 +4240,8 @@ mod tests {
         };
         let creator_id = 930001_u64;
         let peer_id = 930002_u64;
+        ensure_user(&service, creator_id, "channel_test_find_creator").await;
+        ensure_user(&service, peer_id, "channel_test_find_peer").await;
 
         let request = CreateChannelRequest {
             channel_type: ChannelType::Direct,
@@ -4220,7 +4253,7 @@ mod tests {
         };
 
         let response = service.create_channel(creator_id, request).await.unwrap();
-        assert!(response.success);
+        assert!(response.success, "{:?}", response.error);
 
         let conv_id = response.channel.id.clone();
         let found_id = service.find_direct_channel(creator_id, peer_id).await;
@@ -4229,6 +4262,8 @@ mod tests {
         let found_id2 = service.find_direct_channel(peer_id, creator_id).await;
         assert_eq!(found_id2, Some(conv_id));
         cleanup_channel(&service, response.channel.id).await;
+        cleanup_user(&service, peer_id).await;
+        cleanup_user(&service, creator_id).await;
     }
 
     #[tokio::test]
@@ -4239,6 +4274,8 @@ mod tests {
         };
         let creator_id = 940001_u64;
         let joiner_id = 940002_u64;
+        ensure_user(&service, creator_id, "channel_test_join_creator").await;
+        ensure_user(&service, joiner_id, "channel_test_join_member").await;
 
         let request = CreateChannelRequest {
             channel_type: ChannelType::Group,
@@ -4271,6 +4308,9 @@ mod tests {
         let conv = service.get_channel(&conv_id).await.unwrap();
         assert_eq!(conv.members.len(), 1);
         cleanup_channel(&service, conv_id).await;
+        cleanup_group(&service, conv_id).await;
+        cleanup_user(&service, joiner_id).await;
+        cleanup_user(&service, creator_id).await;
     }
 
     #[tokio::test]
@@ -4511,7 +4551,9 @@ mod tests {
     #[tokio::test]
     async fn create_group_member_count_matches_initial_member_ids() {
         let Some(service) = open_test_service().await else {
-            eprintln!("skip create_group_member_count_matches_initial_member_ids: DATABASE_URL not set");
+            eprintln!(
+                "skip create_group_member_count_matches_initial_member_ids: DATABASE_URL not set"
+            );
             return;
         };
         let owner = 950101_u64;
@@ -4624,7 +4666,9 @@ mod tests {
     #[tokio::test]
     async fn admin_add_existing_active_member_does_not_double_count() {
         let Some(service) = open_test_service().await else {
-            eprintln!("skip admin_add_existing_active_member_does_not_double_count: DATABASE_URL not set");
+            eprintln!(
+                "skip admin_add_existing_active_member_does_not_double_count: DATABASE_URL not set"
+            );
             return;
         };
         let owner = 950401_u64;
@@ -4645,7 +4689,11 @@ mod tests {
 
         // owner 已是活跃成员，再 add 应当报 Validation 而非默默 +1
         let err = service.add_member_admin(group_id, owner).await.unwrap_err();
-        assert!(matches!(err, ServerError::Validation(_)), "expected Validation, got {:?}", err);
+        assert!(
+            matches!(err, ServerError::Validation(_)),
+            "expected Validation, got {:?}",
+            err
+        );
 
         assert_eq!(count_active_members(&service, group_id).await, 1);
         assert_group_count_matches_members(&service, group_id).await;
@@ -4658,7 +4706,9 @@ mod tests {
     #[tokio::test]
     async fn admin_add_revives_left_member_without_double_count() {
         let Some(service) = open_test_service().await else {
-            eprintln!("skip admin_add_revives_left_member_without_double_count: DATABASE_URL not set");
+            eprintln!(
+                "skip admin_add_revives_left_member_without_double_count: DATABASE_URL not set"
+            );
             return;
         };
         let owner = 950501_u64;
@@ -4688,13 +4738,12 @@ mod tests {
         assert_eq!(count_active_members(&service, group_id).await, 2);
         assert_group_count_matches_members(&service, group_id).await;
 
-        let total_rows: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM privchat_group_members WHERE group_id = $1",
-        )
-        .bind(group_id as i64)
-        .fetch_one(service.pool())
-        .await
-        .expect("count rows");
+        let total_rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM privchat_group_members WHERE group_id = $1")
+                .bind(group_id as i64)
+                .fetch_one(service.pool())
+                .await
+                .expect("count rows");
         assert_eq!(total_rows.0, 2, "复活应该复用旧行而非插入第二条");
 
         cleanup_channel(&service, group_id).await;
