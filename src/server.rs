@@ -443,8 +443,7 @@ impl ChatServer {
             let url = if !config.redis_url.trim().is_empty() {
                 config.redis_url.clone()
             } else {
-                std::env::var("REDIS_URL")
-                    .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
             };
             crate::config::RedisConfig {
                 url,
@@ -480,8 +479,7 @@ impl ChatServer {
         info!("✅ OfflineQueueService 创建完成（共享 Redis 连接池）");
 
         // 2.5 创建 DeliveryTracker（送达水位追踪）
-        let delivery_tracker =
-            Arc::new(crate::service::DeliveryTracker::new(&config.redis_url)?);
+        let delivery_tracker = Arc::new(crate::service::DeliveryTracker::new(&config.redis_url)?);
         info!("✅ DeliveryTracker 创建完成");
 
         // 3. 创建 OfflineMessageWorker
@@ -535,10 +533,8 @@ impl ChatServer {
         info!("✅ 二维码服务初始化完成");
 
         // 创建审批服务（#72A：pending 申请持久化到 DB，重启不丢）
-        let approval_repo =
-            Arc::new(crate::repository::ApprovalRepository::new(pool.clone()));
-        let approval_service =
-            Arc::new(crate::service::ApprovalService::new(approval_repo));
+        let approval_repo = Arc::new(crate::repository::ApprovalRepository::new(pool.clone()));
+        let approval_service = Arc::new(crate::service::ApprovalService::new(approval_repo));
         // 启动从 DB 恢复所有 pending 申请进缓存；失败不阻塞启动（降级为空缓存）。
         match approval_service.load_pending().await {
             Ok(n) => info!("✅ 审批服务初始化完成（恢复 {} 条 pending）", n),
@@ -843,11 +839,13 @@ impl ChatServer {
         let intent_state = Arc::new(crate::push::IntentStateManager::new());
 
         // 5. 创建 Push Planner（在线态走 ConnectionManager 真源，不走 Redis KEYS）
-        let push_planner = Arc::new(crate::push::PushPlanner::with_state_manager_and_connection_manager(
-            Some(redis_client.clone()),
-            Arc::clone(&intent_state),
-            connection_manager.clone(),
-        ));
+        let push_planner = Arc::new(
+            crate::push::PushPlanner::with_state_manager_and_connection_manager(
+                Some(redis_client.clone()),
+                Arc::clone(&intent_state),
+                connection_manager.clone(),
+            ),
+        );
         let planner_event_bus = Arc::clone(&event_bus);
         let planner_tx = push_tx.clone();
         tokio::spawn(async move {
@@ -1356,6 +1354,7 @@ impl ChatServer {
             sync_cache,
             channel_service.clone(),
             unread_count_service.clone(),
+            message_repository.clone(),
         ));
         crate::service::sync::set_global_sync_service(sync_service.clone());
         info!("✅ SyncService 创建完成");
@@ -1996,17 +1995,17 @@ impl ChatServer {
         let timeout_secs = self.config.unauth_session_timeout_secs;
         let interval_secs = self.config.unauth_cleanup_interval_secs;
         if timeout_secs == 0 {
-            info!(
-                "🛡️ 未认证连接 watchdog: disabled (unauth_session_timeout_secs=0)"
-            );
+            info!("🛡️ 未认证连接 watchdog: disabled (unauth_session_timeout_secs=0)");
             return;
         }
         if interval_secs == 0 {
-            warn!(
-                "🛡️ 未认证连接 watchdog: unauth_cleanup_interval_secs=0 不合法，回退到 30s"
-            );
+            warn!("🛡️ 未认证连接 watchdog: unauth_cleanup_interval_secs=0 不合法，回退到 30s");
         }
-        let actual_interval = if interval_secs == 0 { 30 } else { interval_secs };
+        let actual_interval = if interval_secs == 0 {
+            30
+        } else {
+            interval_secs
+        };
         info!(
             "🛡️ 启动未认证连接 watchdog: timeout={}s interval={}s",
             timeout_secs, actual_interval
@@ -2147,8 +2146,14 @@ impl ChatServer {
                     channel_service_metrics.memory_cache_entries().await;
                 crate::infra::metrics::record_memory_map_entries("channels", ch_map);
                 crate::infra::metrics::record_memory_map_entries("user_channels", uch_map);
-                crate::infra::metrics::record_memory_map_entries("direct_channel_index", direct_idx);
-                crate::infra::metrics::record_memory_map_entries("last_message_cache", last_msg_cache);
+                crate::infra::metrics::record_memory_map_entries(
+                    "direct_channel_index",
+                    direct_idx,
+                );
+                crate::infra::metrics::record_memory_map_entries(
+                    "last_message_cache",
+                    last_msg_cache,
+                );
                 crate::infra::metrics::record_room_subscribers(
                     subscribe_manager_metrics.get_channel_count(),
                     subscribe_manager_metrics.get_total_session_count(),
@@ -2158,8 +2163,9 @@ impl ChatServer {
                 let (hist_channels, hist_messages) = message_history_metrics.memory_entries();
                 crate::infra::metrics::record_memory_map_entries("history_channels", hist_channels);
                 crate::infra::metrics::record_memory_map_entries("history_messages", hist_messages);
-                let evicted = message_history_metrics
-                    .evict_stale_channels(crate::service::MessageHistoryService::DEFAULT_MAX_CHANNELS);
+                let evicted = message_history_metrics.evict_stale_channels(
+                    crate::service::MessageHistoryService::DEFAULT_MAX_CHANNELS,
+                );
                 if evicted > 0 {
                     info!(
                         "🧹 内存消息历史逐出 {} 个最久未活跃 channel（cap={}）",
@@ -2247,8 +2253,9 @@ impl ChatServer {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
-                let (timed_out, recalibrated) =
-                    presence_service.sweep_heartbeat_timeouts(threshold_secs).await;
+                let (timed_out, recalibrated) = presence_service
+                    .sweep_heartbeat_timeouts(threshold_secs)
+                    .await;
                 if timed_out + recalibrated > 0 {
                     info!(
                         "🧹 presence 心跳巡检: 超时下线={} 校准回填={}（阈值 {}s）",

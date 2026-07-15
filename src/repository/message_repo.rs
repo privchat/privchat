@@ -22,7 +22,7 @@ use crate::model::message::Message;
 use privchat_protocol::{
     CanonicalTimelineEvent, FlatBufferMessage, CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
 };
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -101,10 +101,18 @@ pub struct AtomicMessageCommitRequest {
     pub message: Message,
     /// None = 客户端未提供幂等键（local_message_id=0），事务内不 claim dedup key。
     pub dedup_key: Option<String>,
+    /// sync/submit durable idempotency claim. Mutually exclusive with dedup_key.
+    pub client_registry_claim: Option<ClientRegistryClaim>,
     pub attachment_file_ids: Vec<u64>,
     pub channel_type: i16,
     pub commit_content: serde_json::Value,
     pub sender_username: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientRegistryClaim {
+    pub device_id: String,
+    pub decision: String,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +133,121 @@ impl PgMessageRepository {
     /// 获取数据库连接池（用于管理 API）
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    async fn create_dispatch_snapshot_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        event_id: i64,
+        channel_id: i64,
+        wire_channel_type: i16,
+        pts: i64,
+        sender_id: i64,
+        event_kind: i16,
+        now: i64,
+    ) -> Result<(), DatabaseError> {
+        let channel = sqlx::query(
+            r#"
+            SELECT channel_type, membership_version
+            FROM privchat_channels
+            WHERE channel_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(channel_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to lock channel: {e}")))?
+        .ok_or_else(|| DatabaseError::NotFound(format!("Channel not found: {channel_id}")))?;
+
+        let expected_db_channel_type = match wire_channel_type {
+            1 => 0, // Direct
+            2 => 1, // Group
+            3 => 2, // Room
+            value => {
+                return Err(DatabaseError::Database(format!(
+                    "unsupported wire channel type for {channel_id}: {value}"
+                )))
+            }
+        };
+        let channel_type = channel.get::<i16, _>("channel_type");
+        if channel_type != expected_db_channel_type {
+            return Err(DatabaseError::Database(format!(
+                "channel type mismatch for {channel_id}: wire {wire_channel_type} maps to DB {expected_db_channel_type}, actual {channel_type}"
+            )));
+        }
+        let membership_version = channel.get::<i64, _>("membership_version");
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_message_dispatch_outbox
+                (event_id, channel_id, channel_type, pts, sender_id, event_kind,
+                 membership_version, status, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8)
+            "#,
+        )
+        .bind(event_id)
+        .bind(channel_id)
+        .bind(channel_type)
+        .bind(pts)
+        .bind(sender_id)
+        .bind(event_kind)
+        .bind(membership_version)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to create dispatch outbox: {e}")))?;
+
+        // Direct membership is stored on the channel row; group membership is
+        // authoritative in group_members. Room-like channels retain the
+        // participant-table fallback until their membership model is frozen.
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO privchat_message_dispatch_recipient
+                (event_id, user_id, state, attempts, next_attempt_at)
+            SELECT $1, recipients.user_id, 0, 0, $3
+            FROM (
+                SELECT direct_user1_id AS user_id
+                FROM privchat_channels
+                WHERE channel_id = $2 AND channel_type = 0 AND direct_user1_id IS NOT NULL
+                UNION
+                SELECT direct_user2_id AS user_id
+                FROM privchat_channels
+                WHERE channel_id = $2 AND channel_type = 0 AND direct_user2_id IS NOT NULL
+                UNION
+                SELECT user_id
+                FROM privchat_group_members
+                WHERE group_id = $2 AND left_at IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM privchat_channels
+                    WHERE channel_id = $2 AND channel_type = 1
+                  )
+                UNION
+                SELECT user_id
+                FROM privchat_channel_participants
+                WHERE channel_id = $2 AND left_at IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM privchat_channels
+                    WHERE channel_id = $2 AND channel_type NOT IN (0, 1)
+                  )
+            ) recipients
+            ON CONFLICT (event_id, user_id) DO NOTHING
+            "#,
+        )
+        .bind(event_id)
+        .bind(channel_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            DatabaseError::Database(format!("Failed to snapshot dispatch recipients: {e}"))
+        })?;
+
+        if inserted.rows_affected() == 0 {
+            return Err(DatabaseError::Database(format!(
+                "dispatch recipient snapshot is empty for channel {channel_id}"
+            )));
+        }
+        Ok(())
     }
 
     fn message_from_row(row: MessageRow) -> Message {
@@ -176,12 +299,47 @@ impl PgMessageRepository {
         Ok(row.map(Self::message_from_row))
     }
 
+    pub async fn find_message_by_client_registry(
+        &self,
+        sender_id: u64,
+        device_id: &str,
+        local_message_id: u64,
+    ) -> Result<Option<Message>, DatabaseError> {
+        let row = sqlx::query_as::<_, MessageRow>(
+            r#"
+            SELECT
+                m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
+                m.content, m.message_type, m.metadata, m.reply_to_message_id,
+                m.created_at, m.updated_at, m.deleted, m.deleted_at,
+                m.revoked, m.revoked_at, m.revoked_by
+            FROM privchat_client_msg_registry r
+            JOIN privchat_messages m ON m.message_id = r.server_msg_id
+            WHERE r.sender_id = $1 AND r.device_id = $2 AND r.local_message_id = $3
+            LIMIT 1
+            "#,
+        )
+        .bind(sender_id as i64)
+        .bind(device_id)
+        .bind(local_message_id as i64)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| {
+            DatabaseError::Database(format!("Failed to query client registry message: {e}"))
+        })?;
+        Ok(row.map(Self::message_from_row))
+    }
+
     /// 普通客户端消息的权威写入路径：在同一个 DB transaction 内完成
     /// dedup claim、pts 分配、消息落库、附件绑定和 commit log 写入。
     pub async fn create_message_and_commit_atomic(
         &self,
         request: AtomicMessageCommitRequest,
     ) -> Result<AtomicMessageCommitResult, DatabaseError> {
+        if request.dedup_key.is_some() && request.client_registry_claim.is_some() {
+            return Err(DatabaseError::Database(
+                "dedup_key and client_registry_claim are mutually exclusive".to_string(),
+            ));
+        }
         let mut tx =
             self.pool.begin().await.map_err(|e| {
                 DatabaseError::Database(format!("Failed to begin message tx: {}", e))
@@ -403,6 +561,70 @@ impl PgMessageRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to save commit: {}", e)))?;
+
+        Self::create_dispatch_snapshot_in_tx(
+            &mut tx,
+            event_id,
+            message.channel_id as i64,
+            request.channel_type,
+            message.pts.unwrap_or(0),
+            message.sender_id as i64,
+            1,
+            now,
+        )
+        .await?;
+
+        if let Some(claim) = request.client_registry_claim.as_ref() {
+            let local_message_id = message.local_message_id.unwrap_or(0);
+            if local_message_id != 0 {
+                let registered = sqlx::query(
+                    r#"
+                    INSERT INTO privchat_client_msg_registry
+                        (local_message_id, server_msg_id, pts, channel_id, channel_type,
+                         sender_id, device_id, decision, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (sender_id, device_id, local_message_id) DO NOTHING
+                    "#,
+                )
+                .bind(local_message_id as i64)
+                .bind(message.message_id as i64)
+                .bind(message.pts.unwrap_or(0))
+                .bind(message.channel_id as i64)
+                .bind(request.channel_type)
+                .bind(message.sender_id as i64)
+                .bind(&claim.device_id)
+                .bind(&claim.decision)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Database(format!("Failed to claim client registry: {e}"))
+                })?;
+
+                if registered.rows_affected() == 0 {
+                    tx.rollback().await.ok();
+                    let existing = self
+                        .find_message_by_client_registry(
+                            message.sender_id,
+                            &claim.device_id,
+                            local_message_id,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            DatabaseError::Database(
+                                "client registry conflict without message projection".to_string(),
+                            )
+                        })?;
+                    return Ok(AtomicMessageCommitResult {
+                        message: existing,
+                        inserted: false,
+                        event_id: None,
+                        event_schema_version: None,
+                        canonical_event: None,
+                    });
+                }
+            }
+        }
 
         tx.commit()
             .await
@@ -1751,6 +1973,206 @@ impl PgMessageRepository {
                 )
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod atomic_dispatch_tests {
+    use super::*;
+    use chrono::Utc;
+    use sqlx::postgres::PgPoolOptions;
+
+    const GROUP_ID: i64 = 987_674_001;
+    const OWNER_ID: i64 = 987_674_101;
+    const MEMBER_ID: i64 = 987_674_102;
+    const LATE_MEMBER_ID: i64 = 987_674_103;
+    const MESSAGE_ID: u64 = 987_674_201;
+
+    async fn open_repo() -> Option<PgMessageRepository> {
+        let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()?;
+        Some(PgMessageRepository::new(Arc::new(pool)))
+    }
+
+    async fn cleanup(repo: &PgMessageRepository) {
+        let _ = sqlx::query("DELETE FROM privchat_message_dedup WHERE dedup_key = $1")
+            .bind("test:p2:group-snapshot")
+            .execute(repo.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_commit_log WHERE server_msg_id = $1")
+            .bind(MESSAGE_ID as i64)
+            .execute(repo.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
+            .bind(MESSAGE_ID as i64)
+            .execute(repo.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_group_members WHERE group_id = $1")
+            .bind(GROUP_ID)
+            .execute(repo.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = $1")
+            .bind(GROUP_ID)
+            .execute(repo.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(GROUP_ID)
+            .execute(repo.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
+            .bind(GROUP_ID)
+            .execute(repo.pool())
+            .await;
+    }
+
+    async fn ensure_user(repo: &PgMessageRepository, user_id: i64) {
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+            VALUES ($1, $2, $2, $3)
+            ON CONFLICT (user_id) DO NOTHING
+            "#,
+        )
+        .bind(user_id)
+        .bind(format!("p2{}", user_id % 1_000_000))
+        .bind(format!("qp2{}", user_id % 1_000_000))
+        .execute(repo.pool())
+        .await
+        .expect("ensure test user");
+    }
+
+    #[tokio::test]
+    async fn atomic_commit_freezes_group_recipients_and_outbox() {
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip atomic dispatch test: DATABASE_URL not configured");
+            return;
+        };
+        cleanup(&repo).await;
+        for user_id in [OWNER_ID, MEMBER_ID, LATE_MEMBER_ID] {
+            ensure_user(&repo, user_id).await;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_groups
+                (group_id, name, owner_id, member_count, created_at, updated_at, qr_key)
+            VALUES ($1, 'p2-group', $2, 2, $3, $3, $4)
+            "#,
+        )
+        .bind(GROUP_ID)
+        .bind(OWNER_ID)
+        .bind(Utc::now().timestamp_millis())
+        .bind(format!("q{GROUP_ID}"))
+        .execute(repo.pool())
+        .await
+        .expect("insert group");
+        sqlx::query(
+            "INSERT INTO privchat_channels (channel_id, channel_type, group_id) VALUES ($1, 1, $1)",
+        )
+        .bind(GROUP_ID)
+        .execute(repo.pool())
+        .await
+        .expect("insert channel");
+        for user_id in [OWNER_ID, MEMBER_ID] {
+            sqlx::query(
+                r#"
+                INSERT INTO privchat_group_members
+                    (group_id, user_id, role, joined_at, updated_at)
+                VALUES ($1, $2, 2, $3, $3)
+                "#,
+            )
+            .bind(GROUP_ID)
+            .bind(user_id)
+            .bind(Utc::now().timestamp_millis())
+            .execute(repo.pool())
+            .await
+            .expect("insert group member");
+        }
+
+        let now = Utc::now();
+        let legacy = privchat_protocol::LocalMessagePayloadEnvelope {
+            content: "atomic snapshot".to_string(),
+            ..Default::default()
+        };
+        let message = Message {
+            message_id: MESSAGE_ID,
+            channel_id: GROUP_ID as u64,
+            sender_id: OWNER_ID as u64,
+            pts: None,
+            local_message_id: Some(MESSAGE_ID),
+            content: legacy.content.clone(),
+            message_type: privchat_protocol::ContentMessageType::Text,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            reply_to_message_id: None,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+            deleted_at: None,
+            revoked: false,
+            revoked_at: None,
+            revoked_by: None,
+        };
+        let result = repo
+            .create_message_and_commit_atomic(AtomicMessageCommitRequest {
+                message,
+                dedup_key: Some("test:p2:group-snapshot".to_string()),
+                client_registry_claim: None,
+                attachment_file_ids: Vec::new(),
+                channel_type: 2,
+                commit_content: serde_json::to_value(legacy).expect("serialize legacy envelope"),
+                sender_username: None,
+            })
+            .await
+            .expect("atomic message commit");
+        let event_id = result.event_id.expect("event id");
+
+        let snapshot_version: i64 = sqlx::query_scalar(
+            "SELECT membership_version FROM privchat_message_dispatch_outbox WHERE event_id = $1",
+        )
+        .bind(event_id as i64)
+        .fetch_one(repo.pool())
+        .await
+        .expect("outbox row");
+        assert_eq!(snapshot_version, 2);
+
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_group_members
+                (group_id, user_id, role, joined_at, updated_at)
+            VALUES ($1, $2, 2, $3, $3)
+            "#,
+        )
+        .bind(GROUP_ID)
+        .bind(LATE_MEMBER_ID)
+        .bind(Utc::now().timestamp_millis())
+        .execute(repo.pool())
+        .await
+        .expect("insert late member");
+        sqlx::query(
+            "UPDATE privchat_group_members SET left_at = $3, updated_at = $3 WHERE group_id = $1 AND user_id = $2",
+        )
+        .bind(GROUP_ID)
+        .bind(MEMBER_ID)
+        .bind(Utc::now().timestamp_millis())
+        .execute(repo.pool())
+        .await
+        .expect("leave after commit");
+
+        let recipients: Vec<i64> = sqlx::query_scalar(
+            "SELECT user_id FROM privchat_message_dispatch_recipient WHERE event_id = $1 ORDER BY user_id",
+        )
+        .bind(event_id as i64)
+        .fetch_all(repo.pool())
+        .await
+        .expect("recipient snapshot");
+        assert_eq!(recipients, vec![OWNER_ID, MEMBER_ID]);
+
+        cleanup(&repo).await;
     }
 }
 
