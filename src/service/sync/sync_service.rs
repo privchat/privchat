@@ -28,8 +28,13 @@ use super::{ChannelPtsDao, ClientMsgRegistryDao, CommitLogDao, SyncCache};
 use crate::error::Result;
 use crate::model::message::Message;
 use crate::model::pts::PtsGenerator;
-use crate::repository::{AtomicMessageCommitRequest, ClientRegistryClaim, PgMessageRepository};
-use crate::service::{ChannelService, UnreadCountService};
+use crate::repository::{
+    AtomicMessageCommitRequest, AtomicTimelineEventRequest, ClientRegistryClaim,
+    PgMessageRepository,
+};
+use crate::service::{
+    ChannelService, CommittedTimelineDeliveryService, UnreadCountService,
+};
 
 // 重新导出协议类型
 use privchat_protocol::rpc::sync::{
@@ -64,6 +69,7 @@ pub struct SyncService {
 
     /// Canonical message/commit/outbox transaction boundary.
     message_repository: Arc<PgMessageRepository>,
+    delivery_service: Arc<CommittedTimelineDeliveryService>,
 }
 
 impl SyncService {
@@ -77,6 +83,7 @@ impl SyncService {
         channel_service: Arc<ChannelService>,
         unread_count_service: Arc<UnreadCountService>,
         message_repository: Arc<PgMessageRepository>,
+        delivery_service: Arc<CommittedTimelineDeliveryService>,
     ) -> Self {
         Self {
             pts_generator,
@@ -87,6 +94,7 @@ impl SyncService {
             channel_service,
             unread_count_service,
             message_repository,
+            delivery_service,
         }
     }
 
@@ -94,31 +102,32 @@ impl SyncService {
         &self,
         channel_id: u64,
         channel_type: u8,
-        message_type: impl Into<String>,
-        content: serde_json::Value,
+        event: CanonicalTimelineEvent,
         sender_id: u64,
     ) -> Result<ServerCommit> {
-        let mut commit = ServerCommit {
-            event_id: None,
-            pts: 0,
-            server_msg_id: self.generate_msg_id().await,
-            local_message_id: None,
-            channel_id,
-            channel_type,
-            message_type: message_type.into(),
-            content,
-            server_timestamp: chrono::Utc::now().timestamp_millis(),
-            sender_id,
-            sender_info: self.get_sender_info(sender_id).await.ok(),
-            event_schema_version: None,
-            canonical_event: None,
-        };
-        self.commit_dao
-            .allocate_pts_and_save_commit(&mut commit)
-            .await?;
+        let commit = self.message_repository
+            .append_timeline_event_atomic(AtomicTimelineEventRequest {
+                server_msg_id: self.generate_msg_id().await,
+                channel_id,
+                channel_type,
+                event,
+                sender_id,
+                sender_username: self.get_sender_info(sender_id).await.ok().map(|v| v.username),
+                server_timestamp: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .map_err(|e| crate::error::ServerError::Database(e.to_string()))?;
         self.pts_generator.set_pts(channel_id, commit.pts).await;
         self.cache.cache_pts(channel_id, commit.pts).await?;
         self.cache.cache_commit(&commit).await?;
+        if let Some(event_id) = commit.event_id {
+            let delivery = self.delivery_service.clone();
+            tokio::spawn(async move {
+                if let Err(error) = delivery.dispatch_event(event_id).await {
+                    tracing::warn!(event_id, %error, "immediate timeline dispatch failed; worker will retry");
+                }
+            });
+        }
         Ok(commit)
     }
 
@@ -133,27 +142,10 @@ impl SyncService {
         Ok(pts)
     }
 
-    pub async fn record_existing_commit(&self, commit: &ServerCommit) -> Result<()> {
-        let mut stored = commit.clone();
-        stored.populate_canonical_event().map_err(|e| {
-            crate::error::ServerError::Internal(format!("canonical event mapping failed: {e}"))
-        })?;
-        self.pts_dao
-            .bump_pts_to_at_least(commit.channel_id, commit.pts)
-            .await?;
-        self.pts_generator
-            .set_pts(commit.channel_id, commit.pts)
-            .await;
-        stored.event_id = Some(self.commit_dao.save_commit(&stored).await?);
-        self.cache.cache_pts(stored.channel_id, stored.pts).await?;
-        self.cache.cache_commit(&stored).await?;
-        Ok(())
-    }
-
     /// DB 事务已经提交 commit 后，仅刷新本进程内存 pts 与 Redis sync cache。
     ///
     /// 普通发送链路会在同一个 DB transaction 内完成消息写入、pts 分配和 commit log 写入；
-    /// 这里不能再调用 `record_existing_commit`，否则会重复写 commit。
+    /// 这里不能再次写 commit，否则会重复写入 timeline event。
     pub async fn cache_committed_commit(&self, commit: &ServerCommit) -> Result<()> {
         self.pts_generator
             .set_pts(commit.channel_id, commit.pts)
@@ -173,38 +165,9 @@ impl SyncService {
     }
 
     fn attachment_file_ids(metadata: Option<&MessageMetadata>) -> Vec<u64> {
-        let mut ids = Vec::new();
-        match metadata {
-            Some(MessageMetadata::Image(value)) => {
-                ids.push(value.file_id);
-                if let Some(id) = value.thumbnail_file_id {
-                    ids.push(id);
-                }
-            }
-            Some(MessageMetadata::File(value)) => ids.push(value.file_id),
-            Some(MessageMetadata::Voice(value)) => ids.push(value.file_id),
-            Some(MessageMetadata::Video(value)) => {
-                ids.push(value.file_id);
-                if let Some(id) = value.thumbnail_file_id {
-                    ids.push(id);
-                }
-            }
-            Some(MessageMetadata::Location(value)) => {
-                if let Some(id) = value.thumbnail_file_id {
-                    ids.push(id);
-                }
-            }
-            Some(MessageMetadata::Link(value)) => {
-                if let Some(id) = value.thumbnail_file_id {
-                    ids.push(id);
-                }
-            }
-            _ => {}
-        }
-        ids.retain(|id| *id != 0);
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+        metadata
+            .map(MessageMetadata::attachment_file_ids)
+            .unwrap_or_default()
     }
 
     fn message_from_submit(
@@ -212,7 +175,7 @@ impl SyncService {
         sender_id: u64,
         server_message_id: u64,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(Message, Vec<u64>)> {
+    ) -> Result<(Message, Vec<u64>, CanonicalTimelineEvent)> {
         let content_type = Self::normalize_submit_content_type(&req.command_type);
         let event = CanonicalTimelineEvent::from_legacy(
             content_type.as_str(),
@@ -250,7 +213,7 @@ impl SyncService {
             sender_id,
             pts: None,
             local_message_id: Some(req.local_message_id),
-            content: event.payload.content,
+            content: event.payload.content.clone(),
             message_type: event.message_type,
             metadata,
             reply_to_message_id: event.payload.reply_to_message_id,
@@ -262,7 +225,11 @@ impl SyncService {
             revoked_at: None,
             revoked_by: None,
         };
-        Ok((message, attachment_file_ids))
+        Ok((
+            message,
+            attachment_file_ids,
+            CanonicalTimelineEvent::NewMessage(event),
+        ))
     }
 
     // ============================================================
@@ -283,8 +250,8 @@ impl SyncService {
     /// 7. 构造 ServerCommit
     /// 8. 保存到数据库（Commit Log）
     /// 9. 缓存到 Redis
-    /// 10. Fan-out 给在线用户
-    /// 11. 注册 local_message_id
+    /// 10. 投递已提交 timeline event（在线连接或离线队列）
+    /// 11. 返回同步响应
     /// 12. 返回响应
     pub async fn handle_client_submit(
         &self,
@@ -346,8 +313,15 @@ impl SyncService {
         // 6. 生成 server_msg_id（使用 snowflake）并构造权威消息投影。
         let server_msg_id = self.generate_msg_id().await;
         let now = chrono::Utc::now();
-        let (message, attachment_file_ids) =
+        let (message, attachment_file_ids, canonical_event) =
             Self::message_from_submit(&req, sender_id, server_msg_id, now)?;
+        let (_, commit_content) = canonical_event
+            .to_legacy_commit(req.channel_id, req.channel_type)
+            .map_err(|error| {
+                crate::error::ServerError::Protocol(format!(
+                    "sync/submit legacy projection failed: {error}"
+                ))
+            })?;
         let tx_result = self
             .message_repository
             .create_message_and_commit_atomic(AtomicMessageCommitRequest {
@@ -359,7 +333,7 @@ impl SyncService {
                 }),
                 attachment_file_ids,
                 channel_type: i16::from(req.channel_type),
-                commit_content: req.payload.clone(),
+                event: canonical_event,
                 sender_username: None,
             })
             .await
@@ -391,7 +365,7 @@ impl SyncService {
             channel_id: message.channel_id,
             channel_type: req.channel_type,
             message_type: message.message_type.as_str().to_string(),
-            content: req.payload.clone(),
+            content: commit_content,
             server_timestamp: message.created_at.timestamp_millis(),
             sender_id,
             sender_info: self.get_sender_info(sender_id).await.ok(),
@@ -405,6 +379,14 @@ impl SyncService {
         // 9. 缓存到 Redis ⭐
         self.cache.cache_pts(req.channel_id, new_pts).await?;
         self.cache.cache_commit(&commit).await?;
+        if let Some(event_id) = commit.event_id {
+            let delivery = self.delivery_service.clone();
+            tokio::spawn(async move {
+                if let Err(error) = delivery.dispatch_event(event_id).await {
+                    tracing::warn!(event_id, %error, "immediate sync/submit dispatch failed; worker will retry");
+                }
+            });
+        }
 
         // [TRACE] Node 1: committed
         {
@@ -420,25 +402,6 @@ impl SyncService {
                     format!("pts={}", new_pts),
                 )
                 .await;
-        }
-
-        // 10. Fan-out 给在线用户 ⭐
-        let online_users = self.cache.get_online_users(req.channel_id).await?;
-        if !online_users.is_empty() {
-            // [TRACE] Node 2: fanout
-            {
-                use crate::infra::delivery_trace::{global_trace_store, stages};
-                global_trace_store()
-                    .record(
-                        message.message_id,
-                        stages::FANOUT,
-                        format!("online_users={}", online_users.len()),
-                    )
-                    .await;
-            }
-            self.cache
-                .fanout_to_online_users(&online_users, &commit)
-                .await?;
         }
 
         // 10.5 更新其他成员的未读计数 ⭐

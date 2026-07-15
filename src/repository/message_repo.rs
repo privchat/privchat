@@ -22,6 +22,7 @@ use crate::model::message::Message;
 use privchat_protocol::{
     CanonicalTimelineEvent, FlatBufferMessage, CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
 };
+use privchat_protocol::rpc::sync::ServerCommit;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -105,8 +106,19 @@ pub struct AtomicMessageCommitRequest {
     pub client_registry_claim: Option<ClientRegistryClaim>,
     pub attachment_file_ids: Vec<u64>,
     pub channel_type: i16,
-    pub commit_content: serde_json::Value,
+    pub event: CanonicalTimelineEvent,
     pub sender_username: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AtomicTimelineEventRequest {
+    pub server_msg_id: u64,
+    pub channel_id: u64,
+    pub channel_type: u8,
+    pub event: CanonicalTimelineEvent,
+    pub sender_id: u64,
+    pub sender_username: Option<String>,
+    pub server_timestamp: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +408,27 @@ impl PgMessageRepository {
                 "dedup_key and client_registry_claim are mutually exclusive".to_string(),
             ));
         }
+        let CanonicalTimelineEvent::NewMessage(new_message_event) = &request.event else {
+            return Err(DatabaseError::Database(
+                "message transaction requires a canonical new-message event".to_string(),
+            ));
+        };
+        if new_message_event.message_type != request.message.message_type {
+            return Err(DatabaseError::Database(format!(
+                "canonical message type {} does not match row type {}",
+                new_message_event.message_type.as_str(),
+                request.message.message_type.as_str()
+            )));
+        }
+        let (commit_message_type, commit_content) = request
+            .event
+            .to_legacy_commit(request.message.channel_id, request.channel_type as u8)
+            .map_err(|error| {
+                DatabaseError::Database(format!("legacy event projection failed: {error}"))
+            })?;
+        let canonical_event = request.event.encode_fb().map_err(|error| {
+            DatabaseError::Database(format!("canonical event encoding failed: {error}"))
+        })?;
         let mut tx =
             self.pool.begin().await.map_err(|e| {
                 DatabaseError::Database(format!("Failed to begin message tx: {}", e))
@@ -576,20 +609,7 @@ impl PgMessageRepository {
             }
         }
 
-        let canonical_event = CanonicalTimelineEvent::from_legacy(
-            message.message_type.as_str(),
-            &request.commit_content,
-            message.message_id,
-            message.sender_id,
-            message.created_at.timestamp_millis(),
-        )
-        .map_err(|e| DatabaseError::Database(format!("canonical event mapping failed: {e}")))?
-        .map(|event| event.encode_fb())
-        .transpose()
-        .map_err(|e| DatabaseError::Database(format!("canonical event encoding failed: {e}")))?;
-        let event_schema_version = canonical_event
-            .as_ref()
-            .map(|_| CANONICAL_TIMELINE_EVENT_SCHEMA_V1);
+        let event_schema_version = CANONICAL_TIMELINE_EVENT_SCHEMA_V1;
 
         let event_id = sqlx::query_scalar::<_, i64>(
             r#"
@@ -606,14 +626,14 @@ impl PgMessageRepository {
         .bind(message.local_message_id.map(|v| v as i64))
         .bind(message.channel_id as i64)
         .bind(request.channel_type)
-        .bind(message.message_type.as_str())
-        .bind(&request.commit_content)
+        .bind(&commit_message_type)
+        .bind(&commit_content)
         .bind(message.created_at.timestamp_millis())
         .bind(message.sender_id as i64)
         .bind(request.sender_username.as_deref())
         .bind(now)
-        .bind(event_schema_version.map(|v| v as i16))
-        .bind(canonical_event.as_deref())
+        .bind(event_schema_version as i16)
+        .bind(&canonical_event)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to save commit: {}", e)))?;
@@ -690,8 +710,107 @@ impl PgMessageRepository {
             message,
             inserted: true,
             event_id: Some(event_id as u64),
-            event_schema_version,
-            canonical_event,
+            event_schema_version: Some(event_schema_version),
+            canonical_event: Some(canonical_event),
+        })
+    }
+
+    /// Append a non-message timeline event (revoke/reaction) with its dispatch
+    /// snapshot in one transaction. No handler may create the outbox later.
+    pub async fn append_timeline_event_atomic(
+        &self,
+        request: AtomicTimelineEventRequest,
+    ) -> Result<ServerCommit, DatabaseError> {
+        let event_kind = match &request.event {
+            CanonicalTimelineEvent::NewMessage(_) => 1,
+            CanonicalTimelineEvent::Revoke(_) => 2,
+            CanonicalTimelineEvent::ReactionChange(_) => 3,
+        };
+        let (message_type, content) = request
+            .event
+            .to_legacy_commit(request.channel_id, request.channel_type)
+            .map_err(|e| DatabaseError::Database(format!("legacy event projection failed: {e}")))?;
+        let canonical_event = request
+            .event
+            .encode_fb()
+            .map_err(|e| DatabaseError::Database(format!("canonical event encoding failed: {e}")))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("Failed to begin event tx: {e}")))?;
+        let pts = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO privchat_channel_pts
+                (channel_id, current_pts, created_at, updated_at)
+            VALUES ($1, 1, $2, $2)
+            ON CONFLICT (channel_id) DO UPDATE
+            SET current_pts = privchat_channel_pts.current_pts + 1,
+                updated_at = $2
+            RETURNING current_pts
+            "#,
+        )
+        .bind(request.channel_id as i64)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to allocate event pts: {e}")))?;
+        let event_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO privchat_commit_log
+                (pts, server_msg_id, local_message_id, channel_id, channel_type,
+                 message_type, content, server_timestamp, sender_id,
+                 sender_username, created_at, event_schema_version, canonical_event)
+            VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING id
+            "#,
+        )
+        .bind(pts)
+        .bind(request.server_msg_id as i64)
+        .bind(request.channel_id as i64)
+        .bind(i16::from(request.channel_type))
+        .bind(&message_type)
+        .bind(&content)
+        .bind(request.server_timestamp)
+        .bind(request.sender_id as i64)
+        .bind(request.sender_username.as_deref())
+        .bind(now)
+        .bind(CANONICAL_TIMELINE_EVENT_SCHEMA_V1 as i16)
+        .bind(&canonical_event)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to save timeline event: {e}")))?;
+
+        Self::create_dispatch_snapshot_in_tx(
+            &mut tx,
+            event_id,
+            request.channel_id as i64,
+            i16::from(request.channel_type),
+            pts,
+            request.sender_id as i64,
+            event_kind,
+            now,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("Failed to commit event tx: {e}")))?;
+
+        Ok(ServerCommit {
+            event_id: Some(event_id as u64),
+            pts: pts as u64,
+            server_msg_id: request.server_msg_id,
+            local_message_id: None,
+            channel_id: request.channel_id,
+            channel_type: request.channel_type,
+            message_type,
+            content,
+            server_timestamp: request.server_timestamp,
+            sender_id: request.sender_id,
+            sender_info: None,
+            event_schema_version: Some(CANONICAL_TIMELINE_EVENT_SCHEMA_V1),
+            canonical_event: Some(canonical_event),
         })
     }
 
@@ -2198,7 +2317,15 @@ mod atomic_dispatch_tests {
                 client_registry_claim: None,
                 attachment_file_ids: Vec::new(),
                 channel_type: 2,
-                commit_content: serde_json::to_value(legacy).expect("serialize legacy envelope"),
+                event: CanonicalTimelineEvent::NewMessage(
+                    privchat_protocol::NewMessageEvent {
+                        message_type: privchat_protocol::ContentMessageType::Text,
+                        payload: privchat_protocol::MessagePayloadEnvelope::from_legacy(
+                            &legacy,
+                            privchat_protocol::ContentMessageType::Text,
+                        ),
+                    },
+                ),
                 sender_username: None,
             })
             .await

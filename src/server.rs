@@ -477,6 +477,24 @@ impl ChatServer {
         ));
         info!("✅ OfflineQueueService 创建完成（共享 Redis 连接池）");
 
+        let committed_delivery_service = Arc::new(
+            crate::service::CommittedTimelineDeliveryService::new(
+                pool.clone(),
+                message_router.clone(),
+                message_repository.clone(),
+                offline_queue_service.clone(),
+                Arc::new(tokio::sync::Semaphore::new(2_000)),
+                format!("dispatch-{}", std::process::id()),
+            ),
+        );
+        let dispatch_worker = committed_delivery_service.clone();
+        tokio::spawn(async move {
+            if let Err(error) = dispatch_worker.start().await {
+                error!(%error, "dispatch outbox worker stopped");
+            }
+        });
+        info!("✅ CommittedTimelineDeliveryService 后台任务已启动");
+
         // 2.5 创建 DeliveryTracker（送达水位追踪）
         let delivery_tracker = Arc::new(crate::service::DeliveryTracker::new(&config.redis_url)?);
         info!("✅ DeliveryTracker 创建完成");
@@ -635,17 +653,15 @@ impl ChatServer {
             message_history_service.clone(),
             file_service.clone(),
             channel_service.clone(),
-            message_router.clone(),
             blacklist_service.clone(),
             pts_generator.clone(),
-            user_message_index.clone(),
-            offline_queue_service.clone(),
             unread_count_service.clone(),
             privacy_service.clone(),
             friend_service.clone(),
             mention_service.clone(),
             message_repository.clone(),
             auth_session_manager.clone(),
+            committed_delivery_service.clone(),
             Some(user_device_repo.clone()), // ✨ Phase 3.5: 传递 user_device_repo
         );
         // Inject ServerEvent emit deps（spec SERVER_EVENT_DISPATCH_SPEC §11.1：
@@ -662,13 +678,12 @@ impl ChatServer {
         let message_service = Arc::new(
             crate::service::MessageService::new(
                 channel_service.clone(),
-                pts_generator.clone(),
                 message_repository.clone(),
                 user_message_index.clone(),
                 offline_queue_service.clone(),
-                connection_manager.clone(),
                 unread_count_service.clone(),
                 message_history_service.clone(),
+                committed_delivery_service.clone(),
             )
             .with_recall_time_limit_secs(config.message.recall_time_limit_secs),
         );
@@ -1352,6 +1367,7 @@ impl ChatServer {
             channel_service.clone(),
             unread_count_service.clone(),
             message_repository.clone(),
+            committed_delivery_service.clone(),
         ));
         crate::service::sync::set_global_sync_service(sync_service.clone());
         info!("✅ SyncService 创建完成");

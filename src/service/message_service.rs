@@ -24,20 +24,20 @@
 //! 供登录通知、Admin API 发消息、系统公告等所有服务端主动发消息场景复用。
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
-use privchat_protocol::protocol::{MessageSetting, PushMessageRequest};
-use privchat_protocol::ContentMessageType;
-use serde_json::{json, Value};
+use privchat_protocol::{
+    CanonicalTimelineEvent, ContentMessageType, MessageMetadata, MessagePayloadEnvelope,
+    NewMessageEvent, RevokeEvent,
+};
+use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::error::ServerError;
-use crate::infra::ConnectionManager;
 use crate::model::channel::MemberRole;
 use crate::model::message::Message;
-use crate::model::pts::{PtsGenerator, UserMessageIndex};
-use crate::repository::{MessageRepository, PgMessageRepository};
+use crate::model::pts::UserMessageIndex;
+use crate::repository::{AtomicMessageCommitRequest, MessageRepository, PgMessageRepository};
 use crate::service::message_history_service::MessageHistoryService;
 use crate::service::sync::get_global_sync_service;
 use crate::service::{ChannelService, OfflineQueueService, UnreadCountService};
@@ -115,13 +115,12 @@ pub struct RevokedMessageSummary {
 
 pub struct MessageService {
     channel_service: Arc<ChannelService>,
-    pts_generator: Arc<PtsGenerator>,
     message_repository: Arc<PgMessageRepository>,
     user_message_index: Arc<UserMessageIndex>,
     offline_queue_service: Arc<OfflineQueueService>,
-    connection_manager: Arc<ConnectionManager>,
     unread_count_service: Arc<UnreadCountService>,
     message_history_service: Arc<MessageHistoryService>,
+    delivery_service: Arc<crate::service::CommittedTimelineDeliveryService>,
     /// 普通用户撤回时效（秒）。`<= 0` 表示不限制时效。群主/管理员始终不受限。
     recall_time_limit_secs: i64,
 }
@@ -129,23 +128,21 @@ pub struct MessageService {
 impl MessageService {
     pub fn new(
         channel_service: Arc<ChannelService>,
-        pts_generator: Arc<PtsGenerator>,
         message_repository: Arc<PgMessageRepository>,
         user_message_index: Arc<UserMessageIndex>,
         offline_queue_service: Arc<OfflineQueueService>,
-        connection_manager: Arc<ConnectionManager>,
         unread_count_service: Arc<UnreadCountService>,
         message_history_service: Arc<MessageHistoryService>,
+        delivery_service: Arc<crate::service::CommittedTimelineDeliveryService>,
     ) -> Self {
         Self {
             channel_service,
-            pts_generator,
             message_repository,
             user_message_index,
             offline_queue_service,
-            connection_manager,
             unread_count_service,
             message_history_service,
+            delivery_service,
             recall_time_limit_secs: DEFAULT_REVOKE_TIME_LIMIT_SECS,
         }
     }
@@ -174,51 +171,31 @@ impl MessageService {
         req: ServerSendMessageRequest,
     ) -> anyhow::Result<ServerSendMessageResult> {
         let now = Utc::now();
-
-        // RP-12 幂等前置检查：已注入过（dedup_key 命中）→ 直接返回既有 message_id，不重复落库/推送。
-        if let Some(k) = req.dedup_key.as_deref() {
-            if let Some((existing_id, existing_created)) = self
-                .message_repository
-                .find_message_id_by_dedup_key(k)
-                .await?
-            {
-                info!(
-                    "💠 幂等命中，跳过重复注入: dedup_key={}, message_id={}",
-                    k, existing_id
-                );
-                return Ok(ServerSendMessageResult {
-                    message_id: existing_id,
-                    pts: 0,
-                    created_at: existing_created,
-                });
-            }
-        }
-
         let message_id = crate::infra::next_message_id();
-
-        // 1. 分配 pts
-        let pts = if let Some(sync_service) = get_global_sync_service() {
-            match sync_service.allocate_next_pts(req.channel_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "⚠️ MessageService: 分配同步 pts 失败，回退内存计数器: channel_id={}, error={}",
-                        req.channel_id, e
-                    );
-                    self.pts_generator.next_pts(req.channel_id).await
-                }
-            }
-        } else {
-            self.pts_generator.next_pts(req.channel_id).await
-        };
-
-        // 2. 写入 DB
-        let msg = Message {
+        let typed_metadata = MessageMetadata::from_json_value(req.message_type, &req.metadata);
+        let attachment_file_ids = typed_metadata
+            .as_ref()
+            .map(MessageMetadata::attachment_file_ids)
+            .unwrap_or_default();
+        let canonical_event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
+            message_type: req.message_type,
+            payload: MessagePayloadEnvelope {
+                content: req.content.clone(),
+                metadata: typed_metadata,
+                reply_to_message_id: None,
+                mentioned_user_ids: Vec::new(),
+                message_source: None,
+            },
+        });
+        let (_, commit_content) = canonical_event
+            .to_legacy_commit(req.channel_id, req.channel_type)
+            .map_err(|error| anyhow::anyhow!("构造兼容消息投影失败: {error}"))?;
+        let message = Message {
             message_id,
             channel_id: req.channel_id,
             sender_id: req.sender_id,
-            pts: Some(pts as i64),
-            local_message_id: Some(message_id),
+            pts: None,
+            local_message_id: None,
             content: req.content.clone(),
             message_type: req.message_type,
             metadata: req.metadata.clone(),
@@ -231,54 +208,54 @@ impl MessageService {
             revoked_at: None,
             revoked_by: None,
         };
-        let inserted = self
+        let tx_result = self
             .message_repository
-            .create_with_dedup_key(&msg, req.dedup_key.as_deref())
+            .create_message_and_commit_atomic(AtomicMessageCommitRequest {
+                message,
+                dedup_key: req.dedup_key.clone(),
+                client_registry_claim: None,
+                attachment_file_ids,
+                channel_type: i16::from(req.channel_type),
+                event: canonical_event,
+                sender_username: None,
+            })
             .await
-            .map_err(|e| anyhow::anyhow!("写入消息失败: {}", e))?;
-
-        // 并发注入撞车（dedup_key 唯一索引 DO NOTHING）→ 查回既有 message_id，跳过 sync/index/推送。
-        if !inserted {
-            if let Some(k) = req.dedup_key.as_deref() {
-                if let Some((existing_id, existing_created)) = self
-                    .message_repository
-                    .find_message_id_by_dedup_key(k)
-                    .await?
-                {
-                    info!(
-                        "💠 并发幂等撞车，返回既有: dedup_key={}, message_id={}",
-                        k, existing_id
-                    );
-                    return Ok(ServerSendMessageResult {
-                        message_id: existing_id,
-                        pts: 0,
-                        created_at: existing_created,
-                    });
-                }
-            }
+            .map_err(|error| anyhow::anyhow!("事务化写入服务端消息失败: {error}"))?;
+        let message = tx_result.message;
+        let pts = message.pts.unwrap_or(0).max(0) as u64;
+        if !tx_result.inserted {
+            return Ok(ServerSendMessageResult {
+                message_id: message.message_id,
+                pts,
+                created_at: message.created_at.timestamp_millis(),
+            });
         }
 
-        // 3. 记录 sync commit
+        let event_id = tx_result
+            .event_id
+            .ok_or_else(|| anyhow::anyhow!("inserted message is missing event_id"))?;
+        let commit = privchat_protocol::rpc::sync::ServerCommit {
+            event_id: Some(event_id),
+            pts,
+            server_msg_id: message.message_id,
+            local_message_id: None,
+            channel_id: message.channel_id,
+            channel_type: req.channel_type,
+            message_type: message.message_type.as_str().to_string(),
+            content: commit_content,
+            server_timestamp: message.created_at.timestamp_millis(),
+            sender_id: message.sender_id,
+            sender_info: None,
+            event_schema_version: tx_result.event_schema_version,
+            canonical_event: tx_result.canonical_event,
+        };
         if let Some(sync_service) = get_global_sync_service() {
-            let commit = privchat_protocol::rpc::sync::ServerCommit {
-                event_id: None,
-                pts,
-                server_msg_id: message_id,
-                local_message_id: Some(message_id),
-                channel_id: req.channel_id,
-                channel_type: req.channel_type,
-                message_type: req.message_type.as_str().to_string(),
-                content: serde_json::json!({ "text": req.content }),
-                server_timestamp: now.timestamp_millis(),
-                sender_id: req.sender_id,
-                sender_info: None,
-                event_schema_version: None,
-                canonical_event: None,
-            };
-            if let Err(e) = sync_service.record_existing_commit(&commit).await {
+            if let Err(error) = sync_service.cache_committed_commit(&commit).await {
                 warn!(
-                    "⚠️ MessageService: 记录 sync commit 失败: channel_id={}, error={}",
-                    req.channel_id, e
+                    channel_id = message.channel_id,
+                    message_id = message.message_id,
+                    %error,
+                    "cache committed server message failed"
                 );
             }
         }
@@ -322,75 +299,12 @@ impl MessageService {
             }
         }
 
-        // 6. 构建 PushMessageRequest
-        let payload = serde_json::to_vec(&serde_json::json!({ "content": req.content }))
-            .map_err(|e| anyhow::anyhow!("encode payload failed: {}", e))?;
-
-        let push_msg = privchat_protocol::protocol::PushMessageRequest {
-            setting: privchat_protocol::protocol::MessageSetting::default(),
-            msg_key: format!("msg_{}", message_id),
-            server_message_id: message_id,
-            message_seq: u32::try_from(pts).unwrap_or(u32::MAX),
-            local_message_id: message_id,
-            stream_no: String::new(),
-            stream_seq: 0,
-            stream_flag: 0,
-            timestamp: now.timestamp().max(0) as u32,
-            channel_id: req.channel_id,
-            channel_type: req.channel_type,
-            message_type: req.message_type.as_u32(),
-            expire: 0,
-            topic: String::new(),
-            from_uid: req.sender_id,
-            payload,
-            deleted: false,
-        };
-
-        // 7. 推送给接收者。普通消息跳过 sender（其客户端本地已乐观插入，靠 sync pull 同步到其它设备）；
-        //    但服务端注入消息（有 dedup_key，如 RP-12 红包/转账卡片）sender 本地并未创建，必须也推给
-        //    sender，否则发送方在会话里看不到自己刚发的卡片（要等冷同步才出现）。
-        let push_to_sender = req.dedup_key.is_some();
-        for &uid in &req.recipient_user_ids {
-            if uid == req.sender_id && !push_to_sender {
-                continue;
+        let delivery = self.delivery_service.clone();
+        tokio::spawn(async move {
+            if let Err(error) = delivery.dispatch_event(event_id).await {
+                warn!(event_id, %error, "immediate server-message dispatch failed; worker will retry");
             }
-            let online_sessions = match self
-                .connection_manager
-                .send_push_to_user(uid, &push_msg)
-                .await
-            {
-                Ok(report) => report.successful_count(),
-                Err(e) => {
-                    warn!(
-                        "⚠️ MessageService: 实时推送失败: user_id={}, error={:?}",
-                        uid, e
-                    );
-                    0
-                }
-            };
-
-            if online_sessions > 0 {
-                info!(
-                    "📡 MessageService: 实时推送成功 user_id={}, sessions={}",
-                    uid, online_sessions
-                );
-            } else {
-                crate::infra::metrics::increment_offline_enqueue(1);
-                tracing::info!(
-                    target: "delivery.offline_enqueue",
-                    user_id = uid,
-                    server_message_id = push_msg.server_message_id,
-                    source = "MessageService",
-                    "zero-success delivery queued to offline"
-                );
-                if let Err(e) = self.offline_queue_service.add(uid, &push_msg).await {
-                    warn!(
-                        "⚠️ MessageService: 离线队列写入失败: user_id={}, error={:?}",
-                        uid, e
-                    );
-                }
-            }
-        }
+        });
 
         // 8. 更新 last_message
         let _ = self
@@ -401,15 +315,15 @@ impl MessageService {
         info!(
             "✅ MessageService: 消息发送完成 channel_id={}, message_id={}, pts={}, recipients={}",
             req.channel_id,
-            message_id,
+            message.message_id,
             pts,
             req.recipient_user_ids.len()
         );
 
         Ok(ServerSendMessageResult {
-            message_id,
+            message_id: message.message_id,
             pts,
-            created_at: now.timestamp_millis(),
+            created_at: message.created_at.timestamp_millis(),
         })
     }
 
@@ -612,21 +526,16 @@ impl MessageService {
 
         // 4. 写 sync commit
         let revoke_ts_ms = Utc::now().timestamp_millis();
-        let revoke_payload = json!({
-            "message_id": message_id,
-            "channel_id": channel_id,
-            "channel_type": channel_type,
-            "revoke": true,
-            "revoked_by": revoker_id,
-            "revoked_at": revoke_ts_ms,
-        });
         if let Some(sync_service) = get_global_sync_service() {
             if let Err(e) = sync_service
                 .append_server_event_commit(
                     channel_id,
                     channel_type,
-                    "message.revoke",
-                    revoke_payload,
+                    CanonicalTimelineEvent::Revoke(RevokeEvent {
+                        target_server_message_id: message_id,
+                        revoked_by: revoker_id,
+                        revoked_at: revoke_ts_ms,
+                    }),
                     revoker_id,
                 )
                 .await
@@ -637,15 +546,8 @@ impl MessageService {
             warn!("⚠️ SyncService 未初始化，跳过 revoke pts commit");
         }
 
-        // 5. 推送撤回事件给所有参与者
-        if let Err(e) = self
-            .distribute_revoke_event(channel_id, channel_type, message_id, revoker_id)
-            .await
-        {
-            warn!("⚠️ 推送撤回事件失败: {}，但消息已撤回", e);
-        }
-
-        // 6. 清理所有参与者的离线队列
+        // 5. 清理原消息的旧离线队列项；撤回事件自身由 dispatch outbox
+        // 进入在线/离线统一投递，不再由本服务手工 fanout。
         match self
             .channel_service
             .get_channel_participants(channel_id)
@@ -684,91 +586,6 @@ impl MessageService {
             revoker_id,
             revoked_at_ms,
         })
-    }
-
-    /// 推送撤回事件给会话内所有参与者——使用与主发消息相同的 `ConnectionManager`
-    /// 入口（`CONNECTION_LIFECYCLE_SPEC §8.8`），不走离线队列（撤回事件只通知在线端，
-    /// 离线用户通过离线队列清理保证不会再收到原消息）。
-    async fn distribute_revoke_event(
-        &self,
-        channel_id: u64,
-        channel_type: u8,
-        message_id: u64,
-        revoked_by: u64,
-    ) -> std::result::Result<(), ServerError> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        let event_payload = json!({
-            "revoked_by": revoked_by,
-            "revoked_at": now_ms,
-        });
-
-        let revoke_event = PushMessageRequest {
-            setting: MessageSetting {
-                need_receipt: false,
-                signal: 0,
-            },
-            msg_key: format!("revoke_{}", message_id),
-            server_message_id: message_id,
-            message_seq: 0,
-            local_message_id: 0,
-            stream_no: String::new(),
-            stream_seq: 0,
-            stream_flag: 0,
-            timestamp: (now_ms / 1000) as u32,
-            channel_id,
-            channel_type,
-            message_type: ContentMessageType::System.as_u32(),
-            expire: 0,
-            topic: "message.revoke".to_string(),
-            from_uid: revoked_by,
-            payload: event_payload.to_string().into_bytes(),
-            deleted: true,
-        };
-
-        let participants = self
-            .channel_service
-            .get_channel_participants(channel_id)
-            .await
-            .map_err(|e| ServerError::Database(format!("获取会话参与者失败: {}", e)))?;
-
-        info!(
-            "📣 开始分发撤回事件: channel_id={}, channel_type={}, message_id={}, revoked_by={}, participants={}",
-            channel_id,
-            channel_type,
-            message_id,
-            revoked_by,
-            participants.len()
-        );
-
-        for participant in participants {
-            match self
-                .connection_manager
-                .send_push_to_user(participant.user_id, &revoke_event)
-                .await
-            {
-                Ok(report) => {
-                    info!(
-                        "📤 撤回事件推送: target_user={}, message_id={}, success_sessions={}, failed_sessions={}",
-                        participant.user_id,
-                        message_id,
-                        report.successful_count(),
-                        report.failed_count()
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ 推送撤回事件给用户 {} 失败: {:?}",
-                        participant.user_id, e
-                    );
-                }
-            }
-        }
-
-        Ok(())
     }
 
     // ============================================================

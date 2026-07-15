@@ -19,6 +19,7 @@ use crate::repository::MessageRepository;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use privchat_protocol::rpc::message::reaction::MessageReactionRemoveRequest;
+use privchat_protocol::{CanonicalTimelineEvent, ReactionChangeEvent, ReactionOperation};
 use serde_json::{json, Value};
 
 /// 处理 移除 Reaction 请求
@@ -60,24 +61,21 @@ pub async fn handle(
                     .await
                     .map(|channel| channel.channel_type.to_i16() as u8)
                     .unwrap_or(1);
-                let payload = json!({
-                    "message_id": message_id,
-                    "channel_id": channel_id,
-                    "channel_type": channel_type,
-                    "uid": user_id,
-                    "emoji": removed
-                        .as_ref()
-                        .map(|reaction| reaction.emoji.clone())
-                        .unwrap_or_else(|| requested_emoji.clone()),
-                    "deleted": true,
-                });
+                let emoji = removed
+                    .as_ref()
+                    .map(|reaction| reaction.emoji.clone())
+                    .unwrap_or_else(|| requested_emoji.clone());
                 if let Err(e) = services
                     .sync_service
                     .append_server_event_commit(
                         channel_id,
                         channel_type,
-                        "message_reaction",
-                        payload,
+                        CanonicalTimelineEvent::ReactionChange(ReactionChangeEvent {
+                            target_server_message_id: message_id,
+                            actor_id: user_id,
+                            emoji,
+                            operation: ReactionOperation::Remove,
+                        }),
                         user_id,
                     )
                     .await

@@ -8,11 +8,13 @@
 
 use crate::error::{Result, ServerError};
 use crate::infra::MessageRouter;
+use crate::repository::PgMessageRepository;
 use crate::service::OfflineQueueService;
 use futures::stream::{self, StreamExt};
 use privchat_protocol::{
-    CanonicalTimelineEvent, FlatBufferMessage, MessageSetting, PushMessageRequest,
-    CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
+    CanonicalTimelineEvent, ContentMessageType, FlatBufferMessage, MessageSetting,
+    PushMessageRequest, CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
+    CANONICAL_TIMELINE_PUSH_TOPIC_V1,
 };
 use sqlx::{FromRow, PgPool};
 use std::sync::Arc;
@@ -274,6 +276,7 @@ impl DispatchOutboxStore {
 pub struct CommittedTimelineDeliveryService {
     store: DispatchOutboxStore,
     message_router: Arc<MessageRouter>,
+    message_repository: Arc<PgMessageRepository>,
     offline_queue: Arc<OfflineQueueService>,
     global_fanout: Arc<Semaphore>,
     worker_id: String,
@@ -283,6 +286,7 @@ impl CommittedTimelineDeliveryService {
     pub fn new(
         pool: Arc<PgPool>,
         message_router: Arc<MessageRouter>,
+        message_repository: Arc<PgMessageRepository>,
         offline_queue: Arc<OfflineQueueService>,
         global_fanout: Arc<Semaphore>,
         worker_id: impl Into<String>,
@@ -290,6 +294,7 @@ impl CommittedTimelineDeliveryService {
         Self {
             store: DispatchOutboxStore::new(pool),
             message_router,
+            message_repository,
             offline_queue,
             global_fanout,
             worker_id: worker_id.into(),
@@ -358,6 +363,19 @@ impl CommittedTimelineDeliveryService {
             .await
         {
             Ok(route) if route.success_count > 0 => {
+                if let Some(ack_session_id) = route
+                    .delivery_report
+                    .as_ref()
+                    .and_then(|report| report.acknowledged_sessions.first())
+                    .copied()
+                {
+                    if let Err(error) = self
+                        .record_and_push_delivered_receipt(&claim, ack_session_id)
+                        .await
+                    {
+                        return self.complete_failed(claim, &error.to_string()).await;
+                    }
+                }
                 self.complete_terminal(claim, DispatchRecipientState::OnlineSent)
                     .await
             }
@@ -370,6 +388,82 @@ impl CommittedTimelineDeliveryService {
             },
             Err(e) => self.complete_failed(claim, &e.to_string()).await,
         }
+    }
+
+    async fn record_and_push_delivered_receipt(
+        &self,
+        claim: &ClaimedDispatchRecipient,
+        ack_session_id: msgtrans::SessionId,
+    ) -> Result<()> {
+        if claim.channel_type != 1 {
+            return Ok(());
+        }
+        let delivered_at = chrono::Utc::now().timestamp_millis() as u64;
+        let receipt = self
+            .message_repository
+            .record_direct_delivery_receipt_first_ack(
+                claim.server_msg_id as u64,
+                claim.user_id as u64,
+                ack_session_id.as_u64(),
+                delivered_at,
+            )
+            .await
+            .map_err(|error| {
+                ServerError::Database(format!(
+                    "persist delivered receipt failed for message {}: {error}",
+                    claim.server_msg_id
+                ))
+            })?;
+        let Some(receipt) = receipt else {
+            return Ok(());
+        };
+
+        let notification =
+            privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
+                receipt.channel_id,
+                1,
+                receipt.server_message_id,
+                receipt.recipient_user_id,
+                receipt.delivered_at,
+            );
+        let payload = serde_json::to_vec(&notification).map_err(|error| {
+            ServerError::Protocol(format!(
+                "encode delivered receipt for message {} failed: {error}",
+                receipt.server_message_id
+            ))
+        })?;
+        let push = PushMessageRequest {
+            setting: Default::default(),
+            msg_key: String::new(),
+            server_message_id: receipt.server_message_id,
+            message_seq: claim.pts as u32,
+            local_message_id: 0,
+            stream_no: String::new(),
+            stream_seq: 0,
+            stream_flag: 0,
+            timestamp: chrono::Utc::now().timestamp() as u32,
+            channel_id: receipt.channel_id,
+            channel_type: 1,
+            message_type: ContentMessageType::System.as_u32(),
+            expire: 0,
+            topic: String::new(),
+            from_uid: receipt.recipient_user_id,
+            payload,
+            deleted: false,
+        };
+        if let Err(error) = self
+            .message_router
+            .route_message_to_user(&receipt.sender_id, push)
+            .await
+        {
+            warn!(
+                sender_id = receipt.sender_id,
+                server_message_id = receipt.server_message_id,
+                %error,
+                "push delivered receipt notification failed"
+            );
+        }
+        Ok(())
     }
 
     async fn complete_terminal(
@@ -453,32 +547,63 @@ fn push_from_claim(claim: &ClaimedDispatchRecipient) -> Result<PushMessageReques
     })
     .ok_or_else(|| ServerError::Protocol("commit has no mappable timeline event".to_string()))?;
 
-    let CanonicalTimelineEvent::NewMessage(message) = event else {
-        return Err(ServerError::Unsupported(
-            "mutation dispatch requires the P6 mutation wire mapper".to_string(),
-        ));
-    };
-    let payload = privchat_protocol::encode_message(&message.payload)
-        .map_err(|e| ServerError::Protocol(format!("encode message payload failed: {e}")))?;
+    let is_new_message = matches!(event, CanonicalTimelineEvent::NewMessage(_));
+    let (server_message_id, local_message_id, message_type, topic, from_uid, payload) =
+        match &event {
+            CanonicalTimelineEvent::NewMessage(message) => (
+                claim.server_msg_id as u64,
+                claim.local_message_id.unwrap_or(0) as u64,
+                message.message_type.as_u32(),
+                String::new(),
+                claim.sender_id as u64,
+                privchat_protocol::encode_message(&message.payload).map_err(|e| {
+                    ServerError::Protocol(format!("encode message payload failed: {e}"))
+                })?,
+            ),
+            CanonicalTimelineEvent::Revoke(revoke) => (
+                claim.event_id as u64,
+                0,
+                ContentMessageType::System.as_u32(),
+                CANONICAL_TIMELINE_PUSH_TOPIC_V1.to_string(),
+                revoke.revoked_by,
+                event.encode_fb().map_err(|e| {
+                    ServerError::Protocol(format!("encode revoke event failed: {e}"))
+                })?,
+            ),
+            CanonicalTimelineEvent::ReactionChange(reaction) => (
+                claim.event_id as u64,
+                0,
+                ContentMessageType::System.as_u32(),
+                CANONICAL_TIMELINE_PUSH_TOPIC_V1.to_string(),
+                reaction.actor_id,
+                event.encode_fb().map_err(|e| {
+                    ServerError::Protocol(format!("encode reaction event failed: {e}"))
+                })?,
+            ),
+        };
     Ok(PushMessageRequest {
         setting: MessageSetting {
-            need_receipt: claim.channel_type == 1,
+            need_receipt: claim.channel_type == 1 && is_new_message,
             signal: 0,
         },
-        msg_key: format!("msg_{}", claim.server_msg_id),
-        server_message_id: claim.server_msg_id as u64,
+        msg_key: if is_new_message {
+            format!("msg_{}", claim.server_msg_id)
+        } else {
+            format!("event_{}", claim.event_id)
+        },
+        server_message_id,
         message_seq: claim.pts as u32,
-        local_message_id: claim.local_message_id.unwrap_or(0) as u64,
+        local_message_id,
         stream_no: String::new(),
         stream_seq: 0,
         stream_flag: 0,
         timestamp: (claim.server_timestamp / 1_000).max(0) as u32,
         channel_id: claim.channel_id as u64,
         channel_type: claim.channel_type as u8,
-        message_type: message.message_type.as_u32(),
+        message_type,
         expire: 0,
-        topic: String::new(),
-        from_uid: claim.sender_id as u64,
+        topic,
+        from_uid,
         payload,
         deleted: false,
     })
@@ -487,7 +612,9 @@ fn push_from_claim(claim: &ClaimedDispatchRecipient) -> Result<PushMessageReques
 #[cfg(test)]
 mod tests {
     use super::*;
-    use privchat_protocol::{ContentMessageType, MessagePayloadEnvelope, NewMessageEvent};
+    use privchat_protocol::{
+        ContentMessageType, MessagePayloadEnvelope, NewMessageEvent, RevokeEvent,
+    };
     use sqlx::postgres::PgPoolOptions;
 
     const EVENT_ID: i64 = 987_675_001;
@@ -533,6 +660,24 @@ mod tests {
         assert_eq!(push.channel_id, 7);
         assert_eq!(push.message_seq, 4);
         assert!(push.setting.need_receipt);
+    }
+
+    #[test]
+    fn mapper_carries_mutations_as_canonical_flatbuffers() {
+        let mut claim = claim_fixture();
+        let event = CanonicalTimelineEvent::Revoke(RevokeEvent {
+            target_server_message_id: 99,
+            revoked_by: 88,
+            revoked_at: 77,
+        });
+        claim.canonical_event = Some(event.encode_fb().unwrap());
+        claim.message_type = "message.revoke".to_string();
+        let push = push_from_claim(&claim).unwrap();
+        assert_eq!(push.topic, CANONICAL_TIMELINE_PUSH_TOPIC_V1);
+        assert_eq!(push.server_message_id, claim.event_id as u64);
+        assert_eq!(push.from_uid, 88);
+        assert!(!push.setting.need_receipt);
+        assert_eq!(CanonicalTimelineEvent::decode_fb(&push.payload).unwrap(), event);
     }
 
     #[test]
