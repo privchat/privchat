@@ -38,35 +38,43 @@ impl CommitLogDao {
     /// 保存 Commit 到数据库
     ///
     /// INSERT INTO privchat_commit_log (...)
-    pub async fn save_commit(&self, commit: &ServerCommit) -> Result<()> {
+    pub async fn save_commit(&self, commit: &ServerCommit) -> Result<u64> {
         debug!(
             "保存 Commit: channel_id={}, channel_type={}, pts={}, server_msg_id={}",
             commit.channel_id, commit.channel_type, commit.pts, commit.server_msg_id
         );
 
+        let mut stored = commit.clone();
+        stored.populate_canonical_event().map_err(|e| {
+            crate::error::ServerError::Internal(format!("canonical event mapping failed: {e}"))
+        })?;
         let now = chrono::Utc::now().timestamp_millis();
-        let sender_username = commit.sender_info.as_ref().map(|s| s.username.as_str());
+        let sender_username = stored.sender_info.as_ref().map(|s| s.username.as_str());
 
-        sqlx::query!(
+        let event_id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO privchat_commit_log 
             (pts, server_msg_id, local_message_id, channel_id, channel_type, 
-             message_type, content, server_timestamp, sender_id, sender_username, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             message_type, content, server_timestamp, sender_id, sender_username, created_at,
+             event_schema_version, canonical_event)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id
             "#,
-            commit.pts as i64,
-            commit.server_msg_id as i64,
-            commit.local_message_id.map(|v| v as i64),
-            commit.channel_id as i64,
-            commit.channel_type as i16,
-            commit.message_type.as_str(),
-            commit.content.clone(),
-            commit.server_timestamp,
-            commit.sender_id as i64,
-            sender_username,
-            now
         )
-        .execute(self.db.pool())
+        .bind(stored.pts as i64)
+        .bind(stored.server_msg_id as i64)
+        .bind(stored.local_message_id.map(|v| v as i64))
+        .bind(stored.channel_id as i64)
+        .bind(stored.channel_type as i16)
+        .bind(stored.message_type.as_str())
+        .bind(stored.content.clone())
+        .bind(stored.server_timestamp)
+        .bind(stored.sender_id as i64)
+        .bind(sender_username)
+        .bind(now)
+        .bind(stored.event_schema_version.map(|v| v as i16))
+        .bind(stored.canonical_event.as_deref())
+        .fetch_one(self.db.pool())
         .await
         .map_err(|e| {
             error!(
@@ -76,7 +84,7 @@ impl CommitLogDao {
             crate::error::ServerError::Database(format!("Failed to save commit: {}", e))
         })?;
 
-        Ok(())
+        Ok(event_id as u64)
     }
 
     /// 在单个事务内完成「分配 pts + 写入 commit」
@@ -84,6 +92,9 @@ impl CommitLogDao {
     /// 目的：避免先分配 pts 再写 commit 失败导致 pts 空洞。
     /// 成功后会回写 `commit.pts`。
     pub async fn allocate_pts_and_save_commit(&self, commit: &mut ServerCommit) -> Result<()> {
+        commit.populate_canonical_event().map_err(|e| {
+            crate::error::ServerError::Internal(format!("canonical event mapping failed: {e}"))
+        })?;
         let now = chrono::Utc::now().timestamp_millis();
         let sender_username = commit.sender_info.as_ref().map(|s| s.username.as_str());
 
@@ -127,26 +138,30 @@ impl CommitLogDao {
         let new_pts = pts_row.get::<i64, _>("current_pts") as u64;
         commit.pts = new_pts;
 
-        sqlx::query!(
+        let event_id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO privchat_commit_log
             (pts, server_msg_id, local_message_id, channel_id, channel_type,
-             message_type, content, server_timestamp, sender_id, sender_username, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             message_type, content, server_timestamp, sender_id, sender_username, created_at,
+             event_schema_version, canonical_event)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id
             "#,
-            commit.pts as i64,
-            commit.server_msg_id as i64,
-            commit.local_message_id.map(|v| v as i64),
-            commit.channel_id as i64,
-            commit.channel_type as i16,
-            commit.message_type.as_str(),
-            commit.content.clone(),
-            commit.server_timestamp,
-            commit.sender_id as i64,
-            sender_username,
-            now
         )
-        .execute(&mut *tx)
+        .bind(commit.pts as i64)
+        .bind(commit.server_msg_id as i64)
+        .bind(commit.local_message_id.map(|v| v as i64))
+        .bind(commit.channel_id as i64)
+        .bind(commit.channel_type as i16)
+        .bind(commit.message_type.as_str())
+        .bind(commit.content.clone())
+        .bind(commit.server_timestamp)
+        .bind(commit.sender_id as i64)
+        .bind(sender_username)
+        .bind(now)
+        .bind(commit.event_schema_version.map(|v| v as i16))
+        .bind(commit.canonical_event.as_deref())
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             error!(
@@ -159,6 +174,7 @@ impl CommitLogDao {
             ))
         })?;
 
+        commit.event_id = Some(event_id as u64);
         tx.commit().await.map_err(|e| {
             error!(
                 "提交事务失败: channel_id={}, pts={}, error={}",
@@ -187,11 +203,17 @@ impl CommitLogDao {
         local_message_id: u64,
         decision: &str,
     ) -> Result<bool> {
+        commit.populate_canonical_event().map_err(|e| {
+            crate::error::ServerError::Internal(format!("canonical event mapping failed: {e}"))
+        })?;
         let now = chrono::Utc::now().timestamp_millis();
         let sender_username = commit.sender_info.as_ref().map(|s| s.username.as_str());
 
         let mut tx = self.db.pool().begin().await.map_err(|e| {
-            crate::error::ServerError::Database(format!("Failed to begin submit transaction: {}", e))
+            crate::error::ServerError::Database(format!(
+                "Failed to begin submit transaction: {}",
+                e
+            ))
         })?;
 
         // 1) 分配 pts（行锁串行化并发提交）。
@@ -213,12 +235,14 @@ impl CommitLogDao {
         commit.pts = new_pts;
 
         // 2) 落 commit_log。
-        sqlx::query(
+        let event_id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO privchat_commit_log
             (pts, server_msg_id, local_message_id, channel_id, channel_type,
-             message_type, content, server_timestamp, sender_id, sender_username, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             message_type, content, server_timestamp, sender_id, sender_username, created_at,
+             event_schema_version, canonical_event)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id
             "#,
         )
         .bind(commit.pts as i64)
@@ -232,7 +256,9 @@ impl CommitLogDao {
         .bind(commit.sender_id as i64)
         .bind(sender_username)
         .bind(now)
-        .execute(&mut *tx)
+        .bind(commit.event_schema_version.map(|v| v as i16))
+        .bind(commit.canonical_event.as_deref())
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| crate::error::ServerError::Database(format!("save commit failed: {}", e)))?;
 
@@ -263,12 +289,17 @@ impl CommitLogDao {
                 // 幂等冲突：回滚本次 pts 分配 + commit_log（drop 未 commit 的 tx = ROLLBACK），
                 // pts 归还无空洞；调用方读既有 registry 返回，不 fanout。
                 drop(tx);
+                commit.event_id = None;
                 return Ok(false);
             }
         }
 
+        commit.event_id = Some(event_id as u64);
         tx.commit().await.map_err(|e| {
-            crate::error::ServerError::Database(format!("Failed to commit submit transaction: {}", e))
+            crate::error::ServerError::Database(format!(
+                "Failed to commit submit transaction: {}",
+                e
+            ))
         })?;
         Ok(true)
     }
@@ -294,6 +325,7 @@ impl CommitLogDao {
 
         #[derive(sqlx::FromRow)]
         struct CommitRow {
+            id: i64,
             pts: i64,
             server_msg_id: i64,
             local_message_id: Option<i64>,
@@ -304,13 +336,16 @@ impl CommitLogDao {
             server_timestamp: i64,
             sender_id: i64,
             sender_username: Option<String>,
+            event_schema_version: Option<i16>,
+            canonical_event: Option<Vec<u8>>,
         }
 
         let rows = sqlx::query_as::<_, CommitRow>(
             r#"
             SELECT 
-                pts, server_msg_id, local_message_id, channel_id, channel_type,
-                message_type, content, server_timestamp, sender_id, sender_username
+                id, pts, server_msg_id, local_message_id, channel_id, channel_type,
+                message_type, content, server_timestamp, sender_id, sender_username,
+                event_schema_version, canonical_event
             FROM privchat_commit_log
             WHERE channel_id = $1 AND pts > $2
             ORDER BY pts ASC
@@ -333,6 +368,7 @@ impl CommitLogDao {
         let commits: Vec<ServerCommit> = rows
             .into_iter()
             .map(|row| ServerCommit {
+                event_id: Some(row.id as u64),
                 pts: row.pts as u64,
                 server_msg_id: row.server_msg_id as u64,
                 local_message_id: row.local_message_id.map(|v| v as u64),
@@ -348,6 +384,8 @@ impl CommitLogDao {
                     nickname: None,
                     avatar_url: None,
                 }),
+                event_schema_version: row.event_schema_version.map(|v| v as u16),
+                canonical_event: row.canonical_event,
             })
             .collect();
 
@@ -375,6 +413,7 @@ impl CommitLogDao {
 
         #[derive(sqlx::FromRow)]
         struct CommitRow {
+            id: i64,
             pts: i64,
             server_msg_id: i64,
             local_message_id: Option<i64>,
@@ -385,13 +424,16 @@ impl CommitLogDao {
             server_timestamp: i64,
             sender_id: i64,
             sender_username: Option<String>,
+            event_schema_version: Option<i16>,
+            canonical_event: Option<Vec<u8>>,
         }
 
         let row = sqlx::query_as::<_, CommitRow>(
             r#"
             SELECT 
-                pts, server_msg_id, local_message_id, channel_id, channel_type,
-                message_type, content, server_timestamp, sender_id, sender_username
+                id, pts, server_msg_id, local_message_id, channel_id, channel_type,
+                message_type, content, server_timestamp, sender_id, sender_username,
+                event_schema_version, canonical_event
             FROM privchat_commit_log
             WHERE channel_id = $1
             ORDER BY pts DESC
@@ -411,6 +453,7 @@ impl CommitLogDao {
 
         if let Some(row) = row {
             Ok(Some(ServerCommit {
+                event_id: Some(row.id as u64),
                 pts: row.pts as u64,
                 server_msg_id: row.server_msg_id as u64,
                 local_message_id: row.local_message_id.map(|v| v as u64),
@@ -426,6 +469,8 @@ impl CommitLogDao {
                     nickname: None,
                     avatar_url: None,
                 }),
+                event_schema_version: row.event_schema_version.map(|v| v as u16),
+                canonical_event: row.canonical_event,
             }))
         } else {
             Ok(None)

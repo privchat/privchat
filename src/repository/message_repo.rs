@@ -19,6 +19,9 @@
 
 use crate::error::DatabaseError;
 use crate::model::message::Message;
+use privchat_protocol::{
+    CanonicalTimelineEvent, FlatBufferMessage, CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
+};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -108,6 +111,9 @@ pub struct AtomicMessageCommitRequest {
 pub struct AtomicMessageCommitResult {
     pub message: Message,
     pub inserted: bool,
+    pub event_id: Option<u64>,
+    pub event_schema_version: Option<u16>,
+    pub canonical_event: Option<Vec<u8>>,
 }
 
 impl PgMessageRepository {
@@ -230,6 +236,9 @@ impl PgMessageRepository {
                 return Ok(AtomicMessageCommitResult {
                     message: Self::message_from_row(message),
                     inserted: false,
+                    event_id: None,
+                    event_schema_version: None,
+                    canonical_event: None,
                 });
             }
         }
@@ -353,12 +362,29 @@ impl PgMessageRepository {
             }
         }
 
-        sqlx::query(
+        let canonical_event = CanonicalTimelineEvent::from_legacy(
+            message.message_type.as_str(),
+            &request.commit_content,
+            message.message_id,
+            message.sender_id,
+            message.created_at.timestamp_millis(),
+        )
+        .map_err(|e| DatabaseError::Database(format!("canonical event mapping failed: {e}")))?
+        .map(|event| event.encode_fb())
+        .transpose()
+        .map_err(|e| DatabaseError::Database(format!("canonical event encoding failed: {e}")))?;
+        let event_schema_version = canonical_event
+            .as_ref()
+            .map(|_| CANONICAL_TIMELINE_EVENT_SCHEMA_V1);
+
+        let event_id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO privchat_commit_log
             (pts, server_msg_id, local_message_id, channel_id, channel_type,
-             message_type, content, server_timestamp, sender_id, sender_username, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             message_type, content, server_timestamp, sender_id, sender_username, created_at,
+             event_schema_version, canonical_event)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id
             "#,
         )
         .bind(message.pts.unwrap_or(0))
@@ -372,7 +398,9 @@ impl PgMessageRepository {
         .bind(message.sender_id as i64)
         .bind(request.sender_username.as_deref())
         .bind(now)
-        .execute(&mut *tx)
+        .bind(event_schema_version.map(|v| v as i16))
+        .bind(canonical_event.as_deref())
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to save commit: {}", e)))?;
 
@@ -383,6 +411,9 @@ impl PgMessageRepository {
         Ok(AtomicMessageCommitResult {
             message,
             inserted: true,
+            event_id: Some(event_id as u64),
+            event_schema_version,
+            canonical_event,
         })
     }
 
@@ -1560,9 +1591,7 @@ impl PgMessageRepository {
             );
         }
         if cursor.is_some() {
-            sql.push_str(
-                " AND (m.created_at < $4 OR (m.created_at = $4 AND m.message_id < $5))",
-            );
+            sql.push_str(" AND (m.created_at < $4 OR (m.created_at = $4 AND m.message_id < $5))");
         }
         sql.push_str(&format!(
             " ORDER BY m.created_at DESC, m.message_id DESC LIMIT {}",
@@ -1609,8 +1638,14 @@ impl PgMessageRepository {
         anchor_message_id: i64,
         limit: i64,
     ) -> Result<Vec<Message>, DatabaseError> {
-        self.list_context(channel_id, anchor_created_at, anchor_message_id, limit, true)
-            .await
+        self.list_context(
+            channel_id,
+            anchor_created_at,
+            anchor_message_id,
+            limit,
+            true,
+        )
+        .await
     }
 
     /// around：anchor 之后（更新）的一页，ASC 自然序。
@@ -1621,8 +1656,14 @@ impl PgMessageRepository {
         anchor_message_id: i64,
         limit: i64,
     ) -> Result<Vec<Message>, DatabaseError> {
-        self.list_context(channel_id, anchor_created_at, anchor_message_id, limit, false)
-            .await
+        self.list_context(
+            channel_id,
+            anchor_created_at,
+            anchor_message_id,
+            limit,
+            false,
+        )
+        .await
     }
 
     async fn list_context(
@@ -1748,11 +1789,10 @@ mod client_search_tests {
                 .bind(ch as i64)
                 .execute(repo.pool.as_ref())
                 .await;
-            let _ =
-                sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = $1")
-                    .bind(ch as i64)
-                    .execute(repo.pool.as_ref())
-                    .await;
+            let _ = sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = $1")
+                .bind(ch as i64)
+                .execute(repo.pool.as_ref())
+                .await;
             let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
                 .bind(ch as i64)
                 .execute(repo.pool.as_ref())
@@ -1808,7 +1848,9 @@ mod client_search_tests {
     #[tokio::test]
     async fn search_visible_direct_without_participants() {
         let Some(repo) = open_repo().await else {
-            eprintln!("skip search_visible_direct_without_participants: DATABASE_URL not configured");
+            eprintln!(
+                "skip search_visible_direct_without_participants: DATABASE_URL not configured"
+            );
             return;
         };
         const CH_DIRECT: u64 = 987_660_051;
@@ -1825,19 +1867,37 @@ mod client_search_tests {
             .bind(CH_DIRECT as i64).bind(DU1 as i64).bind(DU2 as i64)
             .execute(repo.pool.as_ref()).await.expect("insert channel");
         let kw = "directauthfix测试标记";
-        insert_msg(&repo, MSG_BASE + 51, CH_DIRECT, &format!("你好 {} 收到", kw), 1_780_200_000_000, false).await;
+        insert_msg(
+            &repo,
+            MSG_BASE + 51,
+            CH_DIRECT,
+            &format!("你好 {} 收到", kw),
+            1_780_200_000_000,
+            false,
+        )
+        .await;
 
         let tq = repo.search_tokens_tsquery(kw).await.expect("tokenize");
-        let hits = repo.search_visible(DU1, None, &tq, &format!("%{}%", kw), None, 10)
-            .await.expect("global search");
-        assert_eq!(hits.len(), 1, "direct_user1 must see the message despite missing participants");
+        let hits = repo
+            .search_visible(DU1, None, &tq, &format!("%{}%", kw), None, 10)
+            .await
+            .expect("global search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "direct_user1 must see the message despite missing participants"
+        );
         assert_eq!(hits[0].channel_id, CH_DIRECT as i64);
 
         // 非成员不可见
-        let outsider = repo.search_visible(DOUT, None, &tq, &format!("%{}%", kw), None, 10)
-            .await.expect("outsider search");
-        assert!(outsider.iter().all(|h| h.channel_id != CH_DIRECT as i64),
-            "non-participant of the direct channel must not see it");
+        let outsider = repo
+            .search_visible(DOUT, None, &tq, &format!("%{}%", kw), None, 10)
+            .await
+            .expect("outsider search");
+        assert!(
+            outsider.iter().all(|h| h.channel_id != CH_DIRECT as i64),
+            "non-participant of the direct channel must not see it"
+        );
 
         // 严格模式：给该 Direct 会话插一个脏 participant(非 direct_user1/2)，它不该获得
         // 可见性(participants 对 Direct 不作旁路)。
@@ -1846,16 +1906,24 @@ mod client_search_tests {
         sqlx::query("INSERT INTO privchat_channel_participants (channel_id, user_id, role) VALUES ($1, $2, 2)")
             .bind(CH_DIRECT as i64).bind(DSTRAY as i64)
             .execute(repo.pool.as_ref()).await.expect("insert stray participant");
-        let stray = repo.search_visible(DSTRAY, None, &tq, &format!("%{}%", kw), None, 10)
-            .await.expect("stray search");
-        assert!(stray.iter().all(|h| h.channel_id != CH_DIRECT as i64),
-            "strict: a stray participant of a direct channel must NOT see it");
+        let stray = repo
+            .search_visible(DSTRAY, None, &tq, &format!("%{}%", kw), None, 10)
+            .await
+            .expect("stray search");
+        assert!(
+            stray.iter().all(|h| h.channel_id != CH_DIRECT as i64),
+            "strict: a stray participant of a direct channel must NOT see it"
+        );
 
         clean_channel(&repo, CH_DIRECT).await;
     }
 
     async fn clean_channel(repo: &PgMessageRepository, ch: u64) {
-        for tbl in ["privchat_messages", "privchat_channel_participants", "privchat_channels"] {
+        for tbl in [
+            "privchat_messages",
+            "privchat_channel_participants",
+            "privchat_channels",
+        ] {
             let _ = sqlx::query(&format!("DELETE FROM {} WHERE channel_id = $1", tbl))
                 .bind(ch as i64)
                 .execute(repo.pool.as_ref())
@@ -1896,14 +1964,48 @@ mod client_search_tests {
         ensure_channel(repo, CH_OTHER, USER_B, USER_C).await;
 
         let t0 = 1_780_000_000_000_i64; // 固定基准时间（default 分区）
-        insert_msg(repo, MSG_BASE + 1, CH_MINE, &format!("早一条 {} A", KW), t0 + 1000, false).await;
-        insert_msg(repo, MSG_BASE + 2, CH_MINE, &format!("晚一条 {} B", KW), t0 + 2000, false).await;
-        insert_msg(repo, MSG_BASE + 3, CH_MINE, &format!("已撤回 {} C", KW), t0 + 3000, true).await;
-        insert_msg(repo, MSG_BASE + 4, CH_OTHER, &format!("别人频道 {} D", KW), t0 + 4000, false)
-            .await;
+        insert_msg(
+            repo,
+            MSG_BASE + 1,
+            CH_MINE,
+            &format!("早一条 {} A", KW),
+            t0 + 1000,
+            false,
+        )
+        .await;
+        insert_msg(
+            repo,
+            MSG_BASE + 2,
+            CH_MINE,
+            &format!("晚一条 {} B", KW),
+            t0 + 2000,
+            false,
+        )
+        .await;
+        insert_msg(
+            repo,
+            MSG_BASE + 3,
+            CH_MINE,
+            &format!("已撤回 {} C", KW),
+            t0 + 3000,
+            true,
+        )
+        .await;
+        insert_msg(
+            repo,
+            MSG_BASE + 4,
+            CH_OTHER,
+            &format!("别人频道 {} D", KW),
+            t0 + 4000,
+            false,
+        )
+        .await;
 
         let tq = repo.search_tokens_tsquery(KW).await.expect("tokenize");
-        assert!(!tq.is_empty(), "tokenizer must produce tokens (migration 011 applied?)");
+        assert!(
+            !tq.is_empty(),
+            "tokenizer must produce tokens (migration 011 applied?)"
+        );
         (tq, format!("%{}%", KW))
     }
 
@@ -1921,7 +2023,11 @@ mod client_search_tests {
             .search_visible(USER_A, None, &tq, &pattern, None, 10)
             .await
             .expect("global search");
-        assert_eq!(hits.len(), 2, "revoked + non-member channel must be invisible");
+        assert_eq!(
+            hits.len(),
+            2,
+            "revoked + non-member channel must be invisible"
+        );
         assert_eq!(hits[0].message_id, MSG_BASE + 2, "DESC: newest first");
         assert_eq!(hits[1].message_id, MSG_BASE + 1);
         assert!(hits.iter().all(|h| h.channel_id == CH_MINE as i64));
@@ -1954,38 +2060,69 @@ mod client_search_tests {
         const GID: u64 = 987_663_001;
         clean_channel(&repo, CH_GROUP).await;
         let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
-            .bind(GID as i64).execute(repo.pool.as_ref()).await;
+            .bind(GID as i64)
+            .execute(repo.pool.as_ref())
+            .await;
         sqlx::query("INSERT INTO privchat_groups (group_id, name, owner_id, qr_key) VALUES ($1, 'g', $2, $3)")
             .bind(GID as i64).bind(USER_B as i64).bind(format!("qg{}", GID % 1_000_000))
             .execute(repo.pool.as_ref()).await.expect("insert group");
-        sqlx::query("INSERT INTO privchat_channels (channel_id, channel_type, group_id) VALUES ($1, 1, $2)")
-            .bind(CH_GROUP as i64).bind(GID as i64)
-            .execute(repo.pool.as_ref()).await.expect("insert group channel");
+        sqlx::query(
+            "INSERT INTO privchat_channels (channel_id, channel_type, group_id) VALUES ($1, 1, $2)",
+        )
+        .bind(CH_GROUP as i64)
+        .bind(GID as i64)
+        .execute(repo.pool.as_ref())
+        .await
+        .expect("insert group channel");
         sqlx::query("INSERT INTO privchat_channel_participants (channel_id, user_id, role) VALUES ($1, $2, 2)")
             .bind(CH_GROUP as i64).bind(USER_A as i64)
             .execute(repo.pool.as_ref()).await.expect("insert group participant");
         // 群退群不可见只在 GLOBAL(EXISTS participants left_at) 生效——CHANNEL scope 不做
         // 成员过滤(信任调用方已过 ensure_channel_visible)。用独立 marker 避免撞 CH_MINE 的 KW。
         let gkw = "groupleavemark测试标记";
-        insert_msg(&repo, MSG_BASE + 61, CH_GROUP, &format!("群里 {} B", gkw), 1_780_300_000_000, false).await;
-        let gtq = repo.search_tokens_tsquery(gkw).await.expect("tokenize group kw");
+        insert_msg(
+            &repo,
+            MSG_BASE + 61,
+            CH_GROUP,
+            &format!("群里 {} B", gkw),
+            1_780_300_000_000,
+            false,
+        )
+        .await;
+        let gtq = repo
+            .search_tokens_tsquery(gkw)
+            .await
+            .expect("tokenize group kw");
         let gpat = format!("%{}%", gkw);
 
-        let in_group = repo.search_visible(USER_A, None, &gtq, &gpat, None, 10)
-            .await.expect("group search");
-        assert_eq!(in_group.len(), 1, "active group member must see the message");
+        let in_group = repo
+            .search_visible(USER_A, None, &gtq, &gpat, None, 10)
+            .await
+            .expect("group search");
+        assert_eq!(
+            in_group.len(),
+            1,
+            "active group member must see the message"
+        );
         assert_eq!(in_group[0].channel_id, CH_GROUP as i64);
         // 退群(left_at=1) → GLOBAL 不可见(群认 participants，无 direct 兜底)
         sqlx::query("UPDATE privchat_channel_participants SET left_at = 1 WHERE channel_id = $1 AND user_id = $2")
             .bind(CH_GROUP as i64).bind(USER_A as i64)
             .execute(repo.pool.as_ref()).await.expect("mark left");
-        let after_leave = repo.search_visible(USER_A, None, &gtq, &gpat, None, 10)
-            .await.expect("search after leave");
-        assert!(after_leave.is_empty(), "left group member must lose search visibility");
+        let after_leave = repo
+            .search_visible(USER_A, None, &gtq, &gpat, None, 10)
+            .await
+            .expect("search after leave");
+        assert!(
+            after_leave.is_empty(),
+            "left group member must lose search visibility"
+        );
 
         clean_channel(&repo, CH_GROUP).await;
         let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
-            .bind(GID as i64).execute(repo.pool.as_ref()).await;
+            .bind(GID as i64)
+            .execute(repo.pool.as_ref())
+            .await;
         cleanup(&repo).await;
     }
 
@@ -2016,8 +2153,15 @@ mod client_search_tests {
         let t0 = 1_780_100_000_000_i64;
         // 五条按时间排开 + 一条与 anchor 同毫秒但 id 更大（验证 tie-break）
         for (i, dt) in [(1, 1000), (2, 2000), (3, 3000), (4, 4000), (5, 5000)] {
-            insert_msg(&repo, MSG_BASE + 10 + i, CH_AROUND, &format!("ctx-{}", i), t0 + dt, false)
-                .await;
+            insert_msg(
+                &repo,
+                MSG_BASE + 10 + i,
+                CH_AROUND,
+                &format!("ctx-{}", i),
+                t0 + dt,
+                false,
+            )
+            .await;
         }
         insert_msg(&repo, MSG_BASE + 19, CH_AROUND, "ctx-tie", t0 + 3000, false).await;
 
@@ -2028,7 +2172,10 @@ mod client_search_tests {
             .expect("before");
         // DESC：ctx-2, ctx-1（同毫秒 id 更大的 ctx-tie 不属于 before）
         assert_eq!(
-            before.iter().map(|m| m.message_id as i64).collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|m| m.message_id as i64)
+                .collect::<Vec<_>>(),
             vec![MSG_BASE + 12, MSG_BASE + 11]
         );
 
@@ -2038,7 +2185,10 @@ mod client_search_tests {
             .expect("after");
         // ASC：同毫秒但 id 更大的 ctx-tie 先于 ctx-4/ctx-5
         assert_eq!(
-            after.iter().map(|m| m.message_id as i64).collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|m| m.message_id as i64)
+                .collect::<Vec<_>>(),
             vec![MSG_BASE + 19, MSG_BASE + 14, MSG_BASE + 15]
         );
 

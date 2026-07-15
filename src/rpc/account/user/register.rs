@@ -182,13 +182,7 @@ pub async fn handle(
     // 8.1 签发 refresh token（B1 non-rotation，typ=refresh，长 TTL）
     let refresh_token = services
         .jwt_service
-        .issue_refresh_token(
-            user_id,
-            device_id,
-            "privchat-internal",
-            &app_id,
-            1,
-        )
+        .issue_refresh_token(user_id, device_id, "privchat-internal", &app_id, 1)
         .map_err(|e| RpcError::internal(format!("生成 refresh token 失败: {}", e)))?;
 
     tracing::debug!(
@@ -264,6 +258,7 @@ pub async fn handle(
                         Ok(_) => {
                             if let Some(sync_service) = get_global_sync_service() {
                                 let commit = privchat_protocol::rpc::sync::ServerCommit {
+                                    event_id: None,
                                     pts,
                                     server_msg_id: message_id,
                                     local_message_id: Some(message_id),
@@ -276,6 +271,8 @@ pub async fn handle(
                                     server_timestamp: now.timestamp_millis(),
                                     sender_id: crate::config::SYSTEM_USER_ID,
                                     sender_info: None,
+                                    event_schema_version: None,
+                                    canonical_event: None,
                                 };
                                 if let Err(e) = sync_service.record_existing_commit(&commit).await {
                                     tracing::warn!(

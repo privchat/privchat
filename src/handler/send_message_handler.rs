@@ -15,7 +15,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::Result;
 use crate::context::RequestContext;
 use crate::error::ServerError;
 use crate::handler::MessageHandler;
@@ -27,6 +26,7 @@ use crate::repository::{AtomicMessageCommitRequest, PgMessageRepository};
 use crate::service::message_history_service::{MessageHistoryRecord, MessageHistoryService};
 use crate::service::sync::get_global_sync_service;
 use crate::service::{OfflineQueueService, UnreadCountService};
+use crate::Result;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use privchat_protocol::error_code::ErrorCode;
@@ -240,7 +240,9 @@ impl SendMessageHandler {
         payload_from_uid: u64,
     ) -> std::result::Result<(u64, String), ErrorCode> {
         let (uid_str, device) = session.ok_or(ErrorCode::AuthRequired)?;
-        let uid = uid_str.parse::<u64>().map_err(|_| ErrorCode::AuthRequired)?;
+        let uid = uid_str
+            .parse::<u64>()
+            .map_err(|_| ErrorCode::AuthRequired)?;
         if device.is_empty() {
             return Err(ErrorCode::AuthRequired);
         }
@@ -1397,11 +1399,17 @@ impl MessageHandler for SendMessageHandler {
             }
         };
 
-        let message = tx_result.message;
+        let crate::repository::message_repo::AtomicMessageCommitResult {
+            message,
+            inserted,
+            event_id,
+            event_schema_version,
+            canonical_event,
+        } = tx_result;
         let pts = message.pts.unwrap_or(0).max(0) as u64;
         let message_record = Self::message_to_history_record(&message);
 
-        if !tx_result.inserted {
+        if !inserted {
             info!(
                 "🔄 SendMessageHandler: 并发 DB 幂等命中 - user={}, local_message_id={}, message_id={}, pts={}",
                 from_uid, send_message_request.local_message_id, message.message_id, pts
@@ -1428,6 +1436,7 @@ impl MessageHandler for SendMessageHandler {
         );
 
         let commit = privchat_protocol::rpc::sync::ServerCommit {
+            event_id,
             pts,
             server_msg_id: message.message_id,
             local_message_id: Some(send_message_request.local_message_id),
@@ -1438,6 +1447,8 @@ impl MessageHandler for SendMessageHandler {
             server_timestamp: message.created_at.timestamp_millis(),
             sender_id: from_uid,
             sender_info: None,
+            event_schema_version,
+            canonical_event,
         };
 
         if let Some(sync_service) = get_global_sync_service() {
