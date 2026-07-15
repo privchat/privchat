@@ -89,9 +89,7 @@ pub async fn handle(
     // 3. 三方一致性校验（防越权置顶外群消息）：
     //    request.channel_id 必须就是本群的群聊 channel，message 也必须属于该 channel。
     if request.channel_id != channel.id {
-        return Err(RpcError::validation(
-            "channel_id 不属于该群".to_string(),
-        ));
+        return Err(RpcError::validation("channel_id 不属于该群".to_string()));
     }
 
     // 4. 校验消息存在且属于本群对应的 channel
@@ -232,15 +230,16 @@ pub async fn handle_list(
 
     let items = rows
         .into_iter()
-        .map(|(message_id, channel_id, pinned_by, pinned_at)| PinnedMessageItem {
-            message_id: message_id as u64,
-            channel_id: channel_id as u64,
-            pinned_by: pinned_by as u64,
-            pinned_at: pinned_at as u64,
-        })
+        .map(
+            |(message_id, channel_id, pinned_by, pinned_at)| PinnedMessageItem {
+                message_id: message_id as u64,
+                channel_id: channel_id as u64,
+                pinned_by: pinned_by as u64,
+                pinned_at: pinned_at as u64,
+            },
+        )
         .collect();
 
     let response = MessagePinListResponse { group_id, items };
-    serde_json::to_value(response)
-        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+    serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }

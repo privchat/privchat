@@ -40,7 +40,9 @@ fn generate_qr_key_uses_base62_alphabet_only() {
 #[test]
 fn generate_qr_key_does_not_embed_user_or_group_id_patterns() {
     // 抽样 64 次，不能有可推断的前缀模式或者全数字（base62 应该高熵）
-    let prefixes: HashSet<_> = (0..64).map(|_| generate_qr_key()[..4].to_string()).collect();
+    let prefixes: HashSet<_> = (0..64)
+        .map(|_| generate_qr_key()[..4].to_string())
+        .collect();
     assert!(prefixes.len() > 32, "qr_key prefix entropy too low");
     let all_digits: bool = (0..64).any(|_| generate_qr_key().chars().all(|c| c.is_ascii_digit()));
     // 不强行断言，但有数字-only 的概率 ~ 1e-14；这是健康度量
@@ -51,7 +53,10 @@ fn generate_qr_key_does_not_embed_user_or_group_id_patterns() {
 fn generate_qr_key_does_not_collide_in_1k_samples() {
     let mut seen = HashSet::new();
     for _ in 0..1000 {
-        assert!(seen.insert(generate_qr_key()), "qr_key collision in 1k samples");
+        assert!(
+            seen.insert(generate_qr_key()),
+            "qr_key collision in 1k samples"
+        );
     }
 }
 
@@ -271,7 +276,10 @@ fn build_qrkey_with_special_chars_is_percent_encoded() {
         "expected percent-encoded special chars in path tail, got: {out}"
     );
     // 不再生成 query string
-    assert!(!out.contains('?'), "v1.4 must not generate ?qrkey= query, got: {out}");
+    assert!(
+        !out.contains('?'),
+        "v1.4 must not generate ?qrkey= query, got: {out}"
+    );
 }
 
 #[test]

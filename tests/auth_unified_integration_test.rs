@@ -48,7 +48,11 @@ fn unique_phone(prefix: &str) -> String {
         .unwrap()
         .as_nanos();
     // E.164: prefix 含 `+` 与国家码，再补 9 位号码
-    format!("{}{}", prefix, format!("{:012}", nanos % 1_000_000_000_000)[..9].to_string())
+    format!(
+        "{}{}",
+        prefix,
+        format!("{:012}", nanos % 1_000_000_000_000)[..9].to_string()
+    )
 }
 
 /// 先调 `/api/service/users` 创建一个测试 user，返回 server 分配的 uid。
@@ -166,9 +170,7 @@ async fn jwks_is_public_and_well_formed() {
     let client = Client::new();
     let (status, body) = get_no_envelope(&client, "/api/service/auth/jwks").await;
     assert_eq!(status, StatusCode::OK);
-    let keys = body["keys"]
-        .as_array()
-        .expect("keys must be array");
+    let keys = body["keys"].as_array().expect("keys must be array");
     assert!(!keys.is_empty(), "JWKS keys array 不能为空");
     let k = &keys[0];
     assert_eq!(k["kty"].as_str(), Some("RSA"));
@@ -188,10 +190,22 @@ async fn issue_introspect_refresh_round_trip() {
     let uid = create_test_user(&client).await;
 
     // issue
-    let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
+    let r = post_json(
+        &client,
+        "/api/service/auth/issue",
+        issue_body(uid, None),
+        true,
+    )
+    .await;
     let data = r.ok_data();
-    let access = data["access_token"].as_str().expect("access_token").to_string();
-    let refresh = data["refresh_token"].as_str().expect("refresh_token").to_string();
+    let access = data["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_string();
+    let refresh = data["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_string();
     let device_id = data["device_id"].as_str().expect("device_id").to_string();
     assert_eq!(data["user_id"].as_u64(), Some(uid));
     assert_eq!(data["session_version"].as_i64(), Some(1));
@@ -221,7 +235,10 @@ async fn issue_introspect_refresh_round_trip() {
     )
     .await;
     let data = r.ok_data();
-    let new_access = data["access_token"].as_str().expect("new access").to_string();
+    let new_access = data["access_token"]
+        .as_str()
+        .expect("new access")
+        .to_string();
     assert_ne!(new_access, access, "refresh 必须返回新的 access_token");
     // 非 rotation：refresh_token 原样返回
     assert_eq!(data["refresh_token"].as_str(), Some(refresh.as_str()));
@@ -244,7 +261,13 @@ async fn revoke_by_jti_invalidates_refresh() {
     let client = Client::new();
     let uid = create_test_user(&client).await;
 
-    let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
+    let r = post_json(
+        &client,
+        "/api/service/auth/issue",
+        issue_body(uid, None),
+        true,
+    )
+    .await;
     let data = r.ok_data();
     let refresh = data["refresh_token"].as_str().unwrap().to_string();
     let device_id = data["device_id"].as_str().unwrap().to_string();
@@ -293,7 +316,13 @@ async fn bump_sessions_invalidates_old_access() {
     let client = Client::new();
     let uid = create_test_user(&client).await;
 
-    let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
+    let r = post_json(
+        &client,
+        "/api/service/auth/issue",
+        issue_body(uid, None),
+        true,
+    )
+    .await;
     let data = r.ok_data();
     let access = data["access_token"].as_str().unwrap().to_string();
 
@@ -331,7 +360,13 @@ async fn bump_sessions_invalidates_old_access() {
 async fn introspect_tampered_token_returns_signature_invalid() {
     let client = Client::new();
     let uid = create_test_user(&client).await;
-    let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
+    let r = post_json(
+        &client,
+        "/api/service/auth/issue",
+        issue_body(uid, None),
+        true,
+    )
+    .await;
     let access = r.ok_data()["access_token"].as_str().unwrap().to_string();
 
     // 在签名段最后改一字符
@@ -383,7 +418,13 @@ async fn revoke_requires_exactly_one_of_jti_or_refresh_token() {
 async fn refresh_with_wrong_device_id_fails() {
     let client = Client::new();
     let uid = create_test_user(&client).await;
-    let r = post_json(&client, "/api/service/auth/issue", issue_body(uid, None), true).await;
+    let r = post_json(
+        &client,
+        "/api/service/auth/issue",
+        issue_body(uid, None),
+        true,
+    )
+    .await;
     let refresh = r.ok_data()["refresh_token"].as_str().unwrap().to_string();
 
     let r = post_json(

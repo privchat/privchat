@@ -45,8 +45,8 @@ use crate::infra::{
 };
 use crate::model::pts::{PtsGenerator, UserMessageIndex};
 use crate::repository::UserRepository;
-use crate::service::sync::SyncService;
 use crate::service::qr_login_service::QrLoginService;
+use crate::service::sync::SyncService;
 use crate::service::{
     ApprovalService, BlacklistService, ChannelService, FileService, FriendService,
     MessageHistoryService, MessageService, OfflineQueueService, PresenceService, PrivacyService,
@@ -459,7 +459,10 @@ mod channel_visibility_tests {
             "non-member and missing channel must share the same error code (anti-oracle)"
         );
         // 文案除 channel_id 外必须一致：把 id 归一化后比对
-        let norm = |m: &str| m.replace(&CH.to_string(), "<id>").replace(&MISSING_CH.to_string(), "<id>");
+        let norm = |m: &str| {
+            m.replace(&CH.to_string(), "<id>")
+                .replace(&MISSING_CH.to_string(), "<id>")
+        };
         assert_eq!(
             norm(non_member_err.message()),
             norm(missing_err.message()),

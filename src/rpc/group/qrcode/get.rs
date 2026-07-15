@@ -14,9 +14,7 @@
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::qr::{build_qr_url, QrAction, QrEntity};
 use crate::rpc::RpcServiceContext;
-use privchat_protocol::rpc::group::qrcode::{
-    GroupQRCodeGetRequest, GroupQRCodeGetResponse,
-};
+use privchat_protocol::rpc::group::qrcode::{GroupQRCodeGetRequest, GroupQRCodeGetResponse};
 use serde_json::{json, Value};
 
 pub async fn handle(
@@ -44,14 +42,13 @@ pub async fn handle(
     }
 
     // 2. 读 qr_key
-    let qr_key: String = sqlx::query_scalar::<_, String>(
-        "SELECT qr_key FROM privchat_groups WHERE group_id = $1",
-    )
-    .bind(group_id as i64)
-    .fetch_optional(services.channel_service.pool())
-    .await
-    .map_err(|e| RpcError::internal(format!("读取群 qr_key 失败: {}", e)))?
-    .ok_or_else(|| RpcError::not_found("群组不存在".to_string()))?;
+    let qr_key: String =
+        sqlx::query_scalar::<_, String>("SELECT qr_key FROM privchat_groups WHERE group_id = $1")
+            .bind(group_id as i64)
+            .fetch_optional(services.channel_service.pool())
+            .await
+            .map_err(|e| RpcError::internal(format!("读取群 qr_key 失败: {}", e)))?
+            .ok_or_else(|| RpcError::not_found("群组不存在".to_string()))?;
 
     // 3. 用配置的 qr_base_url 拼 URL（normalize 已在启动期跑过）
     let qr_code = build_qr_url(

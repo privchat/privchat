@@ -146,11 +146,11 @@ impl QrLoginService {
     async fn load_scene(&self, scene_id: &str) -> Result<QrScene> {
         if let Some(redis) = &self.redis {
             let raw = redis.get(&Self::redis_key(scene_id)).await?;
-            let mut scene: QrScene = raw
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .ok_or_else(|| {
-                    ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id))
-                })?;
+            let mut scene: QrScene =
+                raw.and_then(|s| serde_json::from_str(&s).ok())
+                    .ok_or_else(|| {
+                        ServerError::NotFound(format!("QR_SCENE_NOT_FOUND: {}", scene_id))
+                    })?;
             Self::expire_if_due(&mut scene);
             return Ok(scene);
         }
@@ -165,11 +165,14 @@ impl QrLoginService {
     /// 写回 scene（Redis SETEX 到 scene 剩余寿命 / DashMap upsert）。
     async fn store_scene(&self, scene: &QrScene) -> Result<()> {
         if let Some(redis) = &self.redis {
-            let payload = serde_json::to_string(scene).map_err(|e| {
-                ServerError::Internal(format!("序列化 qr scene 失败: {}", e))
-            })?;
+            let payload = serde_json::to_string(scene)
+                .map_err(|e| ServerError::Internal(format!("序列化 qr scene 失败: {}", e)))?;
             redis
-                .setex(&Self::redis_key(&scene.scene_id), Self::ttl_secs_for(scene), &payload)
+                .setex(
+                    &Self::redis_key(&scene.scene_id),
+                    Self::ttl_secs_for(scene),
+                    &payload,
+                )
                 .await?;
             return Ok(());
         }
@@ -223,7 +226,11 @@ impl QrLoginService {
         // 存储失败（Redis 抖动）只 warn，返回 scene——create 不该因存储瞬时失败硬失败；
         // 后续 scan 会 NotFound，Web 重新生成二维码。
         if let Err(e) = self.store_scene(&scene).await {
-            tracing::warn!("qr create_scene 存储失败 scene_id={}: {}", scene.scene_id, e);
+            tracing::warn!(
+                "qr create_scene 存储失败 scene_id={}: {}",
+                scene.scene_id,
+                e
+            );
         }
         scene
     }
@@ -429,7 +436,8 @@ impl QrLoginService {
             }
         }
         for scene in to_publish {
-            self.publish_now(scene, "qr_login.expired", None, true).await;
+            self.publish_now(scene, "qr_login.expired", None, true)
+                .await;
         }
     }
 
@@ -506,7 +514,9 @@ mod tests {
     #[tokio::test]
     async fn create_then_scan_then_confirm() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
+        let scene = svc
+            .create_scene("login".into(), "web-1".into(), make_device(), None)
+            .await;
         assert_eq!(scene.state, QrSceneState::Created);
 
         let r = svc
@@ -533,9 +543,18 @@ mod tests {
     #[tokio::test]
     async fn reject_after_scan() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
+        let scene = svc
+            .create_scene("login".into(), "web-1".into(), make_device(), None)
+            .await;
         let r = svc
-            .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+            .scan_scene(
+                &scene.scene_id,
+                100,
+                "ios-1".into(),
+                &scene.qr_token,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let rejected = svc
@@ -548,9 +567,18 @@ mod tests {
     #[tokio::test]
     async fn scan_with_wrong_qr_token_rejected() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
+        let scene = svc
+            .create_scene("login".into(), "web-1".into(), make_device(), None)
+            .await;
         let err = svc
-            .scan_scene(&scene.scene_id, 100, "ios-1".into(), "wrong-token", None, None)
+            .scan_scene(
+                &scene.scene_id,
+                100,
+                "ios-1".into(),
+                "wrong-token",
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(format!("{}", err).contains("QR_TOKEN_MISMATCH"));
@@ -559,9 +587,18 @@ mod tests {
     #[tokio::test]
     async fn confirm_by_different_scanner_rejected() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
+        let scene = svc
+            .create_scene("login".into(), "web-1".into(), make_device(), None)
+            .await;
         let r = svc
-            .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+            .scan_scene(
+                &scene.scene_id,
+                100,
+                "ios-1".into(),
+                &scene.qr_token,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let err = svc
@@ -574,9 +611,18 @@ mod tests {
     #[tokio::test]
     async fn confirm_token_single_use() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), None).await;
+        let scene = svc
+            .create_scene("login".into(), "web-1".into(), make_device(), None)
+            .await;
         let r = svc
-            .scan_scene(&scene.scene_id, 100, "ios-1".into(), &scene.qr_token, None, None)
+            .scan_scene(
+                &scene.scene_id,
+                100,
+                "ios-1".into(),
+                &scene.qr_token,
+                None,
+                None,
+            )
             .await
             .unwrap();
         svc.confirm_scene(&scene.scene_id, 100, "ios-1", &r.confirm_token)
@@ -594,8 +640,8 @@ mod tests {
     /// B 扫码 + 确认，证明 scene 状态不再绑单进程内存。Redis 不可用则 skip。
     #[tokio::test]
     async fn redis_backed_scene_crosses_instances() {
-        let url = std::env::var("REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let cfg = crate::config::RedisConfig {
             url,
             pool_size: 4,
@@ -623,7 +669,14 @@ mod tests {
         assert_eq!(seen.state, QrSceneState::Created);
         // B 扫码 → scanned
         let r = inst_b
-            .scan_scene(&scene.scene_id, 777, "ios-x".into(), &scene.qr_token, None, None)
+            .scan_scene(
+                &scene.scene_id,
+                777,
+                "ios-x".into(),
+                &scene.qr_token,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(r.scene.state, QrSceneState::Scanned);
@@ -642,7 +695,9 @@ mod tests {
     #[tokio::test]
     async fn expired_after_ttl_marks_state() {
         let svc = QrLoginService::new();
-        let scene = svc.create_scene("login".into(), "web-1".into(), make_device(), Some(1)).await;
+        let scene = svc
+            .create_scene("login".into(), "web-1".into(), make_device(), Some(1))
+            .await;
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let s = svc.get_scene(&scene.scene_id).await.unwrap();
         assert_eq!(s.state, QrSceneState::Expired);

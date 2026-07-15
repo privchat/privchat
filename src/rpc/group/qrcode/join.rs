@@ -65,15 +65,13 @@ pub async fn handle(
     }
 
     // 1. 反查 group_id —— qr_key 是 privchat_groups 表上的 UNIQUE 字段。
-    let group_id: u64 = sqlx::query_scalar::<_, i64>(
-        "SELECT group_id FROM privchat_groups WHERE qr_key = $1",
-    )
-    .bind(&qr_key)
-    .fetch_optional(services.channel_service.pool())
-    .await
-    .map_err(|e| RpcError::internal(format!("查询群二维码失败: {}", e)))?
-    .ok_or_else(|| RpcError::not_found("二维码无效或已被旋转".to_string()))?
-    as u64;
+    let group_id: u64 =
+        sqlx::query_scalar::<_, i64>("SELECT group_id FROM privchat_groups WHERE qr_key = $1")
+            .bind(&qr_key)
+            .fetch_optional(services.channel_service.pool())
+            .await
+            .map_err(|e| RpcError::internal(format!("查询群二维码失败: {}", e)))?
+            .ok_or_else(|| RpcError::not_found("二维码无效或已被旋转".to_string()))? as u64;
 
     tracing::debug!(
         "✅ 二维码反查成功: qr_key={}, group_id={}",

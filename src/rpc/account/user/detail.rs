@@ -81,9 +81,7 @@ pub async fn handle(
                 .map_err(|_| RpcError::validation(format!("Invalid share_id: {}", source_id)))?;
             UserDetailSource::CardShare { share_id }
         }
-        DetailSourceType::FriendPending => {
-            UserDetailSource::Friend { friend_id: None }
-        }
+        DetailSourceType::FriendPending => UserDetailSource::Friend { friend_id: None },
         DetailSourceType::Conversation => {
             let channel_id = source_id
                 .parse::<u64>()

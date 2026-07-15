@@ -51,12 +51,12 @@ use msgtrans::protocol::WebSocketClientConfig;
 use msgtrans::transport::client::TransportClientBuilder;
 use msgtrans::transport::TransportOptions;
 use msgtrans::ClientEvent;
+use privchat_protocol::decode_message;
 use privchat_protocol::protocol::{MessageType, RpcRequest, RpcResponse};
 use privchat_protocol::rpc::qr_login::{
     QrLoginCreateSceneRequest, QrLoginCreateSceneResponse, QrLoginPushEvent,
 };
 use privchat_protocol::rpc::routes;
-use privchat_protocol::decode_message;
 use serde_json::Value;
 
 #[derive(Debug)]
@@ -166,9 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Err(format!("create_scene failed (code={})", resp.code).into());
     }
-    let data = resp
-        .data
-        .ok_or("create_scene response.data is empty")?;
+    let data = resp.data.ok_or("create_scene response.data is empty")?;
     let scene: QrLoginCreateSceneResponse = serde_json::from_slice(&data)?;
 
     eprintln!("[smoke] scene created:");

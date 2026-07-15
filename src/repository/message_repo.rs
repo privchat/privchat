@@ -19,10 +19,10 @@
 
 use crate::error::DatabaseError;
 use crate::model::message::Message;
+use privchat_protocol::rpc::sync::ServerCommit;
 use privchat_protocol::{
     CanonicalTimelineEvent, FlatBufferMessage, CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
 };
-use privchat_protocol::rpc::sync::ServerCommit;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -730,10 +730,9 @@ impl PgMessageRepository {
             .event
             .to_legacy_commit(request.channel_id, request.channel_type)
             .map_err(|e| DatabaseError::Database(format!("legacy event projection failed: {e}")))?;
-        let canonical_event = request
-            .event
-            .encode_fb()
-            .map_err(|e| DatabaseError::Database(format!("canonical event encoding failed: {e}")))?;
+        let canonical_event = request.event.encode_fb().map_err(|e| {
+            DatabaseError::Database(format!("canonical event encoding failed: {e}"))
+        })?;
         let now = chrono::Utc::now().timestamp_millis();
         let mut tx = self
             .pool
@@ -2317,15 +2316,13 @@ mod atomic_dispatch_tests {
                 client_registry_claim: None,
                 attachment_file_ids: Vec::new(),
                 channel_type: 2,
-                event: CanonicalTimelineEvent::NewMessage(
-                    privchat_protocol::NewMessageEvent {
-                        message_type: privchat_protocol::ContentMessageType::Text,
-                        payload: privchat_protocol::MessagePayloadEnvelope::from_legacy(
-                            &legacy,
-                            privchat_protocol::ContentMessageType::Text,
-                        ),
-                    },
-                ),
+                event: CanonicalTimelineEvent::NewMessage(privchat_protocol::NewMessageEvent {
+                    message_type: privchat_protocol::ContentMessageType::Text,
+                    payload: privchat_protocol::MessagePayloadEnvelope::from_legacy(
+                        &legacy,
+                        privchat_protocol::ContentMessageType::Text,
+                    ),
+                }),
                 sender_username: None,
             })
             .await

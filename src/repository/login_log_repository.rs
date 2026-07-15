@@ -207,7 +207,11 @@ impl LoginLogRepository {
     /// refresh access token 时新 token 的 jti 是新的，但 device_id 不变。如果发现该
     /// (user_id, device_id) 已经有任意 login_log 记录（含正在记录的当前条），就视为
     /// 非首次登录——不发"您的账号在 xxx 设备登录了"系统提醒。
-    pub async fn has_prior_device_login(&self, user_id: i64, device_id: uuid::Uuid) -> Result<bool> {
+    pub async fn has_prior_device_login(
+        &self,
+        user_id: i64,
+        device_id: uuid::Uuid,
+    ) -> Result<bool> {
         let result = sqlx::query!(
             r#"
             SELECT EXISTS(
@@ -338,6 +342,59 @@ impl LoginLogRepository {
         let logs = query_builder.fetch_all(&*self.db_pool).await?;
 
         Ok(logs)
+    }
+
+    /// Count login logs with the same filters used by [get_user_logs].
+    pub async fn count_user_logs(&self, query: &LoginLogQuery) -> Result<i64> {
+        let mut sql = String::from("SELECT COUNT(*) FROM privchat_login_logs WHERE 1=1");
+        let mut bind_count = 0;
+
+        if query.user_id.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND user_id = ${}", bind_count));
+        }
+        if query.device_id.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND device_id = ${}", bind_count));
+        }
+        if query.ip_address.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND ip_address = ${}", bind_count));
+        }
+        if query.status.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND status = ${}", bind_count));
+        }
+        if query.start_time.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND created_at >= ${}", bind_count));
+        }
+        if query.end_time.is_some() {
+            bind_count += 1;
+            sql.push_str(&format!(" AND created_at <= ${}", bind_count));
+        }
+
+        let mut query_builder = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(user_id) = query.user_id {
+            query_builder = query_builder.bind(user_id);
+        }
+        if let Some(device_id) = query.device_id {
+            query_builder = query_builder.bind(device_id);
+        }
+        if let Some(ip_address) = &query.ip_address {
+            query_builder = query_builder.bind(ip_address);
+        }
+        if let Some(status) = query.status {
+            query_builder = query_builder.bind(status);
+        }
+        if let Some(start_time) = query.start_time {
+            query_builder = query_builder.bind(start_time);
+        }
+        if let Some(end_time) = query.end_time {
+            query_builder = query_builder.bind(end_time);
+        }
+
+        Ok(query_builder.fetch_one(&*self.db_pool).await?)
     }
 
     /// 根据 log_id 获取登录日志详情（管理 API）

@@ -536,11 +536,7 @@ impl StreamingUpload {
             let _ = writer.close().await;
         }
         if let Err(e) = self.op.delete(&self.file_path).await {
-            tracing::warn!(
-                "⚠️ 清理中止上传的半文件失败 path={}: {}",
-                self.file_path,
-                e
-            );
+            tracing::warn!("⚠️ 清理中止上传的半文件失败 path={}: {}", self.file_path, e);
         }
     }
 }

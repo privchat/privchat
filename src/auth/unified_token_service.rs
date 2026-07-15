@@ -29,7 +29,9 @@ use uuid::Uuid;
 use crate::auth::token_service::{
     IssueClaims, TokenService, VerifyError, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH,
 };
-use crate::auth::{Device, DeviceInfo, DeviceManagerDb, DeviceType, SessionState, SessionVerifyResult};
+use crate::auth::{
+    Device, DeviceInfo, DeviceManagerDb, DeviceType, SessionState, SessionVerifyResult,
+};
 use crate::error::{Result, ServerError};
 use crate::repository::{hash_refresh_token, RefreshTokenRepository};
 
@@ -188,7 +190,10 @@ impl UnifiedTokenService {
             self.devices.register_or_update_device(&device).await?;
 
         // 3) 决定 scope / audience（spec §6.1.1：trusted application 透传，server 不二次审）
-        let scope = params.scope.clone().unwrap_or_else(|| vec!["user".to_string()]);
+        let scope = params
+            .scope
+            .clone()
+            .unwrap_or_else(|| vec!["user".to_string()]);
         let audience = params
             .audience
             .clone()
@@ -208,12 +213,14 @@ impl UnifiedTokenService {
 
         // 5) 签 access + refresh
         // Phase A：access TTL 走 config 默认；params.access_ttl_secs 仅日后扩展用，这里保留接口不消费
-        let access = self.rsa.issue_access(issue_claims.clone()).map_err(|e| {
-            ServerError::Internal(format!("TokenService access 签发失败: {}", e))
-        })?;
-        let refresh = self.rsa.issue_refresh(issue_claims).map_err(|e| {
-            ServerError::Internal(format!("TokenService refresh 签发失败: {}", e))
-        })?;
+        let access = self
+            .rsa
+            .issue_access(issue_claims.clone())
+            .map_err(|e| ServerError::Internal(format!("TokenService access 签发失败: {}", e)))?;
+        let refresh = self
+            .rsa
+            .issue_refresh(issue_claims)
+            .map_err(|e| ServerError::Internal(format!("TokenService refresh 签发失败: {}", e)))?;
 
         // 6) refresh 落库（永不存明文，spec §11.2）
         let now_ms = Utc::now().timestamp_millis();
@@ -328,12 +335,7 @@ impl UnifiedTokenService {
                 self.refresh_repo
                     .touch_last_used(&claims.jti, now_ms)
                     .await
-                    .map_err(|e| {
-                        ServerError::Internal(format!(
-                            "更新 last_used_at 失败: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(|e| ServerError::Internal(format!("更新 last_used_at 失败: {}", e)))?;
 
                 Ok(IssueResult {
                     user_id,
@@ -351,15 +353,12 @@ impl UnifiedTokenService {
                     kid: self.rsa.kid().to_string(),
                 })
             }
-            SessionVerifyResult::DeviceNotFound => Err(ServerError::Unauthorized(
-                "设备不存在".to_string(),
-            )),
-            SessionVerifyResult::SessionInactive { message, .. } => {
-                Err(ServerError::Unauthorized(format!(
-                    "设备会话已失效: {}",
-                    message
-                )))
+            SessionVerifyResult::DeviceNotFound => {
+                Err(ServerError::Unauthorized("设备不存在".to_string()))
             }
+            SessionVerifyResult::SessionInactive { message, .. } => Err(ServerError::Unauthorized(
+                format!("设备会话已失效: {}", message),
+            )),
             SessionVerifyResult::VersionMismatch { .. } => Err(ServerError::Unauthorized(
                 "session_version 已 bump，refresh 已失效".to_string(),
             )),
@@ -453,9 +452,7 @@ impl UnifiedTokenService {
                 .refresh_repo
                 .revoke_by_jti(&jti, "revoked_by_jti", now_ms)
                 .await
-                .map_err(|e| {
-                    ServerError::Internal(format!("revoke by jti 失败: {}", e))
-                }),
+                .map_err(|e| ServerError::Internal(format!("revoke by jti 失败: {}", e))),
             RevokeRequest::ByRefreshToken { refresh_token } => {
                 let token_hash = hash_refresh_token(&refresh_token);
                 self.refresh_repo
@@ -473,12 +470,8 @@ impl UnifiedTokenService {
 fn verify_to_error(e: VerifyError) -> ServerError {
     match e {
         VerifyError::Expired => ServerError::Unauthorized("token 已过期".to_string()),
-        VerifyError::UnknownKid => {
-            ServerError::Unauthorized("token kid 未知".to_string())
-        }
-        VerifyError::Invalid => {
-            ServerError::Unauthorized("token 验签失败".to_string())
-        }
+        VerifyError::UnknownKid => ServerError::Unauthorized("token kid 未知".to_string()),
+        VerifyError::Invalid => ServerError::Unauthorized("token 验签失败".to_string()),
     }
 }
 

@@ -41,17 +41,17 @@ use crate::auth::{IssueTokenRequest, IssueTokenResponse};
 use crate::error::{Result, ServerError};
 use crate::http::dto::admin as dto;
 use crate::http::dto::qr_login as qr_dto;
-use crate::http::{ApiEnvelope, ApiResult, AdminServerState};
+use crate::http::{AdminServerState, ApiEnvelope, ApiResult};
 use axum::{
+    Router,
     extract::{ConnectInfo, Path, Query, State},
     http::HeaderMap,
     response::Json,
     routing::{delete, get, post, put},
-    Router,
 };
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};
@@ -94,10 +94,7 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/room", post(create_room_channel))
         .route("/room", get(list_room_channels))
         .route("/room/{channel_id}", get(get_room_channel))
-        .route(
-            "/room/{channel_id}/broadcast",
-            post(room_broadcast),
-        )
+        .route("/room/{channel_id}/broadcast", post(room_broadcast))
         // 好友管理
         .route("/friendships", post(create_friendship)) // 创建好友关系
         .route("/friendships", get(list_friendships))
@@ -138,10 +135,7 @@ pub fn create_route() -> Router<AdminServerState> {
             put(set_group_member_role),
         )
         // === P0: 消息撤回 + 系统消息 ===
-        .route(
-            "/messages/{message_id}/revoke",
-            post(revoke_message),
-        )
+        .route("/messages/{message_id}/revoke", post(revoke_message))
         .route("/messages/send-system", post(send_system_message))
         .route("/messages/send", post(send_message))
         .route(
@@ -151,10 +145,7 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/system-messages/senders", get(list_system_senders))
         // === P0: 安全管控 ===
         .route("/security/shadow-banned", get(list_shadow_banned))
-        .route(
-            "/security/shadow-ban/{user_id}",
-            delete(unshadow_ban_user),
-        )
+        .route("/security/shadow-ban/{user_id}", delete(unshadow_ban_user))
         .route(
             "/security/users/{user_id}/state",
             get(get_user_security_state),
@@ -166,19 +157,13 @@ pub fn create_route() -> Router<AdminServerState> {
         // === P0: 在线状态 ===
         .route("/presence/online-count", get(get_online_count))
         .route("/presence/users", get(list_online_users))
-        .route(
-            "/presence/user/{user_id}",
-            get(get_user_connection),
-        )
+        .route("/presence/user/{user_id}", get(get_user_connection))
         // === P1: 用户资源 ===
         .route("/users/{user_id}/friends", get(get_user_friends))
         .route("/users/{user_id}/devices", get(get_user_devices))
         .route("/users/{user_id}/groups", get(get_user_groups))
         // === P1: 会话管理 ===
-        .route(
-            "/users/{user_id}/channels",
-            get(list_user_channels),
-        )
+        .route("/users/{user_id}/channels", get(list_user_channels))
         .route("/channels/{channel_id}", get(get_channel))
         .route(
             "/channels/{channel_id}/participants",
@@ -194,7 +179,10 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/qr-login/scenes", post(create_qr_scene))
         .route("/qr-login/scenes/{scene_id}", get(get_qr_scene))
         .route("/qr-login/scenes/{scene_id}/scan", post(scan_qr_scene))
-        .route("/qr-login/scenes/{scene_id}/confirm", post(confirm_qr_scene))
+        .route(
+            "/qr-login/scenes/{scene_id}/confirm",
+            post(confirm_qr_scene),
+        )
         .route("/qr-login/scenes/{scene_id}/reject", post(reject_qr_scene))
         .route(
             "/qr-login/scenes/{scene_id}/push-authorized",
@@ -207,7 +195,10 @@ pub fn create_route() -> Router<AdminServerState> {
 // =====================================================
 
 /// 从请求头中提取并验证 Service Key
-pub(crate) async fn verify_service_key(headers: &HeaderMap, state: &AdminServerState) -> Result<()> {
+pub(crate) async fn verify_service_key(
+    headers: &HeaderMap,
+    state: &AdminServerState,
+) -> Result<()> {
     let key = headers
         .get("X-Service-Key")
         .or_else(|| headers.get("x-service-key"))
@@ -355,7 +346,10 @@ async fn issue_token_for_user(
 
     // 校验 uid 存在（404 USER_NOT_FOUND）
     if !state.user_service.exists(user_id).await? {
-        return Err(ServerError::NotFound(format!("USER_NOT_FOUND: uid {}", user_id)));
+        return Err(ServerError::NotFound(format!(
+            "USER_NOT_FOUND: uid {}",
+            user_id
+        )));
     }
 
     let request = IssueTokenRequest {
@@ -447,7 +441,10 @@ async fn bump_user_sessions(
     verify_service_key(&headers, &state).await?;
 
     if !state.user_service.exists(user_id).await? {
-        return Err(ServerError::NotFound(format!("USER_NOT_FOUND: uid {}", user_id)));
+        return Err(ServerError::NotFound(format!(
+            "USER_NOT_FOUND: uid {}",
+            user_id
+        )));
     }
 
     let reason = body
@@ -1023,9 +1020,7 @@ async fn room_broadcast(
                     crate::infra::next_packet_id(),
                     (*bytes).clone(),
                 );
-                packet.set_biz_type(
-                    privchat_protocol::protocol::MessageType::PublishRequest as u8,
-                );
+                packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
                 match server.send_to_session(sid.clone(), packet).await {
                     Ok(()) => {
                         debug!("📡 Room publish -> session {} 成功", sid);
@@ -1253,6 +1248,12 @@ async fn list_login_logs(
         offset: Some(offset),
     };
 
+    let total = state
+        .login_log_repository
+        .count_user_logs(&query)
+        .await
+        .map_err(|e| ServerError::Database(format!("统计登录日志失败: {}", e)))?;
+
     let logs = state
         .login_log_repository
         .get_user_logs(query)
@@ -1280,7 +1281,7 @@ async fn list_login_logs(
 
     Ok(ApiEnvelope::ok(json!({
         "logs": log_list,
-        "total": log_list.len(),
+        "total": total,
         "page": page,
         "page_size": page_size,
     })))
@@ -1499,10 +1500,7 @@ async fn get_user_devices(
 /// 获取系统统计信息
 ///
 /// GET /api/service/stats
-async fn get_stats(
-    State(state): State<AdminServerState>,
-    headers: HeaderMap,
-) -> ApiResult<Value> {
+async fn get_stats(State(state): State<AdminServerState>, headers: HeaderMap) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
     // 用户数
@@ -2049,7 +2047,10 @@ async fn list_shadow_banned(
 
     let total = users.len();
 
-    Ok(ApiEnvelope::ok(dto::ListShadowBannedResponse { users, total }))
+    Ok(ApiEnvelope::ok(dto::ListShadowBannedResponse {
+        users,
+        total,
+    }))
 }
 
 /// 解除用户的 Shadow Ban
@@ -2360,12 +2361,7 @@ async fn get_user_connection(
 
     let connections = state.connection_manager.get_user_connections(user_id).await;
 
-    let user_info = state
-        .user_service
-        .find_by_id(user_id)
-        .await
-        .ok()
-        .flatten();
+    let user_info = state.user_service.find_by_id(user_id).await.ok().flatten();
 
     Ok(ApiEnvelope::ok(dto::UserConnectionResponse {
         user_id,
@@ -2707,21 +2703,16 @@ async fn list_system_senders(
 ///
 /// **底线**：普通用户（user_type=0）禁止作为系统消息 sender，否则后台可以伪造任意
 /// 用户身份发消息。spec SYSTEM_MESSAGE_ADMIN_SPEC §5（v1.5 sender 多元化）。
-async fn ensure_system_sender(
-    state: &AdminServerState,
-    sender_id: u64,
-) -> Result<i16> {
-    let user_type: Option<i16> = sqlx::query_scalar(
-        r#"SELECT user_type FROM privchat_users WHERE user_id = $1"#,
-    )
-    .bind(sender_id as i64)
-    .fetch_optional(state.channel_service.pool())
-    .await
-    .map_err(|e| ServerError::Database(format!("查询 sender 失败: {}", e)))?;
+async fn ensure_system_sender(state: &AdminServerState, sender_id: u64) -> Result<i16> {
+    let user_type: Option<i16> =
+        sqlx::query_scalar(r#"SELECT user_type FROM privchat_users WHERE user_id = $1"#)
+            .bind(sender_id as i64)
+            .fetch_optional(state.channel_service.pool())
+            .await
+            .map_err(|e| ServerError::Database(format!("查询 sender 失败: {}", e)))?;
 
-    let user_type = user_type.ok_or_else(|| {
-        ServerError::NotFound(format!("sender_id {} 不存在", sender_id))
-    })?;
+    let user_type = user_type
+        .ok_or_else(|| ServerError::NotFound(format!("sender_id {} 不存在", sender_id)))?;
 
     if !matches!(user_type, 1 | 2) {
         return Err(ServerError::Validation(format!(
@@ -2816,16 +2807,17 @@ async fn create_qr_scene(
 ) -> ApiResult<qr_dto::QrSceneResponse> {
     verify_service_key(&headers, &state).await?;
     if request.device_id.trim().is_empty() {
-        return Err(ServerError::Validation(
-            "device_id 不能为空".to_string(),
-        ));
+        return Err(ServerError::Validation("device_id 不能为空".to_string()));
     }
-    let scene = state.qr_login_service.create_scene(
-        request.purpose,
-        request.device_id,
-        request.device_info.into_snapshot(),
-        request.ttl,
-    ).await;
+    let scene = state
+        .qr_login_service
+        .create_scene(
+            request.purpose,
+            request.device_id,
+            request.device_info.into_snapshot(),
+            request.ttl,
+        )
+        .await;
     Ok(ApiEnvelope::ok(qr_dto::QrSceneResponse {
         rpc_topic: scene.rpc_topic(),
         scene_id: scene.scene_id,
@@ -2861,14 +2853,17 @@ async fn scan_qr_scene(
     Json(request): Json<qr_dto::ScanQrSceneRequest>,
 ) -> ApiResult<qr_dto::ScanQrSceneResponse> {
     verify_service_key(&headers, &state).await?;
-    let result = state.qr_login_service.scan_scene(
-        &scene_id,
-        request.scanner_uid,
-        request.scanner_device_id,
-        &request.qr_token,
-        request.scanner_avatar,
-        request.scanner_display_name,
-    ).await?;
+    let result = state
+        .qr_login_service
+        .scan_scene(
+            &scene_id,
+            request.scanner_uid,
+            request.scanner_device_id,
+            &request.qr_token,
+            request.scanner_avatar,
+            request.scanner_display_name,
+        )
+        .await?;
     Ok(ApiEnvelope::ok(qr_dto::ScanQrSceneResponse {
         scene_id: result.scene.scene_id,
         state: result.scene.state,
@@ -2886,12 +2881,15 @@ async fn confirm_qr_scene(
     Json(request): Json<qr_dto::ConfirmQrSceneRequest>,
 ) -> ApiResult<qr_dto::ConfirmQrSceneResponse> {
     verify_service_key(&headers, &state).await?;
-    let scene = state.qr_login_service.confirm_scene(
-        &scene_id,
-        request.scanner_uid,
-        &request.scanner_device_id,
-        &request.confirm_token,
-    ).await?;
+    let scene = state
+        .qr_login_service
+        .confirm_scene(
+            &scene_id,
+            request.scanner_uid,
+            &request.scanner_device_id,
+            &request.confirm_token,
+        )
+        .await?;
     let uid = scene.scanner_uid.unwrap_or_default();
     Ok(ApiEnvelope::ok(qr_dto::ConfirmQrSceneResponse {
         scene_id: scene.scene_id,
@@ -2910,11 +2908,10 @@ async fn reject_qr_scene(
     Json(request): Json<qr_dto::RejectQrSceneRequest>,
 ) -> ApiResult<qr_dto::RejectQrSceneResponse> {
     verify_service_key(&headers, &state).await?;
-    let scene = state.qr_login_service.reject_scene(
-        &scene_id,
-        request.scanner_uid,
-        &request.confirm_token,
-    ).await?;
+    let scene = state
+        .qr_login_service
+        .reject_scene(&scene_id, request.scanner_uid, &request.confirm_token)
+        .await?;
     Ok(ApiEnvelope::ok(qr_dto::RejectQrSceneResponse {
         scene_id: scene.scene_id,
         state: scene.state,

@@ -95,8 +95,12 @@ impl ApprovalService {
         let mut gi = self.group_requests_index.write().await;
         let mut ui = self.user_requests_index.write().await;
         for req in pending {
-            gi.entry(req.group_id).or_default().push(req.request_id.clone());
-            ui.entry(req.user_id).or_default().push(req.request_id.clone());
+            gi.entry(req.group_id)
+                .or_default()
+                .push(req.request_id.clone());
+            ui.entry(req.user_id)
+                .or_default()
+                .push(req.request_id.clone());
             jr.insert(req.request_id.clone(), req);
         }
         info!("🔄 群审批启动恢复：从 DB 加载 {} 条 pending 申请进缓存", n);
@@ -446,7 +450,9 @@ mod tests {
             .create_join_request(
                 group,
                 1001,
-                JoinMethod::QRCode { qr_code_id: "qr_x".into() },
+                JoinMethod::QRCode {
+                    qr_code_id: "qr_x".into(),
+                },
                 Some("我想加入".into()),
                 Some(24),
             )
@@ -469,16 +475,34 @@ mod tests {
         };
         let group = uniq_group();
         let req = service
-            .create_join_request(group, 1002, JoinMethod::QRCode { qr_code_id: "qr_y".into() }, None, None)
+            .create_join_request(
+                group,
+                1002,
+                JoinMethod::QRCode {
+                    qr_code_id: "qr_y".into(),
+                },
+                None,
+                None,
+            )
             .await
             .unwrap();
-        let approved = service.approve_request(&req.request_id, 9001).await.unwrap();
+        let approved = service
+            .approve_request(&req.request_id, 9001)
+            .await
+            .unwrap();
         assert_eq!(approved.status, JoinRequestStatus::Approved);
 
         // 重启后不应再是 pending（DB 已 UPDATE status=approved）。
         let fresh = ApprovalService::new(repo.clone());
         fresh.load_pending().await.unwrap();
-        assert_eq!(fresh.get_pending_requests_by_group(group).await.unwrap().len(), 0);
+        assert_eq!(
+            fresh
+                .get_pending_requests_by_group(group)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
         assert_eq!(
             repo.get(&req.request_id).await.unwrap().unwrap().status,
             JoinRequestStatus::Approved
@@ -492,7 +516,15 @@ mod tests {
         };
         let group = uniq_group();
         let req = service
-            .create_join_request(group, 1003, JoinMethod::MemberInvite { inviter_id: "bob".into() }, None, None)
+            .create_join_request(
+                group,
+                1003,
+                JoinMethod::MemberInvite {
+                    inviter_id: "bob".into(),
+                },
+                None,
+                None,
+            )
             .await
             .unwrap();
         let rejected = service

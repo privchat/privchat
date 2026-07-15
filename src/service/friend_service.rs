@@ -172,11 +172,7 @@ impl FriendService {
     ///
     /// 返回 `true` 表示真的有 pending 行被改；`false` 表示没找到 pending（已
     /// 过期 / 已被接受 / 已被撤回 / 从未存在）—— 调用方据此决定提示语义。
-    pub async fn reject_friend_request(
-        &self,
-        user_id: u64,
-        from_user_id: u64,
-    ) -> Result<bool> {
+    pub async fn reject_friend_request(&self, user_id: u64, from_user_id: u64) -> Result<bool> {
         info!("🛑 用户 {} 拒绝来自 {} 的好友申请", user_id, from_user_id);
 
         let now = chrono::Utc::now().timestamp_millis();
@@ -443,7 +439,19 @@ impl FriendService {
 
     /// 获取与某用户的好友关系（用于列表返回 source_type/source_id）
     pub async fn get_friendship(&self, user_id: u64, friend_id: u64) -> Option<Friendship> {
-        let row = sqlx::query_as::<_, (i64, i64, i16, Option<String>, Option<String>, Option<String>, i64, i64)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                i64,
+                i64,
+                i16,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+                i64,
+            ),
+        >(
             r#"
             SELECT user_id, friend_id, status, source, source_id, alias, created_at, updated_at
             FROM privchat_friendships
@@ -465,11 +473,18 @@ impl FriendService {
     }
 
     /// 设置好友备注
-    pub async fn set_alias(&self, user_id: u64, friend_id: u64, alias: Option<String>) -> Result<bool> {
+    pub async fn set_alias(
+        &self,
+        user_id: u64,
+        friend_id: u64,
+        alias: Option<String>,
+    ) -> Result<bool> {
         // 先检查好友关系
         let is_friend = self.is_friend(user_id, friend_id).await;
         if !is_friend {
-            return Err(ServerError::Validation("不是好友关系，无法设置备注".to_string()));
+            return Err(ServerError::Validation(
+                "不是好友关系，无法设置备注".to_string(),
+            ));
         }
 
         let alias_val = alias.filter(|a| !a.trim().is_empty());
@@ -490,7 +505,9 @@ impl FriendService {
 
         tracing::info!(
             "✅ 设置好友备注: user_id={}, friend_id={}, alias={:?}",
-            user_id, friend_id, alias_val
+            user_id,
+            friend_id,
+            alias_val
         );
 
         Ok(true)

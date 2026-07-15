@@ -75,12 +75,7 @@ impl TransferSendBackend for CannedBackend {
     async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
         self.is_room_member
     }
-    async fn deliver(
-        &self,
-        target_user_id: u64,
-        channel_id: u64,
-        encoded_packet: &[u8],
-    ) -> usize {
+    async fn deliver(&self, target_user_id: u64, channel_id: u64, encoded_packet: &[u8]) -> usize {
         let mut g = self.capture.lock().await;
         g.target_user_id = Some(target_user_id);
         g.channel_id = Some(channel_id);

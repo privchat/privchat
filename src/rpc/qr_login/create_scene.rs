@@ -33,9 +33,7 @@ use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use crate::service::qr_login_service::WebDeviceSnapshot;
 use msgtrans::SessionId;
-use privchat_protocol::rpc::qr_login::{
-    QrLoginCreateSceneRequest, QrLoginCreateSceneResponse,
-};
+use privchat_protocol::rpc::qr_login::{QrLoginCreateSceneRequest, QrLoginCreateSceneResponse};
 use serde_json::Value;
 
 pub async fn handle(
@@ -47,9 +45,7 @@ pub async fn handle(
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
     if request.web_device_id.trim().is_empty() {
-        return Err(RpcError::validation(
-            "web_device_id 不能为空".to_string(),
-        ));
+        return Err(RpcError::validation("web_device_id 不能为空".to_string()));
     }
 
     let session_id = parse_session_id(ctx.session_id.as_deref()).ok_or_else(|| {
@@ -70,12 +66,15 @@ pub async fn handle(
         ip_address: None,
     };
 
-    let scene = services.qr_login_service.create_scene(
-        request.purpose,
-        request.web_device_id,
-        snapshot,
-        request.ttl_secs,
-    ).await;
+    let scene = services
+        .qr_login_service
+        .create_scene(
+            request.purpose,
+            request.web_device_id,
+            snapshot,
+            request.ttl_secs,
+        )
+        .await;
 
     services
         .qr_login_publisher

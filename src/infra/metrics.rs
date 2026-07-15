@@ -137,7 +137,9 @@ pub fn spawn_tokio_task_sampler(interval_secs: u64) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
         loop {
             tick.tick().await;
-            let n = tokio::runtime::Handle::current().metrics().num_alive_tasks() as u64;
+            let n = tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks() as u64;
             record_tokio_alive_tasks(n);
         }
     });

@@ -109,7 +109,10 @@ pub async fn handle(
                 continue;
             }
 
-            let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload_bytes.clone());
+            let mut packet = msgtrans::packet::Packet::one_way(
+                crate::infra::next_packet_id(),
+                payload_bytes.clone(),
+            );
             packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
             match server.send_to_session(sid.clone(), packet).await {
                 Ok(()) => {

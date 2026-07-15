@@ -238,10 +238,7 @@ mod tests {
         let online = tracker.on_device_connected(1003, "ios-1").await.unwrap();
         let before_last_seen = online.last_seen_at;
 
-        let offline = tracker
-            .on_device_disconnected(1003, "ios-1")
-            .await
-            .unwrap();
+        let offline = tracker.on_device_disconnected(1003, "ios-1").await.unwrap();
 
         assert!(!offline.is_online);
         assert_eq!(offline.device_count, 0);
@@ -262,18 +259,12 @@ mod tests {
         assert_eq!(second.device_count, 2);
         assert_eq!(second.version, 2);
 
-        let one_left = tracker
-            .on_device_disconnected(1004, "ios-1")
-            .await
-            .unwrap();
+        let one_left = tracker.on_device_disconnected(1004, "ios-1").await.unwrap();
         assert!(one_left.is_online);
         assert_eq!(one_left.device_count, 1);
         assert_eq!(one_left.version, 3);
 
-        let offline = tracker
-            .on_device_disconnected(1004, "web-1")
-            .await
-            .unwrap();
+        let offline = tracker.on_device_disconnected(1004, "web-1").await.unwrap();
         assert!(!offline.is_online);
         assert_eq!(offline.device_count, 0);
         assert_eq!(offline.version, 4);

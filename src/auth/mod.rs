@@ -22,12 +22,12 @@ pub mod device_manager_db;
 pub mod models;
 pub mod password;
 pub mod service_key_manager;
-pub mod token_service;
-pub mod unified_token_service;
 pub mod session_state;
 pub mod token;
 pub mod token_issue_service;
 pub mod token_revocation;
+pub mod token_service;
+pub mod unified_token_service;
 
 // 重新导出主要类型
 pub use device_manager::{DeviceManager, DeviceStats};
@@ -38,13 +38,13 @@ pub use models::{
 };
 pub use password::{hash_password, verify_password, PASSWORD_COST};
 pub use service_key_manager::{ServiceKeyManager, ServiceKeyStrategy};
+pub use session_state::{KickReason, KickedDevice, SessionState, SessionVerifyResult};
+pub use token::TokenAuth;
+pub use token_issue_service::TokenIssueService;
+pub use token_revocation::TokenRevocationService;
 pub use token_service::{
     IssueClaims, IssuedToken, JwkRsa, JwkSet, TokenService, UnifiedTokenClaims, VerifyError,
 };
 pub use unified_token_service::{
     IntrospectResult, IssueParams, IssueResult, RevokeRequest, UnifiedTokenService,
 };
-pub use session_state::{KickReason, KickedDevice, SessionState, SessionVerifyResult};
-pub use token::TokenAuth;
-pub use token_issue_service::TokenIssueService;
-pub use token_revocation::TokenRevocationService;

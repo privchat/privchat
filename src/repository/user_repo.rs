@@ -424,7 +424,10 @@ impl UserRepository {
                             ));
                         }
                     }
-                    return Err(DatabaseError::Database(format!("Failed to create user: {}", e)));
+                    return Err(DatabaseError::Database(format!(
+                        "Failed to create user: {}",
+                        e
+                    )));
                 }
             }
         }

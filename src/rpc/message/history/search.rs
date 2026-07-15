@@ -247,7 +247,14 @@ pub async fn handle(
     // ---- 查询（statement_timeout=4s + tokio 6s 双兜底）----
     let hits = tokio::time::timeout(
         SEARCH_TIMEOUT,
-        repo.search_visible(user_id, scope_channel, &tsquery, &ilike_pattern, cursor, limit),
+        repo.search_visible(
+            user_id,
+            scope_channel,
+            &tsquery,
+            &ilike_pattern,
+            cursor,
+            limit,
+        ),
     )
     .await
     .map_err(|_| {
@@ -312,7 +319,10 @@ mod tests {
 
     #[test]
     fn cursor_roundtrip_and_rejects_garbage() {
-        assert_eq!(parse_cursor("1751900000000:598433").unwrap(), (1751900000000, 598433));
+        assert_eq!(
+            parse_cursor("1751900000000:598433").unwrap(),
+            (1751900000000, 598433)
+        );
         assert!(parse_cursor("abc").is_err());
         assert!(parse_cursor("1:0").is_err());
         assert!(parse_cursor("-1:5").is_err());
@@ -327,7 +337,10 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         let (s, e) = ranges[0];
         let chars: Vec<char> = snippet.chars().collect();
-        assert_eq!(chars[s as usize..e as usize].iter().collect::<String>(), "福寿");
+        assert_eq!(
+            chars[s as usize..e as usize].iter().collect::<String>(),
+            "福寿"
+        );
 
         // 大小写不敏感
         let (snippet, ranges) = build_snippet("Hello WORLD", "world");

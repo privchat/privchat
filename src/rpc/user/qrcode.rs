@@ -36,14 +36,13 @@ pub async fn get(
 ) -> RpcResult<Value> {
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
 
-    let qr_key: String = sqlx::query_scalar::<_, String>(
-        "SELECT qr_key FROM privchat_users WHERE user_id = $1",
-    )
-    .bind(user_id as i64)
-    .fetch_optional(services.channel_service.pool())
-    .await
-    .map_err(|e| RpcError::internal(format!("读取 qr_key 失败: {}", e)))?
-    .ok_or_else(|| RpcError::not_found("用户不存在".to_string()))?;
+    let qr_key: String =
+        sqlx::query_scalar::<_, String>("SELECT qr_key FROM privchat_users WHERE user_id = $1")
+            .bind(user_id as i64)
+            .fetch_optional(services.channel_service.pool())
+            .await
+            .map_err(|e| RpcError::internal(format!("读取 qr_key 失败: {}", e)))?
+            .ok_or_else(|| RpcError::not_found("用户不存在".to_string()))?;
 
     let qr_code = build_qr_url(
         &services.config.qr_base_url,
@@ -68,14 +67,13 @@ pub async fn refresh(
 ) -> RpcResult<Value> {
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
 
-    let old_qr_key: String = sqlx::query_scalar::<_, String>(
-        "SELECT qr_key FROM privchat_users WHERE user_id = $1",
-    )
-    .bind(user_id as i64)
-    .fetch_optional(services.channel_service.pool())
-    .await
-    .map_err(|e| RpcError::internal(format!("读取旧 qr_key 失败: {}", e)))?
-    .ok_or_else(|| RpcError::not_found("用户不存在".to_string()))?;
+    let old_qr_key: String =
+        sqlx::query_scalar::<_, String>("SELECT qr_key FROM privchat_users WHERE user_id = $1")
+            .bind(user_id as i64)
+            .fetch_optional(services.channel_service.pool())
+            .await
+            .map_err(|e| RpcError::internal(format!("读取旧 qr_key 失败: {}", e)))?
+            .ok_or_else(|| RpcError::not_found("用户不存在".to_string()))?;
 
     let mut last_err: Option<sqlx::Error> = None;
     let mut new_qr_key: Option<String> = None;
@@ -100,10 +98,7 @@ pub async fn refresh(
                 continue;
             }
             Err(e) => {
-                return Err(RpcError::internal(format!(
-                    "UPDATE qr_key failed: {}",
-                    e
-                )));
+                return Err(RpcError::internal(format!("UPDATE qr_key failed: {}", e)));
             }
         }
     }

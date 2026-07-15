@@ -163,9 +163,7 @@ impl ServerError {
             ServerError::Internal(_) => P::InternalError,
             ServerError::Authentication(_) => P::AuthRequired,
             ServerError::Authorization(_) => P::PermissionDenied,
-            ServerError::Validation(msg) => {
-                subcode_from_message(msg).unwrap_or(P::InvalidParams)
-            }
+            ServerError::Validation(msg) => subcode_from_message(msg).unwrap_or(P::InvalidParams),
             ServerError::UserNotFound(_) => P::UserNotFound,
             ServerError::ChannelNotFound(_) => P::ChannelNotFound,
             ServerError::MessageNotFound(_) => P::MessageNotFound,
@@ -191,9 +189,7 @@ impl ServerError {
             ServerError::Unauthorized(_) => P::AuthRequired,
             ServerError::Protocol(_) => P::ProtocolError,
             ServerError::BadRequest(_) => P::InvalidParams,
-            ServerError::NotFound(msg) => {
-                subcode_from_message(msg).unwrap_or(P::ResourceNotFound)
-            }
+            ServerError::NotFound(msg) => subcode_from_message(msg).unwrap_or(P::ResourceNotFound),
             ServerError::Forbidden(_) => P::PermissionDenied,
             ServerError::InvalidDeviceId => P::InvalidParams,
             ServerError::InvalidDeviceType => P::InvalidParams,

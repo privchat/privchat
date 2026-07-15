@@ -71,11 +71,7 @@ impl BotFollowRepository {
     }
 
     /// 按 (user_id, bot_user_id) 取一行；不区分 status。
-    pub async fn find(
-        &self,
-        user_id: u64,
-        bot_user_id: u64,
-    ) -> Result<Option<BotFollowRecord>> {
+    pub async fn find(&self, user_id: u64, bot_user_id: u64) -> Result<Option<BotFollowRecord>> {
         let row = sqlx::query_as::<_, BotFollowRecord>(
             r#"
             SELECT id, user_id, bot_user_id, channel_id, status,
@@ -163,12 +159,7 @@ impl BotFollowRepository {
 
     /// 把已存在的 followed 行翻成 unfollowed。
     /// 返回受影响行数：0 = 行不存在 / 已 unfollowed，1 = 翻转成功。
-    pub async fn set_unfollowed(
-        &self,
-        user_id: u64,
-        bot_user_id: u64,
-        now_ms: i64,
-    ) -> Result<u64> {
+    pub async fn set_unfollowed(&self, user_id: u64, bot_user_id: u64, now_ms: i64) -> Result<u64> {
         let res = sqlx::query(
             r#"
             UPDATE privchat_bot_follow

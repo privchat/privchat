@@ -31,10 +31,8 @@ pub async fn register_routes(services: RpcServiceContext) {
     search::register_routes(services.clone()).await; // 用户搜索接口
     privacy::register_routes(services.clone()).await; // 隐私设置接口
     bot::register_routes(services.clone()).await; // Bot 关注 / 取消关注（spec SERVICE_ACCOUNT_FOLLOW_SPEC）
-                                                      // TODO: 暂时注释 profile 模块
-                                                      // profile::register_routes(services.clone()).await;
+                                                  // TODO: 暂时注释 profile 模块
+                                                  // profile::register_routes(services.clone()).await;
 
-    tracing::debug!(
-        "📋 Account 系统路由注册完成 (user, auth, search, privacy, bot 模块)"
-    );
+    tracing::debug!("📋 Account 系统路由注册完成 (user, auth, search, privacy, bot 模块)");
 }

@@ -109,6 +109,5 @@ pub async fn handle(
     tracing::debug!("✅ 获取群设置成功: group_id={}", group_id);
 
     let response = GroupSettingsGetResponse { group_id, settings };
-    serde_json::to_value(response)
-        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+    serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }

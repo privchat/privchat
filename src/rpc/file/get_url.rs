@@ -31,10 +31,14 @@ pub async fn get_file_url(
 ) -> RpcResult<Value> {
     let user_id = crate::rpc::get_current_user_id(&_ctx)?;
 
-    let request: FileGetUrlRequest =
-        serde_json::from_value(params).map_err(|e| RpcError::validation(format!("参数错误: {}", e)))?;
+    let request: FileGetUrlRequest = serde_json::from_value(params)
+        .map_err(|e| RpcError::validation(format!("参数错误: {}", e)))?;
 
-    tracing::info!("🔗 获取文件 URL: file_id={}, user_id={}", request.file_id, user_id);
+    tracing::info!(
+        "🔗 获取文件 URL: file_id={}, user_id={}",
+        request.file_id,
+        user_id
+    );
 
     // 附件访问授权（ATTACHMENT_ENCRYPTION_SPEC §授权）：本接口返回 CEK，必须校验访问权，
     // 否则任意登录用户拿 file_id 即可解密。方案 A + pending uploader-only fallback：

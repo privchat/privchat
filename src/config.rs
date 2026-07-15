@@ -246,8 +246,7 @@ impl JwtConfig {
                 }
             }
             JwtAlgorithm::Rs256 => {
-                if self.private_key_path.trim().is_empty()
-                    || self.public_key_path.trim().is_empty()
+                if self.private_key_path.trim().is_empty() || self.public_key_path.trim().is_empty()
                 {
                     return Err(
                         "[auth.jwt] algorithm=RS256 但 private_key_path 或 public_key_path 未配置"
@@ -442,8 +441,9 @@ impl ServerConfig {
             self.database.min_connections = value.parse().unwrap_or(self.database.min_connections);
         }
         if let Ok(value) = env::var("PRIVCHAT_DB_ACQUIRE_TIMEOUT_SECONDS") {
-            self.database.acquire_timeout_seconds =
-                value.parse().unwrap_or(self.database.acquire_timeout_seconds);
+            self.database.acquire_timeout_seconds = value
+                .parse()
+                .unwrap_or(self.database.acquire_timeout_seconds);
         }
         if let Ok(value) = env::var("PRIVCHAT_DB_IDLE_TIMEOUT_SECONDS") {
             self.database.idle_timeout_seconds =
@@ -841,8 +841,9 @@ impl ServerConfig {
         //    scheme 校验、禁止预拼 /privchat:protocol）。生产环境强制 https。
         //    failure → server 拒启动。
         let require_https = matches!(cli.env.as_deref(), Some("production") | Some("prod"));
-        config.qr_base_url = crate::rpc::qr::normalize_qr_base_url(&config.qr_base_url, require_https)
-            .map_err(|e| anyhow::anyhow!("[qr_base_url] {}", e))?;
+        config.qr_base_url =
+            crate::rpc::qr::normalize_qr_base_url(&config.qr_base_url, require_https)
+                .map_err(|e| anyhow::anyhow!("[qr_base_url] {}", e))?;
 
         Ok(config)
     }

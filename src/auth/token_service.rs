@@ -188,7 +188,9 @@ impl TokenService {
     /// JWKS 端点返回的 key set。HS256 模式下返回空集合（无对外公开的公钥）。
     pub fn jwks(&self) -> JwkSet {
         match &self.jwk {
-            Some(k) => JwkSet { keys: vec![k.clone()] },
+            Some(k) => JwkSet {
+                keys: vec![k.clone()],
+            },
             None => JwkSet { keys: Vec::new() },
         }
     }
@@ -203,12 +205,7 @@ impl TokenService {
         self.issue_inner(params, TOKEN_TYPE_REFRESH, self.config.refresh_ttl_secs)
     }
 
-    fn issue_inner(
-        &self,
-        params: IssueClaims,
-        typ: &str,
-        ttl_secs: i64,
-    ) -> Result<IssuedToken> {
+    fn issue_inner(&self, params: IssueClaims, typ: &str, ttl_secs: i64) -> Result<IssuedToken> {
         let now = Utc::now().timestamp();
         let exp = now + ttl_secs;
         let jti = Uuid::new_v4().to_string();
@@ -276,20 +273,21 @@ impl TokenService {
         validation.set_audience(&aud_refs);
         validation.leeway = 5;
 
-        let data = decode::<UnifiedTokenClaims>(token, &self.decoding_key, &validation).map_err(
-            |e| match e.kind() {
-                JwtErrorKind::ExpiredSignature => VerifyError::Expired,
-                JwtErrorKind::InvalidSignature
-                | JwtErrorKind::InvalidToken
-                | JwtErrorKind::Base64(_)
-                | JwtErrorKind::Json(_)
-                | JwtErrorKind::Crypto(_) => VerifyError::Invalid,
-                JwtErrorKind::InvalidAudience | JwtErrorKind::InvalidIssuer => {
-                    VerifyError::Invalid
+        let data =
+            decode::<UnifiedTokenClaims>(token, &self.decoding_key, &validation).map_err(|e| {
+                match e.kind() {
+                    JwtErrorKind::ExpiredSignature => VerifyError::Expired,
+                    JwtErrorKind::InvalidSignature
+                    | JwtErrorKind::InvalidToken
+                    | JwtErrorKind::Base64(_)
+                    | JwtErrorKind::Json(_)
+                    | JwtErrorKind::Crypto(_) => VerifyError::Invalid,
+                    JwtErrorKind::InvalidAudience | JwtErrorKind::InvalidIssuer => {
+                        VerifyError::Invalid
+                    }
+                    _ => VerifyError::Invalid,
                 }
-                _ => VerifyError::Invalid,
-            },
-        )?;
+            })?;
 
         if data.claims.token_type != expected_typ {
             return Err(VerifyError::Invalid);

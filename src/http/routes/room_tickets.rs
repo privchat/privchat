@@ -129,9 +129,7 @@ fn validate(req: &IssueTicketRequest) -> Result<(), String> {
     }
     if let Some(scope) = req.scope.as_deref() {
         if scope != SCOPE_SUBSCRIBE {
-            return Err(format!(
-                "scope must be '{SCOPE_SUBSCRIBE}', got '{scope}'"
-            ));
+            return Err(format!("scope must be '{SCOPE_SUBSCRIBE}', got '{scope}'"));
         }
     }
     if let Some(ttl) = req.ttl_secs {
@@ -159,7 +157,11 @@ fn sign_with_kid(
 }
 
 fn ok_envelope(data: IssueTicketResponse) -> Response {
-    (StatusCode::OK, Json(ApiEnvelope::ok(serde_json::json!(data)))).into_response()
+    (
+        StatusCode::OK,
+        Json(ApiEnvelope::ok(serde_json::json!(data))),
+    )
+        .into_response()
 }
 
 fn error_envelope(status: StatusCode, code: u32, message: impl Into<String>) -> Response {
@@ -250,8 +252,7 @@ mod tests {
         };
         let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         let token = sign_with_kid(&cfg, "v1", &claims).expect("sign");
-        let verified =
-            room_ticket::verify(&cfg, &token, 9001, "dev-a").expect("verify");
+        let verified = room_ticket::verify(&cfg, &token, 9001, "dev-a").expect("verify");
         assert_eq!(verified.sub, "100");
         assert_eq!(verified.cid, 9001);
         assert_eq!(verified.did, "dev-a");
