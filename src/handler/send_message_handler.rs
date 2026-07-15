@@ -1376,6 +1376,7 @@ impl MessageHandler for SendMessageHandler {
                 message,
                 // None（local_message_id=0）时事务内不 claim dedup key，退化为无幂等发送。
                 dedup_key: client_dedup_key.clone(),
+                client_registry_claim: None,
                 attachment_file_ids: bind_file_ids,
                 channel_type: channel_type_code as i16,
                 commit_content: commit_content.clone(),

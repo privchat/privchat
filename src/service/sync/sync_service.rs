@@ -26,7 +26,9 @@ use tracing::{debug, info, warn};
 
 use super::{ChannelPtsDao, ClientMsgRegistryDao, CommitLogDao, SyncCache};
 use crate::error::Result;
+use crate::model::message::Message;
 use crate::model::pts::PtsGenerator;
+use crate::repository::{AtomicMessageCommitRequest, ClientRegistryClaim, PgMessageRepository};
 use crate::service::{ChannelService, UnreadCountService};
 
 // 重新导出协议类型
@@ -35,6 +37,7 @@ use privchat_protocol::rpc::sync::{
     ClientSubmitResponse, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
     GetDifferenceResponse, SenderInfo, ServerCommit, ServerDecision,
 };
+use privchat_protocol::{CanonicalTimelineEvent, ContentMessageType, MessageMetadata};
 
 /// 同步服务（完整版本）⭐
 pub struct SyncService {
@@ -58,6 +61,9 @@ pub struct SyncService {
 
     /// 未读计数服务
     unread_count_service: Arc<UnreadCountService>,
+
+    /// Canonical message/commit/outbox transaction boundary.
+    message_repository: Arc<PgMessageRepository>,
 }
 
 impl SyncService {
@@ -70,6 +76,7 @@ impl SyncService {
         cache: Arc<SyncCache>,
         channel_service: Arc<ChannelService>,
         unread_count_service: Arc<UnreadCountService>,
+        message_repository: Arc<PgMessageRepository>,
     ) -> Self {
         Self {
             pts_generator,
@@ -79,6 +86,7 @@ impl SyncService {
             cache,
             channel_service,
             unread_count_service,
+            message_repository,
         }
     }
 
@@ -153,6 +161,108 @@ impl SyncService {
         self.cache.cache_pts(commit.channel_id, commit.pts).await?;
         self.cache.cache_commit(commit).await?;
         Ok(())
+    }
+
+    fn normalize_submit_content_type(command_type: &str) -> ContentMessageType {
+        match command_type.trim().to_ascii_lowercase().as_str() {
+            "audio" => ContentMessageType::File,
+            "contactcard" | "card" => ContentMessageType::ContactCard,
+            "url" => ContentMessageType::Link,
+            value => ContentMessageType::from_str(value).unwrap_or(ContentMessageType::Text),
+        }
+    }
+
+    fn attachment_file_ids(metadata: Option<&MessageMetadata>) -> Vec<u64> {
+        let mut ids = Vec::new();
+        match metadata {
+            Some(MessageMetadata::Image(value)) => {
+                ids.push(value.file_id);
+                if let Some(id) = value.thumbnail_file_id {
+                    ids.push(id);
+                }
+            }
+            Some(MessageMetadata::File(value)) => ids.push(value.file_id),
+            Some(MessageMetadata::Voice(value)) => ids.push(value.file_id),
+            Some(MessageMetadata::Video(value)) => {
+                ids.push(value.file_id);
+                if let Some(id) = value.thumbnail_file_id {
+                    ids.push(id);
+                }
+            }
+            Some(MessageMetadata::Location(value)) => {
+                if let Some(id) = value.thumbnail_file_id {
+                    ids.push(id);
+                }
+            }
+            Some(MessageMetadata::Link(value)) => {
+                if let Some(id) = value.thumbnail_file_id {
+                    ids.push(id);
+                }
+            }
+            _ => {}
+        }
+        ids.retain(|id| *id != 0);
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn message_from_submit(
+        req: &ClientSubmitRequest,
+        sender_id: u64,
+        server_message_id: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Message, Vec<u64>)> {
+        let content_type = Self::normalize_submit_content_type(&req.command_type);
+        let event = CanonicalTimelineEvent::from_legacy(
+            content_type.as_str(),
+            &req.payload,
+            server_message_id,
+            sender_id,
+            now.timestamp_millis(),
+        )
+        .map_err(|error| {
+            crate::error::ServerError::Validation(format!(
+                "invalid sync/submit message payload: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            crate::error::ServerError::Validation(
+                "sync/submit supports only canonical new-message commands".to_string(),
+            )
+        })?;
+        let CanonicalTimelineEvent::NewMessage(event) = event else {
+            return Err(crate::error::ServerError::Validation(
+                "sync/submit mutation commands require their dedicated RPC".to_string(),
+            ));
+        };
+
+        let attachment_file_ids = Self::attachment_file_ids(event.payload.metadata.as_ref());
+        let metadata = event
+            .payload
+            .metadata
+            .as_ref()
+            .map(MessageMetadata::to_inner_json_value)
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        let message = Message {
+            message_id: server_message_id,
+            channel_id: req.channel_id,
+            sender_id,
+            pts: None,
+            local_message_id: Some(req.local_message_id),
+            content: event.payload.content,
+            message_type: event.message_type,
+            metadata,
+            reply_to_message_id: event.payload.reply_to_message_id,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+            deleted_at: None,
+            revoked: false,
+            revoked_at: None,
+            revoked_by: None,
+        };
+        Ok((message, attachment_file_ids))
     }
 
     // ============================================================
@@ -233,57 +343,61 @@ impl SyncService {
             );
         }
 
-        // 6. 生成 server_msg_id（使用 snowflake）
+        // 6. 生成 server_msg_id（使用 snowflake）并构造权威消息投影。
         let server_msg_id = self.generate_msg_id().await;
+        let now = chrono::Utc::now();
+        let (message, attachment_file_ids) =
+            Self::message_from_submit(&req, sender_id, server_msg_id, now)?;
+        let tx_result = self
+            .message_repository
+            .create_message_and_commit_atomic(AtomicMessageCommitRequest {
+                message,
+                dedup_key: None,
+                client_registry_claim: Some(ClientRegistryClaim {
+                    device_id: device_id.to_string(),
+                    decision: "accepted".to_string(),
+                }),
+                attachment_file_ids,
+                channel_type: i16::from(req.channel_type),
+                commit_content: req.payload.clone(),
+                sender_username: None,
+            })
+            .await
+            .map_err(|error| {
+                crate::error::ServerError::Database(format!(
+                    "atomic sync/submit commit failed: {error}"
+                ))
+            })?;
 
-        // 7. 构造 ServerCommit ⭐
-        let mut commit = ServerCommit {
-            event_id: None,
-            pts: 0,
-            server_msg_id,
-            local_message_id: Some(req.local_message_id),
-            channel_id: req.channel_id,
+        let message = tx_result.message;
+        let new_pts = message.pts.unwrap_or(0).max(0) as u64;
+        if !tx_result.inserted {
+            return Ok(ClientSubmitResponse {
+                decision: ServerDecision::Accepted,
+                pts: Some(new_pts),
+                server_msg_id: Some(message.message_id),
+                server_timestamp: message.created_at.timestamp_millis(),
+                local_message_id: req.local_message_id,
+                has_gap,
+                current_pts: server_pts.max(new_pts),
+            });
+        }
+
+        let commit = ServerCommit {
+            event_id: tx_result.event_id,
+            pts: new_pts,
+            server_msg_id: message.message_id,
+            local_message_id: message.local_message_id,
+            channel_id: message.channel_id,
             channel_type: req.channel_type,
-            message_type: req.command_type.clone(),
+            message_type: message.message_type.as_str().to_string(),
             content: req.payload.clone(),
-            server_timestamp: chrono::Utc::now().timestamp_millis(),
+            server_timestamp: message.created_at.timestamp_millis(),
             sender_id,
             sender_info: self.get_sender_info(sender_id).await.ok(),
-            event_schema_version: None,
-            canonical_event: None,
+            event_schema_version: tx_result.event_schema_version,
+            canonical_event: tx_result.canonical_event,
         };
-
-        // 8. 原子提交（CODEX-8 复审 P0）：同一事务内 分配 pts + 落 commit_log + claim 幂等 registry。
-        //    committed=false = 事务内 claim 撞到并发/重试冲突（事务已回滚，无重复落库、无 pts 空洞）→
-        //    读既有 registry 返回、**绝不 fanout**（exactly-once）。lmid=0 恒 committed。
-        let committed = self
-            .commit_dao
-            .allocate_commit_and_claim(
-                &mut commit,
-                sender_id,
-                device_id,
-                req.local_message_id,
-                "accepted",
-            )
-            .await?;
-        if !committed {
-            info!(
-                "并发/重试幂等冲突（tx claim）: local_message_id={}",
-                req.local_message_id
-            );
-            if let Some(existing) = self
-                .registry_dao
-                .check_duplicate(sender_id, device_id, req.local_message_id)
-                .await?
-            {
-                return Ok(existing);
-            }
-            // 理论不达：claim 冲突则 registry 必存在。保守返回错误而非重复 fanout。
-            return Err(crate::error::ServerError::Database(
-                "idempotency conflict but no existing registry row".to_string(),
-            ));
-        }
-        let new_pts = commit.pts;
 
         // 同步到内存 PtsGenerator（可选，提高性能）
         self.pts_generator.set_pts(req.channel_id, new_pts).await;
@@ -297,10 +411,14 @@ impl SyncService {
             use crate::infra::delivery_trace::{global_trace_store, stages};
             let store = global_trace_store();
             store
-                .begin_trace(server_msg_id, req.channel_id, sender_id)
+                .begin_trace(message.message_id, req.channel_id, sender_id)
                 .await;
             store
-                .record(server_msg_id, stages::COMMITTED, format!("pts={}", new_pts))
+                .record(
+                    message.message_id,
+                    stages::COMMITTED,
+                    format!("pts={}", new_pts),
+                )
                 .await;
         }
 
@@ -312,7 +430,7 @@ impl SyncService {
                 use crate::infra::delivery_trace::{global_trace_store, stages};
                 global_trace_store()
                     .record(
-                        server_msg_id,
+                        message.message_id,
                         stages::FANOUT,
                         format!("online_users={}", online_users.len()),
                     )
@@ -378,7 +496,7 @@ impl SyncService {
 
         info!(
             "✅ 命令已提交: local_message_id={}, pts={}, server_msg_id={}, has_gap={}",
-            req.local_message_id, new_pts, server_msg_id, has_gap
+            req.local_message_id, new_pts, message.message_id, has_gap
         );
 
         Ok(response)

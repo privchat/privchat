@@ -231,8 +231,7 @@ async fn handle_submit_rpc(
         // 放行——用 if let 包裹，避免误退整个 handler。
         if channel.channel_type == crate::model::channel::ChannelType::Group {
             if let Some(member) = channel.members.get(&sender_id) {
-                if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now)
-                {
+                if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now) {
                     return Err(RpcError::forbidden(
                         crate::model::channel::mute_reject_message(member.mute_until, now),
                     ));
@@ -472,37 +471,39 @@ async fn project_submit_to_message_views(
         .find_by_id(server_msg_id)
         .await
         .map_err(|e| format!("query message by id failed: {e}"))?;
-    if existing.is_some() {
-        return Ok(());
-    }
-
-    let (message_type, content, metadata) = normalize_submit_payload(request);
-    let server_ts =
-        DateTime::<Utc>::from_timestamp_millis(response.server_timestamp).unwrap_or_else(Utc::now);
-    let msg = crate::model::message::Message {
-        message_id: server_msg_id,
-        channel_id: request.channel_id,
-        sender_id,
-        pts: Some(pts as i64),
-        local_message_id: Some(request.local_message_id),
-        content: content.clone(),
-        message_type,
-        metadata,
-        reply_to_message_id: None,
-        created_at: server_ts,
-        updated_at: server_ts,
-        deleted: false,
-        deleted_at: None,
-        revoked: false,
-        revoked_at: None,
-        revoked_by: None,
+    let msg = if let Some(message) = existing {
+        message
+    } else {
+        // Rolling compatibility for a mixed deployment where an older
+        // SyncService still commits before the message projection.
+        let (message_type, content, metadata) = normalize_submit_payload(request);
+        let server_ts = DateTime::<Utc>::from_timestamp_millis(response.server_timestamp)
+            .unwrap_or_else(Utc::now);
+        let message = crate::model::message::Message {
+            message_id: server_msg_id,
+            channel_id: request.channel_id,
+            sender_id,
+            pts: Some(pts as i64),
+            local_message_id: Some(request.local_message_id),
+            content,
+            message_type,
+            metadata,
+            reply_to_message_id: None,
+            created_at: server_ts,
+            updated_at: server_ts,
+            deleted: false,
+            deleted_at: None,
+            revoked: false,
+            revoked_at: None,
+            revoked_by: None,
+        };
+        services
+            .message_repository
+            .create(&message)
+            .await
+            .map_err(|e| format!("create message failed: {e}"))?;
+        message
     };
-
-    services
-        .message_repository
-        .create(&msg)
-        .await
-        .map_err(|e| format!("create message failed: {e}"))?;
 
     let _ = services
         .channel_service
@@ -536,23 +537,19 @@ async fn project_submit_to_message_views(
             let Some(peer_id) = channel.direct_peer(sender_id) else {
                 return;
             };
-            let sender_t = match crate::rpc::helpers::lookup_user_type(
-                sender_id, &user_repo, &cache,
-            )
-            .await
-            {
-                Ok(t) => t,
-                Err(_) => return,
-            };
+            let sender_t =
+                match crate::rpc::helpers::lookup_user_type(sender_id, &user_repo, &cache).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
             if sender_t == Some(1) {
                 return;
             }
-            let peer_t = match crate::rpc::helpers::lookup_user_type(peer_id, &user_repo, &cache)
-                .await
-            {
-                Ok(t) => t,
-                Err(_) => return,
-            };
+            let peer_t =
+                match crate::rpc::helpers::lookup_user_type(peer_id, &user_repo, &cache).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
             if peer_t != Some(1) {
                 return;
             }
