@@ -359,7 +359,7 @@ impl MessageService {
                 .send_push_to_user(uid, &push_msg)
                 .await
             {
-                Ok(n) => n,
+                Ok(report) => report.successful_count(),
                 Err(e) => {
                     warn!(
                         "⚠️ MessageService: 实时推送失败: user_id={}, error={:?}",
@@ -750,10 +750,13 @@ impl MessageService {
                 .send_push_to_user(participant.user_id, &revoke_event)
                 .await
             {
-                Ok(success_count) => {
+                Ok(report) => {
                     info!(
-                        "📤 撤回事件推送: target_user={}, message_id={}, success_sessions={}",
-                        participant.user_id, message_id, success_count
+                        "📤 撤回事件推送: target_user={}, message_id={}, success_sessions={}, failed_sessions={}",
+                        participant.user_id,
+                        message_id,
+                        report.successful_count(),
+                        report.failed_count()
                     );
                 }
                 Err(e) => {
