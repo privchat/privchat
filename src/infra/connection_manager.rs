@@ -25,12 +25,17 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
+use futures::{stream, StreamExt};
 use msgtrans::SessionId;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
+
+const ROUTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 会话状态（spec §3）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +67,8 @@ pub struct SessionEntry {
     pub state: SessionState,
     pub user_id: Option<u64>,
     pub device_id: Option<String>,
+    /// CODEX-11 seam: transport session owner.
+    pub owner_node_id: String,
     /// 被哪个新 session 取代；在 Replaced 状态下非空
     pub superseded_by: Option<SessionId>,
     pub connected_at: i64,
@@ -74,7 +81,111 @@ pub struct DeviceConnection {
     pub user_id: u64,
     pub device_id: String,
     pub session_id: SessionId,
+    pub owner_node_id: String,
     pub connected_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeliveryFailureClassification {
+    RouteTimeout,
+    DeadConnection,
+    RetryableTransport,
+    PermanentTransport,
+    TransportUnavailable,
+    RemoteOwnerUnsupported,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailedSessionDelivery {
+    pub session_id: SessionId,
+    pub owner_node_id: String,
+    pub classification: DeliveryFailureClassification,
+    pub detail: String,
+    pub cleaned_up: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryReport {
+    pub attempted: usize,
+    pub successful_sessions: Vec<SessionId>,
+    pub failed_sessions: Vec<FailedSessionDelivery>,
+    pub failure_classification: BTreeMap<DeliveryFailureClassification, usize>,
+}
+
+impl DeliveryReport {
+    pub fn successful_count(&self) -> usize {
+        self.successful_sessions.len()
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failed_sessions.len()
+    }
+
+    fn push_failure(&mut self, failure: FailedSessionDelivery) {
+        *self
+            .failure_classification
+            .entry(failure.classification)
+            .or_default() += 1;
+        self.failed_sessions.push(failure);
+    }
+}
+
+#[derive(Debug)]
+enum SessionAttemptOutcome {
+    Success,
+    Failure {
+        classification: DeliveryFailureClassification,
+        detail: String,
+    },
+}
+
+fn classify_transport_error(
+    error: &msgtrans::error::TransportError,
+) -> DeliveryFailureClassification {
+    use msgtrans::error::TransportError;
+    match error {
+        TransportError::Connection {
+            retryable: false, ..
+        } => DeliveryFailureClassification::DeadConnection,
+        TransportError::Connection { .. }
+        | TransportError::Protocol { .. }
+        | TransportError::Resource { .. }
+        | TransportError::Timeout { .. } => DeliveryFailureClassification::RetryableTransport,
+        TransportError::Configuration { .. } => DeliveryFailureClassification::PermanentTransport,
+    }
+}
+
+async fn deliver_sessions_concurrently<F, Fut>(
+    sessions: Vec<SessionId>,
+    route_timeout: Duration,
+    send: F,
+) -> Vec<(SessionId, SessionAttemptOutcome)>
+where
+    F: Fn(SessionId) -> Fut + Clone,
+    Fut: Future<Output = std::result::Result<(), msgtrans::error::TransportError>>,
+{
+    let concurrency = sessions.len().max(1);
+    stream::iter(sessions)
+        .map(|session_id| {
+            let send = send.clone();
+            async move {
+                let outcome = match tokio::time::timeout(route_timeout, send(session_id)).await {
+                    Ok(Ok(())) => SessionAttemptOutcome::Success,
+                    Ok(Err(error)) => SessionAttemptOutcome::Failure {
+                        classification: classify_transport_error(&error),
+                        detail: error.to_string(),
+                    },
+                    Err(_) => SessionAttemptOutcome::Failure {
+                        classification: DeliveryFailureClassification::RouteTimeout,
+                        detail: format!("route timeout after {}ms", route_timeout.as_millis()),
+                    },
+                };
+                (session_id, outcome)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await
 }
 
 /// 一致性自检报告（spec §9）
@@ -113,6 +224,9 @@ pub struct ConnectionManager {
     /// Authenticated 条目计数（热路径统计，避免扫 Index B）
     total_authenticated: AtomicUsize,
 
+    /// Current single-instance owner. Cross-node routing plugs into this seam in CODEX-11.
+    local_node_id: String,
+
     /// TransportServer 引用（用于主动关闭连接）
     pub transport_server: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
 }
@@ -125,10 +239,16 @@ impl Default for ConnectionManager {
 
 impl ConnectionManager {
     pub fn new() -> Self {
+        let node_id = std::env::var("PRIVCHAT_NODE_ID").unwrap_or_else(|_| "local".to_string());
+        Self::new_with_node_id(node_id)
+    }
+
+    pub fn new_with_node_id(node_id: impl Into<String>) -> Self {
         Self {
             index_a: DashMap::new(),
             index_b: DashMap::new(),
             total_authenticated: AtomicUsize::new(0),
+            local_node_id: node_id.into(),
             transport_server: Arc::new(RwLock::new(None)),
         }
     }
@@ -153,6 +273,7 @@ impl ConnectionManager {
             state: SessionState::Connecting,
             user_id: None,
             device_id: None,
+            owner_node_id: self.local_node_id.clone(),
             superseded_by: None,
             connected_at: now,
             authenticated_at: None,
@@ -190,12 +311,14 @@ impl ConnectionManager {
                     state: SessionState::Connecting,
                     user_id: None,
                     device_id: None,
+                    owner_node_id: self.local_node_id.clone(),
                     superseded_by: None,
                     connected_at: now,
                     authenticated_at: None,
                 });
             b_entry.user_id = Some(user_id);
             b_entry.device_id = Some(device_id.clone());
+            b_entry.owner_node_id = self.local_node_id.clone();
             b_entry.state = SessionState::Authenticated;
             b_entry.authenticated_at = Some(now);
         }
@@ -393,12 +516,10 @@ impl ConnectionManager {
 
     /// 断开指定设备（踢设备）
     pub async fn disconnect_device(&self, user_id: u64, device_id: &str) -> Result<()> {
-        let session_id = self.index_a.get(&user_id).and_then(|entry| {
-            entry
-                .value()
-                .get(device_id)
-                .copied()
-        });
+        let session_id = self
+            .index_a
+            .get(&user_id)
+            .and_then(|entry| entry.value().get(device_id).copied());
 
         let Some(session_id) = session_id else {
             debug!(
@@ -617,10 +738,16 @@ impl ConnectionManager {
                     session_id, e
                 );
             } else {
-                info!("🔌 ConnectionManager: 强制断开未认证 session sid={}", session_id);
+                info!(
+                    "🔌 ConnectionManager: 强制断开未认证 session sid={}",
+                    session_id
+                );
             }
         } else {
-            warn!("⚠️ ConnectionManager: TransportServer 未设置，无法强制断开 sid={}", session_id);
+            warn!(
+                "⚠️ ConnectionManager: TransportServer 未设置，无法强制断开 sid={}",
+                session_id
+            );
         }
     }
 
@@ -641,6 +768,7 @@ impl ConnectionManager {
                         user_id,
                         device_id: device_id.clone(),
                         session_id: *sid,
+                        owner_node_id: b_entry.owner_node_id.clone(),
                         connected_at: b_entry.connected_at,
                     });
                 }
@@ -662,6 +790,7 @@ impl ConnectionManager {
             user_id: b_entry.user_id?,
             device_id: b_entry.device_id.clone()?,
             session_id: *session_id,
+            owner_node_id: b_entry.owner_node_id.clone(),
             connected_at: b_entry.connected_at,
         })
     }
@@ -693,6 +822,7 @@ impl ConnectionManager {
                             user_id,
                             device_id: device_id.clone(),
                             session_id: *sid,
+                            owner_node_id: b_entry.owner_node_id.clone(),
                             connected_at: b_entry.connected_at,
                         });
                     }
@@ -721,29 +851,90 @@ impl ConnectionManager {
     // spec §6：消息投递热路径
     // ---------------------------------------------------------------------
 
+    async fn apply_delivery_attempts(
+        &self,
+        user_id: u64,
+        server_message_id: u64,
+        owner_by_session: &HashMap<SessionId, String>,
+        attempts: Vec<(SessionId, SessionAttemptOutcome)>,
+        report: &mut DeliveryReport,
+    ) {
+        for (session_id, outcome) in attempts {
+            match outcome {
+                SessionAttemptOutcome::Success => {
+                    report.successful_sessions.push(session_id);
+                    trace!(
+                        target: "diag.push_route",
+                        user_id = user_id,
+                        sid = %session_id,
+                        server_message_id = server_message_id,
+                        "[PUSH_ROUTE_WRITE] write_ok (transport accepted; not Delivered ACK)"
+                    );
+                }
+                SessionAttemptOutcome::Failure {
+                    classification,
+                    detail,
+                } => {
+                    // Only a non-retryable connection error is positive evidence that the
+                    // session is dead. Route timeout and backpressure remain retryable.
+                    let cleaned_up =
+                        if classification == DeliveryFailureClassification::DeadConnection {
+                            self.unregister_connection(session_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some()
+                        } else {
+                            false
+                        };
+                    warn!(
+                        target: "diag.push_route",
+                        user_id = user_id,
+                        sid = %session_id,
+                        server_message_id = server_message_id,
+                        classification = ?classification,
+                        cleaned_up = cleaned_up,
+                        "[PUSH_ROUTE_WRITE] write_FAILED err={}",
+                        detail
+                    );
+                    report.push_failure(FailedSessionDelivery {
+                        session_id,
+                        owner_node_id: owner_by_session
+                            .get(&session_id)
+                            .cloned()
+                            .unwrap_or_else(|| self.local_node_id.clone()),
+                        classification,
+                        detail,
+                        cleaned_up,
+                    });
+                }
+            }
+        }
+    }
+
     /// 实时推送到用户所有 Authenticated 设备。
     ///
     /// spec §6.1 硬路径：
     /// 1. 取 Index A 当前快照
     /// 2. 到 Index B 二次校验 `state == Authenticated && superseded_by.is_none()`
-    /// 3. 并发投递，收集 success_count
+    /// 3. 并发投递，收集 session-level result
     ///
-    /// 返回 `success_count`。调用方按 §6.3 决定是否写离线队列（success_count == 0 时写）。
+    /// 调用方按 §6.3 决定是否写离线队列（successful_sessions 为空时写）。
     pub async fn send_push_to_user(
         &self,
         user_id: u64,
         message: &privchat_protocol::protocol::PushMessageRequest,
-    ) -> Result<usize> {
+    ) -> Result<DeliveryReport> {
         crate::infra::metrics::increment_delivery_attempt(1);
 
         // Step 1 + 2：A 快照 + B 二次过滤
         let mut filtered_not_auth = 0u64;
         let mut filtered_superseded = 0u64;
         let mut filtered_missing_b = 0u64;
-        let live_sessions: Vec<SessionId> = {
+        let live_sessions: Vec<(SessionId, String)> = {
             let Some(a_entry) = self.index_a.get(&user_id) else {
                 crate::infra::metrics::increment_delivery_zero_success(1);
-                return Ok(0);
+                return Ok(DeliveryReport::default());
             };
             a_entry
                 .value()
@@ -761,7 +952,7 @@ impl ConnectionManager {
                             filtered_superseded += 1;
                             None
                         } else {
-                            Some(*sid)
+                            Some((*sid, b.owner_node_id.clone()))
                         }
                     }
                 })
@@ -769,7 +960,10 @@ impl ConnectionManager {
         };
 
         if filtered_not_auth > 0 {
-            crate::infra::metrics::increment_delivery_filtered("not_authenticated", filtered_not_auth);
+            crate::infra::metrics::increment_delivery_filtered(
+                "not_authenticated",
+                filtered_not_auth,
+            );
         }
         if filtered_superseded > 0 {
             crate::infra::metrics::increment_delivery_filtered("superseded", filtered_superseded);
@@ -790,7 +984,10 @@ impl ConnectionManager {
                             Some(b) => (format!("{:?}", b.state), format!("{:?}", b.superseded_by)),
                             None => ("MISSING_B".to_string(), "-".to_string()),
                         };
-                        format!("dev={} sid={} state={} superseded_by={}", dev, sid, state, superseded)
+                        format!(
+                            "dev={} sid={} state={} superseded_by={}",
+                            dev, sid, state, superseded
+                        )
                     })
                     .collect(),
                 None => vec![],
@@ -806,64 +1003,90 @@ impl ConnectionManager {
                 filtered_missing_b = filtered_missing_b,
                 "[PUSH_ROUTE_TARGET] index_a=[{}] live_targets={:?}",
                 snapshot.join(" | "),
-                live_sessions.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")
+                live_sessions.iter().map(|(s, _)| s.to_string()).collect::<Vec<_>>().join(",")
             );
         }
 
         if live_sessions.is_empty() {
             crate::infra::metrics::increment_delivery_zero_success(1);
-            return Ok(0);
+            return Ok(DeliveryReport::default());
         }
 
-        let transport = self.transport_server.read().await;
-        let Some(server) = transport.as_ref() else {
+        let mut report = DeliveryReport {
+            attempted: live_sessions.len(),
+            ..DeliveryReport::default()
+        };
+        let (local_sessions, remote_sessions): (Vec<_>, Vec<_>) = live_sessions
+            .into_iter()
+            .partition(|(_, owner_node_id)| owner_node_id == &self.local_node_id);
+        for (session_id, owner_node_id) in remote_sessions {
+            report.push_failure(FailedSessionDelivery {
+                session_id,
+                owner_node_id,
+                classification: DeliveryFailureClassification::RemoteOwnerUnsupported,
+                detail: "cross-node dispatch is reserved for CODEX-11".to_string(),
+                cleaned_up: false,
+            });
+        }
+
+        let server = self.transport_server.read().await.clone();
+        let Some(server) = server else {
             warn!("⚠️ ConnectionManager: TransportServer 未设置，无法投递");
+            for (session_id, owner_node_id) in local_sessions {
+                report.push_failure(FailedSessionDelivery {
+                    session_id,
+                    owner_node_id,
+                    classification: DeliveryFailureClassification::TransportUnavailable,
+                    detail: "TransportServer is not configured".to_string(),
+                    cleaned_up: false,
+                });
+            }
             crate::infra::metrics::increment_delivery_zero_success(1);
-            return Ok(0);
+            return Ok(report);
         };
 
         let payload = privchat_protocol::encode_message(message)
             .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
+        let owner_by_session: HashMap<SessionId, String> = local_sessions.iter().cloned().collect();
+        let attempts = deliver_sessions_concurrently(
+            local_sessions
+                .into_iter()
+                .map(|(session_id, _)| session_id)
+                .collect(),
+            ROUTE_TIMEOUT,
+            move |session_id| {
+                let server = server.clone();
+                let payload = payload.clone();
+                async move {
+                    let mut packet =
+                        msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload);
+                    packet.set_biz_type(
+                        privchat_protocol::protocol::MessageType::PushMessageRequest as u8,
+                    );
+                    server.send_to_session(session_id, packet).await
+                }
+            },
+        )
+        .await;
 
-        let mut success = 0usize;
-        for sid in live_sessions {
-            let mut packet = msgtrans::packet::Packet::one_way(
-                crate::infra::next_packet_id(),
-                payload.clone(),
+        self.apply_delivery_attempts(
+            user_id,
+            message.server_message_id,
+            &owner_by_session,
+            attempts,
+            &mut report,
+        )
+        .await;
+
+        if report.successful_count() > 0 {
+            crate::infra::metrics::increment_delivery_success_sessions(
+                report.successful_count() as u64
             );
-            packet
-                .set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
-            match server.send_to_session(sid, packet).await {
-                Ok(()) => {
-                    success += 1;
-                    trace!(
-                        target: "diag.push_route",
-                        user_id = user_id,
-                        sid = %sid,
-                        server_message_id = message.server_message_id,
-                        "[PUSH_ROUTE_WRITE] write_ok (note: 写入传输层成功 ≠ 客户端已收到，半开连接也可能 Ok)"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        target: "diag.push_route",
-                        user_id = user_id,
-                        sid = %sid,
-                        server_message_id = message.server_message_id,
-                        "[PUSH_ROUTE_WRITE] write_FAILED err={} （应触发 stale session 清理）",
-                        e
-                    );
-                }
-            }
-        }
-
-        if success > 0 {
-            crate::infra::metrics::increment_delivery_success_sessions(success as u64);
         } else {
             crate::infra::metrics::increment_delivery_zero_success(1);
         }
 
-        Ok(success)
+        Ok(report)
     }
 
     /// 推送到指定设备（§6.1 A→B 过滤，设备级）。
@@ -960,8 +1183,7 @@ impl ConnectionManager {
         };
         let payload = privchat_protocol::encode_message(message)
             .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
-        let mut packet =
-            msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload);
+        let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload);
         packet.set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
         match server.send_to_session(session_id, packet).await {
             Ok(()) => Ok(1),
@@ -1178,12 +1400,8 @@ mod tests {
 
         let m1 = manager.clone();
         let m2 = manager.clone();
-        let j1 = tokio::spawn(async move {
-            m1.authenticate(sid_a, 42, "same-device".to_string())
-        });
-        let j2 = tokio::spawn(async move {
-            m2.authenticate(sid_b, 42, "same-device".to_string())
-        });
+        let j1 = tokio::spawn(async move { m1.authenticate(sid_a, 42, "same-device".to_string()) });
+        let j2 = tokio::spawn(async move { m2.authenticate(sid_b, 42, "same-device".to_string()) });
         let (_r1, _r2) = tokio::join!(j1, j2);
 
         // I-6：Index A 最终只有一个条目
@@ -1216,7 +1434,10 @@ mod tests {
             .await
             .unwrap();
 
-        manager.unregister_connection(SessionId::new(10)).await.unwrap();
+        manager
+            .unregister_connection(SessionId::new(10))
+            .await
+            .unwrap();
 
         assert!(!manager.is_device_online(1, "A").await);
         assert!(manager.is_device_online(1, "B").await);
@@ -1231,7 +1452,10 @@ mod tests {
             .register_connection(42, "d".to_string(), SessionId::new(1))
             .await
             .unwrap();
-        manager.unregister_connection(SessionId::new(1)).await.unwrap();
+        manager
+            .unregister_connection(SessionId::new(1))
+            .await
+            .unwrap();
 
         assert_eq!(manager.get_user_connections(42).await.len(), 0);
         assert_eq!(manager.get_connection_count().await, 0);
@@ -1347,7 +1571,11 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(live_sessions, vec![new_sid], "filter must pick only new_sid");
+        assert_eq!(
+            live_sessions,
+            vec![new_sid],
+            "filter must pick only new_sid"
+        );
 
         assert!(manager.self_check().is_clean());
     }
@@ -1456,6 +1684,122 @@ mod tests {
         // 计数不重复
         assert_eq!(manager.get_connection_count().await, 1);
         assert!(manager.self_check().is_clean());
+    }
+
+    #[tokio::test]
+    async fn delivery_attempts_run_concurrently() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let attempts = deliver_sessions_concurrently(
+            vec![
+                SessionId::new(8101),
+                SessionId::new(8102),
+                SessionId::new(8103),
+            ],
+            Duration::from_secs(1),
+            {
+                let active = active.clone();
+                let max_active = max_active.clone();
+                move |_| {
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts
+            .iter()
+            .all(|(_, outcome)| matches!(outcome, SessionAttemptOutcome::Success)));
+        assert!(max_active.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn route_timeout_is_classified_without_dead_cleanup() {
+        let attempts = deliver_sessions_concurrently(
+            vec![SessionId::new(8201)],
+            Duration::from_millis(5),
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            attempts.as_slice(),
+            [(
+                _,
+                SessionAttemptOutcome::Failure {
+                    classification: DeliveryFailureClassification::RouteTimeout,
+                    ..
+                }
+            )]
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirmed_dead_attempt_cleans_exact_session() {
+        let manager = ConnectionManager::new_with_node_id("node-a");
+        let session_id = SessionId::new(8301);
+        manager
+            .register_connection(83, "device-a".to_string(), session_id)
+            .await
+            .unwrap();
+
+        let owners = HashMap::from([(session_id, "node-a".to_string())]);
+        let attempts = vec![(
+            session_id,
+            SessionAttemptOutcome::Failure {
+                classification: DeliveryFailureClassification::DeadConnection,
+                detail: "connection closed".to_string(),
+            },
+        )];
+        let mut report = DeliveryReport {
+            attempted: 1,
+            ..DeliveryReport::default()
+        };
+        manager
+            .apply_delivery_attempts(83, 123, &owners, attempts, &mut report)
+            .await;
+
+        assert_eq!(report.failed_count(), 1);
+        assert!(report.failed_sessions[0].cleaned_up);
+        assert!(!manager.is_device_online(83, "device-a").await);
+        assert!(manager.index_b.get(&session_id).is_none());
+        assert!(manager.self_check().is_clean());
+    }
+
+    #[tokio::test]
+    async fn no_transport_returns_classified_report_with_owner_node() {
+        let manager = ConnectionManager::new_with_node_id("node-a");
+        let session_id = SessionId::new(8401);
+        manager
+            .register_connection(84, "device-a".to_string(), session_id)
+            .await
+            .unwrap();
+
+        let report = manager
+            .send_push_to_user(84, &push_fixture())
+            .await
+            .unwrap();
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.successful_count(), 0);
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(
+            report.failed_sessions[0].classification,
+            DeliveryFailureClassification::TransportUnavailable
+        );
+        assert_eq!(report.failed_sessions[0].owner_node_id, "node-a");
+        assert!(manager.is_device_online(84, "device-a").await);
     }
 
     // ---- spec SESSION_LIFECYCLE_SPEC §5：unauth watchdog ----

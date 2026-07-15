@@ -49,9 +49,9 @@ pub mod session_manager;
 pub mod snowflake;
 pub mod subscribe_manager; // 频道事件订阅管理
 pub mod typing_rate_limiter; // typing 限频器 // ✨ 新增：事件总线
-                                              // pub mod redis_cache;
-                                              // pub mod service_protocol;
-                                              // pub mod service_registry;
+                             // pub mod redis_cache;
+                             // pub mod service_protocol;
+                             // pub mod service_registry;
 
 // 重新导出主要类型
 pub use auth_whitelist::{
@@ -69,13 +69,15 @@ pub use cache_manager_simple::{
     SimpleBusinessCacheManager, SimpleCache, SimpleCacheConfig, SimpleCacheStore,
     SimpleOfflineMessage, SimpleUserOnlineStatus, SimpleUserSessions,
 };
-pub use connection_manager::{ConnectionManager, DeviceConnection}; // ✨ 新增
+pub use connection_manager::{
+    ConnectionManager, DeliveryFailureClassification, DeliveryReport, DeviceConnection,
+    FailedSessionDelivery,
+}; // ✨ 新增
 pub use event_bus::EventBus;
 pub use message_router::{MessageRouter, MessageRouterConfig, RouteResult};
 pub use offline_worker::{DeliveryStats, OfflineMessageWorker, OfflineWorkerConfig};
 pub use presence_manager_with_db::{
-    PresenceConfig as PresenceStateStoreConfig,
-    PresenceManagerWithDb as PresenceStateStore,
+    PresenceConfig as PresenceStateStoreConfig, PresenceManagerWithDb as PresenceStateStore,
     PresenceStats as PresenceStateStoreStats,
 };
 pub use presence_tracker::PresenceTracker;

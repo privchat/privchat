@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use crate::infra::connection_manager::DeliveryReport;
 use privchat_protocol::protocol::PushMessageRequest;
 
 fn parse_session_id(raw: &str) -> Result<msgtrans::SessionId> {
@@ -151,6 +152,8 @@ pub struct RouteResult {
     pub offline_count: usize,
     /// 路由延迟（毫秒）
     pub latency_ms: u64,
+    /// Present for user-level fanout. Device/session routes remain scalar compatibility APIs.
+    pub delivery_report: Option<DeliveryReport>,
 }
 
 /// 消息路由器
@@ -200,16 +203,19 @@ impl MessageRouter {
         message: PushMessageRequest,
     ) -> Result<RouteResult> {
         let start_time = SystemTime::now();
-        let success_count = self
+        let delivery_report = self
             .connection_manager
             .send_push_to_user(*user_id, &message)
             .await?;
+        let success_count = delivery_report.successful_count();
+        let failed_count = delivery_report.failed_count();
         let elapsed = start_time.elapsed().unwrap_or_default();
         Ok(RouteResult {
             success_count,
-            failed_count: 0,
+            failed_count,
             offline_count: if success_count == 0 { 1 } else { 0 },
             latency_ms: elapsed.as_millis() as u64,
+            delivery_report: Some(delivery_report),
         })
     }
 
@@ -231,6 +237,7 @@ impl MessageRouter {
             failed_count: 0,
             offline_count: if success_count == 0 { 1 } else { 0 },
             latency_ms: elapsed.as_millis() as u64,
+            delivery_report: None,
         })
     }
 
@@ -254,6 +261,7 @@ impl MessageRouter {
                     failed_count: 1,
                     offline_count: 0,
                     latency_ms: elapsed.as_millis() as u64,
+                    delivery_report: None,
                 });
             }
         };
@@ -267,6 +275,7 @@ impl MessageRouter {
             failed_count: 0,
             offline_count: 0,
             latency_ms: elapsed.as_millis() as u64,
+            delivery_report: None,
         })
     }
 
@@ -299,6 +308,7 @@ impl MessageRouter {
                     failed_count: 1,
                     offline_count: 0,
                     latency_ms: 0,
+                    delivery_report: None,
                 }),
             );
         }
