@@ -131,9 +131,6 @@ impl SyncService {
         // 9. 缓存到 Redis
         self.cache_commit(&commit).await?;
         
-        // 10. Fan-out 给在线用户（TODO: 实现推送）
-        // self.fanout_to_online_users(&commit).await?;
-        
         // 11. 注册 local_message_id（防止重复）
         self.register_local_message_id(req.local_message_id, &commit).await?;
         

@@ -208,105 +208,6 @@ impl SyncCache {
     }
 
     // ============================================================
-    // 在线用户 Fan-out
-    // ============================================================
-
-    /// 推送给在线用户
-    ///
-    /// Pub/Sub: user_msgs:{user_id}
-    pub async fn fanout_to_online_users(
-        &self,
-        user_ids: &[u64],
-        commit: &ServerCommit,
-    ) -> Result<()> {
-        debug!(
-            "Fan-out 推送: user_count={}, channel_id={}, pts={}",
-            user_ids.len(),
-            commit.channel_id,
-            commit.pts
-        );
-
-        let message = serde_json::to_string(commit).map_err(|e| {
-            error!("序列化 Commit 失败: {}", e);
-            crate::error::ServerError::Internal(format!("Failed to serialize commit: {}", e))
-        })?;
-
-        for user_id in user_ids {
-            let channel = format!("user_msgs:{}", user_id);
-            if let Err(e) = self.redis.publish(&channel, &message).await {
-                warn!(
-                    "Fan-out 推送失败: user_id={}, channel={}, error={}",
-                    user_id, channel, e
-                );
-                // 继续推送其他用户，不中断
-            }
-        }
-
-        debug!("✅ Fan-out 完成: 推送给 {} 个用户", user_ids.len());
-
-        Ok(())
-    }
-
-    // ============================================================
-    // 在线用户管理
-    // ============================================================
-
-    /// 获取频道的在线用户列表
-    ///
-    /// Key: online_users:{channel_id}
-    /// Type: Set
-    pub async fn get_online_users(&self, channel_id: u64) -> Result<Vec<u64>> {
-        let key = format!("online_users:{}", channel_id);
-
-        let members = self.redis.smembers(&key).await.map_err(|e| {
-            debug!("Redis SMEMBERS 失败: key={}, error={}", key, e);
-            crate::error::ServerError::Internal(format!("Failed to get online users: {}", e))
-        })?;
-
-        let user_ids: Vec<u64> = members
-            .into_iter()
-            .filter_map(|s: String| s.parse().ok())
-            .collect();
-
-        Ok(user_ids)
-    }
-
-    /// 添加在线用户
-    pub async fn add_online_user(&self, channel_id: u64, user_id: u64) -> Result<()> {
-        let key = format!("online_users:{}", channel_id);
-
-        self.redis
-            .sadd(&key, &user_id.to_string())
-            .await
-            .map_err(|e| {
-                warn!(
-                    "Redis SADD 失败: key={}, user_id={}, error={}",
-                    key, user_id, e
-                );
-                crate::error::ServerError::Internal(format!("Failed to add online user: {}", e))
-            })?;
-
-        self.redis.expire(&key, 3600).await.map_err(|e| {
-            warn!("Redis EXPIRE 失败: key={}, error={}", key, e);
-            crate::error::ServerError::Internal(format!("Failed to set expire: {}", e))
-        })?; // 1 小时过期
-
-        Ok(())
-    }
-
-    /// 移除在线用户
-    pub async fn remove_online_user(&self, channel_id: u64, _user_id: u64) -> Result<()> {
-        let _key = format!("online_users:{}", channel_id);
-
-        // TODO: 实现 Redis 操作
-        /*
-        self.redis.srem(&key, user_id.to_string()).await?;
-        */
-
-        Ok(())
-    }
-
-    // ============================================================
     // 清理
     // ============================================================
 
@@ -314,8 +215,6 @@ impl SyncCache {
     pub async fn clear_channel_cache(&self, channel_id: u64) -> Result<()> {
         let commit_key = format!("commit_log:{}", channel_id);
         let pts_key = format!("pts:{}", channel_id);
-        let online_key = format!("online_users:{}", channel_id);
-
         debug!("清理频道缓存: channel_id={}", channel_id);
 
         // 删除所有相关 key（忽略单个删除失败，继续删除其他）
@@ -325,10 +224,6 @@ impl SyncCache {
 
         if let Err(e) = self.redis.del(&pts_key).await {
             warn!("删除 pts 缓存失败: key={}, error={}", pts_key, e);
-        }
-
-        if let Err(e) = self.redis.del(&online_key).await {
-            warn!("删除在线用户缓存失败: key={}, error={}", online_key, e);
         }
 
         debug!("✅ 频道缓存清理完成: channel_id={}", channel_id);
@@ -349,8 +244,4 @@ mod tests {
         // 测试 pts 缓存
     }
 
-    #[tokio::test]
-    async fn test_fanout() {
-        // 测试 Fan-out 推送
-    }
 }

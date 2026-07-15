@@ -621,15 +621,15 @@ privchat/
 
 **同步机制工作流程**：
 1. **客户端连接时**：SDK 自动触发初始同步（`batch_sync_channels`），拉取所有频道的差异
-2. **实时推送**：服务端通过 WebSocket 实时推送新消息给在线用户（`distribute_message_to_members`）
+2. **实时推送**：已提交消息通过 dispatch outbox 和 WebSocket 投递给在线用户
 3. **离线队列**：离线用户的消息加入离线队列，上线时自动推送
 4. **间隙检测**：SDK 收到推送消息后自动检测 pts 间隙，如有间隙则自动触发补齐同步
 5. **手动同步**：用户可随时调用 `sync_channel()` 或 `sync_all_channels()` 进行手动同步
 
 **服务端推送机制**：
-- ✅ **实时推送**：通过 WebSocket 直接推送给在线用户（`SendMessageHandler::distribute_message_to_members`）
+- ✅ **实时推送**：通过 `CommittedTimelineDeliveryService` → `MessageRouter` → `ConnectionManager` 投递给在线用户
 - ✅ **离线队列**：使用 `OfflineQueueService` 管理离线消息，用户上线时自动推送
-- ✅ **Redis Fan-out**：`SyncService` 的 `fanout_to_online_users` 通过 Redis Pub/Sub 推送 Commits（主要用于同步机制）
+- ✅ **统一投递**：已提交 timeline 事件通过 dispatch outbox → `MessageRouter` → `ConnectionManager` 投递；PTS/Commit Redis 缓存仅用于差异同步
 
 **旧 README 快照后新增的服务端能力**：
 - ✅ 统一服务 Token API：`/api/service/auth/{issue,refresh,introspect,revoke}` + JWKS
