@@ -91,6 +91,7 @@ impl SyncService {
         sender_id: u64,
     ) -> Result<ServerCommit> {
         let mut commit = ServerCommit {
+            event_id: None,
             pts: 0,
             server_msg_id: self.generate_msg_id().await,
             local_message_id: None,
@@ -101,6 +102,8 @@ impl SyncService {
             server_timestamp: chrono::Utc::now().timestamp_millis(),
             sender_id,
             sender_info: self.get_sender_info(sender_id).await.ok(),
+            event_schema_version: None,
+            canonical_event: None,
         };
         self.commit_dao
             .allocate_pts_and_save_commit(&mut commit)
@@ -123,15 +126,19 @@ impl SyncService {
     }
 
     pub async fn record_existing_commit(&self, commit: &ServerCommit) -> Result<()> {
+        let mut stored = commit.clone();
+        stored.populate_canonical_event().map_err(|e| {
+            crate::error::ServerError::Internal(format!("canonical event mapping failed: {e}"))
+        })?;
         self.pts_dao
             .bump_pts_to_at_least(commit.channel_id, commit.pts)
             .await?;
         self.pts_generator
             .set_pts(commit.channel_id, commit.pts)
             .await;
-        self.commit_dao.save_commit(commit).await?;
-        self.cache.cache_pts(commit.channel_id, commit.pts).await?;
-        self.cache.cache_commit(commit).await?;
+        stored.event_id = Some(self.commit_dao.save_commit(&stored).await?);
+        self.cache.cache_pts(stored.channel_id, stored.pts).await?;
+        self.cache.cache_commit(&stored).await?;
         Ok(())
     }
 
@@ -231,6 +238,7 @@ impl SyncService {
 
         // 7. 构造 ServerCommit ⭐
         let mut commit = ServerCommit {
+            event_id: None,
             pts: 0,
             server_msg_id,
             local_message_id: Some(req.local_message_id),
@@ -241,6 +249,8 @@ impl SyncService {
             server_timestamp: chrono::Utc::now().timestamp_millis(),
             sender_id,
             sender_info: self.get_sender_info(sender_id).await.ok(),
+            event_schema_version: None,
+            canonical_event: None,
         };
 
         // 8. 原子提交（CODEX-8 复审 P0）：同一事务内 分配 pts + 落 commit_log + claim 幂等 registry。
@@ -257,7 +267,10 @@ impl SyncService {
             )
             .await?;
         if !committed {
-            info!("并发/重试幂等冲突（tx claim）: local_message_id={}", req.local_message_id);
+            info!(
+                "并发/重试幂等冲突（tx claim）: local_message_id={}",
+                req.local_message_id
+            );
             if let Some(existing) = self
                 .registry_dao
                 .check_duplicate(sender_id, device_id, req.local_message_id)

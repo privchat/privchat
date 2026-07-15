@@ -177,10 +177,15 @@ impl MessageService {
 
         // RP-12 幂等前置检查：已注入过（dedup_key 命中）→ 直接返回既有 message_id，不重复落库/推送。
         if let Some(k) = req.dedup_key.as_deref() {
-            if let Some((existing_id, existing_created)) =
-                self.message_repository.find_message_id_by_dedup_key(k).await?
+            if let Some((existing_id, existing_created)) = self
+                .message_repository
+                .find_message_id_by_dedup_key(k)
+                .await?
             {
-                info!("💠 幂等命中，跳过重复注入: dedup_key={}, message_id={}", k, existing_id);
+                info!(
+                    "💠 幂等命中，跳过重复注入: dedup_key={}, message_id={}",
+                    k, existing_id
+                );
                 return Ok(ServerSendMessageResult {
                     message_id: existing_id,
                     pts: 0,
@@ -235,10 +240,15 @@ impl MessageService {
         // 并发注入撞车（dedup_key 唯一索引 DO NOTHING）→ 查回既有 message_id，跳过 sync/index/推送。
         if !inserted {
             if let Some(k) = req.dedup_key.as_deref() {
-                if let Some((existing_id, existing_created)) =
-                    self.message_repository.find_message_id_by_dedup_key(k).await?
+                if let Some((existing_id, existing_created)) = self
+                    .message_repository
+                    .find_message_id_by_dedup_key(k)
+                    .await?
                 {
-                    info!("💠 并发幂等撞车，返回既有: dedup_key={}, message_id={}", k, existing_id);
+                    info!(
+                        "💠 并发幂等撞车，返回既有: dedup_key={}, message_id={}",
+                        k, existing_id
+                    );
                     return Ok(ServerSendMessageResult {
                         message_id: existing_id,
                         pts: 0,
@@ -251,6 +261,7 @@ impl MessageService {
         // 3. 记录 sync commit
         if let Some(sync_service) = get_global_sync_service() {
             let commit = privchat_protocol::rpc::sync::ServerCommit {
+                event_id: None,
                 pts,
                 server_msg_id: message_id,
                 local_message_id: Some(message_id),
@@ -261,6 +272,8 @@ impl MessageService {
                 server_timestamp: now.timestamp_millis(),
                 sender_id: req.sender_id,
                 sender_info: None,
+                event_schema_version: None,
+                canonical_event: None,
             };
             if let Err(e) = sync_service.record_existing_commit(&commit).await {
                 warn!(
@@ -286,7 +299,11 @@ impl MessageService {
 
         if !receivers.is_empty() {
             for &uid in &receivers {
-                if let Err(e) = self.unread_count_service.increment(uid, req.channel_id, 1).await {
+                if let Err(e) = self
+                    .unread_count_service
+                    .increment(uid, req.channel_id, 1)
+                    .await
+                {
                     warn!(
                         "⚠️ MessageService: 更新未读计数失败: user_id={}, channel_id={}, error={}",
                         uid, req.channel_id, e
@@ -629,7 +646,11 @@ impl MessageService {
         }
 
         // 6. 清理所有参与者的离线队列
-        match self.channel_service.get_channel_participants(channel_id).await {
+        match self
+            .channel_service
+            .get_channel_participants(channel_id)
+            .await
+        {
             Ok(participants) => {
                 for p in participants {
                     if let Err(e) = self
@@ -830,7 +851,7 @@ mod recall_time_tests {
     #[test]
     fn enforced_when_limit_positive() {
         let limit = 172800; // 48h
-        // 刚好在窗口内 / 边界上 → 允许
+                            // 刚好在窗口内 / 边界上 → 允许
         assert!(recall_allowed_by_time(limit, 100 + limit, 100));
         assert!(recall_allowed_by_time(limit, 100, 100));
         // 超过窗口 1 秒 → 拒绝
