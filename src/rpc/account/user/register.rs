@@ -17,10 +17,8 @@
 
 use crate::auth::hash_password;
 use crate::model::user::User;
-use crate::repository::MessageRepository;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
-use crate::service::sync::get_global_sync_service;
 use privchat_protocol::rpc::auth::UserRegisterRequest;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -213,117 +211,29 @@ pub async fn handle(
             Ok((channel_id, _)) => {
                 tracing::debug!("✅ 系统消息会话创建成功: channel_id={}", channel_id);
 
-                // 如果配置了自动发送欢迎消息，插入欢迎消息到数据库，并加入离线推送流程
+                // 统一走 MessageService，确保事务 outbox 与其它消息入口一致。
                 if services.config.system_message.auto_send_welcome {
-                    let now = chrono::Utc::now();
-                    let message_id = crate::infra::next_message_id();
-                    // pts 为 per-channel，优先使用数据库分配，避免重启后内存计数器回退。
-                    let pts = if let Some(sync_service) = get_global_sync_service() {
-                        match sync_service.allocate_next_pts(channel_id).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "⚠️ 欢迎消息分配同步 pts 失败，回退内存计数器: channel_id={}, error={}",
-                                    channel_id,
-                                    e
-                                );
-                                services.pts_generator.next_pts(channel_id).await
-                            }
-                        }
-                    } else {
-                        services.pts_generator.next_pts(channel_id).await
-                    };
                     let content = services.config.system_message.welcome_message.clone();
 
-                    let welcome_msg = crate::model::message::Message {
-                        message_id,
-                        channel_id,
-                        sender_id: crate::config::SYSTEM_USER_ID,
-                        pts: Some(pts as i64),
-                        local_message_id: Some(message_id),
-                        content: content.clone(),
-                        message_type: privchat_protocol::ContentMessageType::Text,
-                        metadata: serde_json::Value::Object(serde_json::Map::new()),
-                        reply_to_message_id: None,
-                        created_at: now,
-                        updated_at: now,
-                        deleted: false,
-                        deleted_at: None,
-                        revoked: false,
-                        revoked_at: None,
-                        revoked_by: None,
-                    };
-
-                    match services.message_repository.create(&welcome_msg).await {
-                        Ok(_) => {
-                            if let Some(sync_service) = get_global_sync_service() {
-                                let commit = privchat_protocol::rpc::sync::ServerCommit {
-                                    event_id: None,
-                                    pts,
-                                    server_msg_id: message_id,
-                                    local_message_id: Some(message_id),
-                                    channel_id,
-                                    channel_type: 1,
-                                    message_type: privchat_protocol::ContentMessageType::Text
-                                        .as_str()
-                                        .to_string(),
-                                    content: json!({ "text": content.clone() }),
-                                    server_timestamp: now.timestamp_millis(),
-                                    sender_id: crate::config::SYSTEM_USER_ID,
-                                    sender_info: None,
-                                    event_schema_version: None,
-                                    canonical_event: None,
-                                };
-                                if let Err(e) = sync_service.record_existing_commit(&commit).await {
-                                    tracing::warn!(
-                                        "⚠️ 欢迎消息 commit 记录失败: channel_id={}, message_id={}, error={}",
-                                        channel_id,
-                                        message_id,
-                                        e
-                                    );
-                                }
-                            }
-                            // ✨ 加入 UserMessageIndex，否则离线推送时 get_message_ids_above 查不到
-                            services
-                                .user_message_index
-                                .add_message(user_id, pts, message_id)
-                                .await;
-
-                            // ✨ 加入 OfflineQueueService，否则离线推送时 get_all 取不到消息
-                            let payload_json = json!({ "content": content });
-                            let payload =
-                                serde_json::to_vec(&payload_json).unwrap_or_else(|_| Vec::new());
-
-                            let push_msg = privchat_protocol::protocol::PushMessageRequest {
-                                setting: privchat_protocol::protocol::MessageSetting::default(),
-                                msg_key: format!("msg_{}", message_id),
-                                server_message_id: message_id,
-                                message_seq: 1,
-                                local_message_id: message_id,
-                                stream_no: String::new(),
-                                stream_seq: 0,
-                                stream_flag: 0,
-                                timestamp: now.timestamp().max(0) as u32,
-                                channel_id,
-                                channel_type: 1, // Direct
-                                message_type: privchat_protocol::ContentMessageType::Text.as_u32(),
-                                expire: 0,
-                                topic: String::new(),
-                                from_uid: crate::config::SYSTEM_USER_ID,
-                                payload,
-                                deleted: false,
-                            };
-
-                            if let Err(e) =
-                                services.offline_queue_service.add(user_id, &push_msg).await
-                            {
-                                tracing::warn!("⚠️ 欢迎消息加入离线队列失败: {:?}", e);
-                            }
-
+                    match services
+                        .message_service
+                        .send_message(crate::service::ServerSendMessageRequest {
+                            channel_id,
+                            sender_id: crate::config::SYSTEM_USER_ID,
+                            content,
+                            message_type: privchat_protocol::ContentMessageType::Text,
+                            metadata: serde_json::Value::Object(serde_json::Map::new()),
+                            channel_type: 1,
+                            recipient_user_ids: vec![user_id, crate::config::SYSTEM_USER_ID],
+                            dedup_key: None,
+                        })
+                        .await
+                    {
+                        Ok(result) => {
                             tracing::debug!(
                                 "✅ 系统欢迎消息已发送: channel_id={}, message_id={}, user_id={}",
                                 channel_id,
-                                message_id,
+                                result.message_id,
                                 user_id
                             );
                         }

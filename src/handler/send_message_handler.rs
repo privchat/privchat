@@ -18,18 +18,17 @@
 use crate::context::RequestContext;
 use crate::error::ServerError;
 use crate::handler::MessageHandler;
-use crate::infra::RouteResult;
 use crate::infra::SessionManager as AuthSessionManager;
 use crate::model::channel::{MessageId, UserId};
-use crate::model::pts::{PtsGenerator, UserMessageIndex};
+use crate::model::pts::PtsGenerator;
 use crate::repository::{AtomicMessageCommitRequest, PgMessageRepository};
 use crate::service::message_history_service::{MessageHistoryRecord, MessageHistoryService};
 use crate::service::sync::get_global_sync_service;
-use crate::service::{OfflineQueueService, UnreadCountService};
+use crate::service::UnreadCountService;
 use crate::Result;
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
 use privchat_protocol::error_code::ErrorCode;
+use privchat_protocol::{CanonicalTimelineEvent, MessagePayloadEnvelope, NewMessageEvent};
 use serde_json::Value;
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::RwLock;
@@ -81,16 +80,10 @@ pub struct SendMessageHandler {
     channel_service: Arc<crate::service::ChannelService>,
     /// 传输层服务器（可选，运行时设置）
     transport: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
-    /// 消息路由器（用于离线消息队列）
-    message_router: Arc<crate::infra::MessageRouter>,
     /// 黑名单服务（用于拦截被拉黑用户的消息）
     blacklist_service: Arc<crate::service::BlacklistService>,
     /// ✨ pts 生成器
     pts_generator: Arc<PtsGenerator>,
-    /// ✨ 用户消息索引（pts -> message_id 映射）
-    user_message_index: Arc<UserMessageIndex>,
-    /// ✨ 离线消息队列服务
-    offline_queue_service: Arc<OfflineQueueService>,
     /// ✨ 未读计数服务
     unread_count_service: Arc<UnreadCountService>,
     /// ✨ 消息去重服务
@@ -102,6 +95,7 @@ pub struct SendMessageHandler {
     mention_service: Arc<crate::service::MentionService>,
     /// ✨ 消息仓库（PostgreSQL）
     message_repository: Arc<PgMessageRepository>,
+    delivery_service: Arc<crate::service::CommittedTimelineDeliveryService>,
     /// ✨ 事件总线（用于发布 Domain Events）
     event_bus: Option<Arc<crate::infra::EventBus>>,
     /// ✨ Phase 3.5: 用户设备仓库（用于推送设备查询）
@@ -152,17 +146,15 @@ impl SendMessageHandler {
         message_history_service: Arc<MessageHistoryService>,
         file_service: Arc<crate::service::FileService>,
         channel_service: Arc<crate::service::ChannelService>,
-        message_router: Arc<crate::infra::MessageRouter>,
         blacklist_service: Arc<crate::service::BlacklistService>,
         pts_generator: Arc<PtsGenerator>,
-        user_message_index: Arc<UserMessageIndex>,
-        offline_queue_service: Arc<OfflineQueueService>,
         unread_count_service: Arc<UnreadCountService>,
         privacy_service: Arc<crate::service::PrivacyService>,
         friend_service: Arc<crate::service::FriendService>,
         mention_service: Arc<crate::service::MentionService>,
         message_repository: Arc<PgMessageRepository>,
         auth_session_manager: Arc<AuthSessionManager>,
+        delivery_service: Arc<crate::service::CommittedTimelineDeliveryService>,
         user_device_repo: Option<Arc<crate::repository::UserDeviceRepository>>, // ✨ Phase 3.5
     ) -> Self {
         Self {
@@ -171,16 +163,14 @@ impl SendMessageHandler {
             file_service,
             channel_service,
             transport: Arc::new(RwLock::new(None)),
-            message_router,
             blacklist_service,
             pts_generator,
-            user_message_index,
-            offline_queue_service,
             unread_count_service,
             privacy_service,
             friend_service,
             mention_service,
             message_repository,
+            delivery_service,
             event_bus: None,
             auth_session_manager,
             user_device_repo, // ✨ Phase 3.5
@@ -273,27 +263,6 @@ impl SendMessageHandler {
         }
     }
 
-    /// 用已解析的 content + metadata 构造 sync commit 内容（{content, metadata?}）。
-    /// 与 `create_push_message_request` 的 push payload 同形，保证 realtime / sync / history
-    /// 三条路径在客户端拿到等价的媒体 metadata。CEK 不进 metadata（解析时已不含）。
-    fn sync_commit_content_from_parsed(
-        content: &str,
-        metadata: &Option<String>,
-    ) -> serde_json::Value {
-        let mut obj = serde_json::Map::new();
-        obj.insert(
-            "content".to_string(),
-            serde_json::Value::String(content.to_string()),
-        );
-        if let Some(meta_str) = metadata {
-            if let Ok(meta_val) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                if !meta_val.is_null() {
-                    obj.insert("metadata".to_string(), meta_val);
-                }
-            }
-        }
-        serde_json::Value::Object(obj)
-    }
 }
 
 #[async_trait]
@@ -1346,7 +1315,7 @@ impl MessageHandler for SendMessageHandler {
             local_message_id: Some(send_message_request.local_message_id),
             content: content.clone(),
             message_type: content_message_type,
-            metadata: metadata_value,
+            metadata: metadata_value.clone(),
             reply_to_message_id: reply_to_id,
             created_at: now,
             updated_at: now,
@@ -1361,8 +1330,31 @@ impl MessageHandler for SendMessageHandler {
         // file_id / thumbnail_file_id 绑定到 message_id（business_type="message"），使接收端
         // get_url 能按 channel 成员授权访问/拿 CEK。绑定、消息、commit 在同一 DB tx 内提交。
         let bind_file_ids = Self::extract_attachment_file_ids(&message.metadata);
-        let commit_content = Self::sync_commit_content_from_parsed(&content, &metadata);
         let channel_type_code = Self::channel_type_code(channel.channel_type);
+        let mut canonical_payload =
+            privchat_protocol::decode_message::<MessagePayloadEnvelope>(
+                &send_message_request.payload,
+            )
+            .unwrap_or_else(|_| MessagePayloadEnvelope {
+                content: content.clone(),
+                metadata: privchat_protocol::MessageMetadata::from_json_value(
+                    content_message_type,
+                    &metadata_value,
+                ),
+                reply_to_message_id: reply_to_id,
+                mentioned_user_ids: mentioned_user_ids.clone(),
+                message_source: None,
+            });
+        canonical_payload.content = content.clone();
+        let canonical_event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
+            message_type: content_message_type,
+            payload: canonical_payload,
+        });
+        let (_, commit_content) = canonical_event
+            .to_legacy_commit(channel_id, channel_type_code)
+            .map_err(|error| {
+                ServerError::Protocol(format!("构造兼容消息投影失败: {error}"))
+            })?;
         let tx_result = match self
             .message_repository
             .create_message_and_commit_atomic(AtomicMessageCommitRequest {
@@ -1372,7 +1364,7 @@ impl MessageHandler for SendMessageHandler {
                 client_registry_claim: None,
                 attachment_file_ids: bind_file_ids,
                 channel_type: channel_type_code as i16,
-                commit_content: commit_content.clone(),
+                event: canonical_event,
                 sender_username: None,
             })
             .await
@@ -1707,29 +1699,17 @@ impl MessageHandler for SendMessageHandler {
 
         crate::infra::metrics::record_message_sent();
 
-        // 8. 后台分发消息到其他在线成员（不阻塞响应返回）
-        let this = self.clone();
-        let channel_clone = channel.clone();
-        let message_record_clone = message_record.clone();
-        let reply_preview = reply_to_id_str.clone();
-        let mentioned = mentioned_user_ids.to_vec();
-        tokio::spawn(async move {
-            if let Err(e) = this
-                .distribute_message_to_members(
-                    &channel_clone,
-                    &from_uid,
-                    send_message_request.local_message_id,
-                    &message_record_clone,
-                    reply_preview.as_deref(),
-                    &mentioned,
-                    is_mention_all,
-                    pts as u64,
-                )
-                .await
-            {
-                warn!("⚠️ SendMessageHandler: 后台分发消息失败: {}", e);
-            }
-        });
+        // 8. Immediate low-latency attempt. The durable outbox worker uses the
+        // same lease claim and is the crash/retry backstop, so this cannot
+        // double-fanout.
+        if let Some(event_id) = event_id {
+            let delivery = self.delivery_service.clone();
+            tokio::spawn(async move {
+                if let Err(error) = delivery.dispatch_event(event_id).await {
+                    warn!(event_id, %error, "wire immediate dispatch failed; worker will retry");
+                }
+            });
+        }
 
         response
     }
@@ -2115,359 +2095,6 @@ impl SendMessageHandler {
         Ok(())
     }
 
-    /// 分发消息到其他在线成员（有界并发 fanout）
-    async fn distribute_message_to_members(
-        &self,
-        channel: &crate::model::channel::Channel,
-        sender_id: &UserId,
-        original_local_message_id: u64,
-        message_record: &crate::service::message_history_service::MessageHistoryRecord,
-        reply_to_message_id: Option<&str>,
-        mentioned_user_ids: &[u64],
-        is_mention_all: bool,
-        pts: u64,
-    ) -> Result<()> {
-        info!(
-            "📡 SendMessageHandler: 分发消息 {} 到频道 {}",
-            message_record.message_id, channel.id
-        );
-
-        let all_member_ids: Vec<UserId> = channel.get_member_ids();
-
-        if all_member_ids.is_empty() {
-            debug!(
-                "📡 SendMessageHandler: 频道 {} 没有成员，无需分发",
-                channel.id
-            );
-            return Ok(());
-        }
-
-        info!(
-            "📡 SendMessageHandler: 需要分发给 {} 个成员（包括发送者）",
-            all_member_ids.len()
-        );
-
-        // 创建 PushMessageRequest
-        let push_message_request = self
-            .create_push_message_request(
-                sender_id,
-                channel,
-                original_local_message_id,
-                message_record,
-                reply_to_message_id,
-                mentioned_user_ids,
-                is_mention_all,
-                pts,
-            )
-            .await?;
-
-        let message_id = push_message_request.local_message_id;
-
-        // 1. 写 UserMessageIndex
-        //
-        // 注意：这里不能再分配新的 channel pts。
-        // sync/get_difference 的权威序列只能由 commit log 路径消耗，
-        // 否则会出现「pts 被占用但没有对应 commit」的历史空洞。
-        let receiver_ids: Vec<UserId> = all_member_ids
-            .iter()
-            .filter(|id| *id != sender_id)
-            .cloned()
-            .collect();
-
-        if !receiver_ids.is_empty() {
-            for &member_id in &receiver_ids {
-                debug!(
-                    "✨ 为频道 {} 生成 pts={} (用户: {})",
-                    channel.id, pts, member_id
-                );
-                self.user_message_index
-                    .add_message(member_id, pts, message_id)
-                    .await;
-            }
-        }
-
-        // 2. 有界并发 fanout（buffer_unordered 限制最大并发数）
-        let results: Vec<(UserId, anyhow::Result<RouteResult>)> = stream::iter(all_member_ids)
-            .map(|member_id| {
-                let router = self.message_router.clone();
-                let msg = push_message_request.clone();
-                async move {
-                    let result = router.route_message_to_user(&member_id, msg).await;
-                    (member_id, result)
-                }
-            })
-            .buffer_unordered(50)
-            .collect()
-            .await;
-
-        // 3. 汇总 transport 结果；Delivered 必须来自协议 ACK，不能由 success_count 推断。
-        let mut success_count = 0usize;
-        let mut failed_count = 0usize;
-        let mut offline_user_ids: Vec<u64> = Vec::new();
-        let mut acknowledged_peer: Option<(u64, msgtrans::SessionId)> = None;
-
-        for (member_id, result) in &results {
-            match result {
-                Ok(route_result) => {
-                    success_count += route_result.success_count;
-                    failed_count += route_result.failed_count;
-                    if route_result.offline_count > 0 {
-                        offline_user_ids.push(*member_id);
-                    }
-                    if member_id != sender_id {
-                        if let Some(session_id) = route_result
-                            .delivery_report
-                            .as_ref()
-                            .and_then(|report| report.acknowledged_sessions.first())
-                            .copied()
-                        {
-                            acknowledged_peer.get_or_insert((*member_id, session_id));
-                        }
-                    }
-                    debug!(
-                        "📡 route user={} success={} acked={} failed={} offline={}",
-                        member_id,
-                        route_result.success_count,
-                        route_result
-                            .delivery_report
-                            .as_ref()
-                            .map(|report| report.acknowledged_count())
-                            .unwrap_or(0),
-                        route_result.failed_count,
-                        route_result.offline_count
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "❌ route_message_to_user 失败 user={} error={}",
-                        member_id, e
-                    );
-                    failed_count += 1;
-                }
-            }
-        }
-
-        // 4. 离线消息批量写入 Redis（Pipeline，单次网络往返）
-        if !offline_user_ids.is_empty() {
-            crate::infra::metrics::increment_offline_enqueue(offline_user_ids.len() as u64);
-            tracing::info!(
-                target: "delivery.offline_enqueue",
-                channel_id = channel.id,
-                server_message_id = push_message_request.server_message_id,
-                offline_user_count = offline_user_ids.len(),
-                "fanout zero-success users queued to offline"
-            );
-            if let Err(e) = self
-                .offline_queue_service
-                .add_batch_users(&offline_user_ids, &push_message_request)
-                .await
-            {
-                warn!("⚠️ SendMessageHandler: 批量离线消息写入 Redis 失败: {}", e);
-            }
-        }
-
-        // 5. 仅直聊对端协议 ACK 可生成 Delivered。DB 唯一键保证多设备
-        // 并发 ACK 和重复 dispatch 下 first-ack-wins，只有首次插入者推通知。
-        if channel.channel_type == crate::model::channel::ChannelType::Direct {
-            if let Some((recipient_user_id, ack_session_id)) = acknowledged_peer {
-                self.record_and_push_delivered_receipt(
-                    push_message_request.server_message_id,
-                    push_message_request.channel_type,
-                    recipient_user_id,
-                    ack_session_id,
-                    pts,
-                )
-                .await;
-            }
-        }
-
-        info!(
-            "📡 SendMessageHandler: 消息分发完成 - 成功: {}, 失败: {}, 离线: {}, peer_ack={}",
-            success_count,
-            failed_count,
-            offline_user_ids.len(),
-            acknowledged_peer.is_some()
-        );
-
-        Ok(())
-    }
-
-    async fn record_and_push_delivered_receipt(
-        &self,
-        server_message_id: u64,
-        channel_type: u8,
-        recipient_user_id: u64,
-        ack_session_id: msgtrans::SessionId,
-        pts: u64,
-    ) {
-        let delivered_at = chrono::Utc::now().timestamp_millis() as u64;
-        let receipt = match self
-            .message_repository
-            .record_direct_delivery_receipt_first_ack(
-                server_message_id,
-                recipient_user_id,
-                ack_session_id.as_u64(),
-                delivered_at,
-            )
-            .await
-        {
-            Ok(Some(receipt)) => receipt,
-            Ok(None) => {
-                debug!(
-                    "Delivered receipt duplicate/invalid ignored server_message_id={} recipient={}",
-                    server_message_id, recipient_user_id
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "Persist delivered receipt failed server_message_id={} recipient={} error={}",
-                    server_message_id, recipient_user_id, e
-                );
-                return;
-            }
-        };
-
-        let notification = privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
-            receipt.channel_id,
-            1,
-            receipt.server_message_id,
-            receipt.recipient_user_id,
-            receipt.delivered_at,
-        );
-        let payload = match serde_json::to_vec(&notification) {
-            Ok(payload) => payload,
-            Err(e) => {
-                warn!(
-                    "Encode delivered receipt failed server_message_id={} error={}",
-                    receipt.server_message_id, e
-                );
-                return;
-            }
-        };
-        let push = privchat_protocol::protocol::PushMessageRequest {
-            setting: Default::default(),
-            msg_key: String::new(),
-            server_message_id: receipt.server_message_id,
-            message_seq: pts as u32,
-            local_message_id: 0,
-            stream_no: String::new(),
-            stream_seq: 0,
-            stream_flag: 0,
-            timestamp: chrono::Utc::now().timestamp() as u32,
-            channel_id: receipt.channel_id,
-            channel_type,
-            message_type: privchat_protocol::ContentMessageType::System.as_u32(),
-            expire: 0,
-            topic: String::new(),
-            from_uid: receipt.recipient_user_id,
-            payload,
-            deleted: false,
-        };
-        if let Err(e) = self
-            .message_router
-            .route_message_to_user(&receipt.sender_id, push)
-            .await
-        {
-            warn!(
-                "Push delivered notification failed sender={} error={}",
-                receipt.sender_id, e
-            );
-        }
-    }
-
-    /// 创建 RecvRequest 消息
-    async fn create_push_message_request(
-        &self,
-        sender_id: &UserId,
-        channel: &crate::model::channel::Channel,
-        original_local_message_id: u64,
-        message_record: &crate::service::message_history_service::MessageHistoryRecord,
-        reply_to_message_id: Option<&str>,
-        mentioned_user_ids: &[u64], // ✨ @提及的用户ID列表
-        is_mention_all: bool,       // ✨ 是否@全体成员
-        pts: u64,                   // ✨ 真实 pts（来自 SyncService/DB）
-    ) -> Result<privchat_protocol::protocol::PushMessageRequest> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // 生成消息键
-        let msg_key = format!("msg_{}", message_record.message_id);
-
-        // 获取时间戳
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| ServerError::Internal(format!("获取时间戳失败: {}", e)))?
-            .as_secs() as u32;
-
-        // 构建 payload（包含 content + metadata + reply_to）
-        let mut payload_json = serde_json::Map::new();
-        payload_json.insert(
-            "content".to_string(),
-            serde_json::Value::String(message_record.content.clone()),
-        );
-
-        // 添加 metadata（如果存在）
-        if let Some(ref metadata_str) = message_record.metadata {
-            if let Ok(metadata_value) = serde_json::from_str::<Value>(metadata_str) {
-                payload_json.insert("metadata".to_string(), metadata_value);
-            }
-        }
-
-        // 保留 reply_to_message_id（与 MessagePayloadEnvelope 对齐；接收端本地查找渲染）
-        if let Some(reply_id) = reply_to_message_id {
-            payload_json.insert(
-                "reply_to_message_id".to_string(),
-                serde_json::Value::String(reply_id.to_string()),
-            );
-        }
-
-        // ✨ 添加@提及信息（如果存在）
-        if !mentioned_user_ids.is_empty() || is_mention_all {
-            payload_json.insert(
-                "mentioned_user_ids".to_string(),
-                serde_json::json!(mentioned_user_ids),
-            );
-            payload_json.insert(
-                "is_mention_all".to_string(),
-                serde_json::json!(is_mention_all),
-            );
-        }
-
-        let payload_json_value = serde_json::Value::Object(payload_json);
-        let payload = serde_json::to_string(&payload_json_value)
-            .map_err(|e| ServerError::Internal(format!("序列化 payload 失败: {}", e)))?
-            .into_bytes();
-
-        // 创建 RecvRequest
-        let push_message_request = privchat_protocol::protocol::PushMessageRequest {
-            setting: privchat_protocol::protocol::MessageSetting {
-                need_receipt: channel.channel_type == crate::model::channel::ChannelType::Direct,
-                signal: 0,
-            },
-            msg_key: msg_key.clone(),
-            server_message_id: message_record.message_id,
-            message_seq: pts as u32,
-            local_message_id: original_local_message_id,
-            stream_no: String::new(),
-            stream_seq: 0,
-            stream_flag: 0,
-            timestamp,
-            channel_id: channel.id,
-            channel_type: match channel.channel_type {
-                crate::model::channel::ChannelType::Direct => 1u8,
-                crate::model::channel::ChannelType::Group => 2u8,
-                crate::model::channel::ChannelType::Room => 2u8,
-            },
-            message_type: message_record.message_type,
-            expire: 0,
-            topic: String::new(),
-            from_uid: *sender_id,
-            payload,
-            deleted: false,
-        };
-
-        Ok(push_message_request)
-    }
 
     /// 创建成功响应
     async fn create_success_response(
