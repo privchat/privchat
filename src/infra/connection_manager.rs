@@ -93,6 +93,8 @@ pub enum DeliveryFailureClassification {
     PermanentTransport,
     TransportUnavailable,
     RemoteOwnerUnsupported,
+    ProtocolAckRejected,
+    ProtocolAckMalformed,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +109,12 @@ pub struct FailedSessionDelivery {
 #[derive(Debug, Clone, Default)]
 pub struct DeliveryReport {
     pub attempted: usize,
+    /// Sessions for which the route completed successfully. For receipt-required
+    /// pushes this means the protocol ACK was also received within the deadline.
     pub successful_sessions: Vec<SessionId>,
+    /// Strict subset of `successful_sessions` that returned a positive
+    /// `PushMessageResponse`; never inferred from a transport write.
+    pub acknowledged_sessions: Vec<SessionId>,
     pub failed_sessions: Vec<FailedSessionDelivery>,
     pub failure_classification: BTreeMap<DeliveryFailureClassification, usize>,
 }
@@ -121,6 +128,10 @@ impl DeliveryReport {
         self.failed_sessions.len()
     }
 
+    pub fn acknowledged_count(&self) -> usize {
+        self.acknowledged_sessions.len()
+    }
+
     fn push_failure(&mut self, failure: FailedSessionDelivery) {
         *self
             .failure_classification
@@ -132,8 +143,19 @@ impl DeliveryReport {
 
 #[derive(Debug)]
 enum SessionAttemptOutcome {
-    Success,
+    Success {
+        acknowledged: bool,
+    },
     Failure {
+        classification: DeliveryFailureClassification,
+        detail: String,
+    },
+}
+
+#[derive(Debug)]
+enum SessionSendFailure {
+    Transport(msgtrans::error::TransportError),
+    Classified {
         classification: DeliveryFailureClassification,
         detail: String,
     },
@@ -162,7 +184,7 @@ async fn deliver_sessions_concurrently<F, Fut>(
 ) -> Vec<(SessionId, SessionAttemptOutcome)>
 where
     F: Fn(SessionId) -> Fut + Clone,
-    Fut: Future<Output = std::result::Result<(), msgtrans::error::TransportError>>,
+    Fut: Future<Output = std::result::Result<bool, SessionSendFailure>>,
 {
     let concurrency = sessions.len().max(1);
     stream::iter(sessions)
@@ -170,10 +192,19 @@ where
             let send = send.clone();
             async move {
                 let outcome = match tokio::time::timeout(route_timeout, send(session_id)).await {
-                    Ok(Ok(())) => SessionAttemptOutcome::Success,
-                    Ok(Err(error)) => SessionAttemptOutcome::Failure {
-                        classification: classify_transport_error(&error),
-                        detail: error.to_string(),
+                    Ok(Ok(acknowledged)) => SessionAttemptOutcome::Success { acknowledged },
+                    Ok(Err(SessionSendFailure::Transport(error))) => {
+                        SessionAttemptOutcome::Failure {
+                            classification: classify_transport_error(&error),
+                            detail: error.to_string(),
+                        }
+                    }
+                    Ok(Err(SessionSendFailure::Classified {
+                        classification,
+                        detail,
+                    })) => SessionAttemptOutcome::Failure {
+                        classification,
+                        detail,
                     },
                     Err(_) => SessionAttemptOutcome::Failure {
                         classification: DeliveryFailureClassification::RouteTimeout,
@@ -861,14 +892,18 @@ impl ConnectionManager {
     ) {
         for (session_id, outcome) in attempts {
             match outcome {
-                SessionAttemptOutcome::Success => {
+                SessionAttemptOutcome::Success { acknowledged } => {
                     report.successful_sessions.push(session_id);
+                    if acknowledged {
+                        report.acknowledged_sessions.push(session_id);
+                    }
                     trace!(
                         target: "diag.push_route",
                         user_id = user_id,
                         sid = %session_id,
                         server_message_id = server_message_id,
-                        "[PUSH_ROUTE_WRITE] write_ok (transport accepted; not Delivered ACK)"
+                        acknowledged = acknowledged,
+                        "[PUSH_ROUTE_WRITE] route_ok"
                     );
                 }
                 SessionAttemptOutcome::Failure {
@@ -1048,6 +1083,7 @@ impl ConnectionManager {
         let payload = privchat_protocol::encode_message(message)
             .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
         let owner_by_session: HashMap<SessionId, String> = local_sessions.iter().cloned().collect();
+        let receipt_required = message.setting.need_receipt;
         let attempts = deliver_sessions_concurrently(
             local_sessions
                 .into_iter()
@@ -1058,12 +1094,53 @@ impl ConnectionManager {
                 let server = server.clone();
                 let payload = payload.clone();
                 async move {
-                    let mut packet =
-                        msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload);
+                    let packet_id = crate::infra::next_packet_id();
+                    let mut packet = if receipt_required {
+                        msgtrans::packet::Packet::request(packet_id, payload)
+                    } else {
+                        msgtrans::packet::Packet::one_way(packet_id, payload)
+                    };
                     packet.set_biz_type(
                         privchat_protocol::protocol::MessageType::PushMessageRequest as u8,
                     );
-                    server.send_to_session(session_id, packet).await
+                    if !receipt_required {
+                        return server
+                            .send_to_session(session_id, packet)
+                            .await
+                            .map(|_| false)
+                            .map_err(SessionSendFailure::Transport);
+                    }
+
+                    // msgtrans owns request-tracker cleanup on its 10s timeout. Run
+                    // it in a detached task so our stricter 5s route deadline can
+                    // expire without cancelling and leaking the tracker entry.
+                    let request =
+                        tokio::spawn(
+                            async move { server.request_to_session(session_id, packet).await },
+                        );
+                    let response = request
+                        .await
+                        .map_err(|e| SessionSendFailure::Classified {
+                            classification: DeliveryFailureClassification::RetryableTransport,
+                            detail: format!("protocol ACK task failed: {e}"),
+                        })?
+                        .map_err(SessionSendFailure::Transport)?;
+                    let ack = privchat_protocol::decode_message::<
+                        privchat_protocol::protocol::PushMessageResponse,
+                    >(&response.payload)
+                    .map_err(|e| SessionSendFailure::Classified {
+                        classification: DeliveryFailureClassification::ProtocolAckMalformed,
+                        detail: format!("invalid PushMessageResponse: {e}"),
+                    })?;
+                    if !ack.succeed {
+                        return Err(SessionSendFailure::Classified {
+                            classification: DeliveryFailureClassification::ProtocolAckRejected,
+                            detail: ack
+                                .message
+                                .unwrap_or_else(|| "receiver rejected delivery ACK".to_string()),
+                        });
+                    }
+                    Ok(true)
                 }
             },
         )
@@ -1708,7 +1785,7 @@ mod tests {
                         max_active.fetch_max(current, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(30)).await;
                         active.fetch_sub(1, Ordering::SeqCst);
-                        Ok(())
+                        Ok(false)
                     }
                 }
             },
@@ -1716,9 +1793,12 @@ mod tests {
         .await;
 
         assert_eq!(attempts.len(), 3);
-        assert!(attempts
-            .iter()
-            .all(|(_, outcome)| matches!(outcome, SessionAttemptOutcome::Success)));
+        assert!(attempts.iter().all(|(_, outcome)| matches!(
+            outcome,
+            SessionAttemptOutcome::Success {
+                acknowledged: false
+            }
+        )));
         assert!(max_active.load(Ordering::SeqCst) >= 2);
     }
 
@@ -1729,7 +1809,7 @@ mod tests {
             Duration::from_millis(5),
             |_| async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok(())
+                Ok(false)
             },
         )
         .await;
@@ -1776,6 +1856,33 @@ mod tests {
         assert!(!manager.is_device_online(83, "device-a").await);
         assert!(manager.index_b.get(&session_id).is_none());
         assert!(manager.self_check().is_clean());
+    }
+
+    #[tokio::test]
+    async fn protocol_ack_is_distinct_from_transport_acceptance() {
+        let manager = ConnectionManager::new_with_node_id("node-a");
+        let session_id = SessionId::new(8351);
+        manager
+            .register_connection(835, "device-a".to_string(), session_id)
+            .await
+            .unwrap();
+
+        let owners = HashMap::from([(session_id, "node-a".to_string())]);
+        let attempts = vec![(
+            session_id,
+            SessionAttemptOutcome::Success { acknowledged: true },
+        )];
+        let mut report = DeliveryReport {
+            attempted: 1,
+            ..DeliveryReport::default()
+        };
+        manager
+            .apply_delivery_attempts(835, 456, &owners, attempts, &mut report)
+            .await;
+
+        assert_eq!(report.successful_sessions, vec![session_id]);
+        assert_eq!(report.acknowledged_sessions, vec![session_id]);
+        assert_eq!(report.acknowledged_count(), 1);
     }
 
     #[tokio::test]

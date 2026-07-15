@@ -124,6 +124,16 @@ pub struct AtomicMessageCommitResult {
     pub canonical_event: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageDeliveryReceiptRecord {
+    pub server_message_id: u64,
+    pub channel_id: u64,
+    pub sender_id: u64,
+    pub recipient_user_id: u64,
+    pub ack_session_id: u64,
+    pub delivered_at: u64,
+}
+
 impl PgMessageRepository {
     /// 创建新的消息仓库
     pub fn new(pool: Arc<PgPool>) -> Self {
@@ -133,6 +143,52 @@ impl PgMessageRepository {
     /// 获取数据库连接池（用于管理 API）
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Persist a direct-message Delivered receipt. The INSERT itself verifies
+    /// that the ACK user is the direct peer and uses the unique key to enforce
+    /// first-ack-wins across concurrent sessions and repeated dispatch.
+    pub async fn record_direct_delivery_receipt_first_ack(
+        &self,
+        server_message_id: u64,
+        recipient_user_id: u64,
+        ack_session_id: u64,
+        delivered_at: u64,
+    ) -> Result<Option<MessageDeliveryReceiptRecord>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO privchat_message_delivery_receipts
+                (server_message_id, receipt_type, channel_id, sender_id,
+                 recipient_user_id, ack_session_id, delivered_at)
+            SELECT m.message_id, 'delivered', m.channel_id, m.sender_id,
+                   $2, $3, $4
+            FROM privchat_messages m
+            JOIN privchat_channels c ON c.channel_id = m.channel_id
+            WHERE m.message_id = $1
+              AND c.channel_type = 0
+              AND m.sender_id <> $2
+              AND $2 IN (c.direct_user1_id, c.direct_user2_id)
+            ON CONFLICT (server_message_id, receipt_type) DO NOTHING
+            RETURNING server_message_id, channel_id, sender_id,
+                      recipient_user_id, ack_session_id, delivered_at
+            "#,
+        )
+        .bind(server_message_id as i64)
+        .bind(recipient_user_id as i64)
+        .bind(ack_session_id as i64)
+        .bind(delivered_at as i64)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to record delivery receipt: {e}")))?;
+
+        Ok(row.map(|row| MessageDeliveryReceiptRecord {
+            server_message_id: row.get::<i64, _>("server_message_id") as u64,
+            channel_id: row.get::<i64, _>("channel_id") as u64,
+            sender_id: row.get::<i64, _>("sender_id") as u64,
+            recipient_user_id: row.get::<i64, _>("recipient_user_id") as u64,
+            ack_session_id: row.get::<i64, _>("ack_session_id") as u64,
+            delivered_at: row.get::<i64, _>("delivered_at") as u64,
+        }))
     }
 
     async fn create_dispatch_snapshot_in_tx(
@@ -1987,6 +2043,10 @@ mod atomic_dispatch_tests {
     const MEMBER_ID: i64 = 987_674_102;
     const LATE_MEMBER_ID: i64 = 987_674_103;
     const MESSAGE_ID: u64 = 987_674_201;
+    const DIRECT_CHANNEL_ID: i64 = 987_674_301;
+    const DIRECT_SENDER_ID: i64 = 987_674_401;
+    const DIRECT_RECIPIENT_ID: i64 = 987_674_402;
+    const DIRECT_MESSAGE_ID: u64 = 987_674_501;
 
     async fn open_repo() -> Option<PgMessageRepository> {
         let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
@@ -2001,6 +2061,20 @@ mod atomic_dispatch_tests {
     }
 
     async fn cleanup(repo: &PgMessageRepository) {
+        let _ = sqlx::query(
+            "DELETE FROM privchat_message_delivery_receipts WHERE server_message_id = $1",
+        )
+        .bind(DIRECT_MESSAGE_ID as i64)
+        .execute(repo.pool())
+        .await;
+        let _ = sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
+            .bind(DIRECT_MESSAGE_ID as i64)
+            .execute(repo.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(DIRECT_CHANNEL_ID)
+            .execute(repo.pool())
+            .await;
         let _ = sqlx::query("DELETE FROM privchat_message_dedup WHERE dedup_key = $1")
             .bind("test:p2:group-snapshot")
             .execute(repo.pool())
@@ -2172,6 +2246,103 @@ mod atomic_dispatch_tests {
         .expect("recipient snapshot");
         assert_eq!(recipients, vec![OWNER_ID, MEMBER_ID]);
 
+        let group_ack = repo
+            .record_direct_delivery_receipt_first_ack(
+                MESSAGE_ID,
+                MEMBER_ID as u64,
+                404,
+                Utc::now().timestamp_millis() as u64,
+            )
+            .await
+            .expect("group ACK query");
+        assert!(
+            group_ack.is_none(),
+            "group messages have no Delivered in v1"
+        );
+
+        cleanup(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn direct_delivery_receipt_is_first_ack_wins_and_rejects_sender_ack() {
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip delivery receipt test: DATABASE_URL not configured");
+            return;
+        };
+        cleanup(&repo).await;
+        for user_id in [DIRECT_SENDER_ID, DIRECT_RECIPIENT_ID] {
+            ensure_user(&repo, user_id).await;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_channels
+                (channel_id, channel_type, direct_user1_id, direct_user2_id)
+            VALUES ($1, 0, $2, $3)
+            "#,
+        )
+        .bind(DIRECT_CHANNEL_ID)
+        .bind(DIRECT_SENDER_ID)
+        .bind(DIRECT_RECIPIENT_ID)
+        .execute(repo.pool())
+        .await
+        .expect("insert direct channel");
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_messages
+                (message_id, channel_id, sender_id, pts, message_type, content,
+                 created_at, updated_at)
+            VALUES ($1, $2, $3, 1, 1, 'receipt-test', $4, $4)
+            "#,
+        )
+        .bind(DIRECT_MESSAGE_ID as i64)
+        .bind(DIRECT_CHANNEL_ID)
+        .bind(DIRECT_SENDER_ID)
+        .bind(now)
+        .execute(repo.pool())
+        .await
+        .expect("insert direct message");
+
+        let (first, second) = tokio::join!(
+            repo.record_direct_delivery_receipt_first_ack(
+                DIRECT_MESSAGE_ID,
+                DIRECT_RECIPIENT_ID as u64,
+                101,
+                now as u64,
+            ),
+            repo.record_direct_delivery_receipt_first_ack(
+                DIRECT_MESSAGE_ID,
+                DIRECT_RECIPIENT_ID as u64,
+                202,
+                (now + 1) as u64,
+            )
+        );
+        let inserted = [first.unwrap(), second.unwrap()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(inserted.len(), 1, "only one concurrent ACK may win");
+        assert_eq!(inserted[0].recipient_user_id, DIRECT_RECIPIENT_ID as u64);
+
+        let sender_ack = repo
+            .record_direct_delivery_receipt_first_ack(
+                DIRECT_MESSAGE_ID,
+                DIRECT_SENDER_ID as u64,
+                303,
+                (now + 2) as u64,
+            )
+            .await
+            .unwrap();
+        assert!(sender_ack.is_none(), "sender cannot ACK its own message");
+
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM privchat_message_delivery_receipts WHERE server_message_id = $1",
+        )
+        .bind(DIRECT_MESSAGE_ID as i64)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt_count, 1);
         cleanup(&repo).await;
     }
 }

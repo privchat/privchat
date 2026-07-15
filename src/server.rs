@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use msgtrans::{
@@ -484,7 +483,7 @@ impl ChatServer {
 
         // 3. 创建 OfflineMessageWorker
         let offline_worker_config = crate::infra::OfflineWorkerConfig::default();
-        let mut offline_worker_inner = crate::infra::OfflineMessageWorker::new(
+        let offline_worker_inner = crate::infra::OfflineMessageWorker::new(
             offline_worker_config,
             message_router.clone(),
             offline_queue_cache.clone(),
@@ -493,7 +492,6 @@ impl ChatServer {
             offline_queue_service.clone(), // ✨ 用于从 Redis 获取消息
             connection_manager.clone(),    // ✨ Step 2：在线态唯一真源
         );
-        offline_worker_inner.set_delivery_tracker(delivery_tracker.clone());
         let offline_worker = Arc::new(offline_worker_inner);
         info!("✅ OfflineMessageWorker 创建完成");
 
@@ -650,7 +648,6 @@ impl ChatServer {
             auth_session_manager.clone(),
             Some(user_device_repo.clone()), // ✨ Phase 3.5: 传递 user_device_repo
         );
-        send_handler_inner.set_delivery_tracker(delivery_tracker.clone());
         // Inject ServerEvent emit deps（spec SERVER_EVENT_DISPATCH_SPEC §11.1：
         // system_user.message_received）。`server_event_client` 可能为 None
         // （未配 [server_event]），此时 emit 整体跳过。
