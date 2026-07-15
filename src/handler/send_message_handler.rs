@@ -108,8 +108,6 @@ pub struct SendMessageHandler {
     user_device_repo: Option<Arc<crate::repository::UserDeviceRepository>>,
     /// 认证会话管理器（用于 READY 推送闸门）
     auth_session_manager: Arc<AuthSessionManager>,
-    /// 送达水位追踪器
-    delivery_tracker: Option<Arc<crate::service::DeliveryTracker>>,
     /// ServerEvent 出站 client（用于 fire-and-forget 向 application 投递
     /// `system_user.message_received` 等事件；spec SERVER_EVENT_DISPATCH_SPEC §11.1）。
     /// None = 未配 `[server_event]` 段，server 内部 emit 全部跳过。
@@ -186,15 +184,10 @@ impl SendMessageHandler {
             event_bus: None,
             auth_session_manager,
             user_device_repo, // ✨ Phase 3.5
-            delivery_tracker: None,
             server_event_client: None,
             user_repository: None,
             cache_manager: None,
         }
-    }
-
-    pub fn set_delivery_tracker(&mut self, tracker: Arc<crate::service::DeliveryTracker>) {
-        self.delivery_tracker = Some(tracker);
     }
 
     /// Inject the deps needed for `system_user.message_received` emit
@@ -2207,11 +2200,11 @@ impl SendMessageHandler {
             .collect()
             .await;
 
-        // 3. 汇总结果 + 收集离线用户 + 收集已送达用户
+        // 3. 汇总 transport 结果；Delivered 必须来自协议 ACK，不能由 success_count 推断。
         let mut success_count = 0usize;
         let mut failed_count = 0usize;
         let mut offline_user_ids: Vec<u64> = Vec::new();
-        let mut delivered_to_peer = false;
+        let mut acknowledged_peer: Option<(u64, msgtrans::SessionId)> = None;
 
         for (member_id, result) in &results {
             match result {
@@ -2221,14 +2214,25 @@ impl SendMessageHandler {
                     if route_result.offline_count > 0 {
                         offline_user_ids.push(*member_id);
                     }
-                    // 非发送者成功收到 ACK → 已送达
-                    if member_id != sender_id && route_result.success_count > 0 {
-                        delivered_to_peer = true;
+                    if member_id != sender_id {
+                        if let Some(session_id) = route_result
+                            .delivery_report
+                            .as_ref()
+                            .and_then(|report| report.acknowledged_sessions.first())
+                            .copied()
+                        {
+                            acknowledged_peer.get_or_insert((*member_id, session_id));
+                        }
                     }
                     debug!(
-                        "📡 route user={} success={} failed={} offline={}",
+                        "📡 route user={} success={} acked={} failed={} offline={}",
                         member_id,
                         route_result.success_count,
+                        route_result
+                            .delivery_report
+                            .as_ref()
+                            .map(|report| report.acknowledged_count())
+                            .unwrap_or(0),
                         route_result.failed_count,
                         route_result.offline_count
                     );
@@ -2239,17 +2243,6 @@ impl SendMessageHandler {
                         member_id, e
                     );
                     failed_count += 1;
-                }
-            }
-        }
-
-        // 3.5 推进送达水位：推送成功的成员推进 delivered_contiguous_pts
-        if let Some(tracker) = &self.delivery_tracker {
-            for (member_id, result) in &results {
-                if let Ok(route_result) = result {
-                    if route_result.success_count > 0 {
-                        tracker.try_advance(*member_id, channel.id, pts).await;
-                    }
                 }
             }
         }
@@ -2273,67 +2266,114 @@ impl SendMessageHandler {
             }
         }
 
-        // 5. 已送达通知：至少一个非发送者 ACK 了推送 → 通知发送者
-        if delivered_to_peer {
-            let channel_type_i32 = match channel.channel_type {
-                crate::model::channel::ChannelType::Direct => 1i32,
-                crate::model::channel::ChannelType::Group => 2i32,
-                crate::model::channel::ChannelType::Room => 2i32,
-            };
-            let delivered_at = chrono::Utc::now().timestamp_millis() as u64;
-            let receipt_notification =
-                privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
-                    channel.id,
-                    channel_type_i32,
+        // 5. 仅直聊对端协议 ACK 可生成 Delivered。DB 唯一键保证多设备
+        // 并发 ACK 和重复 dispatch 下 first-ack-wins，只有首次插入者推通知。
+        if channel.channel_type == crate::model::channel::ChannelType::Direct {
+            if let Some((recipient_user_id, ack_session_id)) = acknowledged_peer {
+                self.record_and_push_delivered_receipt(
                     push_message_request.server_message_id,
-                    delivered_at,
-                );
-            let receipt_bytes = serde_json::to_vec(&receipt_notification).unwrap_or_default();
-            let receipt_push = privchat_protocol::protocol::PushMessageRequest {
-                setting: Default::default(),
-                msg_key: String::new(),
-                server_message_id: push_message_request.server_message_id,
-                message_seq: pts as u32,
-                local_message_id: 0,
-                stream_no: String::new(),
-                stream_seq: 0,
-                stream_flag: 0,
-                timestamp: chrono::Utc::now().timestamp() as u32,
-                channel_id: channel.id,
-                channel_type: push_message_request.channel_type,
-                message_type: privchat_protocol::ContentMessageType::System.as_u32(),
-                expire: 0,
-                topic: String::new(),
-                from_uid: *sender_id,
-                payload: receipt_bytes,
-                deleted: false,
-            };
-            if let Err(e) = self
-                .message_router
-                .route_message_to_user(sender_id, receipt_push)
-                .await
-            {
-                warn!(
-                    "⚠️ SendMessageHandler: 推送 delivered 通知失败 sender={} error={}",
-                    sender_id, e
-                );
-            } else {
-                debug!(
-                    "✅ SendMessageHandler: delivered 通知已推送 sender={} server_message_id={}",
-                    sender_id, push_message_request.server_message_id
-                );
+                    push_message_request.channel_type,
+                    recipient_user_id,
+                    ack_session_id,
+                    pts,
+                )
+                .await;
             }
         }
 
         info!(
-            "📡 SendMessageHandler: 消息分发完成 - 成功: {}, 失败: {}, 离线: {}, delivered={}",
+            "📡 SendMessageHandler: 消息分发完成 - 成功: {}, 失败: {}, 离线: {}, peer_ack={}",
             success_count,
             failed_count,
             offline_user_ids.len(),
-            delivered_to_peer
+            acknowledged_peer.is_some()
         );
 
         Ok(())
+    }
+
+    async fn record_and_push_delivered_receipt(
+        &self,
+        server_message_id: u64,
+        channel_type: u8,
+        recipient_user_id: u64,
+        ack_session_id: msgtrans::SessionId,
+        pts: u64,
+    ) {
+        let delivered_at = chrono::Utc::now().timestamp_millis() as u64;
+        let receipt = match self
+            .message_repository
+            .record_direct_delivery_receipt_first_ack(
+                server_message_id,
+                recipient_user_id,
+                ack_session_id.as_u64(),
+                delivered_at,
+            )
+            .await
+        {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => {
+                debug!(
+                    "Delivered receipt duplicate/invalid ignored server_message_id={} recipient={}",
+                    server_message_id, recipient_user_id
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "Persist delivered receipt failed server_message_id={} recipient={} error={}",
+                    server_message_id, recipient_user_id, e
+                );
+                return;
+            }
+        };
+
+        let notification = privchat_protocol::notification::MessageDeliveryReceiptNotification::new(
+            receipt.channel_id,
+            1,
+            receipt.server_message_id,
+            receipt.recipient_user_id,
+            receipt.delivered_at,
+        );
+        let payload = match serde_json::to_vec(&notification) {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!(
+                    "Encode delivered receipt failed server_message_id={} error={}",
+                    receipt.server_message_id, e
+                );
+                return;
+            }
+        };
+        let push = privchat_protocol::protocol::PushMessageRequest {
+            setting: Default::default(),
+            msg_key: String::new(),
+            server_message_id: receipt.server_message_id,
+            message_seq: pts as u32,
+            local_message_id: 0,
+            stream_no: String::new(),
+            stream_seq: 0,
+            stream_flag: 0,
+            timestamp: chrono::Utc::now().timestamp() as u32,
+            channel_id: receipt.channel_id,
+            channel_type,
+            message_type: privchat_protocol::ContentMessageType::System.as_u32(),
+            expire: 0,
+            topic: String::new(),
+            from_uid: receipt.recipient_user_id,
+            payload,
+            deleted: false,
+        };
+        if let Err(e) = self
+            .message_router
+            .route_message_to_user(&receipt.sender_id, push)
+            .await
+        {
+            warn!(
+                "Push delivered notification failed sender={} error={}",
+                receipt.sender_id, e
+            );
+        }
     }
 
     /// 创建 RecvRequest 消息
@@ -2400,7 +2440,10 @@ impl SendMessageHandler {
 
         // 创建 RecvRequest
         let push_message_request = privchat_protocol::protocol::PushMessageRequest {
-            setting: privchat_protocol::protocol::MessageSetting::default(),
+            setting: privchat_protocol::protocol::MessageSetting {
+                need_receipt: channel.channel_type == crate::model::channel::ChannelType::Direct,
+                signal: 0,
+            },
             msg_key: msg_key.clone(),
             server_message_id: message_record.message_id,
             message_seq: pts as u32,

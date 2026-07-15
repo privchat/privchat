@@ -114,7 +114,8 @@ pub use device_repo::*;
 pub use file_upload_repo::FileUploadRepository;
 pub use login_log_repository::{CreateLoginLogRequest, LoginLogQuery, LoginLogRepository};
 pub use message_repo::{
-    AtomicMessageCommitRequest, ClientRegistryClaim, MessageRepository, PgMessageRepository,
+    AtomicMessageCommitRequest, ClientRegistryClaim, MessageDeliveryReceiptRecord,
+    MessageRepository, PgMessageRepository,
 };
 pub use presence_repository::PresenceRepository;
 pub use refresh_token_repository::{
