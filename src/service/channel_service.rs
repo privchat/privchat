@@ -301,31 +301,35 @@ impl ChannelService {
             return Ok(());
         }
 
-        self.ensure_user_channel_rows(channel_id, user_ids).await?;
-
         let now = chrono::Utc::now().timestamp_millis();
-        for user_id in user_ids {
-            sqlx::query(
-                r#"
-                UPDATE privchat_user_channels
-                SET unread_count = GREATEST(0, unread_count + $3),
-                    updated_at = $4
-                WHERE user_id = $1 AND channel_id = $2
-                "#,
+        let user_ids: Vec<i64> = user_ids.iter().map(|id| *id as i64).collect();
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_user_channels (
+                user_id, channel_id, unread_count, is_pinned, is_muted, updated_at
             )
-            .bind(*user_id as i64)
-            .bind(channel_id as i64)
-            .bind(count)
-            .bind(now)
-            .execute(self.pool())
-            .await
-            .map_err(|e| {
-                ServerError::Database(format!(
-                    "increment privchat_user_channels unread failed for user={} channel={}: {}",
-                    user_id, channel_id, e
-                ))
-            })?;
-        }
+            SELECT user_id, $2, $3, false, false, $4
+            FROM UNNEST($1::BIGINT[]) AS users(user_id)
+            ON CONFLICT (user_id, channel_id) DO UPDATE SET
+                unread_count = GREATEST(
+                    0,
+                    privchat_user_channels.unread_count + EXCLUDED.unread_count
+                ),
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&user_ids)
+        .bind(channel_id as i64)
+        .bind(count)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(|e| {
+            ServerError::Database(format!(
+                "batch increment privchat_user_channels unread failed for channel={}: {}",
+                channel_id, e
+            ))
+        })?;
 
         Ok(())
     }

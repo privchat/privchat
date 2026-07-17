@@ -147,6 +147,62 @@ impl RedisClient {
         .await
     }
 
+    /// SET key value NX EX seconds. Returns false when another owner exists.
+    pub async fn set_nx_ex(
+        &self,
+        key: &str,
+        seconds: usize,
+        value: &str,
+    ) -> Result<bool, crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let result: Option<String> = redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .arg("NX")
+                .arg("EX")
+                .arg(seconds)
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!("Redis SET NX EX failed: {e}"))
+                })?;
+            Ok(result.as_deref() == Some("OK"))
+        })
+        .await
+    }
+
+    /// Refresh a lease only when the fencing token still matches.
+    pub async fn compare_and_expire(
+        &self,
+        key: &str,
+        expected_value: &str,
+        seconds: usize,
+    ) -> Result<bool, crate::error::ServerError> {
+        const SCRIPT: &str = r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('EXPIRE', KEYS[1], ARGV[2])
+            end
+            return 0
+        "#;
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let refreshed: i64 = redis::Script::new(SCRIPT)
+                .key(key)
+                .arg(expected_value)
+                .arg(seconds)
+                .invoke_async(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!(
+                        "Redis compare-and-expire failed: {e}"
+                    ))
+                })?;
+            Ok(refreshed == 1)
+        })
+        .await
+    }
+
     /// GET key
     pub async fn get(&self, key: &str) -> Result<Option<String>, crate::error::ServerError> {
         self.with_timeout(async {
@@ -262,6 +318,36 @@ impl RedisClient {
             }
             pipe.query_async::<()>(&mut *conn).await.map_err(|e| {
                 crate::error::ServerError::Internal(format!("Redis HINCRBY pipeline failed: {}", e))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Batch HINCRBY across multiple keys in one Redis pipeline. This is used
+    /// for group unread fanout where one message updates many users.
+    pub async fn hincrby_multi_keys_expire(
+        &self,
+        increments: &[(String, String, i64)],
+        expire_seconds: usize,
+    ) -> Result<(), crate::error::ServerError> {
+        if increments.is_empty() {
+            return Ok(());
+        }
+
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let mut pipe = redis::pipe();
+            for (key, field, delta) in increments {
+                pipe.cmd("HINCRBY").arg(key).arg(field).arg(*delta).ignore();
+                if expire_seconds > 0 {
+                    pipe.cmd("EXPIRE").arg(key).arg(expire_seconds).ignore();
+                }
+            }
+            pipe.query_async::<()>(&mut *conn).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!(
+                    "Redis multi-key HINCRBY pipeline failed: {e}"
+                ))
             })?;
             Ok(())
         })
@@ -438,6 +524,41 @@ impl RedisClient {
         .await
     }
 
+    pub async fn zremrangebyscore(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+    ) -> Result<(), crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            redis::cmd("ZREMRANGEBYSCORE")
+                .arg(key)
+                .arg(min)
+                .arg(max)
+                .query_async::<usize>(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!(
+                        "Redis ZREMRANGEBYSCORE failed: {e}"
+                    ))
+                })?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn zrem(&self, key: &str, member: &str) -> Result<(), crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            conn.zrem::<_, _, ()>(key, member).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!("Redis ZREM failed: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
     // ============================================================
     // Set 操作
     // ============================================================
@@ -490,6 +611,30 @@ impl RedisClient {
                 crate::error::ServerError::Internal(format!("Redis LPUSH failed: {}", e))
             })?;
             Ok(())
+        })
+        .await
+    }
+
+    pub async fn rpush(&self, key: &str, value: &str) -> Result<(), crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            conn.rpush::<_, _, ()>(key, value).await.map_err(|e| {
+                crate::error::ServerError::Internal(format!("Redis RPUSH failed: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Non-blocking LPOP. Cross-node dispatch deliberately uses polling on the
+    /// shared short-command pool; blocking commands require a dedicated Redis
+    /// connection and must not outlive `command_timeout`.
+    pub async fn lpop(&self, key: &str) -> Result<Option<String>, crate::error::ServerError> {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            conn.lpop::<_, Option<String>>(key, None)
+                .await
+                .map_err(|e| crate::error::ServerError::Internal(format!("Redis LPOP failed: {e}")))
         })
         .await
     }

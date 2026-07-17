@@ -13,7 +13,7 @@
 //
 // gate：未配 PRIVCHAT_TEST_DATABASE_URL / DATABASE_URL 时跳过。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sqlx::postgres::PgPoolOptions;
 
@@ -36,6 +36,13 @@ const FILE_PENDING: u64 = 9_943_004;
 const FILE_BROKEN: u64 = 9_943_005;
 const FILE_BIND_MAIN: u64 = 9_943_006;
 const FILE_BIND_THUMB: u64 = 9_943_007;
+
+// Both DB-backed cases intentionally share this fixed fixture namespace. Keep
+// them serial so one case cannot clean up rows while the other is asserting.
+fn fixture_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 async fn open_test_pool() -> Option<Arc<sqlx::PgPool>> {
     let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
@@ -223,6 +230,7 @@ async fn seed_common(pool: &sqlx::PgPool) {
 
 #[tokio::test]
 async fn attachment_get_url_authz_rc_gate() {
+    let _fixture_guard = fixture_lock().lock().await;
     let Some(pool) = open_test_pool().await else {
         eprintln!("skip attachment_get_url_authz_rc_gate: DATABASE_URL not configured");
         return;
@@ -346,6 +354,7 @@ async fn attachment_get_url_authz_rc_gate() {
 
 #[tokio::test]
 async fn attachment_file_and_thumbnail_bind_to_message() {
+    let _fixture_guard = fixture_lock().lock().await;
     let Some(pool) = open_test_pool().await else {
         eprintln!(
             "skip attachment_file_and_thumbnail_bind_to_message: DATABASE_URL not configured"

@@ -2241,6 +2241,7 @@ mod atomic_dispatch_tests {
 
     #[tokio::test]
     async fn atomic_commit_freezes_group_recipients_and_outbox() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(repo) = open_repo().await else {
             eprintln!("skip atomic dispatch test: DATABASE_URL not configured");
             return;
@@ -2389,6 +2390,7 @@ mod atomic_dispatch_tests {
 
     #[tokio::test]
     async fn direct_delivery_receipt_is_first_ack_wins_and_rejects_sender_ack() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(repo) = open_repo().await else {
             eprintln!("skip delivery receipt test: DATABASE_URL not configured");
             return;

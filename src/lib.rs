@@ -57,3 +57,14 @@ pub use handler::{
 pub use infra::CacheManager;
 pub use model::*;
 pub use server::ChatServer;
+
+#[cfg(test)]
+pub(crate) fn database_fixture_lock() -> &'static tokio::sync::Mutex<()> {
+    use std::sync::OnceLock;
+
+    // A small set of DB-backed state-machine tests deliberately uses fixed
+    // primary keys so they can assert fencing and cascade behavior. They must
+    // not run concurrently against the same DATABASE_URL.
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}

@@ -71,6 +71,8 @@ const COUNTER_DELIVERY_ZERO_SUCCESS: &str = "privchat_delivery_zero_success_tota
 const COUNTER_OFFLINE_ENQUEUE: &str = "privchat_offline_enqueue_total";
 /// 累计被 A→B 二次校验过滤掉的 session 次数（带 reason label）
 const COUNTER_DELIVERY_FILTERED: &str = "privchat_delivery_filtered_total";
+/// Session-level delivery failures by bounded classification.
+const COUNTER_DELIVERY_FAILURE_SESSIONS: &str = "privchat_delivery_failure_sessions_total";
 
 /// 初始化 Prometheus 指标（安装全局 Recorder，返回 Handle 用于 HTTP 暴露）。
 /// 仅需在进程内调用一次；重复调用会返回 Err。
@@ -280,6 +282,14 @@ pub fn increment_offline_enqueue(by: u64) {
 /// reason 取值：`not_authenticated` / `superseded` / `missing_in_b`
 pub fn increment_delivery_filtered(reason: &'static str, by: u64) {
     metrics::counter!(COUNTER_DELIVERY_FILTERED, "reason" => reason).increment(by);
+}
+
+pub fn increment_delivery_failure_sessions(classification: &'static str, by: u64) {
+    metrics::counter!(
+        COUNTER_DELIVERY_FAILURE_SESSIONS,
+        "classification" => classification
+    )
+    .increment(by);
 }
 
 // ---------------------------------------------------------------------------

@@ -1740,13 +1740,11 @@ impl SendMessageHandler {
                 Ok(v) => v,
                 Err(_) => {
                     // fallback: 纯文本模式（旧客户端 / 测试可能直接传 utf-8）
-                    return Ok((
-                        String::from_utf8_lossy(payload).to_string(),
-                        None,
-                        None,
-                        Vec::new(),
-                        None,
-                    ));
+                    let text = String::from_utf8_lossy(payload).replace('\u{0}', "");
+                    if let Some(normalized) = Self::parse_legacy_json_payload(&text) {
+                        return Ok(normalized);
+                    }
+                    return Ok((text, None, None, Vec::new(), None));
                 }
             };
 
@@ -1796,6 +1794,70 @@ impl SendMessageHandler {
             metadata,
             reply_to_message_id,
             parsed.mentioned_user_ids,
+            message_source,
+        ))
+    }
+
+    fn parse_legacy_json_payload(
+        text: &str,
+    ) -> Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Vec<u64>,
+        Option<crate::model::privacy::FriendRequestSource>,
+    )> {
+        use privchat_protocol::message::LocalMessagePayloadEnvelope;
+
+        let value = serde_json::from_str::<serde_json::Value>(text.trim()).ok()?;
+        let object = value.as_object()?;
+        object.get("content")?.as_str()?;
+        let is_envelope = [
+            "metadata",
+            "reply_to_message_id",
+            "mentioned_user_ids",
+            "message_source",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key));
+        if !is_envelope {
+            return None;
+        }
+
+        let envelope = serde_json::from_value::<LocalMessagePayloadEnvelope>(value).ok()?;
+        let metadata = envelope
+            .metadata
+            .as_ref()
+            .and_then(|value| serde_json::to_string(value).ok());
+        let message_source =
+            envelope
+                .message_source
+                .and_then(|source| match source.source_type.as_str() {
+                    "search" => source.source_id.parse::<u64>().ok().map(|id| {
+                        crate::model::privacy::FriendRequestSource::Search {
+                            search_session_id: id,
+                        }
+                    }),
+                    "group" => source.source_id.parse::<u64>().ok().map(|id| {
+                        crate::model::privacy::FriendRequestSource::Group { group_id: id }
+                    }),
+                    "card_share" => source.source_id.parse::<u64>().ok().map(|id| {
+                        crate::model::privacy::FriendRequestSource::CardShare { share_id: id }
+                    }),
+                    "qrcode" => Some(crate::model::privacy::FriendRequestSource::Qrcode {
+                        qrcode: source.source_id,
+                    }),
+                    "phone" => Some(crate::model::privacy::FriendRequestSource::Phone {
+                        phone: source.source_id,
+                    }),
+                    _ => None,
+                });
+
+        Some((
+            envelope.content.replace('\u{0}', ""),
+            metadata,
+            envelope.reply_to_message_id,
+            envelope.mentioned_user_ids.unwrap_or_default(),
             message_source,
         ))
     }
@@ -2360,5 +2422,37 @@ mod attachment_bind_tests {
             SendMessageHandler::resolve_authenticated_sender(sess("not-a-number", "devA"), 0),
             Err(ErrorCode::AuthRequired)
         );
+    }
+}
+
+#[cfg(test)]
+mod payload_normalization_tests {
+    use super::SendMessageHandler;
+
+    #[test]
+    fn legacy_json_envelope_is_normalized_before_persistence() {
+        let payload = serde_json::json!({
+            "content": "归一化后的正文",
+            "mentioned_user_ids": [],
+            "reply_to_message_id": "600997771041832960"
+        })
+        .to_string();
+        let (content, metadata, reply, mentions, _) =
+            SendMessageHandler::parse_payload(payload.as_bytes()).expect("parse legacy payload");
+        assert_eq!(content, "归一化后的正文");
+        assert!(metadata.is_none());
+        assert_eq!(reply.as_deref(), Some("600997771041832960"));
+        assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn user_authored_json_with_only_content_remains_text() {
+        let payload = r#"{"content":"literal user JSON"}"#;
+        let (content, metadata, reply, mentions, _) =
+            SendMessageHandler::parse_payload(payload.as_bytes()).expect("parse literal json");
+        assert_eq!(content, payload);
+        assert!(metadata.is_none());
+        assert!(reply.is_none());
+        assert!(mentions.is_empty());
     }
 }

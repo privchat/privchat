@@ -34,6 +34,7 @@ pub mod cache;
 pub mod cache_manager;
 pub mod cache_manager_simple;
 pub mod connection_manager; // ✨ 新增
+pub mod cross_node_dispatch;
 pub mod database;
 pub mod delivery_trace;
 pub mod event_bus;
@@ -74,6 +75,9 @@ pub use connection_manager::{
     ConnectionManager, DeliveryFailureClassification, DeliveryReport, DeviceConnection,
     FailedSessionDelivery,
 }; // ✨ 新增
+pub use cross_node_dispatch::{
+    CrossNodeDispatchBus, RemoteDispatchOutcome, SessionOwnershipRegistry,
+};
 pub use event_bus::EventBus;
 pub use message_router::{MessageRouter, MessageRouterConfig, RouteResult};
 pub use offline_worker::{DeliveryStats, OfflineMessageWorker, OfflineWorkerConfig};
