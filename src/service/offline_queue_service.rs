@@ -31,7 +31,7 @@ use crate::error::ServerError;
 use crate::infra::redis::RedisClient;
 use privchat_protocol::protocol::PushMessageRequest;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 
 /// 离线消息队列服务
 #[derive(Clone)]
@@ -74,7 +74,7 @@ impl OfflineQueueService {
             .await
             .map_err(|e| ServerError::Internal(format!("离线队列写入失败: {}", e)))?;
 
-        info!(
+        debug!(
             "📥 推送离线消息: user={}, 队列上限={}",
             user_id, self.max_queue_size
         );
@@ -106,7 +106,7 @@ impl OfflineQueueService {
             .await
             .map_err(|e| ServerError::Internal(format!("离线队列批量写入失败: {}", e)))?;
 
-        info!(
+        debug!(
             "📥 批量推送离线消息(pipeline): user={}, count={}, 队列上限={}",
             user_id,
             messages.len(),
@@ -139,7 +139,7 @@ impl OfflineQueueService {
             .await
             .map_err(|e| ServerError::Internal(format!("离线队列多用户写入失败: {}", e)))?;
 
-        info!(
+        debug!(
             "📥 Pipeline 批量推送离线消息: users={}, 队列上限={}",
             user_ids.len(),
             self.max_queue_size

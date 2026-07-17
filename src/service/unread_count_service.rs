@@ -246,6 +246,19 @@ impl UnreadCountService {
             return Ok(());
         }
 
+        if let Some(redis) = &self.redis_client {
+            let field = Self::redis_field(channel_id);
+            let delta = Self::normalize_count_i64(count);
+            let increments: Vec<_> = user_ids
+                .iter()
+                .map(|user_id| (Self::redis_key(*user_id), field.clone(), delta))
+                .collect();
+            redis
+                .hincrby_multi_keys_expire(&increments, self.ttl_seconds as usize)
+                .await?;
+            return Ok(());
+        }
+
         stream::iter(user_ids.iter().copied())
             .for_each_concurrent(UNREAD_MEMBER_UPDATE_CONCURRENCY, |user_id| async move {
                 if let Err(e) = self.increment(user_id, channel_id, count).await {

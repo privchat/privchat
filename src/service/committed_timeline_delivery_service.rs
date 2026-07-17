@@ -15,7 +15,8 @@ use privchat_protocol::{
     CanonicalTimelineEvent, ContentMessageType, FlatBufferMessage, MessageSetting,
     PushMessageRequest, CANONICAL_TIMELINE_EVENT_SCHEMA_V1, CANONICAL_TIMELINE_PUSH_TOPIC_V1,
 };
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Row};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -25,7 +26,9 @@ const MAX_ATTEMPTS: i32 = 8;
 const LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_CHUNK_SIZE: i64 = 100;
 const PER_BATCH_CONCURRENCY: usize = 50;
+const MAX_IMMEDIATE_EVENTS: usize = 8;
 const WORKER_IDLE_DELAY: Duration = Duration::from_millis(100);
+const PARENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const RETENTION_BATCH_SIZE: i64 = 1_000;
 const DISPATCHED_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -82,6 +85,56 @@ pub struct DispatchOutcome {
     pub event_id: u64,
     pub user_id: u64,
     pub outcome: RecipientDeliveryOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct DispatchCompletion {
+    claim: ClaimedDispatchRecipient,
+    terminal_state: Option<DispatchRecipientState>,
+    error_message: Option<String>,
+}
+
+impl DispatchCompletion {
+    fn new(
+        claim: ClaimedDispatchRecipient,
+        terminal_state: Option<DispatchRecipientState>,
+        error_message: Option<String>,
+    ) -> Self {
+        Self {
+            claim,
+            terminal_state,
+            error_message,
+        }
+    }
+}
+
+enum DispatchResolution {
+    Completion(DispatchCompletion),
+    OfflineCandidate {
+        claim: ClaimedDispatchRecipient,
+        push: PushMessageRequest,
+    },
+}
+
+type OfflineDispatchBatches = BTreeMap<i64, (PushMessageRequest, Vec<ClaimedDispatchRecipient>)>;
+
+fn partition_dispatch_resolutions(
+    resolutions: Vec<DispatchResolution>,
+) -> (Vec<DispatchCompletion>, OfflineDispatchBatches) {
+    let mut completions = Vec::with_capacity(resolutions.len());
+    let mut offline_by_event = BTreeMap::new();
+    for resolution in resolutions {
+        match resolution {
+            DispatchResolution::Completion(completion) => completions.push(completion),
+            DispatchResolution::OfflineCandidate { claim, push } => {
+                let entry = offline_by_event
+                    .entry(claim.event_id)
+                    .or_insert_with(|| (push, Vec::new()));
+                entry.1.push(claim);
+            }
+        }
+    }
+    (completions, offline_by_event)
 }
 
 #[derive(Clone)]
@@ -174,116 +227,99 @@ impl DispatchOutboxStore {
         terminal_state: Option<DispatchRecipientState>,
         error_message: Option<&str>,
     ) -> Result<RecipientDeliveryOutcome> {
+        let completion = DispatchCompletion::new(
+            claim.clone(),
+            terminal_state,
+            error_message.map(str::to_string),
+        );
+        let mut outcomes = self.complete_many(&[completion]).await?;
+        self.reconcile_events(&[claim.event_id]).await?;
+        Ok(outcomes.pop().expect("single completion has one outcome"))
+    }
+
+    async fn complete_many(
+        &self,
+        completions: &[DispatchCompletion],
+    ) -> Result<Vec<RecipientDeliveryOutcome>> {
+        if completions.is_empty() {
+            return Ok(Vec::new());
+        }
         let now = chrono::Utc::now().timestamp_millis();
-        let (state, next_attempt_at, outcome) = match terminal_state {
-            Some(DispatchRecipientState::OnlineSent) => (
-                DispatchRecipientState::OnlineSent as i16,
-                now,
-                RecipientDeliveryOutcome::OnlineSent,
-            ),
-            Some(DispatchRecipientState::OfflineQueued) => (
-                DispatchRecipientState::OfflineQueued as i16,
-                now,
-                RecipientDeliveryOutcome::OfflineQueued,
-            ),
-            Some(DispatchRecipientState::Dead) => (
-                DispatchRecipientState::Dead as i16,
-                now,
-                RecipientDeliveryOutcome::Dead {
-                    error: error_message.unwrap_or("dispatch exhausted").to_string(),
-                },
-            ),
-            None if claim.attempts >= MAX_ATTEMPTS => (
-                DispatchRecipientState::Dead as i16,
-                now,
-                RecipientDeliveryOutcome::Dead {
-                    error: error_message.unwrap_or("dispatch exhausted").to_string(),
-                },
-            ),
-            None => {
-                let backoff_ms = retry_backoff_ms(claim.attempts);
-                (
-                    0,
-                    now + backoff_ms,
-                    RecipientDeliveryOutcome::RetryScheduled {
-                        error: error_message.unwrap_or("dispatch failed").to_string(),
-                    },
-                )
-            }
-        };
+        let mut event_ids = Vec::with_capacity(completions.len());
+        let mut user_ids = Vec::with_capacity(completions.len());
+        let mut lease_tokens = Vec::with_capacity(completions.len());
+        let mut states = Vec::with_capacity(completions.len());
+        let mut errors = Vec::with_capacity(completions.len());
+        let mut retry_times = Vec::with_capacity(completions.len());
+        let mut planned_outcomes = Vec::with_capacity(completions.len());
 
-        let mut tx = self.pool.begin().await.map_err(|e| {
-            ServerError::Database(format!("begin dispatch completion tx failed: {e}"))
-        })?;
-        let updated = sqlx::query(
-            r#"
-            UPDATE privchat_message_dispatch_recipient
-            SET state = $1,
-                last_error = $2,
-                next_attempt_at = $3,
-                lease_owner = NULL,
-                lease_until = NULL
-            WHERE event_id = $4 AND user_id = $5
-              AND state = 0 AND lease_token = $6
-            "#,
-        )
-        .bind(state)
-        .bind(error_message)
-        .bind(next_attempt_at)
-        .bind(claim.event_id)
-        .bind(claim.user_id)
-        .bind(claim.lease_token)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| ServerError::Database(format!("complete dispatch recipient failed: {e}")))?;
-
-        if updated.rows_affected() == 0 {
-            tx.rollback().await.ok();
-            return Ok(RecipientDeliveryOutcome::Fenced);
+        for completion in completions {
+            let (state, retry_at, outcome) = completion_values(
+                &completion.claim,
+                completion.terminal_state,
+                completion.error_message.as_deref(),
+                now,
+            );
+            event_ids.push(completion.claim.event_id);
+            user_ids.push(completion.claim.user_id);
+            lease_tokens.push(completion.claim.lease_token);
+            states.push(state);
+            errors.push(completion.error_message.clone());
+            retry_times.push(retry_at);
+            planned_outcomes.push(outcome);
         }
 
-        // Recipient completions for one event run concurrently. Serialize the
-        // parent aggregation so the last committer observes every preceding
-        // terminal recipient instead of leaving the parent pending forever
-        // because of READ COMMITTED snapshots taken during parallel commits.
-        sqlx::query(
-            "SELECT event_id FROM privchat_message_dispatch_outbox WHERE event_id = $1 FOR UPDATE",
-        )
-        .bind(claim.event_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| ServerError::Database(format!("lock dispatch outbox failed: {e}")))?;
-
-        sqlx::query(
+        let rows = sqlx::query(
             r#"
-            UPDATE privchat_message_dispatch_outbox o
-            SET status = CASE
-                    WHEN NOT EXISTS (
-                        SELECT 1 FROM privchat_message_dispatch_recipient r
-                        WHERE r.event_id = o.event_id AND r.state = 0
-                    ) THEN CASE WHEN EXISTS (
-                        SELECT 1 FROM privchat_message_dispatch_recipient r
-                        WHERE r.event_id = o.event_id AND r.state = 3
-                    ) THEN 2 ELSE 1 END
-                    ELSE 0
-                END,
-                dispatched_at = CASE
-                    WHEN o.dispatched_at IS NULL AND NOT EXISTS (
-                        SELECT 1 FROM privchat_message_dispatch_recipient r
-                        WHERE r.event_id = o.event_id AND r.state IN (0, 3)
-                    ) THEN $2 ELSE o.dispatched_at END
-            WHERE o.event_id = $1
+            WITH input AS (
+                SELECT *
+                FROM UNNEST(
+                    $1::BIGINT[], $2::BIGINT[], $3::BIGINT[], $4::SMALLINT[],
+                    $5::TEXT[], $6::BIGINT[]
+                ) WITH ORDINALITY AS i(
+                    event_id, user_id, lease_token, state, last_error,
+                    next_attempt_at, ordinal
+                )
+            ), updated AS (
+                UPDATE privchat_message_dispatch_recipient r
+                SET state = i.state,
+                    last_error = i.last_error,
+                    next_attempt_at = i.next_attempt_at,
+                    lease_owner = NULL,
+                    lease_until = NULL
+                FROM input i
+                WHERE r.event_id = i.event_id AND r.user_id = i.user_id
+                  AND r.state = 0 AND r.lease_token = i.lease_token
+                RETURNING r.event_id, r.user_id
+            )
+            SELECT i.ordinal, (u.event_id IS NOT NULL) AS updated
+            FROM input i
+            LEFT JOIN updated u
+              ON u.event_id = i.event_id AND u.user_id = i.user_id
+            ORDER BY i.ordinal
             "#,
         )
-        .bind(claim.event_id)
-        .bind(now)
-        .execute(&mut *tx)
+        .bind(&event_ids)
+        .bind(&user_ids)
+        .bind(&lease_tokens)
+        .bind(&states)
+        .bind(&errors)
+        .bind(&retry_times)
+        .fetch_all(self.pool.as_ref())
         .await
-        .map_err(|e| ServerError::Database(format!("aggregate dispatch outbox failed: {e}")))?;
-        tx.commit().await.map_err(|e| {
-            ServerError::Database(format!("commit dispatch completion failed: {e}"))
-        })?;
-        Ok(outcome)
+        .map_err(|e| ServerError::Database(format!("complete dispatch recipients failed: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .zip(planned_outcomes)
+            .map(|(row, outcome)| {
+                if row.get::<bool, _>("updated") {
+                    outcome
+                } else {
+                    RecipientDeliveryOutcome::Fenced
+                }
+            })
+            .collect())
     }
 
     pub async fn reconcile_terminal_parents(&self, limit: i64) -> Result<u64> {
@@ -323,6 +359,38 @@ impl DispatchOutboxStore {
         Ok(result.rows_affected())
     }
 
+    async fn reconcile_events(&self, event_ids: &[i64]) -> Result<u64> {
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            r#"
+            UPDATE privchat_message_dispatch_outbox o
+            SET status = CASE WHEN EXISTS (
+                    SELECT 1 FROM privchat_message_dispatch_recipient r
+                    WHERE r.event_id = o.event_id AND r.state = 3
+                ) THEN 2 ELSE 1 END,
+                dispatched_at = CASE WHEN NOT EXISTS (
+                    SELECT 1 FROM privchat_message_dispatch_recipient r
+                    WHERE r.event_id = o.event_id AND r.state = 3
+                ) THEN COALESCE(o.dispatched_at, $2) ELSE o.dispatched_at END
+            WHERE o.event_id = ANY($1::BIGINT[])
+              AND o.status = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM privchat_message_dispatch_recipient r
+                  WHERE r.event_id = o.event_id AND r.state = 0
+              )
+            "#,
+        )
+        .bind(event_ids)
+        .bind(now)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("reconcile dispatch events failed: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn cleanup_retained(&self, now_ms: i64, limit: i64) -> Result<u64> {
         let result = sqlx::query(
             r#"
@@ -357,6 +425,7 @@ pub struct CommittedTimelineDeliveryService {
     message_repository: Arc<PgMessageRepository>,
     offline_queue: Arc<OfflineQueueService>,
     global_fanout: Arc<Semaphore>,
+    immediate_events: Arc<Semaphore>,
     worker_id: String,
 }
 
@@ -375,19 +444,22 @@ impl CommittedTimelineDeliveryService {
             message_repository,
             offline_queue,
             global_fanout,
+            immediate_events: Arc::new(Semaphore::new(MAX_IMMEDIATE_EVENTS)),
             worker_id: worker_id.into(),
         }
     }
 
     pub async fn dispatch_event(&self, event_id: u64) -> Result<Vec<DispatchOutcome>> {
+        let Ok(_event_permit) = self.immediate_events.try_acquire() else {
+            // The row is durable and remains pending. Never create an unbounded
+            // queue of per-event tasks in memory; the outbox worker will claim it.
+            return Ok(Vec::new());
+        };
         let claims = self.store.claim_event(&self.worker_id, event_id).await?;
         self.dispatch_claims(claims).await
     }
 
     pub async fn process_once(&self) -> Result<Vec<DispatchOutcome>> {
-        self.store
-            .reconcile_terminal_parents(DEFAULT_CHUNK_SIZE)
-            .await?;
         let claims = self
             .store
             .claim_pending(&self.worker_id, DEFAULT_CHUNK_SIZE)
@@ -398,7 +470,18 @@ impl CommittedTimelineDeliveryService {
     pub async fn start(&self) -> Result<()> {
         info!(worker_id = %self.worker_id, "CommittedTimelineDeliveryService started");
         let mut last_retention_sweep = tokio::time::Instant::now() - RETENTION_SWEEP_INTERVAL;
+        let mut last_parent_reconcile = tokio::time::Instant::now() - PARENT_RECONCILE_INTERVAL;
         loop {
+            if last_parent_reconcile.elapsed() >= PARENT_RECONCILE_INTERVAL {
+                if let Err(error) = self
+                    .store
+                    .reconcile_terminal_parents(DEFAULT_CHUNK_SIZE)
+                    .await
+                {
+                    warn!(%error, "dispatch outbox parent reconciliation failed");
+                }
+                last_parent_reconcile = tokio::time::Instant::now();
+            }
             if last_retention_sweep.elapsed() >= RETENTION_SWEEP_INTERVAL {
                 match self
                     .store
@@ -429,29 +512,90 @@ impl CommittedTimelineDeliveryService {
         claims: Vec<ClaimedDispatchRecipient>,
     ) -> Result<Vec<DispatchOutcome>> {
         let service = self.clone();
-        Ok(stream::iter(claims)
+        let resolutions: Vec<DispatchResolution> = stream::iter(claims)
             .map(move |claim| {
                 let service = service.clone();
-                async move { service.dispatch_claim(claim).await }
+                async move { service.resolve_online_claim(claim).await }
             })
             .buffer_unordered(PER_BATCH_CONCURRENCY)
             .collect()
-            .await)
+            .await;
+
+        let (mut completions, offline_by_event) = partition_dispatch_resolutions(resolutions);
+
+        // Every recipient of one event receives the same wire payload. Persist
+        // all offline copies with one Redis pipeline instead of one round trip
+        // per user, while retaining one fenced PostgreSQL state row per user.
+        let service = self.clone();
+        let offline_completions: Vec<Vec<DispatchCompletion>> =
+            stream::iter(offline_by_event.into_values())
+                .map(move |(push, claims)| {
+                    let service = service.clone();
+                    async move { service.resolve_offline_batch(push, claims).await }
+                })
+                .buffer_unordered(PER_BATCH_CONCURRENCY)
+                .collect()
+                .await;
+        completions.extend(offline_completions.into_iter().flatten());
+
+        let delivery_outcomes = self.store.complete_many(&completions).await?;
+        let mut event_ids: Vec<i64> = completions
+            .iter()
+            .map(|completion| completion.claim.event_id)
+            .collect();
+        event_ids.sort_unstable();
+        event_ids.dedup();
+        let outcomes = completions
+            .into_iter()
+            .zip(delivery_outcomes)
+            .map(|(completion, outcome)| {
+                if matches!(outcome, RecipientDeliveryOutcome::Dead { .. }) {
+                    warn!(
+                        event_id = completion.claim.event_id,
+                        user_id = completion.claim.user_id,
+                        error = completion
+                            .error_message
+                            .as_deref()
+                            .unwrap_or("dispatch exhausted"),
+                        "dispatch recipient DEAD"
+                    );
+                }
+                DispatchOutcome {
+                    event_id: completion.claim.event_id as u64,
+                    user_id: completion.claim.user_id as u64,
+                    outcome,
+                }
+            })
+            .collect();
+
+        // Recipient completions are independent fenced writes. Aggregate parent
+        // state once per dispatch batch instead of making every recipient race
+        // for the same parent tuple (100 recipients used to mean 100 contenders).
+        self.store.reconcile_events(&event_ids).await?;
+        Ok(outcomes)
     }
 
-    async fn dispatch_claim(&self, claim: ClaimedDispatchRecipient) -> DispatchOutcome {
+    async fn resolve_online_claim(&self, claim: ClaimedDispatchRecipient) -> DispatchResolution {
         let _permit = match self.global_fanout.acquire().await {
             Ok(permit) => permit,
             Err(_) => {
-                return self
-                    .complete_failed(claim, "global fanout semaphore closed")
-                    .await;
+                return DispatchResolution::Completion(DispatchCompletion::new(
+                    claim,
+                    None,
+                    Some("global fanout semaphore closed".to_string()),
+                ));
             }
         };
 
         let push = match push_from_claim(&claim) {
             Ok(push) => push,
-            Err(e) => return self.complete_failed(claim, &e.to_string()).await,
+            Err(e) => {
+                return DispatchResolution::Completion(DispatchCompletion::new(
+                    claim,
+                    None,
+                    Some(e.to_string()),
+                ));
+            }
         };
         match self
             .message_router
@@ -469,21 +613,68 @@ impl CommittedTimelineDeliveryService {
                         .record_and_push_delivered_receipt(&claim, ack_session_id)
                         .await
                     {
-                        return self.complete_failed(claim, &error.to_string()).await;
+                        return DispatchResolution::Completion(DispatchCompletion::new(
+                            claim,
+                            None,
+                            Some(error.to_string()),
+                        ));
                     }
                 }
-                self.complete_terminal(claim, DispatchRecipientState::OnlineSent)
-                    .await
+                DispatchResolution::Completion(DispatchCompletion::new(
+                    claim,
+                    Some(DispatchRecipientState::OnlineSent),
+                    None,
+                ))
             }
-            Ok(_) => match self.offline_queue.add(claim.user_id as u64, &push).await {
-                Ok(()) => {
-                    self.complete_terminal(claim, DispatchRecipientState::OfflineQueued)
-                        .await
-                }
-                Err(e) => self.complete_failed(claim, &e.to_string()).await,
-            },
-            Err(e) => self.complete_failed(claim, &e.to_string()).await,
+            Ok(route) if route.failed_count > 0 => {
+                DispatchResolution::Completion(DispatchCompletion::new(
+                    claim,
+                    None,
+                    Some("one or more local/cross-node routes failed".to_string()),
+                ))
+            }
+            Ok(_) => DispatchResolution::OfflineCandidate { claim, push },
+            Err(e) => DispatchResolution::Completion(DispatchCompletion::new(
+                claim,
+                None,
+                Some(e.to_string()),
+            )),
         }
+    }
+
+    async fn resolve_offline_batch(
+        &self,
+        push: PushMessageRequest,
+        claims: Vec<ClaimedDispatchRecipient>,
+    ) -> Vec<DispatchCompletion> {
+        let _permit = match self.global_fanout.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return claims
+                    .into_iter()
+                    .map(|claim| {
+                        DispatchCompletion::new(
+                            claim,
+                            None,
+                            Some("global fanout semaphore closed".to_string()),
+                        )
+                    })
+                    .collect();
+            }
+        };
+        let user_ids: Vec<u64> = claims.iter().map(|claim| claim.user_id as u64).collect();
+        let result = self.offline_queue.add_batch_users(&user_ids, &push).await;
+        claims
+            .into_iter()
+            .map(|claim| match &result {
+                Ok(()) => DispatchCompletion::new(
+                    claim,
+                    Some(DispatchRecipientState::OfflineQueued),
+                    None,
+                ),
+                Err(error) => DispatchCompletion::new(claim, None, Some(error.to_string())),
+            })
+            .collect()
     }
 
     async fn record_and_push_delivered_receipt(
@@ -560,62 +751,53 @@ impl CommittedTimelineDeliveryService {
         }
         Ok(())
     }
-
-    async fn complete_terminal(
-        &self,
-        claim: ClaimedDispatchRecipient,
-        state: DispatchRecipientState,
-    ) -> DispatchOutcome {
-        let event_id = claim.event_id as u64;
-        let user_id = claim.user_id as u64;
-        let outcome = self
-            .store
-            .complete(&claim, Some(state), None)
-            .await
-            .unwrap_or_else(|e| RecipientDeliveryOutcome::CompletionFailed {
-                error: e.to_string(),
-            });
-        DispatchOutcome {
-            event_id,
-            user_id,
-            outcome,
-        }
-    }
-
-    async fn complete_failed(
-        &self,
-        claim: ClaimedDispatchRecipient,
-        error_message: &str,
-    ) -> DispatchOutcome {
-        let event_id = claim.event_id as u64;
-        let user_id = claim.user_id as u64;
-        let outcome = self
-            .store
-            .complete(&claim, None, Some(error_message))
-            .await
-            .unwrap_or_else(|e| RecipientDeliveryOutcome::CompletionFailed {
-                error: e.to_string(),
-            });
-        if matches!(outcome, RecipientDeliveryOutcome::Dead { .. }) {
-            warn!(
-                event_id,
-                user_id,
-                error = error_message,
-                "dispatch recipient DEAD"
-            );
-        }
-        DispatchOutcome {
-            event_id,
-            user_id,
-            outcome,
-        }
-    }
 }
 
 fn retry_backoff_ms(attempts: i32) -> i64 {
     let exponent = attempts.saturating_sub(1).clamp(0, 30) as u32;
     let base = (1_000i64.saturating_mul(1i64 << exponent)).min(30_000);
     base + fastrand::i64(0..=250)
+}
+
+fn completion_values(
+    claim: &ClaimedDispatchRecipient,
+    terminal_state: Option<DispatchRecipientState>,
+    error_message: Option<&str>,
+    now: i64,
+) -> (i16, i64, RecipientDeliveryOutcome) {
+    match terminal_state {
+        Some(DispatchRecipientState::OnlineSent) => (
+            DispatchRecipientState::OnlineSent as i16,
+            now,
+            RecipientDeliveryOutcome::OnlineSent,
+        ),
+        Some(DispatchRecipientState::OfflineQueued) => (
+            DispatchRecipientState::OfflineQueued as i16,
+            now,
+            RecipientDeliveryOutcome::OfflineQueued,
+        ),
+        Some(DispatchRecipientState::Dead) => (
+            DispatchRecipientState::Dead as i16,
+            now,
+            RecipientDeliveryOutcome::Dead {
+                error: error_message.unwrap_or("dispatch exhausted").to_string(),
+            },
+        ),
+        None if claim.attempts >= MAX_ATTEMPTS => (
+            DispatchRecipientState::Dead as i16,
+            now,
+            RecipientDeliveryOutcome::Dead {
+                error: error_message.unwrap_or("dispatch exhausted").to_string(),
+            },
+        ),
+        None => (
+            0,
+            now + retry_backoff_ms(claim.attempts),
+            RecipientDeliveryOutcome::RetryScheduled {
+                error: error_message.unwrap_or("dispatch failed").to_string(),
+            },
+        ),
+    }
 }
 
 fn push_from_claim(claim: &ClaimedDispatchRecipient) -> Result<PushMessageRequest> {
@@ -742,6 +924,30 @@ mod tests {
             event_schema_version: Some(CANONICAL_TIMELINE_EVENT_SCHEMA_V1 as i16),
             canonical_event: Some(event.encode_fb().unwrap()),
         }
+    }
+
+    #[test]
+    fn offline_candidates_for_one_event_share_one_pipeline_batch() {
+        let first = claim_fixture();
+        let mut second = first.clone();
+        second.user_id += 1;
+        let push = push_from_claim(&first).expect("claim maps to push");
+        let (completions, batches) = partition_dispatch_resolutions(vec![
+            DispatchResolution::OfflineCandidate {
+                claim: first,
+                push: push.clone(),
+            },
+            DispatchResolution::OfflineCandidate {
+                claim: second,
+                push,
+            },
+        ]);
+
+        assert!(completions.is_empty());
+        assert_eq!(batches.len(), 1);
+        let (_push, claims) = batches.into_values().next().expect("one event batch");
+        assert_eq!(claims.len(), 2);
+        assert_ne!(claims[0].user_id, claims[1].user_id);
     }
 
     #[test]
@@ -904,6 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_claim_is_fenced_retriable_and_aggregated() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(store) = open_store().await else {
             eprintln!("skip outbox state test: DATABASE_URL not configured");
             return;
@@ -994,6 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_lease_is_reclaimed_after_worker_crash() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(store) = open_store().await else {
             eprintln!("skip outbox crash-recovery test: DATABASE_URL not configured");
             return;
@@ -1059,6 +1267,7 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_offline_queue_failure_reaches_dead_after_bounded_attempts() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(store) = open_store().await else {
             eprintln!("skip outbox persistent-failure test: DATABASE_URL not configured");
             return;
@@ -1121,6 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_recipient_completions_finalize_parent() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(store) = open_store().await else {
             eprintln!("skip concurrent parent aggregation test: DATABASE_URL not configured");
             return;
@@ -1164,6 +1374,7 @@ mod tests {
 
     #[tokio::test]
     async fn retention_uses_distinct_dispatched_and_dead_windows() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(store) = open_store().await else {
             eprintln!("skip outbox retention test: DATABASE_URL not configured");
             return;

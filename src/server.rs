@@ -172,7 +172,7 @@ pub struct ChatServer {
     config: ServerConfig,
     /// Dedicated PostgreSQL session lock required by the single-instance
     /// CODEX-9 dispatch boundary.
-    _single_instance_guard: crate::infra::SingleInstanceGuard,
+    _single_instance_guard: Option<crate::infra::SingleInstanceGuard>,
     token_auth: Arc<TokenAuth>,
     cache_manager: Arc<CacheManager>,
     stats: Arc<tokio::sync::RwLock<ServerStats>>,
@@ -247,11 +247,27 @@ impl ChatServer {
     pub async fn new(config: ServerConfig) -> Result<Self, ServerError> {
         info!("🔧 初始化聊天服务器组件...");
 
-        let single_instance_guard =
-            crate::infra::SingleInstanceGuard::acquire(&config.database_url)
+        let cluster_mode = match std::env::var("PRIVCHAT_CLUSTER_MODE")
+            .unwrap_or_else(|_| "single".to_string())
+            .as_str()
+        {
+            "single" => false,
+            "multi" => true,
+            other => {
+                return Err(ServerError::Internal(format!(
+                    "PRIVCHAT_CLUSTER_MODE must be single|multi, got {other:?}"
+                )))
+            }
+        };
+        let single_instance_guard = if cluster_mode {
+            None
+        } else {
+            let guard = crate::infra::SingleInstanceGuard::acquire(&config.database_url)
                 .await
                 .map_err(|error| ServerError::Internal(format!("单实例门禁失败: {error}")))?;
-        info!("✅ 单实例 PostgreSQL advisory lock 已获取");
+            info!("✅ 单实例 PostgreSQL advisory lock 已获取");
+            Some(guard)
+        };
 
         // 🤖 初始化系统用户列表（必须在最开始）
         info!("🤖 初始化系统用户列表...");
@@ -383,7 +399,14 @@ impl ChatServer {
         info!("✅ 登录日志仓库初始化完成");
 
         // 3.3 创建连接管理器（✨ 新增，用于管理活跃连接和设备断连）
-        let connection_manager = Arc::new(crate::infra::ConnectionManager::new());
+        let node_id = std::env::var("PRIVCHAT_NODE_ID").unwrap_or_else(|_| "local".to_string());
+        if cluster_mode && (node_id.trim().is_empty() || node_id == "local") {
+            return Err(ServerError::Internal(
+                "PRIVCHAT_NODE_ID must be explicit in multi cluster mode".to_string(),
+            ));
+        }
+        let connection_manager =
+            Arc::new(crate::infra::ConnectionManager::new_with_node_id(node_id));
         info!("✅ 连接管理器初始化完成");
 
         // 3.4 创建 Room 管理器（用于发布订阅频道管理）
@@ -468,6 +491,31 @@ impl ChatServer {
                 .map_err(|e| ServerError::Internal(format!("Redis 客户端初始化失败: {}", e)))?,
         );
         info!("✅ RedisClient 创建完成");
+
+        if cluster_mode {
+            let node_id = std::env::var("PRIVCHAT_NODE_ID").map_err(|_| {
+                ServerError::Internal("PRIVCHAT_NODE_ID is required in multi mode".to_string())
+            })?;
+            let ownership =
+                crate::infra::SessionOwnershipRegistry::claim(redis_client.clone(), node_id)
+                    .await
+                    .map_err(|error| {
+                        ServerError::Internal(format!("cross-node identity lease failed: {error}"))
+                    })?;
+            connection_manager
+                .set_session_ownership_registry(ownership.clone())
+                .await;
+            ownership.start_maintenance(connection_manager.clone());
+
+            let dispatch_bus = crate::infra::CrossNodeDispatchBus::new(
+                redis_client.clone(),
+                ownership,
+                connection_manager.clone(),
+            );
+            dispatch_bus.start_worker();
+            message_router.set_cross_node_bus(dispatch_bus).await;
+            info!("✅ Cross-node session ownership and dispatch bus started");
+        }
 
         // 🔧 初始化 pts 同步系统（需要在 OfflineMessageWorker 之前创建）
         info!("🔧 初始化 pts 同步系统...");

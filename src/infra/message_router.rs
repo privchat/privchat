@@ -163,6 +163,7 @@ pub struct MessageRouter {
     config: MessageRouterConfig,
     connection_manager: Arc<crate::infra::ConnectionManager>,
     stats: Arc<RwLock<MessageRouterStats>>,
+    cross_node_bus: Arc<RwLock<Option<Arc<crate::infra::CrossNodeDispatchBus>>>>,
 }
 
 /// 消息路由统计
@@ -189,7 +190,12 @@ impl MessageRouter {
             config,
             connection_manager,
             stats: Arc::new(RwLock::new(MessageRouterStats::default())),
+            cross_node_bus: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub async fn set_cross_node_bus(&self, bus: Arc<crate::infra::CrossNodeDispatchBus>) {
+        *self.cross_node_bus.write().await = Some(bus);
     }
 
     /// 路由消息到指定用户（spec §6.1 热路径）。
@@ -203,12 +209,31 @@ impl MessageRouter {
         message: PushMessageRequest,
     ) -> Result<RouteResult> {
         let start_time = SystemTime::now();
-        let delivery_report = self
+        let mut delivery_report = self
             .connection_manager
             .send_push_to_user(*user_id, &message)
             .await?;
+        let mut remote_failed_count = 0;
+        if let Some(bus) = self.cross_node_bus.read().await.clone() {
+            for remote in bus.dispatch_remote_owners(*user_id, &message).await? {
+                delivery_report.attempted += remote.attempted;
+                delivery_report.successful_sessions.extend(
+                    remote
+                        .successful_session_ids
+                        .into_iter()
+                        .map(msgtrans::SessionId::from),
+                );
+                delivery_report.acknowledged_sessions.extend(
+                    remote
+                        .acknowledged_session_ids
+                        .into_iter()
+                        .map(msgtrans::SessionId::from),
+                );
+                remote_failed_count += remote.failed_count;
+            }
+        }
         let success_count = delivery_report.successful_count();
-        let failed_count = delivery_report.failed_count();
+        let failed_count = delivery_report.failed_count() + remote_failed_count;
         let elapsed = start_time.elapsed().unwrap_or_default();
         Ok(RouteResult {
             success_count,

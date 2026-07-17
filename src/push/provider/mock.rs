@@ -36,8 +36,8 @@ impl PushProvider for MockProvider {
         info!(
             "[MOCK PUSH] Payload: type={}, conversation_id={}, message_id={}, sender_id={}, preview={}",
             task.payload.r#type, 
-            task.payload.conversation_id, 
-            task.payload.message_id, 
+            task.payload.conversation_id,
+            task.payload.message_id,
             task.payload.sender_id,
             task.payload.content_preview
         );

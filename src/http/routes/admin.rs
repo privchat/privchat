@@ -43,15 +43,15 @@ use crate::http::dto::admin as dto;
 use crate::http::dto::qr_login as qr_dto;
 use crate::http::{AdminServerState, ApiEnvelope, ApiResult};
 use axum::{
-    Router,
     extract::{ConnectInfo, Path, Query, State},
     http::HeaderMap,
     response::Json,
     routing::{delete, get, post, put},
+    Router,
 };
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};

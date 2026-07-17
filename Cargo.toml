@@ -21,7 +21,7 @@ path = "examples/qr_login_smoke.rs"
 
 [dependencies]
 # 传输层
-msgtrans = "~1.0.6"
+msgtrans = { version = "~1.0.8", path = "../msgtrans" }
 
 # 协议
 privchat-protocol = { git = "https://github.com/privchat/privchat-protocol.git", rev = "c85937d3a325ea76c105b8166916e45b67ee53d7" }

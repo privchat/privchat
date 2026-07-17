@@ -28,7 +28,7 @@
 //! 5. offline_enqueued — 消息入离线队列
 //! 6. catchup_delivered — 离线补推送达
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -120,7 +120,7 @@ pub struct TraceStore {
     /// 最大容量
     max_capacity: usize,
     /// 插入顺序（用于淘汰）
-    order: Mutex<Vec<u64>>,
+    order: Mutex<VecDeque<u64>>,
 }
 
 impl TraceStore {
@@ -129,7 +129,7 @@ impl TraceStore {
         Self {
             traces: Mutex::new(HashMap::with_capacity(max_capacity)),
             max_capacity,
-            order: Mutex::new(Vec::with_capacity(max_capacity)),
+            order: Mutex::new(VecDeque::with_capacity(max_capacity)),
         }
     }
 
@@ -141,12 +141,13 @@ impl TraceStore {
 
         // LRU 淘汰
         while traces.len() >= self.max_capacity && !order.is_empty() {
-            let oldest = order.remove(0);
-            traces.remove(&oldest);
+            if let Some(oldest) = order.pop_front() {
+                traces.remove(&oldest);
+            }
         }
 
         traces.insert(server_msg_id, trace);
-        order.push(server_msg_id);
+        order.push_back(server_msg_id);
     }
 
     /// 记录追踪节点

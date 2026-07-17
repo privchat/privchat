@@ -21,7 +21,11 @@
 /// - 处理客户端提交命令（sync/submit）
 /// - 提供差异拉取（sync/get_difference）
 /// - 管理 pts 分配和间隙检测
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use super::{ChannelPtsDao, ClientMsgRegistryDao, CommitLogDao, SyncCache};
@@ -41,6 +45,160 @@ use privchat_protocol::rpc::sync::{
     GetDifferenceResponse, SenderInfo, ServerCommit, ServerDecision,
 };
 use privchat_protocol::{CanonicalTimelineEvent, ContentMessageType, MessageMetadata};
+
+const UNREAD_BATCH_QUEUE_CAPACITY: usize = 4_096;
+const UNREAD_BATCH_INTERVAL: Duration = Duration::from_millis(100);
+const POST_COMMIT_CACHE_QUEUE_CAPACITY: usize = 4_096;
+
+struct UnreadResolveRequest {
+    channel_id: u64,
+    sender_id: u64,
+    count: u64,
+}
+
+struct UnreadIncrement {
+    channel_id: u64,
+    user_ids: Vec<u64>,
+    count: u64,
+}
+
+#[derive(Clone)]
+struct UnreadIncrementBatcher {
+    tx: mpsc::Sender<UnreadResolveRequest>,
+}
+
+impl UnreadIncrementBatcher {
+    fn new(
+        channel_service: Arc<ChannelService>,
+        unread_count_service: Arc<UnreadCountService>,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel::<UnreadResolveRequest>(UNREAD_BATCH_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            let mut pending: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
+            let mut ticker = tokio::time::interval(UNREAD_BATCH_INTERVAL);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    item = rx.recv() => match item {
+                        Some(item) => match channel_service.get_channel_members(&item.channel_id).await {
+                            Ok(members) => {
+                                let user_ids = members
+                                    .into_iter()
+                                    .map(|member| member.user_id)
+                                    .filter(|user_id| *user_id != item.sender_id)
+                                    .collect();
+                                merge_unread_increment(
+                                    &mut pending,
+                                    UnreadIncrement {
+                                        channel_id: item.channel_id,
+                                        user_ids,
+                                        count: item.count,
+                                    },
+                                );
+                            }
+                            Err(error) => warn!(
+                                channel_id = item.channel_id,
+                                %error,
+                                "post-commit unread membership resolution failed"
+                            ),
+                        },
+                        None => break,
+                    },
+                    _ = ticker.tick(), if !pending.is_empty() => {
+                        let batch = std::mem::take(&mut pending);
+                        for (channel_id, user_counts) in batch {
+                            let mut by_count: HashMap<u64, Vec<u64>> = HashMap::new();
+                            for (user_id, count) in user_counts {
+                                by_count.entry(count).or_default().push(user_id);
+                            }
+                            for (count, user_ids) in by_count {
+                                match channel_service
+                                    .increment_user_channel_unread(channel_id, &user_ids, count.min(i32::MAX as u64) as i32)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if let Err(error) = unread_count_service
+                                            .increment_for_channel_members(channel_id, &user_ids, count)
+                                            .await
+                                        {
+                                            // Redis/L1 unread state is a rebuildable acceleration layer;
+                                            // the DB projection above remains authoritative.
+                                            warn!(channel_id, %error, "batched unread cache update failed");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!(channel_id, %error, "batched unread DB update failed; retaining batch for retry");
+                                        merge_unread_increment(
+                                            &mut pending,
+                                            UnreadIncrement { channel_id, user_ids, count },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    fn enqueue(&self, channel_id: u64, sender_id: u64, count: u64) {
+        if let Err(error) = self.tx.try_send(UnreadResolveRequest {
+            channel_id,
+            sender_id,
+            count,
+        }) {
+            warn!(channel_id, %error, "post-commit unread queue unavailable");
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PostCommitCacheWriter {
+    tx: mpsc::Sender<ServerCommit>,
+}
+
+impl PostCommitCacheWriter {
+    fn new(cache: Arc<SyncCache>) -> Self {
+        let (tx, mut rx) = mpsc::channel::<ServerCommit>(POST_COMMIT_CACHE_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(commit) = rx.recv().await {
+                if let Err(error) = cache.cache_pts(commit.channel_id, commit.pts).await {
+                    warn!(
+                        channel_id = commit.channel_id,
+                        %error,
+                        "post-commit pts cache update failed"
+                    );
+                }
+                if let Err(error) = cache.cache_commit(&commit).await {
+                    warn!(
+                        event_id = commit.event_id,
+                        %error,
+                        "post-commit timeline cache update failed"
+                    );
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    fn enqueue(&self, commit: ServerCommit) {
+        if let Err(error) = self.tx.try_send(commit) {
+            warn!(%error, "post-commit cache queue unavailable");
+        }
+    }
+}
+
+fn merge_unread_increment(pending: &mut HashMap<u64, HashMap<u64, u64>>, item: UnreadIncrement) {
+    let channel = pending.entry(item.channel_id).or_default();
+    for user_id in item.user_ids {
+        channel
+            .entry(user_id)
+            .and_modify(|count| *count = count.saturating_add(item.count))
+            .or_insert(item.count);
+    }
+}
 
 /// 同步服务（完整版本）⭐
 pub struct SyncService {
@@ -62,8 +220,8 @@ pub struct SyncService {
     /// 频道服务（获取成员列表）
     channel_service: Arc<ChannelService>,
 
-    /// 未读计数服务
-    unread_count_service: Arc<UnreadCountService>,
+    unread_increment_batcher: UnreadIncrementBatcher,
+    post_commit_cache_writer: PostCommitCacheWriter,
 
     /// Canonical message/commit/outbox transaction boundary.
     message_repository: Arc<PgMessageRepository>,
@@ -83,6 +241,9 @@ impl SyncService {
         message_repository: Arc<PgMessageRepository>,
         delivery_service: Arc<CommittedTimelineDeliveryService>,
     ) -> Self {
+        let unread_increment_batcher =
+            UnreadIncrementBatcher::new(channel_service.clone(), unread_count_service.clone());
+        let post_commit_cache_writer = PostCommitCacheWriter::new(cache.clone());
         Self {
             pts_generator,
             commit_dao,
@@ -90,7 +251,8 @@ impl SyncService {
             registry_dao,
             cache,
             channel_service,
-            unread_count_service,
+            unread_increment_batcher,
+            post_commit_cache_writer,
             message_repository,
             delivery_service,
         }
@@ -262,7 +424,7 @@ impl SyncService {
         sender_id: u64,  // 从 JWT token 中提取
         device_id: &str, // 从认证会话提取（CODEX-8：幂等命名空间的 device 维度，服务端权威）
     ) -> Result<ClientSubmitResponse> {
-        info!(
+        debug!(
             "收到客户端提交: local_message_id={}, channel_id={}, channel_type={}",
             req.local_message_id, req.channel_id, req.channel_type
         );
@@ -379,9 +541,10 @@ impl SyncService {
         // 同步到内存 PtsGenerator（可选，提高性能）
         self.pts_generator.set_pts(req.channel_id, new_pts).await;
 
-        // 9. 缓存到 Redis ⭐
-        self.cache.cache_pts(req.channel_id, new_pts).await?;
-        self.cache.cache_commit(&commit).await?;
+        // PostgreSQL commit_log + message projection + dispatch outbox are the
+        // authority. Redis is a rebuildable acceleration layer and must not
+        // delay or fail a request after the authoritative transaction commits.
+        self.post_commit_cache_writer.enqueue(commit.clone());
         if let Some(event_id) = commit.event_id {
             let delivery = self.delivery_service.clone();
             tokio::spawn(async move {
@@ -391,60 +554,24 @@ impl SyncService {
             });
         }
 
-        // [TRACE] Node 1: committed
+        // Delivery tracing is diagnostic state, not part of submit durability.
         {
             use crate::infra::delivery_trace::{global_trace_store, stages};
             let store = global_trace_store();
-            store
-                .begin_trace(message.message_id, req.channel_id, sender_id)
-                .await;
-            store
-                .record(
-                    message.message_id,
-                    stages::COMMITTED,
-                    format!("pts={}", new_pts),
-                )
-                .await;
+            let message_id = message.message_id;
+            let channel_id = req.channel_id;
+            tokio::spawn(async move {
+                store.begin_trace(message_id, channel_id, sender_id).await;
+                store
+                    .record(message_id, stages::COMMITTED, format!("pts={}", new_pts))
+                    .await;
+            });
         }
 
-        // 10.5 更新其他成员的未读计数 ⭐
-        {
-            match self
-                .channel_service
-                .get_channel_members(&req.channel_id)
-                .await
-            {
-                Ok(members) => {
-                    let receiver_ids: Vec<u64> = members
-                        .iter()
-                        .map(|m| m.user_id)
-                        .filter(|&id| id != sender_id)
-                        .collect();
-                    if !receiver_ids.is_empty() {
-                        if let Err(e) = self
-                            .channel_service
-                            .increment_user_channel_unread(req.channel_id, &receiver_ids, 1)
-                            .await
-                        {
-                            warn!(
-                                "⚠️ sync/submit: 持久化 privchat_user_channels 未读计数失败: {}",
-                                e
-                            );
-                        }
-                        if let Err(e) = self
-                            .unread_count_service
-                            .increment_for_channel_members(req.channel_id, &receiver_ids, 1)
-                            .await
-                        {
-                            warn!("⚠️ sync/submit: 更新未读计数失败: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("⚠️ sync/submit: 获取频道成员失败, 跳过未读计数: {}", e);
-                }
-            }
-        }
+        // Unread is a derived projection. Resolve membership and enqueue its
+        // durable-DB-first batch after returning the authoritative commit.
+        self.unread_increment_batcher
+            .enqueue(req.channel_id, sender_id, 1);
 
         // (registry 已在步骤 8 的原子事务内 claim —— 不再单独 register，杜绝「commit 后 register 前
         //  崩溃 → 重试产生重复消息」的窗口。)
@@ -460,7 +587,7 @@ impl SyncService {
             current_pts: server_pts,
         };
 
-        info!(
+        debug!(
             "✅ 命令已提交: local_message_id={}, pts={}, server_msg_id={}, has_gap={}",
             req.local_message_id, new_pts, message.message_id, has_gap
         );
@@ -679,6 +806,43 @@ impl SyncService {
 
 #[cfg(test)]
 mod tests {
+    use super::{merge_unread_increment, UnreadIncrement};
+    use std::collections::HashMap;
+
+    #[test]
+    fn unread_batch_merges_by_channel_and_user_without_losing_counts() {
+        let mut pending = HashMap::new();
+        merge_unread_increment(
+            &mut pending,
+            UnreadIncrement {
+                channel_id: 7,
+                user_ids: vec![10, 11],
+                count: 1,
+            },
+        );
+        merge_unread_increment(
+            &mut pending,
+            UnreadIncrement {
+                channel_id: 7,
+                user_ids: vec![10, 12],
+                count: 2,
+            },
+        );
+        merge_unread_increment(
+            &mut pending,
+            UnreadIncrement {
+                channel_id: 8,
+                user_ids: vec![10],
+                count: 4,
+            },
+        );
+
+        assert_eq!(pending[&7][&10], 3);
+        assert_eq!(pending[&7][&11], 1);
+        assert_eq!(pending[&7][&12], 2);
+        assert_eq!(pending[&8][&10], 4);
+    }
+
     #[tokio::test]
     async fn test_handle_client_submit() {
         // 测试客户端提交

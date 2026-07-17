@@ -89,12 +89,29 @@ pub struct DeviceConnection {
 pub enum DeliveryFailureClassification {
     RouteTimeout,
     DeadConnection,
+    SlowConsumer,
     RetryableTransport,
     PermanentTransport,
     TransportUnavailable,
     RemoteOwnerUnsupported,
     ProtocolAckRejected,
     ProtocolAckMalformed,
+}
+
+impl DeliveryFailureClassification {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::RouteTimeout => "route_timeout",
+            Self::DeadConnection => "dead_connection",
+            Self::SlowConsumer => "slow_consumer",
+            Self::RetryableTransport => "retryable_transport",
+            Self::PermanentTransport => "permanent_transport",
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::RemoteOwnerUnsupported => "remote_owner_unsupported",
+            Self::ProtocolAckRejected => "protocol_ack_rejected",
+            Self::ProtocolAckMalformed => "protocol_ack_malformed",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +186,9 @@ fn classify_transport_error(
         TransportError::Connection {
             retryable: false, ..
         } => DeliveryFailureClassification::DeadConnection,
+        TransportError::Resource { resource, .. } if resource.contains("outbound_queue") => {
+            DeliveryFailureClassification::SlowConsumer
+        }
         TransportError::Connection { .. }
         | TransportError::Protocol { .. }
         | TransportError::Resource { .. }
@@ -258,6 +278,9 @@ pub struct ConnectionManager {
     /// Current single-instance owner. Cross-node routing plugs into this seam in CODEX-11.
     local_node_id: String,
 
+    /// Cluster-mode session ownership mirror. Local indexes remain authoritative.
+    ownership_registry: Arc<RwLock<Option<Arc<crate::infra::SessionOwnershipRegistry>>>>,
+
     /// TransportServer 引用（用于主动关闭连接）
     pub transport_server: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
 }
@@ -280,8 +303,16 @@ impl ConnectionManager {
             index_b: DashMap::new(),
             total_authenticated: AtomicUsize::new(0),
             local_node_id: node_id.into(),
+            ownership_registry: Arc::new(RwLock::new(None)),
             transport_server: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub async fn set_session_ownership_registry(
+        &self,
+        registry: Arc<crate::infra::SessionOwnershipRegistry>,
+    ) {
+        *self.ownership_registry.write().await = Some(registry);
     }
 
     pub async fn set_transport_server(&self, server: Arc<msgtrans::transport::TransportServer>) {
@@ -437,6 +468,9 @@ impl ConnectionManager {
     ) -> Result<()> {
         self.register_connecting(session_id);
         let outcome = self.authenticate(session_id, user_id, device_id.clone());
+        if let Some(registry) = self.ownership_registry.read().await.clone() {
+            registry.register(user_id, &device_id, session_id).await?;
+        }
         // [DIAG: SESSION_REGISTER] 关键诊断：device_id 是否稳定。若同一物理设备每次重连
         // 携带不同 device_id，则旧 session 不会被 supersede（按 device_id 去重），会以
         // 「活的」状态残留 → push 分裂到死会话 → success 虚高、客户端收不到。
@@ -494,6 +528,11 @@ impl ConnectionManager {
         let Some(device_id) = entry.device_id.clone() else {
             return Ok(None);
         };
+        if let Some(registry) = self.ownership_registry.read().await.clone() {
+            if let Err(error) = registry.unregister(user_id, &device_id, session_id).await {
+                warn!(%error, user_id, %device_id, %session_id, "session owner unregister failed");
+            }
+        }
 
         // 条件清理 Index A：仅当映射仍指向本 session_id 时才删除
         let mut cleaned_a = false;
@@ -763,7 +802,7 @@ impl ConnectionManager {
 
         let transport = self.transport_server.read().await;
         if let Some(server) = transport.as_ref() {
-            if let Err(e) = server.close_session(session_id).await {
+            if let Err(e) = server.force_close_session(session_id).await {
                 warn!(
                     "⚠️ ConnectionManager: force_close_session 失败 sid={} err={}",
                     session_id, e
@@ -910,18 +949,27 @@ impl ConnectionManager {
                     classification,
                     detail,
                 } => {
-                    // Only a non-retryable connection error is positive evidence that the
-                    // session is dead. Route timeout and backpressure remain retryable.
-                    let cleaned_up =
-                        if classification == DeliveryFailureClassification::DeadConnection {
-                            self.unregister_connection(session_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .is_some()
-                        } else {
-                            false
-                        };
+                    crate::infra::metrics::increment_delivery_failure_sessions(
+                        classification.metric_label(),
+                        1,
+                    );
+                    // Queue overflow is positive evidence of a slow consumer. Keeping that
+                    // socket alive only accumulates more data, so fail closed and let the
+                    // durable offline/PTS paths recover the client after reconnect.
+                    let cleaned_up = if matches!(
+                        classification,
+                        DeliveryFailureClassification::DeadConnection
+                            | DeliveryFailureClassification::SlowConsumer
+                    ) {
+                        self.force_close_session(session_id).await;
+                        self.unregister_connection(session_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some()
+                    } else {
+                        false
+                    };
                     warn!(
                         target: "diag.push_route",
                         user_id = user_id,
@@ -1824,6 +1872,44 @@ mod tests {
                 }
             )]
         ));
+    }
+
+    #[test]
+    fn outbound_queue_overflow_is_classified_as_slow_consumer() {
+        let error = msgtrans::error::TransportError::resource_error("tcp_outbound_queue", 512, 512);
+        assert_eq!(
+            classify_transport_error(&error),
+            DeliveryFailureClassification::SlowConsumer
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_attempt_removes_session_from_routing() {
+        let manager = ConnectionManager::new_with_node_id("node-a");
+        let session_id = SessionId::new(8251);
+        manager
+            .register_connection(82, "slow-device".to_string(), session_id)
+            .await
+            .unwrap();
+        let owners = HashMap::from([(session_id, "node-a".to_string())]);
+        let attempts = vec![(
+            session_id,
+            SessionAttemptOutcome::Failure {
+                classification: DeliveryFailureClassification::SlowConsumer,
+                detail: "outbound queue full".to_string(),
+            },
+        )];
+        let mut report = DeliveryReport {
+            attempted: 1,
+            ..DeliveryReport::default()
+        };
+
+        manager
+            .apply_delivery_attempts(82, 456, &owners, attempts, &mut report)
+            .await;
+
+        assert!(report.failed_sessions[0].cleaned_up);
+        assert!(!manager.is_device_online(82, "slow-device").await);
     }
 
     #[tokio::test]
