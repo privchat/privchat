@@ -711,7 +711,6 @@ impl ChatServer {
             channel_service.clone(),
             blacklist_service.clone(),
             pts_generator.clone(),
-            unread_count_service.clone(),
             privacy_service.clone(),
             friend_service.clone(),
             mention_service.clone(),

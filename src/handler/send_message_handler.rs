@@ -19,12 +19,10 @@ use crate::context::RequestContext;
 use crate::error::ServerError;
 use crate::handler::MessageHandler;
 use crate::infra::SessionManager as AuthSessionManager;
-use crate::model::channel::{MessageId, UserId};
 use crate::model::pts::PtsGenerator;
 use crate::repository::{AtomicMessageCommitRequest, PgMessageRepository};
 use crate::service::message_history_service::{MessageHistoryRecord, MessageHistoryService};
 use crate::service::sync::get_global_sync_service;
-use crate::service::UnreadCountService;
 use crate::Result;
 use async_trait::async_trait;
 use privchat_protocol::error_code::ErrorCode;
@@ -32,7 +30,7 @@ use privchat_protocol::{CanonicalTimelineEvent, MessagePayloadEnvelope, NewMessa
 use serde_json::Value;
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// 附件加密 v1：缩略图 `thumbnail_cek` 现随消息 metadata 下发，主文件 `cek` 永不进 metadata。
 /// 任何打印 message metadata/payload 的日志都必须先经此函数把 `cek`/`thumbnail_cek` 值
@@ -84,8 +82,6 @@ pub struct SendMessageHandler {
     blacklist_service: Arc<crate::service::BlacklistService>,
     /// ✨ pts 生成器
     pts_generator: Arc<PtsGenerator>,
-    /// ✨ 未读计数服务
-    unread_count_service: Arc<UnreadCountService>,
     /// ✨ 消息去重服务
     /// ✨ 隐私服务（用于检查非好友消息权限）
     privacy_service: Arc<crate::service::PrivacyService>,
@@ -148,7 +144,6 @@ impl SendMessageHandler {
         channel_service: Arc<crate::service::ChannelService>,
         blacklist_service: Arc<crate::service::BlacklistService>,
         pts_generator: Arc<PtsGenerator>,
-        unread_count_service: Arc<UnreadCountService>,
         privacy_service: Arc<crate::service::PrivacyService>,
         friend_service: Arc<crate::service::FriendService>,
         mention_service: Arc<crate::service::MentionService>,
@@ -165,7 +160,6 @@ impl SendMessageHandler {
             transport: Arc::new(RwLock::new(None)),
             blacklist_service,
             pts_generator,
-            unread_count_service,
             privacy_service,
             friend_service,
             mention_service,
@@ -1672,20 +1666,21 @@ impl MessageHandler for SendMessageHandler {
         // 5.5. channel last preview is derived client-side from local message table.
         // Server keeps stable anchor only (last_message_id/timestamp) via update_last_message.
 
-        // 6. 更新其他成员的未读计数（批量并发）
-        {
-            let receiver_ids: Vec<u64> = channel
-                .get_member_ids()
-                .into_iter()
-                .filter(|&id| id != from_uid)
-                .collect();
-            if let Err(e) = self
-                .unread_count_service
-                .increment_for_channel_members(channel.id, &receiver_ids, 1)
-                .await
-            {
-                warn!("⚠️ SendMessageHandler: 更新未读计数失败: {}", e);
-            }
+        // 6. Use the same DB-authoritative unread projection as sync/submit.
+        // The previous Redis-only write made live badges appear, then reset to
+        // zero when a browser refresh rebuilt channels from PostgreSQL.
+        if let Some(sync_service) = get_global_sync_service() {
+            sync_service
+                .enqueue_unread_increment(channel.id, from_uid, 1)
+                .await;
+        } else {
+            // Startup should install the global SyncService before accepting
+            // traffic. Fail visibly instead of recreating a cache-only split.
+            warn!(
+                channel_id = channel.id,
+                sender_id = from_uid,
+                "SyncService unavailable; unread projection was not queued"
+            );
         }
 
         // 7. 先创建成功响应（不阻塞客户端）
@@ -2116,41 +2111,6 @@ impl SendMessageHandler {
             .get_channel(&send_message_request.channel_id)
             .await
             .map_err(|e| ServerError::Internal(format!("获取频道失败: {}", e)))
-    }
-
-    /// 更新其他成员的未读计数
-    async fn update_member_unread_counts(
-        &self,
-        channel: &crate::model::channel::Channel,
-        sender_id: &UserId,
-        _message_id: &MessageId,
-    ) -> Result<()> {
-        // 获取频道所有成员
-        let member_ids = channel.get_member_ids();
-
-        // 为除发送者外的所有成员增加未读计数
-        for member_id in member_ids {
-            if member_id != *sender_id {
-                // ✨ 使用新的 unread_count_service
-                if let Err(e) = self
-                    .unread_count_service
-                    .increment(member_id, channel.id, 1)
-                    .await
-                {
-                    warn!(
-                        "⚠️ SendMessageHandler: 为用户 {} 增加未读计数失败: {}",
-                        member_id, e
-                    );
-                } else {
-                    debug!(
-                        "📊 SendMessageHandler: 为用户 {} 在频道 {} 增加未读计数",
-                        member_id, channel.id
-                    );
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// 创建成功响应
