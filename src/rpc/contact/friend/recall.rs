@@ -18,7 +18,9 @@
 use crate::rpc::contact::friend::push_helpers;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::rpc::contact::friend::FriendRecallRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::{json, Value};
 
 /// 处理 撤回好友申请 请求（requester 主动撤回自己发出的、尚未处理的 pending）。
@@ -64,6 +66,18 @@ pub async fn handle(
                     requester_id,
                 )
                 .await;
+                let publisher =
+                    EntityInvalidationPublisher::new(services.connection_manager.clone());
+                if let Err(error) = publisher
+                    .publish_friend_pair_change(
+                        requester_id,
+                        target_user_id,
+                        EntityMutationHint::Delete,
+                    )
+                    .await
+                {
+                    tracing::warn!(requester_id, target_user_id, %error, "friend invalidation failed");
+                }
             } else {
                 tracing::debug!(
                     "ℹ️ 撤回好友申请：无 pending 行（已过期/已被处理）requester={} target={}",

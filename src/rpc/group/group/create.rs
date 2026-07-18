@@ -17,8 +17,10 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::error_code::ErrorCode;
 use privchat_protocol::rpc::group::group::GroupCreateRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::{json, Value};
 
 const USER_TYPE_SYSTEM: i16 = 1;
@@ -259,6 +261,21 @@ pub async fn handle(
 
                     // 返回客户端期望的群组信息格式（返回 channel_id，客户端应使用此 ID 发送消息）
                     let member_count = 1 + initial_members.len();
+                    let publisher =
+                        EntityInvalidationPublisher::new(services.connection_manager.clone());
+                    let recipients = std::iter::once(creator_id)
+                        .chain(initial_members.iter().copied())
+                        .collect::<Vec<_>>();
+                    if let Err(error) = publisher
+                        .publish_group_projection_change(
+                            recipients,
+                            actual_channel_id,
+                            EntityMutationHint::Upsert,
+                        )
+                        .await
+                    {
+                        tracing::warn!(group_id = actual_channel_id, %error, "group invalidation failed");
+                    }
                     Ok(json!({
                         "group_id": actual_channel_id, // ✨ 返回会话 ID 给客户端
                         "name": name,

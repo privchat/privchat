@@ -1,6 +1,8 @@
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::rpc::contact::friend::FriendSetAliasRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::Value;
 
 /// 处理 设置好友备注 请求
@@ -21,6 +23,18 @@ pub async fn handle(
         .set_alias(user_id, friend_id, alias.clone())
         .await
         .map_err(|e| RpcError::internal(format!("设置备注失败: {}", e)))?;
+
+    // Alias is private relationship state: notify only the actor's sessions,
+    // never the friend whose display name was changed locally.
+    if success {
+        let publisher = EntityInvalidationPublisher::new(services.connection_manager.clone());
+        if let Err(error) = publisher
+            .publish_friend_change([user_id], friend_id, EntityMutationHint::Upsert)
+            .await
+        {
+            tracing::warn!(user_id, friend_id, %error, "friend alias invalidation failed");
+        }
+    }
 
     Ok(serde_json::to_value(success).unwrap())
 }

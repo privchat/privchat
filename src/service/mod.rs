@@ -20,6 +20,7 @@ pub mod admin_service;
 pub mod auth_service;
 pub mod channel_service; // ChannelService 在这里
 pub mod committed_timeline_delivery_service;
+pub mod entity_invalidation_publisher;
 pub mod friend_service;
 pub mod group_service;
 pub mod message_service;
@@ -85,6 +86,7 @@ pub use committed_timeline_delivery_service::{
     DispatchOutcome, DispatchRecipientState, RecipientDeliveryOutcome,
 };
 pub use delivery_tracker::DeliveryTracker;
+pub use entity_invalidation_publisher::EntityInvalidationPublisher;
 pub use file_service::{FileMetadata, FileService, FileType, FileUrlResponse};
 pub use friend_service::FriendService;
 pub use group_service::GroupService;

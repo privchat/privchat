@@ -17,7 +17,9 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::rpc::GroupMemberRemoveRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::{json, Value};
 
 /// 处理 删除群成员 请求（管理员/群主移除他人）
@@ -66,6 +68,7 @@ pub async fn handle(
             return Err(RpcError::forbidden("Cannot remove group owner".to_string()));
         }
     }
+    let recipients = channel.members.keys().copied().collect::<Vec<_>>();
 
     // 移除成员
     match services
@@ -75,6 +78,13 @@ pub async fn handle(
     {
         Ok(_) => {
             tracing::debug!("✅ 成功移除成员 {} 从群组 {}", user_id, group_id);
+            let publisher = EntityInvalidationPublisher::new(services.connection_manager.clone());
+            if let Err(error) = publisher
+                .publish_group_projection_change(recipients, group_id, EntityMutationHint::Delete)
+                .await
+            {
+                tracing::warn!(group_id, user_id, %error, "group member invalidation failed");
+            }
             // 简单操作，返回 true
             Ok(json!(true))
         }

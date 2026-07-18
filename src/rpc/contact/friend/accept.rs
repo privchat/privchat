@@ -19,7 +19,9 @@ use crate::rpc::contact::friend::push_helpers;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use crate::service::friend_service::AcceptFriendRequestResult;
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::rpc::contact::friend::FriendAcceptRequest;
+use privchat_protocol::EntityMutationHint;
 use privchat_protocol::ErrorCode;
 use serde_json::{json, Value};
 
@@ -113,6 +115,13 @@ pub async fn handle(
             user_id,
         )
         .await;
+    }
+    let publisher = EntityInvalidationPublisher::new(services.connection_manager.clone());
+    if let Err(error) = publisher
+        .publish_friend_pair_change(user_id, from_user_id, EntityMutationHint::Upsert)
+        .await
+    {
+        tracing::warn!(user_id, from_user_id, %error, "friend invalidation failed");
     }
 
     // 返回会话 ID
