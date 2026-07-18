@@ -143,12 +143,16 @@ impl UnreadIncrementBatcher {
         Self { tx }
     }
 
-    fn enqueue(&self, channel_id: u64, sender_id: u64, count: u64) {
-        if let Err(error) = self.tx.try_send(UnreadResolveRequest {
-            channel_id,
-            sender_id,
-            count,
-        }) {
+    async fn enqueue(&self, channel_id: u64, sender_id: u64, count: u64) {
+        if let Err(error) = self
+            .tx
+            .send(UnreadResolveRequest {
+                channel_id,
+                sender_id,
+                count,
+            })
+            .await
+        {
             warn!(channel_id, %error, "post-commit unread queue unavailable");
         }
     }
@@ -256,6 +260,15 @@ impl SyncService {
             message_repository,
             delivery_service,
         }
+    }
+
+    /// Queue the shared unread projection pipeline after an authoritative
+    /// message commit. Every message ingress must use this path so the DB
+    /// baseline and the Redis acceleration layer cannot diverge.
+    pub async fn enqueue_unread_increment(&self, channel_id: u64, sender_id: u64, count: u64) {
+        self.unread_increment_batcher
+            .enqueue(channel_id, sender_id, count)
+            .await;
     }
 
     pub async fn append_server_event_commit(
@@ -570,8 +583,8 @@ impl SyncService {
 
         // Unread is a derived projection. Resolve membership and enqueue its
         // durable-DB-first batch after returning the authoritative commit.
-        self.unread_increment_batcher
-            .enqueue(req.channel_id, sender_id, 1);
+        self.enqueue_unread_increment(req.channel_id, sender_id, 1)
+            .await;
 
         // (registry 已在步骤 8 的原子事务内 claim —— 不再单独 register，杜绝「commit 后 register 前
         //  崩溃 → 重试产生重复消息」的窗口。)
