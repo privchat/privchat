@@ -18,7 +18,9 @@
 use crate::rpc::contact::friend::push_helpers;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::rpc::contact::friend::FriendApplyRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::{json, Value};
 
 /// 处理 好友申请 请求
@@ -243,6 +245,18 @@ pub async fn handle(
                     .await;
                     push_helpers::push_friend_request_sent(&services, from_user_id, target_user_id)
                         .await;
+                    let publisher =
+                        EntityInvalidationPublisher::new(services.connection_manager.clone());
+                    if let Err(error) = publisher
+                        .publish_friend_pair_change(
+                            from_user_id,
+                            target_user_id,
+                            EntityMutationHint::Upsert,
+                        )
+                        .await
+                    {
+                        tracing::warn!(from_user_id, target_user_id, %error, "friend invalidation failed");
+                    }
 
                     Ok(json!({
                         // 协议约定 user_id 必须是 u64 数字，不是字符串

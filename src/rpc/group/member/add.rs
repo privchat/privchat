@@ -17,8 +17,10 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::{helpers, RpcServiceContext};
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::error_code::ErrorCode;
 use privchat_protocol::rpc::GroupMemberAddRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::{json, Value};
 
 const USER_TYPE_SYSTEM: i16 = 1;
@@ -177,6 +179,20 @@ pub async fn handle(
                 .await
             {
                 tracing::warn!("⚠️ 写入入群系统消息失败 group_id={}: {}", group_id, e);
+            }
+
+            let recipients = services
+                .channel_service
+                .get_channel(&group_id)
+                .await
+                .map(|channel| channel.members.keys().copied().collect::<Vec<_>>())
+                .unwrap_or_else(|_| vec![inviter_id, user_id]);
+            let publisher = EntityInvalidationPublisher::new(services.connection_manager.clone());
+            if let Err(error) = publisher
+                .publish_group_projection_change(recipients, group_id, EntityMutationHint::Upsert)
+                .await
+            {
+                tracing::warn!(group_id, user_id, %error, "group member invalidation failed");
             }
 
             // 简单操作，返回 true

@@ -17,7 +17,9 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::rpc::contact::friend::FriendRemoveRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::{json, Value};
 
 /// 处理 删除好友 请求
@@ -46,6 +48,13 @@ pub async fn handle(
     {
         Ok(_) => {
             tracing::debug!("✅ 好友删除成功: {} <-> {}", user_id, friend_id);
+            let publisher = EntityInvalidationPublisher::new(services.connection_manager.clone());
+            if let Err(error) = publisher
+                .publish_friend_pair_change(user_id, friend_id, EntityMutationHint::Delete)
+                .await
+            {
+                tracing::warn!(user_id, friend_id, %error, "friend invalidation failed");
+            }
             // 简单操作，返回 true
             Ok(json!(true))
         }

@@ -18,7 +18,9 @@
 use crate::rpc::contact::friend::push_helpers;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::rpc::contact::friend::FriendRejectRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::{json, Value};
 
 /// 处理 拒绝好友申请 请求。
@@ -64,6 +66,14 @@ pub async fn handle(
                     user_id,
                 )
                 .await;
+                let publisher =
+                    EntityInvalidationPublisher::new(services.connection_manager.clone());
+                if let Err(error) = publisher
+                    .publish_friend_pair_change(from_user_id, user_id, EntityMutationHint::Delete)
+                    .await
+                {
+                    tracing::warn!(from_user_id, user_id, %error, "friend invalidation failed");
+                }
             } else {
                 tracing::debug!(
                     "ℹ️ 拒绝好友申请：无 pending 行（已过期/已处理/已撤回）from={} target={}",

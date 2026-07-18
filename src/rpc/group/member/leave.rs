@@ -17,7 +17,9 @@
 
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
+use crate::service::EntityInvalidationPublisher;
 use privchat_protocol::rpc::GroupMemberLeaveRequest;
+use privchat_protocol::EntityMutationHint;
 use serde_json::{json, Value};
 
 /// 处理 退群 请求（用户主动离开）
@@ -60,6 +62,7 @@ pub async fn handle(
             ));
         }
     }
+    let recipients = channel.members.keys().copied().collect::<Vec<_>>();
 
     // 离开群组
     match services
@@ -69,6 +72,13 @@ pub async fn handle(
     {
         Ok(_) => {
             tracing::debug!("✅ 用户 {} 成功退出群组 {}", user_id, group_id);
+            let publisher = EntityInvalidationPublisher::new(services.connection_manager.clone());
+            if let Err(error) = publisher
+                .publish_group_projection_change(recipients, group_id, EntityMutationHint::Delete)
+                .await
+            {
+                tracing::warn!(group_id, user_id, %error, "group member invalidation failed");
+            }
             // 简单操作，返回 true
             Ok(json!(true))
         }
