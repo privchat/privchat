@@ -118,20 +118,14 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
             let mut related_user_ids = BTreeSet::new();
             related_user_ids.insert(user_id);
 
-            let channels = services
-                .channel_service
-                .get_user_channels(user_id)
-                .await
-                .channels;
-            if let Some(scoped_channel_id) = parse_scope_channel_id(scope) {
-                if let Some(channel) = channels.iter().find(|ch| ch.id == scoped_channel_id) {
-                    for uid in channel.get_member_ids().into_iter() {
-                        related_user_ids.insert(uid);
-                    }
-                }
-            } else if let Some(scoped_user_id) = parse_scope_user_id(scope) {
+            if let Some(scoped_user_id) = parse_scope_user_id(scope) {
                 related_user_ids.insert(scoped_user_id);
             } else {
+                let channels = services
+                    .channel_service
+                    .get_user_channels(user_id)
+                    .await
+                    .channels;
                 if let Ok(friend_ids) = services.friend_service.get_friends(user_id).await {
                     for fid in friend_ids {
                         related_user_ids.insert(fid);
@@ -298,6 +292,12 @@ mod tests {
         assert_eq!(parse_scope_user_id(Some("20001")), Some(20001));
         assert_eq!(parse_scope_user_id(Some("user:20001")), Some(20001));
         assert_eq!(parse_scope_user_id(Some("friend/20001")), Some(20001));
+    }
+
+    #[test]
+    fn user_scope_is_a_user_id_not_a_channel_id() {
+        assert_eq!(parse_scope_user_id(Some("user:20001")), Some(20001));
+        assert_eq!(parse_scope_user_id(Some("20001")), Some(20001));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::repository::{LoginLogRepository, PgMessageRepository, UserRepository}
 // It is still needed as a constructor dependency for AdminService (until that also converges).
 use crate::security::SecurityService;
 use crate::service::{
-    AdminService, ChannelService, FileService, MessageService, RoomHistoryService,
+    AdminService, ChannelService, FileService, FriendService, MessageService, RoomHistoryService,
     UploadTokenService, UserService,
 };
 
@@ -51,6 +51,7 @@ pub struct AdminServerState {
     pub login_log_repository: Arc<LoginLogRepository>,
     pub device_manager_db: Arc<DeviceManagerDb>,
     pub channel_service: Arc<ChannelService>,
+    pub friend_service: Arc<FriendService>,
     pub connection_manager: Arc<ConnectionManager>,
     pub security_service: Arc<SecurityService>,
     pub admin_service: Arc<AdminService>,
@@ -134,6 +135,7 @@ impl AdminHttpServer {
         device_manager_db: Arc<DeviceManagerDb>,
         message_repository: Arc<PgMessageRepository>,
         channel_service: Arc<ChannelService>,
+        friend_service: Arc<FriendService>,
         connection_manager: Arc<ConnectionManager>,
         security_service: Arc<SecurityService>,
         subscribe_manager: Arc<SubscribeManager>,
@@ -161,6 +163,7 @@ impl AdminHttpServer {
                 login_log_repository,
                 device_manager_db,
                 channel_service,
+                friend_service,
                 connection_manager,
                 security_service,
                 admin_service,

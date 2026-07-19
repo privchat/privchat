@@ -1,5 +1,6 @@
 use crate::infra::connection_manager::ConnectionManager;
 use crate::Result;
+use futures::stream::{self, StreamExt};
 use privchat_protocol::protocol::{MessageSetting, PushMessageRequest};
 use privchat_protocol::{
     encode_message, ContentMessageType, EntityInvalidation, EntityInvalidationBatch,
@@ -61,20 +62,23 @@ impl EntityInvalidationPublisher {
             deleted: false,
         };
 
-        for user_id in recipients {
-            if let Err(error) = self
-                .connection_manager
-                .send_push_to_user(user_id, &push)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    notification_id,
-                    %error,
-                    "entity invalidation online dispatch failed; entity sync remains authoritative"
-                );
-            }
-        }
+        let connection_manager = self.connection_manager.clone();
+        stream::iter(recipients)
+            .for_each_concurrent(50, |user_id| {
+                let connection_manager = connection_manager.clone();
+                let push = push.clone();
+                async move {
+                    if let Err(error) = connection_manager.send_push_to_user(user_id, &push).await {
+                        tracing::warn!(
+                            user_id,
+                            notification_id,
+                            %error,
+                            "entity invalidation online dispatch failed; entity sync remains authoritative"
+                        );
+                    }
+                }
+            })
+            .await;
         Ok(())
     }
 

@@ -52,7 +52,7 @@ use axum::{
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
@@ -692,7 +692,7 @@ async fn update_user(
         status,
     } = request;
 
-    state
+    let updated = state
         .user_service
         .update_user_admin(
             user_id,
@@ -707,11 +707,86 @@ async fn update_user(
         )
         .await?;
 
+    publish_user_profile_invalidation(&state, user_id).await;
+
     Ok(ApiEnvelope::ok(json!({
-        "success": true,
-        "user_id": user_id,
-        "message": "用户更新成功"
+        "user_id": updated.id,
+        "username": updated.username,
+        "display_name": updated.display_name,
+        "email": updated.email,
+        "phone": updated.phone,
+        "avatar_url": updated.avatar_url,
+        "user_type": updated.user_type,
+        "status": updated.status,
+        "privacy_settings": updated.privacy_settings,
+        "business_system_id": updated.business_system_id,
+        "created_at": updated.created_at.timestamp_millis(),
+        "updated_at": updated.updated_at.timestamp_millis(),
+        "last_active_at": updated.last_active_at.map(|dt| dt.timestamp_millis()),
     })))
+}
+
+/// Profile writes commit before this best-effort control-plane hint. The
+/// entity row + sync_version remain authoritative, so a failed online push is
+/// repaired by reconnect/foreground entity sync.
+async fn publish_user_profile_invalidation(state: &AdminServerState, user_id: u64) {
+    let (friends, channels) = tokio::join!(state.friend_service.get_friends(user_id), async {
+        state
+            .channel_service
+            .get_user_channels(user_id)
+            .await
+            .channels
+    },);
+    let friend_ids = match friends {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(
+                user_id,
+                %error,
+                "profile invalidation friend recipient resolution failed"
+            );
+            Vec::new()
+        }
+    };
+    let recipients = profile_invalidation_recipients(
+        user_id,
+        friend_ids,
+        channels.into_iter().map(|channel| channel.get_member_ids()),
+    );
+
+    let publisher =
+        crate::service::EntityInvalidationPublisher::new(state.connection_manager.clone());
+    if let Err(error) = publisher
+        .publish_to_users(
+            recipients,
+            vec![privchat_protocol::EntityInvalidation {
+                entity_type: "user".to_string(),
+                entity_id: Some(user_id.to_string()),
+                // user entity scope is always the target user id. It is not
+                // a channel id even when visibility came from a channel.
+                scope: Some(user_id.to_string()),
+                target_version: 0,
+                mutation_hint: privchat_protocol::EntityMutationHint::Upsert,
+            }],
+        )
+        .await
+    {
+        warn!(user_id, %error, "profile invalidation dispatch failed");
+    }
+}
+
+fn profile_invalidation_recipients(
+    user_id: u64,
+    friend_ids: impl IntoIterator<Item = u64>,
+    channel_member_ids: impl IntoIterator<Item = Vec<u64>>,
+) -> BTreeSet<u64> {
+    let mut recipients = BTreeSet::from([user_id]);
+    recipients.extend(friend_ids);
+    for members in channel_member_ids {
+        recipients.extend(members);
+    }
+    recipients.remove(&0);
+    recipients
 }
 
 /// 删除/禁用用户
@@ -2949,4 +3024,18 @@ async fn push_qr_authorized(
         scene_id,
         delivered: matches!(outcome, crate::service::PushOutcome::Delivered),
     }))
+}
+
+#[cfg(test)]
+mod profile_invalidation_tests {
+    use super::profile_invalidation_recipients;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn recipients_include_self_friends_and_shared_channel_members_once() {
+        assert_eq!(
+            profile_invalidation_recipients(10, [20, 30], [vec![10, 30, 40], vec![0, 20, 50]],),
+            BTreeSet::from([10, 20, 30, 40, 50]),
+        );
+    }
 }

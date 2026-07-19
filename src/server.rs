@@ -180,6 +180,8 @@ pub struct ChatServer {
     message_dispatcher: Arc<MessageDispatcher>,
     /// 频道服务（原会话服务）
     channel_service: Arc<crate::service::ChannelService>,
+    /// 好友关系服务（管理 API 资料变更的可见用户收件人解析）
+    friend_service: Arc<crate::service::FriendService>,
     /// SendMessageHandler 的引用（用于设置 TransportServer）
     send_message_handler: Arc<SendMessageHandler>,
     /// 文件服务
@@ -1574,6 +1576,7 @@ impl ChatServer {
             transport: None,
             message_dispatcher: Arc::new(message_dispatcher),
             channel_service,
+            friend_service,
             send_message_handler,
             file_service,
             upload_token_service,
@@ -2463,6 +2466,7 @@ impl ChatServer {
             self.device_manager_db.clone(),
             self.message_repository.clone(),
             self.channel_service.clone(),
+            self.friend_service.clone(),
             self.connection_manager.clone(),
             self.security_service.clone(),
             self.subscribe_manager.clone(),
