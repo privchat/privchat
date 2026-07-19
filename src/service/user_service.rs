@@ -453,11 +453,10 @@ impl UserService {
             user.status = UserStatus::from_i16(status);
         }
 
-        // 实体级版本/更新时间。客户端 sync_users 增量按 updated_at 拉，这里不刷新
-        // 会让 admin 改完用户后客户端永远拿不到最新资料。
-        // 注意：这只是实体更新时间，**不**等价于 session_version——profile 类字段
-        // 不应 bump session_version；phone/密码 等敏感字段的 session bump 走专门
-        // 路径（spec AUTH_SPEC §2.5），此处不参与。
+        // updated_at 仅用于审计/展示；数据库 BEFORE UPDATE trigger 会分配单调
+        // sync_version，客户端实体增量同步只使用 sync_version，不能使用墙钟时间。
+        // profile 类字段不应 bump session_version；phone/密码等敏感字段的 session
+        // bump 走专门路径（spec AUTH_SPEC §2.5）。
         user.updated_at = chrono::Utc::now();
 
         match self.user_repository.update(&user).await {
