@@ -2320,8 +2320,6 @@ impl ChannelService {
             group_id: Option<i64>,
             last_message_id: Option<i64>,
             last_message_at: Option<i64>,
-            last_message_content: Option<String>,
-            last_message_type: Option<i16>,
             message_count: i64,
             created_at: i64,
             updated_at: i64,
@@ -2372,8 +2370,6 @@ impl ChannelService {
                 c.group_id,
                 c.last_message_id,
                 c.last_message_at,
-                lm.content AS last_message_content,
-                lm.message_type AS last_message_type,
                 c.message_count,
                 c.created_at,
                 c.updated_at,
@@ -2397,8 +2393,6 @@ impl ChannelService {
                     WHEN c.direct_user1_id = $1 THEN c.direct_user2_id
                     ELSE c.direct_user1_id
                 END
-            LEFT JOIN privchat_messages lm
-                ON lm.message_id = c.last_message_id
             WHERE uc.user_id = $1
               AND ($2::BIGINT IS NULL OR c.sync_version > $2 OR uc.sync_version > $2)
               AND (
@@ -2432,8 +2426,6 @@ impl ChannelService {
         .map_err(|e| ServerError::Database(format!("查询频道同步分页失败: {}", e)))?;
 
         let (page, has_more) = take_sync_page(rows, limit as usize);
-        let last_message_cache = self.last_message_cache.read().await;
-
         let items: Vec<SyncEntityItem> = page
             .iter()
             .map(|row| {
@@ -2466,28 +2458,10 @@ impl ChannelService {
                     row.group_name.clone().unwrap_or_default()
                 };
 
-                let preview = last_message_cache.get(&channel_id).cloned();
-
-                let last_msg_content = preview
-                    .as_ref()
-                    .map(|p| p.content.clone())
-                    .or_else(|| row.last_message_content.clone())
-                    .unwrap_or_default();
-                let last_msg_timestamp = preview
-                    .as_ref()
-                    .map(|p| p.timestamp.timestamp_millis())
-                    .or(row.last_message_at)
-                    .unwrap_or(0);
-                let last_msg_type =
-                    preview
-                        .as_ref()
-                        .map(|p| p.message_type.clone())
-                        .or_else(|| {
-                            row.last_message_type.and_then(|value| {
-                                privchat_protocol::ContentMessageType::from_u32(value as u32)
-                                    .map(|kind| kind.as_str().to_string())
-                            })
-                        });
+                // Conversation preview content is a client-side projection of
+                // locally loaded messages. Keep this legacy wire field empty;
+                // the server only supplies the authoritative ordering time.
+                let last_msg_timestamp = row.last_message_at.unwrap_or(0);
 
                 let channel_type = match channel_type_enum {
                     ChannelType::Direct => 1i64,
@@ -2502,8 +2476,7 @@ impl ChannelService {
                     name: Some(channel_name),
                     avatar: Some(row.group_avatar_url.clone().unwrap_or_default()),
                     unread_count: Some(row.unread_count),
-                    last_msg_content: Some(last_msg_content),
-                    last_msg_type,
+                    last_msg_content: Some(String::new()),
                     last_msg_timestamp: Some(last_msg_timestamp),
                     top: Some(if row.is_pinned { 1 } else { 0 }),
                     mute: Some(if row.is_muted { 1 } else { 0 }),
