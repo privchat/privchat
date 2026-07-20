@@ -1088,17 +1088,20 @@ impl MessageHandler for SendMessageHandler {
             match Self::parse_payload(&send_message_request.payload) {
                 Ok(t) => t,
                 Err(e) => {
+                    // 二进制守卫（生产乱码事故回归）：解不了的二进制 payload 直接拒发 20006——
+                    // 绝不能 lossy-stringify 落库（会存成不可见控制符+长度字节+正文的永久脏数据，
+                    // 且未剥 NUL 时 Postgres UTF8 列直接报错）。
                     warn!(
-                        "⚠️ SendMessageHandler: 解析 payload 失败，使用原始字符串: {}",
+                        "⚠️ SendMessageHandler: payload 既非 envelope 也非文本，拒绝发送: {}",
                         e
                     );
-                    (
-                        String::from_utf8_lossy(&send_message_request.payload).to_string(),
-                        None,
-                        None,
-                        Vec::new(),
-                        None,
-                    )
+                    return self
+                        .create_error_response(
+                            &send_message_request,
+                            ErrorCode::MessageContentInvalid,
+                            "无法解析的消息负载",
+                        )
+                        .await;
                 }
             };
 
@@ -1713,6 +1716,18 @@ impl MessageHandler for SendMessageHandler {
 impl SendMessageHandler {
     /// 解析 payload 为 content + metadata + reply_to_message_id + mentioned_user_ids + message_source
     /// 消息类型由协议层 SendMessageRequest.message_type（u32）提供，不在此解析。
+    /// 二进制判定：非 UTF-8，或含 C0 控制字节（保留用户可合法输入的 \t \n \r）。真实聊天文本
+    /// 不会命中；FlatBuffers 头/表必含 NUL 或小整数字节必命中。与 TS SDK
+    /// `decodePlainTextPayload`（cache/types.ts）语义一致。
+    fn payload_looks_binary(payload: &[u8]) -> bool {
+        match std::str::from_utf8(payload) {
+            Err(_) => true,
+            Ok(s) => s
+                .bytes()
+                .any(|b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r'),
+        }
+    }
+
     /// Payload 格式见 protocol 层 MessagePayloadEnvelope。
     fn parse_payload(
         payload: &[u8],
@@ -1734,6 +1749,15 @@ impl SendMessageHandler {
             match privchat_protocol::decode_message::<MessagePayloadEnvelope>(payload) {
                 Ok(v) => v,
                 Err(_) => {
+                    // 二进制守卫（生产乱码事故回归；对齐 TS decodePlainTextPayload）：FlatBuffers/未知
+                    // 二进制在 decode 失败时绝不能 lossy-stringify 落库——那会存成「不可见控制符+字符串
+                    // 长度字节+正文」的永久脏数据。非 UTF-8 或含 C0 控制符（\t\n\r 除外）= 二进制 → 拒绝。
+                    if Self::payload_looks_binary(payload) {
+                        return Err(crate::ServerError::Validation(
+                            "消息负载既非合法 FlatBuffers envelope 也非文本".to_string(),
+                        )
+                        .into());
+                    }
                     // fallback: 纯文本模式（旧客户端 / 测试可能直接传 utf-8）
                     let text = String::from_utf8_lossy(payload).replace('\u{0}', "");
                     if let Some(normalized) = Self::parse_legacy_json_payload(&text) {
@@ -2414,5 +2438,32 @@ mod payload_normalization_tests {
         assert!(metadata.is_none());
         assert!(reply.is_none());
         assert!(mentions.is_empty());
+    }
+
+    // 生产乱码事故回归（web FB envelope × 版本偏斜）：FlatBuffers 二进制在 decode 失败时
+    // 绝不能被 lossy-stringify 落库成「不可见控制符+长度字节+正文」——必须拒绝（对齐 TS
+    // decodePlainTextPayload 的二进制守卫）。
+    #[test]
+    fn undecodable_binary_payload_rejected_not_mojibaked() {
+        // 合法 envelope → 损坏 root offset 使 verifier 失败，但字节仍是典型 FB 二进制（含 C0/NUL）。
+        let mut bytes = privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
+            content: "大家记住一句话，天下没有白吃的苦，没有白走的路！".to_string(),
+            ..Default::default()
+        })
+        .expect("encode envelope");
+        bytes[0] = 0xF0; bytes[1] = 0xFF; bytes[2] = 0xFF; bytes[3] = 0xFF; // root offset 指向界外
+        assert!(
+            SendMessageHandler::parse_payload(&bytes).is_err(),
+            "binary garbage must be rejected, not stored as mojibake text"
+        );
+    }
+
+    // 二进制守卫不能误伤：用户可合法输入的控制符（\t \n \r）仍按纯文本接受。
+    #[test]
+    fn plain_text_with_newline_still_accepted() {
+        let payload = "第一行\n\t第二行\r\n第三行";
+        let (content, ..) =
+            SendMessageHandler::parse_payload(payload.as_bytes()).expect("plain text with newline");
+        assert_eq!(content, payload);
     }
 }
