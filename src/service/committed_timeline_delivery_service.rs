@@ -833,7 +833,11 @@ fn push_from_claim(claim: &ClaimedDispatchRecipient) -> Result<PushMessageReques
             message.message_type.as_u32(),
             String::new(),
             claim.sender_id as u64,
-            privchat_protocol::encode_message(&message.payload).map_err(|e| {
+            // 滚动兼容（生产乱码事故根修）：NewMessage 推送 payload 用 **legacy JSON envelope**，
+            // 三代客户端都能解——旧 APK（JSON-first，解不了 FB 会 lossy 成「控制符+长度字节+正文」
+            // 写本地库）、新 TS（JSON 优先）、新 Rust SDK（FB 失败落 JSON）。FlatBuffers 推送升级
+            // 必须等客户端能力协商（CODEX-9 P1/D2 additive migration）就位后再开，禁止再裸切。
+            serde_json::to_vec(&message.payload.to_legacy()).map_err(|e| {
                 ServerError::Protocol(format!("encode message payload failed: {e}"))
             })?,
         ),
@@ -950,17 +954,52 @@ mod tests {
         assert_ne!(claims[0].user_id, claims[1].user_id);
     }
 
+    // 契约变更（生产乱码事故根修）：NewMessage 推送 payload = legacy JSON envelope（滚动兼容，
+    // 旧 APK/新 TS/新 Rust 三代都能解），不再是 FlatBuffers（原断言随契约更新）。
     #[test]
     fn mapper_preserves_typed_payload_and_id_roles() {
         let push = push_from_claim(&claim_fixture()).unwrap();
-        let payload = privchat_protocol::decode_message::<MessagePayloadEnvelope>(&push.payload)
-            .expect("typed payload");
-        assert_eq!(payload.content, "typed dispatch");
+        // 1) 必须是 legacy JSON envelope（旧 APK JSON-first 可解）
+        let legacy: privchat_protocol::message::LocalMessagePayloadEnvelope =
+            serde_json::from_slice(&push.payload).expect("legacy JSON envelope payload");
+        assert_eq!(legacy.content, "typed dispatch");
+        // 2) 绝不能再是裸 FlatBuffers（那会让旧 APK lossy 成「控制符+长度字节+正文」）
+        assert!(
+            privchat_protocol::decode_message::<MessagePayloadEnvelope>(&push.payload).is_err(),
+            "NewMessage push payload must be legacy JSON until client capability negotiation exists"
+        );
+        // 3) 无 C0 控制字节（\t\n\r 除外）——三代客户端的纯文本/二进制守卫都不会误判
+        assert!(!push
+            .payload
+            .iter()
+            .any(|&b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r'));
         assert_eq!(push.server_message_id, 5);
         assert_eq!(push.local_message_id, 6);
         assert_eq!(push.channel_id, 7);
         assert_eq!(push.message_seq, 4);
         assert!(push.setting.need_receipt);
+    }
+
+    // 滚动兼容保真：reply/mentions 经 legacy JSON envelope 不丢。
+    #[test]
+    fn new_message_push_payload_keeps_reply_and_mentions() {
+        let event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
+            message_type: ContentMessageType::Text,
+            payload: MessagePayloadEnvelope {
+                content: "with refs".to_string(),
+                reply_to_message_id: Some(4242),
+                mentioned_user_ids: vec![11, 22],
+                ..Default::default()
+            },
+        });
+        let mut claim = claim_fixture();
+        claim.canonical_event = Some(event.encode_fb().unwrap());
+        let push = push_from_claim(&claim).unwrap();
+        let legacy: privchat_protocol::message::LocalMessagePayloadEnvelope =
+            serde_json::from_slice(&push.payload).expect("legacy JSON envelope payload");
+        assert_eq!(legacy.content, "with refs");
+        assert_eq!(legacy.reply_to_message_id.as_deref(), Some("4242"));
+        assert_eq!(legacy.mentioned_user_ids, Some(vec![11, 22]));
     }
 
     #[test]
