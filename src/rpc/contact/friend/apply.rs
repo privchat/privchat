@@ -149,6 +149,29 @@ pub async fn handle(
         }
     }
 
+    // 群业务策略强制：`privchat_groups.allow_member_add_friend = false` 时，禁止**经由该群**
+    // 发起好友申请。覆盖两条来源：source=group（群成员列表点开）与 source=conversation
+    // （群聊会话里点开——source_id 是 channel_id，群聊 channel_id == group_id；DM 查无
+    // group policy 返回 None 自然放行）。仅有开关无强制曾是纯摆设（客户端照样能加）。
+    if matches!(source_str, Some("group") | Some("conversation")) {
+        if let Some(gid) = source_id_str.and_then(|s| s.parse::<u64>().ok()) {
+            if let Ok(Some(policy)) = services.channel_service.get_group_policy(gid).await {
+                if !policy.allow_member_add_friend {
+                    tracing::info!(
+                        "🚫 群 {} 禁止成员互加好友，拒绝申请: {} -> {}",
+                        gid,
+                        from_user_id,
+                        target_user_id
+                    );
+                    return Err(RpcError::from_code(
+                        privchat_protocol::ErrorCode::GroupAddFriendDisabled,
+                        "该群不允许成员互相添加好友".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     // 构建 FriendRequestSource（用于存储）
     let source: Option<crate::model::privacy::FriendRequestSource> =
         if let (Some(source_str), Some(source_id_str)) = (source_str, source_id_str) {
