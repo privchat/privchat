@@ -1961,7 +1961,9 @@ impl ChatServer {
                                     let msg_type = MessageType::from(biz_type);
                                     let mut request_context = crate::context::RequestContext::new(
                                         session_id_clone.clone(),
-                                        msg_data,
+                                        // msgtrans 1.0.10 起 payload 为 Bytes(零拷贝);
+                                        // RequestContext 仍持 Vec<u8>,此处物化一次。
+                                        msg_data.to_vec(),
                                         "127.0.0.1:0".parse().unwrap(),
                                     );
                                     if let Some(info) = dispatch_session_info {
