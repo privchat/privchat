@@ -62,7 +62,11 @@ pub async fn handle(
             // 创建搜索记录（用于后续查看详情）
             let search_record = services
                 .cache_manager
-                .create_search_record(searcher_id, user_id)
+                .create_search_record(
+                    searcher_id,
+                    user_id,
+                    Some(crate::model::privacy::SearchType::Qrcode),
+                )
                 .await
                 .map_err(|e| {
                     RpcError::internal(format!("Failed to create search record: {}", e))
@@ -78,9 +82,12 @@ pub async fn handle(
             {
                 Ok(Some(user_profile)) => {
                     tracing::debug!("✅ 扫码查找成功: qrcode={} -> user_id={}", qrcode, user_id);
+                    // PROFILE_VISIBILITY:扫码来源不解锁 username(公开投影);
+                    // 好友扫好友仍可见。
+                    let is_friend = services.friend_service.is_friend(searcher_id, user_id).await;
                     Ok(json!({
                         "user_id": user_profile.user_id,
-                        "username": user_profile.username,
+                        "username": if is_friend { user_profile.username.clone() } else { String::new() },
                         "nickname": user_profile.nickname,
                         "avatar_url": user_profile.avatar_url,
                         "search_session_id": search_record.search_session_id, // 用于后续查看详情
