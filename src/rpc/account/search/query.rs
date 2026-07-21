@@ -69,8 +69,10 @@ pub async fn handle(
     let mut hit_by: Option<SearchType> = None;
     // 平台级双闸(D4 顶层):关闭后 username 精确查直接跳过,级联继续
     // (uid/phone/email 不受影响);个人开关在其之下 deny-wins。
-    let platform_username_searchable =
-        services.privacy_service.platform_username_searchable().await;
+    let platform_username_searchable = services
+        .privacy_service
+        .platform_username_searchable()
+        .await;
     if platform_username_searchable {
         if let Ok(Some(user)) = services.user_repository.find_by_username(&query).await {
             user_opt = Some(user);

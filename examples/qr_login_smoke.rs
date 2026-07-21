@@ -148,8 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let req_bytes = serde_json::to_vec(&rpc_req)?;
 
-    // events 必须在 connect() 之后、request() 之前订阅，避免漏掉早到的 push
-    let mut events = client.subscribe_events();
+    // 事件流是单消费者、只能取一次；在 request() 之前取走，避免漏掉早到的 push
+    let mut events = client.events().await?;
 
     let opt = TransportOptions::new()
         .with_biz_type(MessageType::RpcRequest as u8)
@@ -195,8 +195,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = client.disconnect().await;
                 return Ok(());
             }
-            ev = events.recv() => {
-                let Ok(ev) = ev else { continue };
+            ev = events.next() => {
+                let Some(ev) = ev else { continue };
                 match ev {
                     ClientEvent::Connected { info } => {
                         eprintln!("[smoke] connected info={:?}", info.peer_addr);

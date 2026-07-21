@@ -20,7 +20,6 @@ use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 
 use msgtrans::{
-    event::ServerEvent,
     protocol::{QuicServerConfig, TcpServerConfig, WebSocketServerConfig},
     transport::TransportServerBuilder,
 };
@@ -1622,8 +1621,11 @@ impl ChatServer {
         // 启动 HTTP 文件服务器（在单独的 tokio task 中）
         self.start_http_server().await?;
 
-        // 创建传输层服务器
-        let transport = self.create_transport_server().await?;
+        // 创建传输层服务器。msgtrans 2.0 起每条连接由自己的 actor 驱动，
+        // 业务侧实现 SessionHandler，不再有全局 event bus（旧的 fan-out 在
+        // 消费者跟不上时会静默丢消息）。
+        let session_handler = Arc::new(self.build_session_handler());
+        let transport = self.create_transport_server(session_handler).await?;
 
         // 设置 TransportServer 到 SendMessageHandler
         self.send_message_handler
@@ -1642,9 +1644,6 @@ impl ChatServer {
             .set_transport_server(transport.clone())
             .await;
         info!("✅ TransportServer 已设置到 ConnectionManager");
-
-        // 启动事件处理
-        self.start_event_handling(transport.clone()).await;
 
         // 启动后台任务
         self.start_background_tasks().await;
@@ -1757,6 +1756,7 @@ impl ChatServer {
     /// 创建传输层服务器
     async fn create_transport_server(
         &self,
+        handler: Arc<dyn msgtrans::transport::SessionHandler>,
     ) -> Result<Arc<msgtrans::transport::TransportServer>, ServerError> {
         info!("🔧 创建传输层服务器...");
 
@@ -1777,7 +1777,7 @@ impl ChatServer {
             .with_protocol(tcp_config)
             .with_protocol(websocket_config)
             .with_protocol(quic_config)
-            .build()
+            .build(handler)
             .await
             .map_err(|e| ServerError::Internal(format!("传输服务器创建失败: {}", e)))?;
 
@@ -1792,252 +1792,23 @@ impl ChatServer {
         Ok(Arc::new(transport))
     }
 
-    /// 启动事件处理
-    async fn start_event_handling(&self, transport: Arc<msgtrans::transport::TransportServer>) {
-        info!("🎯 启动事件处理器...");
-
-        let mut events = transport.subscribe_events();
-        let stats = self.stats.clone();
-        let message_dispatcher = self.message_dispatcher.clone();
-        let security_middleware = self.security_middleware.clone();
-        let auth_session_manager = self.auth_session_manager.clone();
-        let connection_manager = self.connection_manager.clone();
-        let message_router = self.message_router.clone();
-        let handler_limiter = self.handler_limiter.clone();
-        let subscribe_manager = self.subscribe_manager.clone();
-        let presence_service = self.presence_service.clone();
-        let qr_login_publisher = self.qr_login_publisher.clone();
-
-        tokio::spawn(async move {
-            info!("📡 事件处理器开始监听...");
-
-            loop {
-                let event = match events.recv().await {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(
-                            "📡 事件处理器消费落后，跳过 {} 个 transport event；继续监听",
-                            skipped
-                        );
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        warn!("📡 transport event channel 已关闭，事件处理器退出");
-                        break;
-                    }
-                };
-
-                match event {
-                    ServerEvent::ConnectionEstablished { session_id, info } => {
-                        // server 侧 ConnectionEstablished 事件处理耗时（G8 归因，不含 transport 握手）：
-                        // 守卫覆盖安全拒绝 continue 与正常结束两条路径。
-                        let _connect_timer = crate::infra::metrics::DurationRecorder::new(
-                            crate::infra::metrics::record_connection_established_handling,
-                        );
-                        info!("🔗 新连接建立: {} ({})", session_id, info.peer_addr);
-                        connection_manager.register_connecting(session_id);
-
-                        // 🔐 安全检查：IP 连接层防护
-                        let peer_ip = info.peer_addr.ip().to_string();
-                        if let Err(e) = security_middleware.check_connection(&peer_ip).await {
-                            warn!("🚫 连接被安全系统拒绝: {} - {:?}", peer_ip, e);
-                            connection_manager.force_close_session(session_id).await;
-                            continue;
-                        }
-
-                        // 更新统计信息
-                        {
-                            let mut stats = stats.write().await;
-                            stats.total_connections += 1;
-                            stats.active_sessions += 1;
-                        }
-                        // 欢迎消息改为认证成功后以 PushMessageRequest 发送（见 ConnectMessageHandler），保证客户端落库
-                    }
-                    ServerEvent::ConnectionClosed { session_id, reason } => {
-                        info!("🔌 连接关闭: {} (原因: {:?})", session_id, reason);
-
-                        // 更新统计信息
-                        {
-                            let mut stats = stats.write().await;
-                            stats.active_sessions = stats.active_sessions.saturating_sub(1);
-                        }
-
-                        // 清理认证会话
-                        auth_session_manager.unbind_session(&session_id).await;
-
-                        // 清理 QR 登录 publisher binding（spec QR_API §5）
-                        if let Some(scene_id) = qr_login_publisher.unbind_by_session(&session_id) {
-                            info!(
-                                "🪪 QR Login: 连接关闭释放 scene_id={} (session={})",
-                                scene_id, session_id
-                            );
-                        }
-
-                        // 清理频道订阅（防止幽灵 session 堆积）
-                        let left_channels = subscribe_manager.on_session_disconnect(&session_id);
-                        if !left_channels.is_empty() {
-                            info!(
-                                "📡 连接关闭: session {} 离开频道 {:?}",
-                                session_id, left_channels
-                            );
-                        }
-
-                        // 清理 ConnectionManager —— spec §1 唯一在线态真源
-                        match connection_manager.unregister_connection(session_id).await {
-                            Ok(Some((user_id, device_id))) => {
-                                if let Err(e) = presence_service
-                                    .on_device_disconnected(user_id, &device_id)
-                                    .await
-                                {
-                                    warn!(
-                                        "⚠️ 连接关闭后更新 Presence 下线失败: user_id={}, error={}",
-                                        user_id, e
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                warn!("⚠️ 连接关闭后清理 ConnectionManager 失败: {}", e);
-                            }
-                        }
-                    }
-                    ServerEvent::MessageReceived {
-                        session_id,
-                        context,
-                    } => {
-                        // [FIX] Extract data before moving context into the async task
-                        let msg_data = context.data.clone();
-                        let msg_text = sanitize_inbound_payload_for_log(&context.as_text_lossy());
-                        let biz_type = context.biz_type;
-                        let user_id = auth_session_manager.get_user_id(&session_id).await;
-                        let msg_type = MessageType::from(biz_type);
-                        if matches!(msg_type, MessageType::PingRequest) {
-                            if let Some(user_id) = user_id {
-                                trace!(
-                                    "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                                    session_id, user_id, biz_type, msg_type, msg_text
-                                );
-                            } else {
-                                trace!(
-                                    "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                                    session_id, biz_type, msg_type, msg_text
-                                );
-                            }
-                        } else if let Some(user_id) = user_id {
-                            info!(
-                                "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                                session_id, user_id, biz_type, msg_type, msg_text
-                            );
-                        } else {
-                            info!(
-                                "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                                session_id, biz_type, msg_type, msg_text
-                            );
-                        }
-
-                        // 更新统计信息
-                        {
-                            let mut stats = stats.write().await;
-                            stats.messages_received += 1;
-                        }
-
-                        // 🎯 使用消息分发器处理消息（受 HandlerLimiter 限流保护）
-                        let message_dispatcher = message_dispatcher.clone();
-                        let session_id_clone = session_id.clone();
-                        // 保存 user_id / device_id 供 handler 使用。device_id 是
-                        // Room subscribe ticket 校验（spec ROOM_CHANNEL_SPEC §4.3
-                        // ticket.did 必须匹配）等场景必需的——以前漏注入导致
-                        // ticket 全部 device_mismatch 拒绝。
-                        let dispatch_session_info =
-                            auth_session_manager.get_session_info(&session_id).await;
-
-                        // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop
-                        match handler_limiter.try_acquire() {
-                            Ok(permit) => {
-                                tokio::spawn(async move {
-                                    // permit 绑定在 task 内部，task 结束自动释放
-                                    let _permit = permit;
-
-                                    let msg_type = MessageType::from(biz_type);
-                                    let mut request_context = crate::context::RequestContext::new(
-                                        session_id_clone.clone(),
-                                        // msgtrans 1.0.10 起 payload 为 Bytes(零拷贝);
-                                        // RequestContext 仍持 Vec<u8>,此处物化一次。
-                                        msg_data.to_vec(),
-                                        "127.0.0.1:0".parse().unwrap(),
-                                    );
-                                    if let Some(info) = dispatch_session_info {
-                                        request_context = request_context
-                                            .with_user_id(info.user_id)
-                                            .with_device_id(info.device_id);
-                                    }
-
-                                    match message_dispatcher
-                                        .dispatch(msg_type, request_context)
-                                        .await
-                                    {
-                                        Ok(Some(response)) => {
-                                            context.respond(response);
-                                            if matches!(msg_type, MessageType::PingRequest) {
-                                                trace!("✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})", session_id_clone, biz_type, msg_type);
-                                            } else {
-                                                debug!("✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})", session_id_clone, biz_type, msg_type);
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            debug!(
-                                                "消息分发器无响应: {} (biz_type: {}, MessageType: {:?})",
-                                                session_id_clone, biz_type, msg_type
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!("❌ 消息分发器处理失败: {:?} - {}", msg_type, e);
-                                        }
-                                    }
-                                });
-                            }
-                            Err(_) => {
-                                // 限流触发：handler 并发已满（busy 单独由 privchat_handler_rejected_total
-                                // 计，不并入 rpc_requests_total 以免分子分母作用域不一致）。
-                                let overload_response = ErrorResponseBuilder::build(
-                                    session_id.clone(),
-                                    "SERVER_BUSY",
-                                    "server handler is overloaded, please retry later",
-                                );
-                                context.respond(overload_response);
-                                warn!(
-                                    "🚫 Handler 限流触发，已返回 SERVER_BUSY: session={}, biz_type={}",
-                                    session_id, biz_type
-                                );
-                            }
-                        }
-                    }
-                    ServerEvent::MessageSent {
-                        session_id,
-                        message_id,
-                    } => {
-                        trace!("📤 消息已发送: {} -> {}", session_id, message_id);
-
-                        // 更新统计信息
-                        {
-                            let mut stats = stats.write().await;
-                            stats.messages_sent += 1;
-                        }
-                    }
-                    ServerEvent::TransportError { session_id, error } => {
-                        warn!("⚠️ 传输错误: {:?} (会话: {:?})", error, session_id);
-                    }
-                    ServerEvent::ServerStarted { address } => {
-                        info!("🚀 服务器启动: {}", address);
-                    }
-                    ServerEvent::ServerStopped => {
-                        info!("🛑 服务器停止");
-                    }
-                }
-            }
-
-            warn!("📡 事件处理器已停止");
-        });
+    /// 构造 SessionHandler —— msgtrans 2.0 的业务入口。
+    ///
+    /// 每条连接由自己的 actor 调用它，所以这里的回调天然是 per-session 串行的，
+    /// 且邮箱有界：处理慢只会拖慢自己那条连接，而不会像旧的 broadcast bus
+    /// 那样在消费者落后时静默丢掉所有人的消息。
+    fn build_session_handler(&self) -> PrivchatSessionHandler {
+        PrivchatSessionHandler {
+            stats: self.stats.clone(),
+            message_dispatcher: self.message_dispatcher.clone(),
+            security_middleware: self.security_middleware.clone(),
+            auth_session_manager: self.auth_session_manager.clone(),
+            connection_manager: self.connection_manager.clone(),
+            handler_limiter: self.handler_limiter.clone(),
+            subscribe_manager: self.subscribe_manager.clone(),
+            presence_service: self.presence_service.clone(),
+            qr_login_publisher: self.qr_login_publisher.clone(),
+        }
     }
 
     /// 启动后台任务
@@ -2520,5 +2291,254 @@ impl ChatServer {
         );
 
         Ok(())
+    }
+}
+
+/// 连接会话处理器 —— msgtrans `SessionHandler` 的实现。
+///
+/// 取代了原先基于 `subscribe_events()` 的全局事件循环。每条连接由自己的
+/// actor 驱动这些回调，因此 `on_connected` 一定先于该连接的任何
+/// `on_message`，`on_disconnected` 恰好触发一次。
+pub struct PrivchatSessionHandler {
+    stats: Arc<tokio::sync::RwLock<ServerStats>>,
+    message_dispatcher: Arc<MessageDispatcher>,
+    security_middleware: Arc<crate::middleware::SecurityMiddleware>,
+    auth_session_manager: Arc<crate::infra::SessionManager>,
+    connection_manager: Arc<crate::infra::ConnectionManager>,
+    handler_limiter: crate::infra::handler_limiter::HandlerLimiter,
+    subscribe_manager: Arc<crate::infra::SubscribeManager>,
+    presence_service: Arc<crate::service::PresenceService>,
+    qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
+}
+
+#[async_trait::async_trait]
+impl msgtrans::transport::SessionHandler for PrivchatSessionHandler {
+    async fn on_connected(
+        &self,
+        session_id: msgtrans::SessionId,
+        info: msgtrans::command::ConnectionInfo,
+    ) {
+        // server 侧连接建立处理耗时（G8 归因，不含 transport 握手）：
+        // 守卫覆盖安全拒绝与正常结束两条路径。
+        let _connect_timer = crate::infra::metrics::DurationRecorder::new(
+            crate::infra::metrics::record_connection_established_handling,
+        );
+        info!("🔗 新连接建立: {} ({})", session_id, info.peer_addr);
+        self.connection_manager.register_connecting(session_id);
+
+        // 🔐 安全检查：IP 连接层防护
+        let peer_ip = info.peer_addr.ip().to_string();
+        if let Err(e) = self.security_middleware.check_connection(&peer_ip).await {
+            warn!("🚫 连接被安全系统拒绝: {} - {:?}", peer_ip, e);
+            self.connection_manager
+                .force_close_session(session_id)
+                .await;
+            return;
+        }
+
+        // 更新统计信息
+        {
+            let mut stats = self.stats.write().await;
+            stats.total_connections += 1;
+            stats.active_sessions += 1;
+        }
+        // 欢迎消息改为认证成功后以 PushMessageRequest 发送（见 ConnectMessageHandler），保证客户端落库
+    }
+
+    async fn on_message(
+        &self,
+        session_id: msgtrans::SessionId,
+        packet: msgtrans::packet::Packet,
+        sender: msgtrans::transport::SessionSender,
+    ) {
+        let biz_type = packet.header.biz_type;
+        let message_id = packet.header.message_id;
+        let msg_data = packet.payload.clone();
+        let msg_text = sanitize_inbound_payload_for_log(&String::from_utf8_lossy(&packet.payload));
+        let user_id = self.auth_session_manager.get_user_id(&session_id).await;
+        let msg_type = MessageType::from(biz_type);
+
+        if matches!(msg_type, MessageType::PingRequest) {
+            if let Some(user_id) = user_id {
+                trace!(
+                    "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
+                    session_id,
+                    user_id,
+                    biz_type,
+                    msg_type,
+                    msg_text
+                );
+            } else {
+                trace!(
+                    "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
+                    session_id,
+                    biz_type,
+                    msg_type,
+                    msg_text
+                );
+            }
+        } else if let Some(user_id) = user_id {
+            info!(
+                "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
+                session_id, user_id, biz_type, msg_type, msg_text
+            );
+        } else {
+            info!(
+                "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
+                session_id, biz_type, msg_type, msg_text
+            );
+        }
+
+        // 更新统计信息
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_received += 1;
+        }
+
+        // 保存 user_id / device_id 供 handler 使用。device_id 是 Room subscribe
+        // ticket 校验（spec ROOM_CHANNEL_SPEC §4.3 ticket.did 必须匹配）等场景必需的。
+        let dispatch_session_info = self
+            .auth_session_manager
+            .get_session_info(&session_id)
+            .await;
+        let message_dispatcher = self.message_dispatcher.clone();
+
+        // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop
+        match self.handler_limiter.try_acquire() {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    // permit 绑定在 task 内部，task 结束自动释放
+                    let _permit = permit;
+                    let mut request_context = crate::context::RequestContext::new(
+                        session_id,
+                        // msgtrans 起 payload 为 Bytes(零拷贝);
+                        // RequestContext 仍持 Vec<u8>,此处物化一次。
+                        msg_data.to_vec(),
+                        "127.0.0.1:0".parse().unwrap(),
+                    );
+                    if let Some(info) = dispatch_session_info {
+                        request_context = request_context
+                            .with_user_id(info.user_id)
+                            .with_device_id(info.device_id);
+                    }
+
+                    match message_dispatcher.dispatch(msg_type, request_context).await {
+                        Ok(Some(response)) => {
+                            let _ = sender.respond(message_id, biz_type, response).await;
+                            if matches!(msg_type, MessageType::PingRequest) {
+                                trace!(
+                                    "✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})",
+                                    session_id,
+                                    biz_type,
+                                    msg_type
+                                );
+                            } else {
+                                debug!(
+                                    "✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})",
+                                    session_id, biz_type, msg_type
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            debug!(
+                                "消息分发器无响应: {} (biz_type: {}, MessageType: {:?})",
+                                session_id, biz_type, msg_type
+                            );
+                        }
+                        Err(e) => {
+                            error!("❌ 消息分发器处理失败: {:?} - {}", msg_type, e);
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                // 限流触发：handler 并发已满（busy 单独由 privchat_handler_rejected_total
+                // 计，不并入 rpc_requests_total 以免分子分母作用域不一致）。
+                let overload_response = ErrorResponseBuilder::build(
+                    session_id,
+                    "SERVER_BUSY",
+                    "server handler is overloaded, please retry later",
+                );
+                let _ = sender
+                    .respond(message_id, biz_type, overload_response)
+                    .await;
+                warn!(
+                    "🚫 Handler 限流触发，已返回 SERVER_BUSY: session={}, biz_type={}",
+                    session_id, biz_type
+                );
+            }
+        }
+    }
+
+    async fn on_message_sent(&self, session_id: msgtrans::SessionId, message_id: u32) {
+        trace!("📤 消息已发送: {} -> {}", session_id, message_id);
+
+        // 更新统计信息
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_sent += 1;
+        }
+    }
+
+    async fn on_disconnected(
+        &self,
+        session_id: msgtrans::SessionId,
+        reason: msgtrans::CloseReason,
+    ) {
+        info!("🔌 连接关闭: {} (原因: {:?})", session_id, reason);
+
+        // 更新统计信息
+        {
+            let mut stats = self.stats.write().await;
+            stats.active_sessions = stats.active_sessions.saturating_sub(1);
+        }
+
+        // 清理认证会话
+        self.auth_session_manager.unbind_session(&session_id).await;
+
+        // 清理 QR 登录 publisher binding（spec QR_API §5）
+        if let Some(scene_id) = self.qr_login_publisher.unbind_by_session(&session_id) {
+            info!(
+                "🪪 QR Login: 连接关闭释放 scene_id={} (session={})",
+                scene_id, session_id
+            );
+        }
+
+        // 清理频道订阅（防止幽灵 session 堆积）
+        let left_channels = self.subscribe_manager.on_session_disconnect(&session_id);
+        if !left_channels.is_empty() {
+            info!(
+                "📡 连接关闭: session {} 离开频道 {:?}",
+                session_id, left_channels
+            );
+        }
+
+        // 清理 ConnectionManager —— spec §1 唯一在线态真源
+        match self
+            .connection_manager
+            .unregister_connection(session_id)
+            .await
+        {
+            Ok(Some((user_id, device_id))) => {
+                if let Err(e) = self
+                    .presence_service
+                    .on_device_disconnected(user_id, &device_id)
+                    .await
+                {
+                    warn!(
+                        "⚠️ 连接关闭后更新 Presence 下线失败: user_id={}, error={}",
+                        user_id, e
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("⚠️ 连接关闭后清理 ConnectionManager 失败: {}", e);
+            }
+        }
+    }
+
+    async fn on_error(&self, session_id: msgtrans::SessionId, error: msgtrans::TransportError) {
+        warn!("⚠️ 传输错误: {:?} (会话: {})", error, session_id);
     }
 }
