@@ -2446,12 +2446,16 @@ mod payload_normalization_tests {
     #[test]
     fn undecodable_binary_payload_rejected_not_mojibaked() {
         // 合法 envelope → 损坏 root offset 使 verifier 失败，但字节仍是典型 FB 二进制（含 C0/NUL）。
-        let mut bytes = privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
-            content: "大家记住一句话，天下没有白吃的苦，没有白走的路！".to_string(),
-            ..Default::default()
-        })
-        .expect("encode envelope");
-        bytes[0] = 0xF0; bytes[1] = 0xFF; bytes[2] = 0xFF; bytes[3] = 0xFF; // root offset 指向界外
+        let mut bytes =
+            privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
+                content: "大家记住一句话，天下没有白吃的苦，没有白走的路！".to_string(),
+                ..Default::default()
+            })
+            .expect("encode envelope");
+        bytes[0] = 0xF0;
+        bytes[1] = 0xFF;
+        bytes[2] = 0xFF;
+        bytes[3] = 0xFF; // root offset 指向界外
         assert!(
             SendMessageHandler::parse_payload(&bytes).is_err(),
             "binary garbage must be rejected, not stored as mojibake text"

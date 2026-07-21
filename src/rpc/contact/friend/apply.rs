@@ -57,9 +57,9 @@ pub async fn handle(
     // 的判定快照放行,不再重跑来源校验;黑名单在 apply 时刻重验(拉黑必须即时
     // 生效)。凭证无效/过期 → 20313,客户端重拉 detail 自愈。
     if let Some(grant_id_str) = request.grant_id.as_deref() {
-        let grant_id = grant_id_str.parse::<u64>().map_err(|_| {
-            RpcError::validation(format!("Invalid grant_id: {}", grant_id_str))
-        })?;
+        let grant_id = grant_id_str
+            .parse::<u64>()
+            .map_err(|_| RpcError::validation(format!("Invalid grant_id: {}", grant_id_str)))?;
         let grant = services
             .cache_manager
             .get_profile_view_grant(grant_id)
@@ -107,7 +107,14 @@ pub async fn handle(
             ));
         }
         let grant_source = build_request_source(&grant.source_type, &grant.source_id);
-        return finish_apply(services, from_user_id, target_user_id, message, grant_source).await;
+        return finish_apply(
+            services,
+            from_user_id,
+            target_user_id,
+            message,
+            grant_source,
+        )
+        .await;
     }
 
     // 解析来源信息

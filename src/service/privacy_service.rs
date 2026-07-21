@@ -96,7 +96,8 @@ impl PrivacyService {
             .ok()
             .flatten();
             if let Some(v) = loaded {
-                self.platform_username_searchable.store(v, Ordering::Release);
+                self.platform_username_searchable
+                    .store(v, Ordering::Release);
             }
             self.platform_loaded.store(1, Ordering::Release);
         }
@@ -116,7 +117,8 @@ impl PrivacyService {
         .execute(self.channel_service.pool())
         .await
         .map_err(|e| ServerError::Database(format!("persist platform privacy setting: {e}")))?;
-        self.platform_username_searchable.store(enabled, Ordering::Release);
+        self.platform_username_searchable
+            .store(enabled, Ordering::Release);
         self.platform_loaded.store(1, Ordering::Release);
         Ok(())
     }
@@ -179,8 +181,7 @@ impl PrivacyService {
                 // 会话来源:能进入会话即有查看资格(既有语义)。加好友权限对
                 // 群会话套用 group 同款双闸(群聊 channel_id == group_id;DM 无
                 // policy 行,natural 放行)。
-                if let Ok(Some(policy)) = self.channel_service.get_group_policy(channel_id).await
-                {
+                if let Ok(Some(policy)) = self.channel_service.get_group_policy(channel_id).await {
                     if !policy.allow_member_add_friend {
                         return Ok(DetailAccessVerdict::view_only("group_policy"));
                     }

@@ -84,7 +84,10 @@ pub async fn handle(
                     tracing::debug!("✅ 扫码查找成功: qrcode={} -> user_id={}", qrcode, user_id);
                     // PROFILE_VISIBILITY:扫码来源不解锁 username(公开投影);
                     // 好友扫好友仍可见。
-                    let is_friend = services.friend_service.is_friend(searcher_id, user_id).await;
+                    let is_friend = services
+                        .friend_service
+                        .is_friend(searcher_id, user_id)
+                        .await;
                     Ok(json!({
                         "user_id": user_profile.user_id,
                         "username": if is_friend { user_profile.username.clone() } else { String::new() },
