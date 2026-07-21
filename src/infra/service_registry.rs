@@ -95,11 +95,11 @@ impl ServiceConnection {
     pub async fn new(service_info: ServiceInfo) -> Result<Self, crate::error::ServerError> {
         let tcp_config = TcpClientConfig::new(&service_info.full_address())
             .map_err(|e| crate::error::ServerError::Internal(format!("TCP配置失败: {}", e)))?
-            .with_connect_timeout(Duration::from_secs(10))
-            .with_nodelay(true);
+            .connect_timeout(Duration::from_secs(10))
+            .nodelay(true);
         
         let mut client = TransportClientBuilder::new()
-            .with_protocol(tcp_config)
+            .protocol(tcp_config)
             .connect_timeout(Duration::from_secs(10))
             .build()
             .await

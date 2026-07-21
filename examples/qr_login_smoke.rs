@@ -124,11 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[smoke] connecting to {}", args.url);
 
     let cfg = WebSocketClientConfig::new(&args.url)?
-        .with_connect_timeout(Duration::from_secs(10))
-        .with_verify_tls(false);
-    let mut client = TransportClientBuilder::new()
-        .with_protocol(cfg)
         .connect_timeout(Duration::from_secs(10))
+        .verify_tls(false);
+    let mut client = TransportClientBuilder::new()
+        .protocol(cfg)
         .build()
         .await?;
     client.connect().await?;
@@ -152,8 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = client.events().await?;
 
     let opt = TransportOptions::new()
-        .with_biz_type(MessageType::RpcRequest as u8)
-        .with_timeout(Duration::from_secs(15));
+        .biz_type(MessageType::RpcRequest as u8)
+        .timeout(Duration::from_secs(15));
     let raw = client
         .request_with_options(Bytes::from(req_bytes), opt)
         .await?;
