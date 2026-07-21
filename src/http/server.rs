@@ -68,6 +68,8 @@ pub struct AdminServerState {
     /// Room subscribe ticket 配置（spec ROOM_CHANNEL_SPEC §4）。`None` = 未配
     /// `[room_ticket]`，`/api/service/room-tickets/issue` 端点返回 503。
     pub room_ticket: Option<Arc<crate::config::RoomTicketConfig>>,
+    /// 隐私服务(PROFILE_VISIBILITY P2:平台级开关 admin 读写)。
+    pub privacy_service: Arc<crate::service::PrivacyService>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -146,6 +148,7 @@ impl AdminHttpServer {
         qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
         unified_token_service: Arc<crate::auth::UnifiedTokenService>,
         room_ticket: Option<Arc<crate::config::RoomTicketConfig>>,
+        privacy_service: Arc<crate::service::PrivacyService>,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -175,6 +178,7 @@ impl AdminHttpServer {
                 qr_login_publisher,
                 unified_token_service,
                 room_ticket,
+                privacy_service,
             },
             port,
         }

@@ -68,6 +68,8 @@ pub fn create_route() -> Router<AdminServerState> {
             post(issue_token_for_user), // v1.2 新路径：uid-scoped IM token 签发
         )
         // 用户管理
+        .route("/privacy-config", get(get_privacy_config)) // 平台隐私开关(PROFILE_VISIBILITY P2)
+        .route("/privacy-config", put(update_privacy_config))
         .route("/users", post(create_user)) // 创建用户
         .route("/users", get(list_users))
         .route(
@@ -3038,4 +3040,35 @@ mod profile_invalidation_tests {
             BTreeSet::from([10, 20, 30, 40, 50]),
         );
     }
+}
+
+/// 平台级隐私配置(PROFILE_VISIBILITY P2 D4 顶层)。
+async fn get_privacy_config(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+) -> ApiResult<Value> {
+    verify_service_key(&headers, &state).await?;
+    Ok(ApiEnvelope::ok(json!({
+        "username_searchable": state.privacy_service.platform_username_searchable().await,
+    })))
+}
+
+/// 更新平台级隐私配置(写 privchat_platform_settings + 刷内存)。
+async fn update_privacy_config(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> ApiResult<Value> {
+    verify_service_key(&headers, &state).await?;
+    let enabled = body
+        .get("username_searchable")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            ServerError::Validation("username_searchable (boolean) is required".to_string())
+        })?;
+    state
+        .privacy_service
+        .set_platform_username_searchable(enabled)
+        .await?;
+    Ok(ApiEnvelope::ok(json!({ "username_searchable": enabled })))
 }

@@ -67,9 +67,15 @@ pub async fn handle(
     // 才解锁 username 回显;uid 命中沿用 username 的搜索开关但 hit_by=None
     // (知道 uid ≠ 知道账号,不得借搜索通道套取凭证)。
     let mut hit_by: Option<SearchType> = None;
-    if let Ok(Some(user)) = services.user_repository.find_by_username(&query).await {
-        user_opt = Some(user);
-        hit_by = Some(SearchType::Username);
+    // 平台级双闸(D4 顶层):关闭后 username 精确查直接跳过,级联继续
+    // (uid/phone/email 不受影响);个人开关在其之下 deny-wins。
+    let platform_username_searchable =
+        services.privacy_service.platform_username_searchable().await;
+    if platform_username_searchable {
+        if let Ok(Some(user)) = services.user_repository.find_by_username(&query).await {
+            user_opt = Some(user);
+            hit_by = Some(SearchType::Username);
+        }
     }
     if user_opt.is_none() {
         if let Ok(uid) = raw_query.parse::<u64>() {
