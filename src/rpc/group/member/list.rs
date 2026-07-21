@@ -56,7 +56,9 @@ pub async fn handle(
                 {
                     member_list.push(json!({
                         "user_id": member.user_id,
-                        "username": profile.username, // 账号
+                        // PROFILE_VISIBILITY:批量面恒公开投影,username 仅本人
+                        // 行保留(好友的 username 由 friend 实体同步携带)。
+                        "username": if member.user_id == request.user_id { profile.username.clone() } else { String::new() },
                         "nickname": profile.nickname, // 昵称
                         "avatar_url": profile.avatar_url, // 头像
                         "role": format!("{:?}", member.role),

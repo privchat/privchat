@@ -63,8 +63,13 @@ pub async fn handle(
     // allows_search（同为账号标识搜索，不新增隐私维度）。
     let mut user_opt: Option<crate::model::user::User> = None;
     let mut search_type = SearchType::Username;
+    // PROFILE_VISIBILITY D1:hit_by 记录真实命中方式。仅 username 精确命中
+    // 才解锁 username 回显;uid 命中沿用 username 的搜索开关但 hit_by=None
+    // (知道 uid ≠ 知道账号,不得借搜索通道套取凭证)。
+    let mut hit_by: Option<SearchType> = None;
     if let Ok(Some(user)) = services.user_repository.find_by_username(&query).await {
         user_opt = Some(user);
+        hit_by = Some(SearchType::Username);
     }
     if user_opt.is_none() {
         if let Ok(uid) = raw_query.parse::<u64>() {
@@ -79,15 +84,17 @@ pub async fn handle(
         if let Ok(Some(user)) = services.user_repository.find_by_phone(&raw_query).await {
             user_opt = Some(user);
             search_type = SearchType::Phone;
+            hit_by = Some(SearchType::Phone);
         }
     }
     if user_opt.is_none() {
         if let Ok(Some(user)) = services.user_repository.find_by_email(&query).await {
             user_opt = Some(user);
             search_type = SearchType::Email;
+            hit_by = Some(SearchType::Email);
         }
     }
-    let (user_opt, search_type) = (user_opt, search_type);
+    let (user_opt, search_type, hit_by) = (user_opt, search_type, hit_by);
 
     // 处理找到的用户
     if let Some(user) = user_opt {
@@ -157,11 +164,17 @@ pub async fn handle(
             // 3. 创建搜索记录
             match services
                 .cache_manager
-                .create_search_record(searcher_id, user_id)
+                .create_search_record(searcher_id, user_id, hit_by)
                 .await
             {
                 Ok(search_record) => {
-                    let username = user.username.clone().unwrap_or_default();
+                    // 投影:username 仅在 by_username 命中(搜索者已知)或好友
+                    // 关系下回显;uid/phone/email 命中回空串(公开投影)。
+                    let username = if matches!(hit_by, Some(SearchType::Username)) || is_friend {
+                        user.username.clone().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let nickname = user.display_name.clone().unwrap_or_default();
                     tracing::debug!(
                         "✨ 创建搜索记录: username={}, user_id={}, search_session_id={}",

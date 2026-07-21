@@ -160,8 +160,10 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
                     payload: Some(json!({
                         "user_id": user.id,
                         "uid": user.id,
-                        // username / nickname 未设置则透传 null/空——不再 fallback 为 user_<uid>
-                        "username": user.username,
+                        // PROFILE_VISIBILITY D5:user 实体是共享公开投影,username
+                        // 仅 self 行下发;好友的 username 由 friend 实体携带。
+                        // nickname 未设置则透传 null/空——不再 fallback 为 user_<uid>
+                        "username": if user.id == user_id { user.username.clone() } else { None },
                         "nickname": user.display_name,
                         "avatar": user.avatar_url.clone().unwrap_or_default(),
                         "user_type": user.user_type,

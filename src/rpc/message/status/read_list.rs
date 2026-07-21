@@ -87,7 +87,8 @@ pub async fn handle(
         {
             read_users_info.push(json!({
                 "user_id": profile.user_id,
-                "username": profile.username,
+                // PROFILE_VISIBILITY:公开投影,不回他人 username。
+                "username": String::new(),
                 "nickname": profile.nickname,
                 "avatar_url": profile.avatar_url,
                 "read_at": reader.updated_at.timestamp_millis()

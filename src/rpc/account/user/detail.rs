@@ -90,13 +90,13 @@ pub async fn handle(
         }
     };
 
-    // 验证访问权限
+    // 验证访问权限 + 取加好友判定(PROFILE_VISIBILITY §2.5:查看与添加分离)
     match services
         .privacy_service
-        .validate_detail_access(searcher_id, user_id, source)
+        .evaluate_detail_access(searcher_id, user_id, source.clone())
         .await
     {
-        Ok(_) => {
+        Ok(verdict) => {
             // 权限验证通过，从数据库读取用户资料
             match helpers::get_user_profile_with_fallback(
                 user_id,
@@ -159,16 +159,65 @@ pub async fn handle(
                     };
 
                     let uid: u64 = user_profile.user_id.parse().unwrap_or(user_id);
+                    let is_self = searcher_id == uid;
+
+                    // 黑名单在来源之后、能力位之前裁决(§2.5):被拉黑 →
+                    // 公开投影最小集 + 不能添加。
+                    let (i_block_target, target_blocks_me) = services
+                        .blacklist_service
+                        .check_mutual_block(searcher_id, user_id)
+                        .await
+                        .unwrap_or((false, false));
+                    let blocked = i_block_target || target_blocks_me;
+
+                    let can_add_friend = !is_self && !blocked && verdict.can_add_friend;
+                    let deny_reason: Option<&str> = if is_self {
+                        None
+                    } else if blocked {
+                        Some("blacklist")
+                    } else {
+                        verdict.deny_reason
+                    };
+
+                    // 字段投影(D1/D2):username 仅 本人/好友/by_username 搜索来源;
+                    // 其余回空串(滚动兼容:老客户端解析不炸,且天然清洗本地旧缓存)。
+                    // phone/email 只有本人可见——此前对任意查看者裸奔,一并收口。
+                    let username_visible =
+                        is_self || verdict.is_friend || verdict.username_unlocked;
+                    let projected_username = if username_visible {
+                        user_profile.username.clone()
+                    } else {
+                        String::new()
+                    };
+
+                    // 签发查看凭证(§2.5.1):friend/apply 凭 grant_id 放行。
+                    let grant = crate::model::privacy::ProfileViewGrant::new(
+                        searcher_id,
+                        uid,
+                        source_str.clone(),
+                        source_id.clone(),
+                        can_add_friend,
+                        deny_reason.map(|r| r.to_string()),
+                        verdict.username_unlocked,
+                    );
+                    if let Err(e) = services.cache_manager.save_profile_view_grant(&grant).await {
+                        // 凭证落库失败不阻断查看;客户端 apply 会走旧 source 路径。
+                        tracing::warn!("⚠️ 查看凭证保存失败(降级旧路径): {}", e);
+                    }
+
                     Ok(json!({
                         "user_id": uid,
-                        "username": user_profile.username, // 账号
+                        "username": projected_username, // 账号(按可见性投影)
                         "nickname": user_profile.nickname, // 昵称
                         "avatar_url": user_profile.avatar_url, // 头像
-                        "phone": user_profile.phone, // 手机号（可选）
-                        "email": user_profile.email, // 邮箱（可选）
+                        "phone": if is_self { user_profile.phone.clone() } else { None }, // 仅本人
+                        "email": if is_self { user_profile.email.clone() } else { None }, // 仅本人
                         "user_type": user_profile.user_type, // 用户类型（0 普通 1 系统 2 机器人）
                         "is_friend": is_friend, // ✨ 是否好友
                         "can_send_message": can_send_message, // ✨ 是否有权限发消息
+                        "can_add_friend": can_add_friend, // ✨ 服务端算好的能力位(§2.5)
+                        "deny_reason": deny_reason, // group_policy/personal_privacy/blacklist/already_friend
+                        "grant_id": grant.grant_id.to_string(), // 查看凭证(§2.5.1,u64 走字符串防 JS 精度)
                         "is_follow": is_follow, // ✨ 是否已关注 Bot（仅 user_type=2 有意义）
                         "source_type": source_str, // 本次查看的来源类型
                         "source_id": source_id, // 本次查看的来源 ID

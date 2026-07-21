@@ -53,6 +53,63 @@ pub async fn handle(
     let target_user_id = request.target_user_id;
     let message = request.message.as_deref().unwrap_or("");
 
+    // ✨ 凭证路径(PROFILE_VISIBILITY §2.5.1):携带 grant_id 时按 detail 时刻
+    // 的判定快照放行,不再重跑来源校验;黑名单在 apply 时刻重验(拉黑必须即时
+    // 生效)。凭证无效/过期 → 20313,客户端重拉 detail 自愈。
+    if let Some(grant_id_str) = request.grant_id.as_deref() {
+        let grant_id = grant_id_str.parse::<u64>().map_err(|_| {
+            RpcError::validation(format!("Invalid grant_id: {}", grant_id_str))
+        })?;
+        let grant = services
+            .cache_manager
+            .get_profile_view_grant(grant_id)
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                RpcError::from_code(
+                    privchat_protocol::ErrorCode::ProfileViewGrantExpired,
+                    "查看凭证已过期,请重新打开对方资料".to_string(),
+                )
+            })?;
+        if grant.viewer_id != from_user_id || grant.target_id != target_user_id {
+            return Err(RpcError::forbidden(
+                "Profile view grant does not match this request".to_string(),
+            ));
+        }
+        if !grant.can_add_friend {
+            return Err(match grant.deny_reason.as_deref() {
+                Some("group_policy") => RpcError::from_code(
+                    privchat_protocol::ErrorCode::GroupAddFriendDisabled,
+                    "该群不允许成员互相添加好友".to_string(),
+                ),
+                Some("personal_privacy") => RpcError::from_code(
+                    privchat_protocol::ErrorCode::GroupAddFriendPersonalDisabled,
+                    "对方不允许通过此方式添加好友".to_string(),
+                ),
+                Some("already_friend") => RpcError::from_code(
+                    privchat_protocol::ErrorCode::AlreadyFriends,
+                    "你们已经是好友".to_string(),
+                ),
+                _ => RpcError::forbidden("Cannot add this user as friend".to_string()),
+            });
+        }
+        // 黑名单 apply 时刻重验(§2.5.1 定案的唯一非快照项)。
+        let (a, b) = services
+            .blacklist_service
+            .check_mutual_block(from_user_id, target_user_id)
+            .await
+            .unwrap_or((false, false));
+        if a || b {
+            return Err(RpcError::from_code(
+                privchat_protocol::ErrorCode::UserInBlacklist,
+                "无法添加该用户".to_string(),
+            ));
+        }
+        let grant_source = build_request_source(&grant.source_type, &grant.source_id);
+        return finish_apply(services, from_user_id, target_user_id, message, grant_source).await;
+    }
+
     // 解析来源信息
     let (source_str, source_id_str) = (request.source.as_deref(), request.source_id.as_deref());
 
@@ -124,14 +181,29 @@ pub async fn handle(
         }
     };
 
-    // 验证来源（和 detail 接口使用相同的验证逻辑）
+    // 验证来源（和 detail 接口相同的裁决:真伪 Err;加好友权限按 verdict 映射
+    // 错误码——group_policy→20311 / personal_privacy→20312。老客户端(无
+    // grant_id)由此获得与凭证路径一致的判定,单一判定点在 privacy_service）。
     if let Some(detail_source) = detail_source {
         match services
             .privacy_service
-            .validate_detail_access(from_user_id, target_user_id, detail_source.clone())
+            .evaluate_detail_access(from_user_id, target_user_id, detail_source.clone())
             .await
         {
-            Ok(_) => {
+            Ok(verdict) => {
+                if !verdict.can_add_friend && !verdict.is_friend {
+                    return Err(match verdict.deny_reason {
+                        Some("group_policy") => RpcError::from_code(
+                            privchat_protocol::ErrorCode::GroupAddFriendDisabled,
+                            "该群不允许成员互相添加好友".to_string(),
+                        ),
+                        Some("personal_privacy") => RpcError::from_code(
+                            privchat_protocol::ErrorCode::GroupAddFriendPersonalDisabled,
+                            "对方不允许通过此方式添加好友".to_string(),
+                        ),
+                        _ => RpcError::forbidden("Cannot add this user as friend".to_string()),
+                    });
+                }
                 tracing::debug!("✅ 来源验证通过: {} -> {}", from_user_id, target_user_id);
             }
             Err(e) => {
@@ -145,29 +217,6 @@ pub async fn handle(
                     "Source validation failed: {}",
                     e
                 )));
-            }
-        }
-    }
-
-    // 群业务策略强制：`privchat_groups.allow_member_add_friend = false` 时，禁止**经由该群**
-    // 发起好友申请。覆盖两条来源：source=group（群成员列表点开）与 source=conversation
-    // （群聊会话里点开——source_id 是 channel_id，群聊 channel_id == group_id；DM 查无
-    // group policy 返回 None 自然放行）。仅有开关无强制曾是纯摆设（客户端照样能加）。
-    if matches!(source_str, Some("group") | Some("conversation")) {
-        if let Some(gid) = source_id_str.and_then(|s| s.parse::<u64>().ok()) {
-            if let Ok(Some(policy)) = services.channel_service.get_group_policy(gid).await {
-                if !policy.allow_member_add_friend {
-                    tracing::info!(
-                        "🚫 群 {} 禁止成员互加好友，拒绝申请: {} -> {}",
-                        gid,
-                        from_user_id,
-                        target_user_id
-                    );
-                    return Err(RpcError::from_code(
-                        privchat_protocol::ErrorCode::GroupAddFriendDisabled,
-                        "该群不允许成员互相添加好友".to_string(),
-                    ));
-                }
             }
         }
     }
@@ -210,6 +259,40 @@ pub async fn handle(
             None
         };
 
+    finish_apply(services, from_user_id, target_user_id, message, source).await
+}
+
+/// 由来源快照(grant.source_type/source_id 或 legacy source 参数)构建落库用
+/// FriendRequestSource。
+fn build_request_source(
+    source_type: &str,
+    source_id: &str,
+) -> Option<crate::model::privacy::FriendRequestSource> {
+    use crate::model::privacy::FriendRequestSource as S;
+    let id = source_id.parse::<u64>().unwrap_or(0);
+    match source_type {
+        "search" => Some(S::Search {
+            search_session_id: id,
+        }),
+        "group" => Some(S::Group { group_id: id }),
+        "card_share" => Some(S::CardShare { share_id: id }),
+        // friend 来源在 FriendRequestSource 中没有对应项，使用 search 作为占位
+        "friend" => Some(S::Search {
+            search_session_id: id,
+        }),
+        "conversation" => Some(S::Conversation { channel_id: id }),
+        _ => None,
+    }
+}
+
+/// 申请落库 + 双路 push + 实体失效(凭证路径与 legacy 路径共用尾段)。
+async fn finish_apply(
+    services: RpcServiceContext,
+    from_user_id: u64,
+    target_user_id: u64,
+    message: &str,
+    source: Option<crate::model::privacy::FriendRequestSource>,
+) -> RpcResult<Value> {
     // 如果来源是名片分享，标记分享记录为已使用
     if let Some(crate::model::privacy::FriendRequestSource::CardShare { share_id }) = &source {
         if let Err(e) = services
@@ -230,7 +313,7 @@ pub async fn handle(
     )
     .await
     {
-        Ok(Some(target_user)) => {
+        Ok(Some(_target_user)) => {
             // 发送好友请求（带来源）
             match services
                 .friend_service
@@ -284,7 +367,7 @@ pub async fn handle(
                     Ok(json!({
                         // 协议约定 user_id 必须是 u64 数字，不是字符串
                         "user_id": target_user_id,
-                        "username": target_user.username,
+                        "username": "",
                         "status": "pending",
                         "added_at": chrono::Utc::now().timestamp_millis(),
                         "message": message

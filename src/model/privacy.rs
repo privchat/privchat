@@ -28,6 +28,10 @@ pub struct UserPrivacySettings {
     /// 是否允许通过群组添加好友
     pub allow_add_by_group: bool,
 
+    /// 是否允许通过名片分享添加好友（PROFILE_VISIBILITY §2.5;老数据缺省 true）
+    #[serde(default = "default_true")]
+    pub allow_add_by_card: bool,
+
     /// 是否允许通过手机号搜索到自己
     pub allow_search_by_phone: bool,
 
@@ -57,6 +61,7 @@ impl UserPrivacySettings {
         Self {
             user_id,
             allow_add_by_group: true,
+            allow_add_by_card: true,
             allow_search_by_phone: true,
             allow_search_by_username: true,
             allow_search_by_email: true,
@@ -79,12 +84,16 @@ impl UserPrivacySettings {
 }
 
 /// 搜索类型
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchType {
     Phone,
     Username,
     Email,
     Qrcode,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 用户资料查看来源
@@ -123,6 +132,11 @@ pub struct SearchRecord {
     /// 被搜索的用户
     pub target_id: u64,
 
+    /// 命中方式（PROFILE_VISIBILITY D1:仅 by_username 精确命中解锁 username
+    /// 回显）。老缓存记录缺省 None,按"不解锁"处理。
+    #[serde(default)]
+    pub hit_by: Option<SearchType>,
+
     /// 创建时间
     pub created_at: DateTime<Utc>,
 
@@ -132,12 +146,13 @@ pub struct SearchRecord {
 
 impl SearchRecord {
     /// 创建新的搜索记录
-    pub fn new(searcher_id: u64, target_id: u64) -> Self {
+    pub fn new(searcher_id: u64, target_id: u64, hit_by: Option<SearchType>) -> Self {
         let search_session_id = next_message_id();
         Self {
             search_session_id,
             searcher_id,
             target_id,
+            hit_by,
             created_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::hours(1), // 1小时后过期
         }
@@ -220,4 +235,59 @@ pub enum FriendRequestSource {
 
     /// 通过聊天会话添加（1v1 / 群聊页打开对方资料后添加）
     Conversation { channel_id: u64 },
+}
+
+/// 查看凭证(PROFILE_VISIBILITY §2.5.1)。
+///
+/// `account/user/detail` 来源校验通过后签发;`friend/apply` 凭 grant_id 放行,
+/// 不再重跑来源校验。detail 时刻的判定快照(TTL 窗口内状态漂移按快照,唯
+/// 黑名单在 apply 时刻重验)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileViewGrant {
+    pub grant_id: u64,
+    pub viewer_id: u64,
+    pub target_id: u64,
+    /// 来源快照(落申请记录用,供审计/"通过群聊添加"展示)
+    pub source_type: String,
+    pub source_id: String,
+    /// detail 时刻的加好友判定
+    pub can_add_friend: bool,
+    /// can_add_friend=false 时的原因:group_policy / personal_privacy /
+    /// blacklist / already_friend
+    pub deny_reason: Option<String>,
+    /// by_username 精确搜索来源为 true(D1 username 回显解锁)
+    pub username_unlocked: bool,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl ProfileViewGrant {
+    pub const TTL_MINUTES: i64 = 10;
+
+    pub fn new(
+        viewer_id: u64,
+        target_id: u64,
+        source_type: String,
+        source_id: String,
+        can_add_friend: bool,
+        deny_reason: Option<String>,
+        username_unlocked: bool,
+    ) -> Self {
+        Self {
+            grant_id: next_message_id(),
+            viewer_id,
+            target_id,
+            source_type,
+            source_id,
+            can_add_friend,
+            deny_reason,
+            username_unlocked,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(Self::TTL_MINUTES),
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        Utc::now() > self.expires_at
+    }
 }

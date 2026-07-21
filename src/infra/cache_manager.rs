@@ -854,8 +854,9 @@ impl CacheManager {
         &self,
         searcher_id: u64,
         target_id: u64,
+        hit_by: Option<crate::model::privacy::SearchType>,
     ) -> Result<crate::model::privacy::SearchRecord, ServerError> {
-        let record = crate::model::privacy::SearchRecord::new(searcher_id, target_id);
+        let record = crate::model::privacy::SearchRecord::new(searcher_id, target_id, hit_by);
         let session_id = record.search_session_id;
 
         // 更新 L1 缓存（使用 u64 key）
@@ -897,6 +898,45 @@ impl CacheManager {
             }
         }
 
+        Ok(None)
+    }
+
+    // ========== 查看凭证管理(PROFILE_VISIBILITY §2.5.1) ==========
+
+    /// 构建查看凭证缓存 key
+    fn profile_view_grant_cache_key(grant_id: u64) -> String {
+        format!("profile_view_grant:{}", grant_id)
+    }
+
+    /// 持久化查看凭证(KeyDB;TTL 由 expires_at 字段在读取时判定,
+    /// 与 SearchRecord 同款语义)
+    pub async fn save_profile_view_grant(
+        &self,
+        grant: &crate::model::privacy::ProfileViewGrant,
+    ) -> Result<(), ServerError> {
+        let redis_key = Self::profile_view_grant_cache_key(grant.grant_id);
+        self.set_to_redis(&redis_key, grant).await?;
+        debug!(
+            "Created profile view grant: {} ({} -> {})",
+            grant.grant_id, grant.viewer_id, grant.target_id
+        );
+        Ok(())
+    }
+
+    /// 读取查看凭证;过期即视为不存在
+    pub async fn get_profile_view_grant(
+        &self,
+        grant_id: u64,
+    ) -> Result<Option<crate::model::privacy::ProfileViewGrant>, ServerError> {
+        let redis_key = Self::profile_view_grant_cache_key(grant_id);
+        if let Some(grant) = self
+            .get_from_redis::<crate::model::privacy::ProfileViewGrant>(&redis_key)
+            .await?
+        {
+            if !grant.is_expired() {
+                return Ok(Some(grant));
+            }
+        }
         Ok(None)
     }
 
