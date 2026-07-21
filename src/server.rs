@@ -1772,11 +1772,13 @@ impl ChatServer {
             .map_err(|e| ServerError::Internal(format!("QUIC配置失败: {}", e)))?;
 
         // 构建传输服务器
+        // 注意：config.max_connections 目前**没有任何强制点**。旧代码调用的
+        // TransportServerBuilder::max_connections() 是个空实现（存了字段但
+        // build() 从不读），2.0 已删除。要真正限流需要在 transport 层实现。
         let transport = TransportServerBuilder::new()
-            .max_connections(self.config.max_connections as usize)
-            .with_protocol(tcp_config)
-            .with_protocol(websocket_config)
-            .with_protocol(quic_config)
+            .protocol(tcp_config)
+            .protocol(websocket_config)
+            .protocol(quic_config)
             .build(handler)
             .await
             .map_err(|e| ServerError::Internal(format!("传输服务器创建失败: {}", e)))?;
