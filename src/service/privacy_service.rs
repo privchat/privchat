@@ -21,6 +21,7 @@ use crate::model::privacy::{UserDetailSource, UserPrivacySettings};
 use crate::service::ChannelService;
 use crate::service::FriendService;
 use chrono::Utc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// detail 访问裁决(PROFILE_VISIBILITY §2.5):来源真伪已通过,
@@ -58,6 +59,10 @@ pub struct PrivacyService {
     cache_manager: Arc<CacheManager>,
     channel_service: Arc<ChannelService>,
     friend_service: Arc<FriendService>,
+    /// 平台级「按用户名搜索」开关的内存镜像(真源 privchat_platform_settings)。
+    platform_username_searchable: AtomicBool,
+    /// 0=未加载 1=已加载(懒加载一次,admin 更新时同步刷新)
+    platform_loaded: AtomicU8,
 }
 
 impl PrivacyService {
@@ -70,7 +75,50 @@ impl PrivacyService {
             cache_manager,
             channel_service,
             friend_service,
+            platform_username_searchable: AtomicBool::new(true),
+            platform_loaded: AtomicU8::new(0),
         }
+    }
+
+    const PLATFORM_KEY_USERNAME_SEARCHABLE: &'static str = "privacy.username_searchable";
+
+    /// 平台级:是否开放按用户名搜索(D4 顶层;默认 true)。懒加载 DB 一次,
+    /// admin 更新时写库并同步内存,多实例部署下其它实例最迟重启后收敛
+    /// (单实例 fail-closed 部署模型下即时生效)。
+    pub async fn platform_username_searchable(&self) -> bool {
+        if self.platform_loaded.load(Ordering::Acquire) == 0 {
+            let loaded: Option<bool> = sqlx::query_scalar(
+                "SELECT (value #>> '{}')::boolean FROM privchat_platform_settings WHERE key = $1",
+            )
+            .bind(Self::PLATFORM_KEY_USERNAME_SEARCHABLE)
+            .fetch_optional(self.channel_service.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(v) = loaded {
+                self.platform_username_searchable.store(v, Ordering::Release);
+            }
+            self.platform_loaded.store(1, Ordering::Release);
+        }
+        self.platform_username_searchable.load(Ordering::Acquire)
+    }
+
+    /// admin:更新平台级用户名搜索开关(写库 + 刷内存)。
+    pub async fn set_platform_username_searchable(&self, enabled: bool) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO privchat_platform_settings (key, value, updated_at)
+             VALUES ($1, to_jsonb($2::boolean), $3)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(Self::PLATFORM_KEY_USERNAME_SEARCHABLE)
+        .bind(enabled)
+        .bind(Utc::now().timestamp_millis())
+        .execute(self.channel_service.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("persist platform privacy setting: {e}")))?;
+        self.platform_username_searchable.store(enabled, Ordering::Release);
+        self.platform_loaded.store(1, Ordering::Release);
+        Ok(())
     }
 
     /// 评估查看用户资料的权限(PROFILE_VISIBILITY §2.5)。
