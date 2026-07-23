@@ -124,8 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[smoke] connecting to {}", args.url);
 
     let cfg = WebSocketClientConfig::new(&args.url)?
-        .connect_timeout(Duration::from_secs(10))
-        .verify_tls(false);
+        .connect_timeout(Duration::from_secs(10));
     let mut client = TransportClientBuilder::new()
         .protocol(cfg)
         .build()
