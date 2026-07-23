@@ -1917,7 +1917,28 @@ impl SendMessageHandler {
             | privchat_protocol::ContentMessageType::MoneyTransfer => Ok(()),
             privchat_protocol::ContentMessageType::Image => {
                 self.validate_file_metadata(&metadata, "image", sender_id)
-                    .await
+                    .await?;
+                // 图片消息必须带缩略图引用(thumbnail_file_id 或 legacy thumbnail_url)。
+                // 发送端生成失败时应把原图 file 引用为缩略图;接收端气泡只渲染缩略图,
+                // 缺失会落成永久占位。视频允许无缩略图(播放器自取首帧),此约束仅图片。
+                let has_thumb_id = metadata
+                    .get("thumbnail_file_id")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
+                    .is_some_and(|id| id > 0);
+                let has_thumb_url = metadata
+                    .get("thumbnail_url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                if !has_thumb_id && !has_thumb_url {
+                    return Err(crate::error::ServerError::Validation(
+                        "image 消息缺少缩略图引用(metadata.thumbnail_file_id 或 thumbnail_url)"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
             }
             privchat_protocol::ContentMessageType::Video => {
                 self.validate_file_metadata(&metadata, "video", sender_id)
