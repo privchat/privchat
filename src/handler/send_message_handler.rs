@@ -2013,12 +2013,40 @@ impl SendMessageHandler {
 
         match self.file_service.get_file_metadata(file_id).await {
             Ok(Some(file_metadata)) => {
-                // 验证文件所有权
+                // 验证文件所有权;非 uploader 时按 get_url 同款授权规则放行转发引用
+                // (ATTACHMENT_ENCRYPTION_SPEC §授权):文件已绑定某条消息且发送者是
+                // 该消息所在会话成员(= 能合法看到这份文件)→ 允许复用 file_id 转发,
+                // 与 Telegram/微信一致(转发复用媒体引用,不重新上传)。
                 if file_metadata.uploader_id != sender_id {
-                    return Err(crate::error::ServerError::Authorization(format!(
-                        "文件 {} 不属于发送者 {}",
-                        file_id, sender_id
-                    )));
+                    let bound_message_id = file_metadata
+                        .business_id
+                        .as_deref()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|id| *id > 0);
+                    let member_of_message_channel = match bound_message_id {
+                        Some(message_id) => {
+                            match self.message_repository.get_channel_id(message_id).await {
+                                Ok(Some(channel_id)) => self
+                                    .channel_service
+                                    .is_channel_member(channel_id, sender_id)
+                                    .await
+                                    .unwrap_or(false),
+                                _ => false,
+                            }
+                        }
+                        None => false,
+                    };
+                    if !member_of_message_channel {
+                        return Err(crate::error::ServerError::Authorization(format!(
+                            "文件 {} 不属于发送者 {}",
+                            file_id, sender_id
+                        )));
+                    }
+                    info!(
+                        "✅ 文件消息验证通过(转发引用): type={}, file_id={}, uploader={}, sender={}",
+                        file_type_name, file_id, file_metadata.uploader_id, sender_id
+                    );
+                    return Ok(());
                 }
                 info!(
                     "✅ 文件消息验证通过: type={}, file_id={}, uploader={}",
