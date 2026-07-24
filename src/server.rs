@@ -1764,9 +1764,13 @@ impl ChatServer {
         let tcp_config = TcpServerConfig::new(&self.config.tcp_bind_address.to_string())
             .map_err(|e| ServerError::Internal(format!("TCP配置失败: {}", e)))?;
 
+        // WS 握手路径必须为 /gate：nginx（h5.fflunp.cn / web.fflunp.cn 的 location /gate）
+        // 都把请求转发到后端 :9080/gate。msgtrans 2.0 起严格校验 WS path（默认 "/"），
+        // 不设则 /gate 握手 404、web/native 的 WSS 全连不上（1.x 不校验路径故此前无需设）。
         let websocket_config =
             WebSocketServerConfig::new(&self.config.websocket_bind_address.to_string())
-                .map_err(|e| ServerError::Internal(format!("WebSocket配置失败: {}", e)))?;
+                .map_err(|e| ServerError::Internal(format!("WebSocket配置失败: {}", e)))?
+                .path("/gate");
 
         let quic_config = QuicServerConfig::new(&self.config.quic_bind_address.to_string())
             .map_err(|e| ServerError::Internal(format!("QUIC配置失败: {}", e)))?;
