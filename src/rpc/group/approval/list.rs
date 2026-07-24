@@ -70,7 +70,8 @@ pub async fn handle(
     // 解析参数（标准 u64 number；string 向后兼容）。此前按 as_str 读，与协议/其他 handler 不一致，
     // 导致 typed FFI / TS SDK 送的 number id 命中不到 → list 运行期失败（已修）。
     let group_id = read_u64_id(&body, "group_id")?;
-    let operator_id = read_u64_id(&body, "operator_id")?;
+    // 操作者由服务端从鉴权会话取，绝不信任客户端传的 operator_id。
+    let operator_id = crate::rpc::get_current_user_id(&ctx)?;
 
     // 1. 获取群组
     let channel = services

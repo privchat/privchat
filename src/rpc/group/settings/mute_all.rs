@@ -59,13 +59,8 @@ pub async fn handle(
     }
     .ok_or_else(|| RpcError::validation("group_id is required".to_string()))?;
 
-    let operator_id_str = body
-        .get("operator_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("operator_id is required".to_string()))?;
-    let operator_id = operator_id_str
-        .parse::<u64>()
-        .map_err(|_| RpcError::validation(format!("Invalid operator_id: {}", operator_id_str)))?;
+    // 操作者由服务端从鉴权会话取，绝不信任客户端传的 operator_id（客户端无权声明"我是谁"）。
+    let operator_id = crate::rpc::get_current_user_id(&ctx)?;
 
     let muted = body
         .get("muted")
@@ -116,7 +111,7 @@ pub async fn handle(
         "group_id": group_id.to_string(),
         "all_muted": muted,
         "message": format!("已{}全员禁言", action),
-        "operator_id": operator_id_str,
+        "operator_id": operator_id.to_string(),
         "updated_at": chrono::Utc::now().timestamp_millis()
     }))
 }
