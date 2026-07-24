@@ -61,7 +61,9 @@ pub async fn handle(
                         "username": if member.user_id == request.user_id { profile.username.clone() } else { String::new() },
                         "nickname": profile.nickname, // 昵称
                         "avatar_url": profile.avatar_url, // 头像
-                        "role": format!("{:?}", member.role),
+                        // 稳定小写角色契约("owner"/"admin"/"member")——Debug 格式首字母
+                        // 大写曾导致 web/h5 权限判定全挂(canManage 恒 false)。
+                        "role": format!("{:?}", member.role).to_lowercase(),
                         "joined_at": member.joined_at.timestamp_millis(),
                         "is_muted": member.is_muted,
                     }));
