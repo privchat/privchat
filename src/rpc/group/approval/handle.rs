@@ -67,10 +67,8 @@ pub async fn handle(
         .get("request_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("request_id is required".to_string()))?;
-    let operator_id = body
-        .get("operator_id")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| RpcError::validation("operator_id is required".to_string()))?;
+    // 操作者由服务端从鉴权会话取，绝不信任客户端传的 operator_id。
+    let operator_id = crate::rpc::get_current_user_id(&ctx)?;
     let action = body
         .get("action")
         .and_then(|v| v.as_str())
