@@ -1175,7 +1175,7 @@ impl ConnectionManager {
                         .map_err(SessionSendFailure::Transport)?;
                     let ack = privchat_protocol::decode_message::<
                         privchat_protocol::protocol::PushMessageResponse,
-                    >(&response.payload)
+                    >(response.payload())
                     .map_err(|e| SessionSendFailure::Classified {
                         classification: DeliveryFailureClassification::ProtocolAckMalformed,
                         detail: format!("invalid PushMessageResponse: {e}"),

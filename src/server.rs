@@ -1776,6 +1776,10 @@ impl ChatServer {
         // 后立即关闭，不分配会话资源。（2.0 之前这是个空实现，从未强制过。）
         let transport = TransportServerBuilder::new()
             .max_connections(self.config.max_connections as usize)
+            // 显式保留 msgtrans 1.x 的 Lenient 帧策略。2.0 默认改为 Strict——会关闭发送
+            // WebSocket text 帧或不可解码帧的连接。生产上已部署的各端(web/native)均按
+            // 1.x Lenient 行为运行，切 Strict 有打挂已连客户端的风险，故显式钉住 Lenient。
+            .frame_policy(msgtrans::packet::FramePolicy::Lenient)
             .protocol(tcp_config)
             .protocol(websocket_config)
             .protocol(quic_config)
@@ -2313,6 +2317,120 @@ pub struct PrivchatSessionHandler {
     qr_login_publisher: Arc<crate::service::QrLoginPublisher>,
 }
 
+impl PrivchatSessionHandler {
+    /// 入站包统一处理：msgtrans 2.0 把请求路由到 on_request(带 Responder 回响应)、
+    /// 单向消息路由到 on_message(无响应)；1.x 时都进 on_message。此处合并两条路径，
+    /// 保留原有分发/限流/日志/统计行为，仅按是否有 responder 决定回不回响应。
+    async fn handle_inbound(
+        &self,
+        session_id: msgtrans::SessionId,
+        biz_type: u8,
+        msg_data: bytes::Bytes,
+        responder: Option<msgtrans::transport::Responder>,
+    ) {
+        let msg_text = sanitize_inbound_payload_for_log(&String::from_utf8_lossy(&msg_data));
+        let user_id = self.auth_session_manager.get_user_id(&session_id).await;
+        let msg_type = MessageType::from(biz_type);
+
+        if matches!(msg_type, MessageType::PingRequest) {
+            if let Some(user_id) = user_id {
+                trace!(
+                    "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
+                    session_id, user_id, biz_type, msg_type, msg_text
+                );
+            } else {
+                trace!(
+                    "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
+                    session_id, biz_type, msg_type, msg_text
+                );
+            }
+        } else if let Some(user_id) = user_id {
+            info!(
+                "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
+                session_id, user_id, biz_type, msg_type, msg_text
+            );
+        } else {
+            info!(
+                "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
+                session_id, biz_type, msg_type, msg_text
+            );
+        }
+
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_received += 1;
+        }
+
+        let dispatch_session_info = self
+            .auth_session_manager
+            .get_session_info(&session_id)
+            .await;
+        let message_dispatcher = self.message_dispatcher.clone();
+
+        // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop
+        match self.handler_limiter.try_acquire() {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let mut request_context = crate::context::RequestContext::new(
+                        session_id,
+                        msg_data.to_vec(),
+                        "127.0.0.1:0".parse().unwrap(),
+                    );
+                    if let Some(info) = dispatch_session_info {
+                        request_context = request_context
+                            .with_user_id(info.user_id)
+                            .with_device_id(info.device_id);
+                    }
+
+                    match message_dispatcher.dispatch(msg_type, request_context).await {
+                        Ok(Some(response)) => {
+                            if let Some(responder) = responder {
+                                let _ = responder.respond(response).await;
+                            }
+                            if matches!(msg_type, MessageType::PingRequest) {
+                                trace!(
+                                    "✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})",
+                                    session_id, biz_type, msg_type
+                                );
+                            } else {
+                                debug!(
+                                    "✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})",
+                                    session_id, biz_type, msg_type
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            debug!(
+                                "消息分发器无响应: {} (biz_type: {}, MessageType: {:?})",
+                                session_id, biz_type, msg_type
+                            );
+                        }
+                        Err(e) => {
+                            error!("❌ 消息分发器处理失败: {:?} - {}", msg_type, e);
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                // 限流触发：handler 并发已满。有 responder 才回 SERVER_BUSY。
+                if let Some(responder) = responder {
+                    let overload_response = ErrorResponseBuilder::build(
+                        session_id,
+                        "SERVER_BUSY",
+                        "server handler is overloaded, please retry later",
+                    );
+                    let _ = responder.respond(overload_response).await;
+                }
+                warn!(
+                    "🚫 Handler 限流触发，已返回 SERVER_BUSY: session={}, biz_type={}",
+                    session_id, biz_type
+                );
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl msgtrans::transport::SessionHandler for PrivchatSessionHandler {
     async fn on_connected(
@@ -2351,125 +2469,29 @@ impl msgtrans::transport::SessionHandler for PrivchatSessionHandler {
         &self,
         session_id: msgtrans::SessionId,
         packet: msgtrans::packet::Packet,
-        sender: msgtrans::transport::SessionSender,
+        _sender: msgtrans::transport::SessionSender,
     ) {
-        let biz_type = packet.header.biz_type;
-        let message_id = packet.header.message_id;
-        let msg_data = packet.payload.clone();
-        let msg_text = sanitize_inbound_payload_for_log(&String::from_utf8_lossy(&packet.payload));
-        let user_id = self.auth_session_manager.get_user_id(&session_id).await;
-        let msg_type = MessageType::from(biz_type);
-
-        if matches!(msg_type, MessageType::PingRequest) {
-            if let Some(user_id) = user_id {
-                trace!(
-                    "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                    session_id,
-                    user_id,
-                    biz_type,
-                    msg_type,
-                    msg_text
-                );
-            } else {
-                trace!(
-                    "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                    session_id,
-                    biz_type,
-                    msg_type,
-                    msg_text
-                );
-            }
-        } else if let Some(user_id) = user_id {
-            info!(
-                "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                session_id, user_id, biz_type, msg_type, msg_text
-            );
-        } else {
-            info!(
-                "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                session_id, biz_type, msg_type, msg_text
-            );
-        }
-
-        // 更新统计信息
-        {
-            let mut stats = self.stats.write().await;
-            stats.messages_received += 1;
-        }
-
-        // 保存 user_id / device_id 供 handler 使用。device_id 是 Room subscribe
-        // ticket 校验（spec ROOM_CHANNEL_SPEC §4.3 ticket.did 必须匹配）等场景必需的。
-        let dispatch_session_info = self
-            .auth_session_manager
-            .get_session_info(&session_id)
+        // 单向消息(msgtrans 2.0)：客户端 RPC 走 request→on_request，这里只兜真正的
+        // one-way 入站，照常分发但没有回响应的通道。
+        self.handle_inbound(session_id, packet.biz_type(), packet.payload().clone(), None)
             .await;
-        let message_dispatcher = self.message_dispatcher.clone();
+    }
 
-        // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop
-        match self.handler_limiter.try_acquire() {
-            Ok(permit) => {
-                tokio::spawn(async move {
-                    // permit 绑定在 task 内部，task 结束自动释放
-                    let _permit = permit;
-                    let mut request_context = crate::context::RequestContext::new(
-                        session_id,
-                        // msgtrans 起 payload 为 Bytes(零拷贝);
-                        // RequestContext 仍持 Vec<u8>,此处物化一次。
-                        msg_data.to_vec(),
-                        "127.0.0.1:0".parse().unwrap(),
-                    );
-                    if let Some(info) = dispatch_session_info {
-                        request_context = request_context
-                            .with_user_id(info.user_id)
-                            .with_device_id(info.device_id);
-                    }
-
-                    match message_dispatcher.dispatch(msg_type, request_context).await {
-                        Ok(Some(response)) => {
-                            let _ = sender.respond(message_id, biz_type, response).await;
-                            if matches!(msg_type, MessageType::PingRequest) {
-                                trace!(
-                                    "✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})",
-                                    session_id,
-                                    biz_type,
-                                    msg_type
-                                );
-                            } else {
-                                debug!(
-                                    "✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})",
-                                    session_id, biz_type, msg_type
-                                );
-                            }
-                        }
-                        Ok(None) => {
-                            debug!(
-                                "消息分发器无响应: {} (biz_type: {}, MessageType: {:?})",
-                                session_id, biz_type, msg_type
-                            );
-                        }
-                        Err(e) => {
-                            error!("❌ 消息分发器处理失败: {:?} - {}", msg_type, e);
-                        }
-                    }
-                });
-            }
-            Err(_) => {
-                // 限流触发：handler 并发已满（busy 单独由 privchat_handler_rejected_total
-                // 计，不并入 rpc_requests_total 以免分子分母作用域不一致）。
-                let overload_response = ErrorResponseBuilder::build(
-                    session_id,
-                    "SERVER_BUSY",
-                    "server handler is overloaded, please retry later",
-                );
-                let _ = sender
-                    .respond(message_id, biz_type, overload_response)
-                    .await;
-                warn!(
-                    "🚫 Handler 限流触发，已返回 SERVER_BUSY: session={}, biz_type={}",
-                    session_id, biz_type
-                );
-            }
-        }
+    async fn on_request(
+        &self,
+        session_id: msgtrans::SessionId,
+        request: msgtrans::packet::Packet,
+        responder: msgtrans::transport::Responder,
+    ) {
+        // 请求(msgtrans 2.0)：分发后经请求作用域的 Responder 回响应（biz_type/message_id
+        // 由 Responder 内部携带，不再手工传）。
+        self.handle_inbound(
+            session_id,
+            request.biz_type(),
+            request.payload().clone(),
+            Some(responder),
+        )
+        .await;
     }
 
     async fn on_message_sent(&self, session_id: msgtrans::SessionId, message_id: u32) {
