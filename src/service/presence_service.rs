@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use msgtrans::{packet::Packet, SessionId};
+use msgtrans::{Packet, SessionId};
 #[cfg(test)]
 use sqlx::postgres::PgPoolOptions;
 #[cfg(test)]

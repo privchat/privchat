@@ -115,7 +115,7 @@ impl SubscribeMessageHandler {
             };
 
             let mut packet =
-                msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload_bytes);
+                msgtrans::Packet::one_way(crate::infra::next_packet_id(), payload_bytes);
             packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
 
             let send_ok = match server.send_to_session(session_id.clone(), packet).await {

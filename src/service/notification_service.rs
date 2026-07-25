@@ -32,7 +32,7 @@ use crate::error::{Result, ServerError};
 /// 通知服务：向指定会话/用户推送消息等
 pub struct NotificationService {
     /// 传输层（运行时由 server 设置）
-    transport: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
+    transport: Arc<RwLock<Option<Arc<msgtrans::TransportServer>>>>,
 }
 
 impl NotificationService {
@@ -43,7 +43,7 @@ impl NotificationService {
     }
 
     /// 设置传输层（由 server 在启动时调用）
-    pub async fn set_transport(&self, transport: Arc<msgtrans::transport::TransportServer>) {
+    pub async fn set_transport(&self, transport: Arc<msgtrans::TransportServer>) {
         *self.transport.write().await = Some(transport);
     }
 
@@ -61,8 +61,7 @@ impl NotificationService {
         let recv_data = privchat_protocol::encode_message(message)
             .map_err(|e| ServerError::Protocol(format!("编码 PushMessageRequest 失败: {}", e)))?;
 
-        let mut packet =
-            msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), recv_data);
+        let mut packet = msgtrans::Packet::one_way(crate::infra::next_packet_id(), recv_data);
         packet.set_biz_type(MessageType::PushMessageRequest as u8);
         transport
             .send_to_session(session_id.clone(), packet)
