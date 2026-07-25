@@ -2406,6 +2406,9 @@ impl PrivchatSessionHandler {
                                             session_id, biz_type, msg_type
                                         );
                                     }
+                                    // RespondOutcome 是 #[non_exhaustive]：未来新增
+                                    // 的成功语义按「已写入」保守处理，不当作失败。
+                                    Ok(_) => {}
                                     Err(e) => {
                                         warn!(
                                             "⚠️ 响应写入失败: {} (biz_type: {}, MessageType: {:?}) - {}",

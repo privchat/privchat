@@ -209,6 +209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     ClientEvent::Message(msg) => (msg.biz_type(), msg.into_payload()),
                     ClientEvent::Request(req) => (req.biz_type(), req.into_payload()),
+                    // ClientEvent 是 #[non_exhaustive]：忽略未来新增的事件类型。
+                    _ => continue,
                 };
                 if biz_type != push_biz {
                     continue;

@@ -187,11 +187,16 @@ fn classify_transport_error(error: &msgtrans::TransportError) -> DeliveryFailure
         TransportError::Resource { resource, .. } if resource.contains("outbound_queue") => {
             DeliveryFailureClassification::SlowConsumer
         }
+        TransportError::Configuration { .. } => DeliveryFailureClassification::PermanentTransport,
+        // Connection / Protocol / Resource / Timeout, plus any variant a future
+        // msgtrans adds (`TransportError` is `#[non_exhaustive]`). Retrying is
+        // the safe default for an unknown transport failure: the delivery layer
+        // re-attempts with backoff rather than dropping the message.
         TransportError::Connection { .. }
         | TransportError::Protocol { .. }
         | TransportError::Resource { .. }
         | TransportError::Timeout { .. } => DeliveryFailureClassification::RetryableTransport,
-        TransportError::Configuration { .. } => DeliveryFailureClassification::PermanentTransport,
+        _ => DeliveryFailureClassification::RetryableTransport,
     }
 }
 
