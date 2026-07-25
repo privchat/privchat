@@ -19,10 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 
-use msgtrans::{
-    protocol::{QuicServerConfig, TcpServerConfig, WebSocketServerConfig},
-    transport::TransportServerBuilder,
-};
+use msgtrans::{QuicServerConfig, TcpServerConfig, TransportServerBuilder, WebSocketServerConfig};
 
 use privchat_protocol::protocol::MessageType;
 use serde_json::Value;
@@ -175,7 +172,7 @@ pub struct ChatServer {
     token_auth: Arc<TokenAuth>,
     cache_manager: Arc<CacheManager>,
     stats: Arc<tokio::sync::RwLock<ServerStats>>,
-    transport: Option<Arc<msgtrans::transport::TransportServer>>,
+    transport: Option<Arc<msgtrans::TransportServer>>,
     message_dispatcher: Arc<MessageDispatcher>,
     /// 频道服务（原会话服务）
     channel_service: Arc<crate::service::ChannelService>,
@@ -1756,8 +1753,8 @@ impl ChatServer {
     /// 创建传输层服务器
     async fn create_transport_server(
         &self,
-        handler: Arc<dyn msgtrans::transport::SessionHandler>,
-    ) -> Result<Arc<msgtrans::transport::TransportServer>, ServerError> {
+        handler: Arc<dyn msgtrans::SessionHandler>,
+    ) -> Result<Arc<msgtrans::TransportServer>, ServerError> {
         info!("🔧 创建传输层服务器...");
 
         // 创建协议配置
@@ -1783,7 +1780,7 @@ impl ChatServer {
             // 显式保留 msgtrans 1.x 的 Lenient 帧策略。2.0 默认改为 Strict——会关闭发送
             // WebSocket text 帧或不可解码帧的连接。生产上已部署的各端(web/native)均按
             // 1.x Lenient 行为运行，切 Strict 有打挂已连客户端的风险，故显式钉住 Lenient。
-            .frame_policy(msgtrans::packet::FramePolicy::Lenient)
+            .frame_policy(msgtrans::FramePolicy::Lenient)
             .protocol(tcp_config)
             .protocol(websocket_config)
             .protocol(quic_config)
@@ -2330,7 +2327,7 @@ impl PrivchatSessionHandler {
         session_id: msgtrans::SessionId,
         biz_type: u8,
         msg_data: bytes::Bytes,
-        responder: Option<msgtrans::transport::Responder>,
+        responder: Option<msgtrans::Responder>,
     ) {
         let msg_text = sanitize_inbound_payload_for_log(&String::from_utf8_lossy(&msg_data));
         let user_id = self.auth_session_manager.get_user_id(&session_id).await;
@@ -2340,12 +2337,19 @@ impl PrivchatSessionHandler {
             if let Some(user_id) = user_id {
                 trace!(
                     "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                    session_id, user_id, biz_type, msg_type, msg_text
+                    session_id,
+                    user_id,
+                    biz_type,
+                    msg_type,
+                    msg_text
                 );
             } else {
                 trace!(
                     "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                    session_id, biz_type, msg_type, msg_text
+                    session_id,
+                    biz_type,
+                    msg_type,
+                    msg_text
                 );
             }
         } else if let Some(user_id) = user_id {
@@ -2390,12 +2394,32 @@ impl PrivchatSessionHandler {
                     match message_dispatcher.dispatch(msg_type, request_context).await {
                         Ok(Some(response)) => {
                             if let Some(responder) = responder {
-                                let _ = responder.respond(response).await;
+                                // msgtrans 2.0 写入确认语义：respond() 返回后
+                                // Ok(Written)=字节已写入，Ok(AlreadyHandled)=请求已被
+                                // 应答过（重复/过期），Err=真实写入失败。过去 `let _`
+                                // 丢弃了写失败信号，客户端收不到响应也无从观测。
+                                match responder.respond(response).await {
+                                    Ok(msgtrans::RespondOutcome::Written) => {}
+                                    Ok(msgtrans::RespondOutcome::AlreadyHandled) => {
+                                        debug!(
+                                            "↩️ 响应被幂等跳过(已应答/过期): {} (biz_type: {}, MessageType: {:?})",
+                                            session_id, biz_type, msg_type
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "⚠️ 响应写入失败: {} (biz_type: {}, MessageType: {:?}) - {}",
+                                            session_id, biz_type, msg_type, e
+                                        );
+                                    }
+                                }
                             }
                             if matches!(msg_type, MessageType::PingRequest) {
                                 trace!(
                                     "✅ 消息分发器响应已发送: {} (biz_type: {}, MessageType: {:?})",
-                                    session_id, biz_type, msg_type
+                                    session_id,
+                                    biz_type,
+                                    msg_type
                                 );
                             } else {
                                 debug!(
@@ -2424,7 +2448,12 @@ impl PrivchatSessionHandler {
                         "SERVER_BUSY",
                         "server handler is overloaded, please retry later",
                     );
-                    let _ = responder.respond(overload_response).await;
+                    if let Err(e) = responder.respond(overload_response).await {
+                        warn!(
+                            "⚠️ SERVER_BUSY 响应写入失败: session={}, biz_type={} - {}",
+                            session_id, biz_type, e
+                        );
+                    }
                 }
                 warn!(
                     "🚫 Handler 限流触发，已返回 SERVER_BUSY: session={}, biz_type={}",
@@ -2436,12 +2465,8 @@ impl PrivchatSessionHandler {
 }
 
 #[async_trait::async_trait]
-impl msgtrans::transport::SessionHandler for PrivchatSessionHandler {
-    async fn on_connected(
-        &self,
-        session_id: msgtrans::SessionId,
-        info: msgtrans::command::ConnectionInfo,
-    ) {
+impl msgtrans::SessionHandler for PrivchatSessionHandler {
+    async fn on_connected(&self, session_id: msgtrans::SessionId, info: msgtrans::ConnectionInfo) {
         // server 侧连接建立处理耗时（G8 归因，不含 transport 握手）：
         // 守卫覆盖安全拒绝与正常结束两条路径。
         let _connect_timer = crate::infra::metrics::DurationRecorder::new(
@@ -2472,20 +2497,25 @@ impl msgtrans::transport::SessionHandler for PrivchatSessionHandler {
     async fn on_message(
         &self,
         session_id: msgtrans::SessionId,
-        packet: msgtrans::packet::Packet,
-        _sender: msgtrans::transport::SessionSender,
+        packet: msgtrans::Packet,
+        _sender: msgtrans::SessionSender,
     ) {
         // 单向消息(msgtrans 2.0)：客户端 RPC 走 request→on_request，这里只兜真正的
         // one-way 入站，照常分发但没有回响应的通道。
-        self.handle_inbound(session_id, packet.biz_type(), packet.payload().clone(), None)
-            .await;
+        self.handle_inbound(
+            session_id,
+            packet.biz_type(),
+            packet.payload().clone(),
+            None,
+        )
+        .await;
     }
 
     async fn on_request(
         &self,
         session_id: msgtrans::SessionId,
-        request: msgtrans::packet::Packet,
-        responder: msgtrans::transport::Responder,
+        request: msgtrans::Packet,
+        responder: msgtrans::Responder,
     ) {
         // 请求(msgtrans 2.0)：分发后经请求作用域的 Responder 回响应（biz_type/message_id
         // 由 Responder 内部携带，不再手工传）。

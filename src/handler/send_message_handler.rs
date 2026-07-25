@@ -77,7 +77,7 @@ pub struct SendMessageHandler {
     /// 会话服务（用于更新会话列表）
     channel_service: Arc<crate::service::ChannelService>,
     /// 传输层服务器（可选，运行时设置）
-    transport: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
+    transport: Arc<RwLock<Option<Arc<msgtrans::TransportServer>>>>,
     /// 黑名单服务（用于拦截被拉黑用户的消息）
     blacklist_service: Arc<crate::service::BlacklistService>,
     /// ✨ pts 生成器
@@ -196,7 +196,7 @@ impl SendMessageHandler {
     }
 
     /// 设置传输层服务器（在服务器启动后调用）
-    pub async fn set_transport(&self, transport: Arc<msgtrans::transport::TransportServer>) {
+    pub async fn set_transport(&self, transport: Arc<msgtrans::TransportServer>) {
         *self.transport.write().await = Some(transport);
     }
 

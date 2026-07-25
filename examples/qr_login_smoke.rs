@@ -47,10 +47,10 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use msgtrans::protocol::WebSocketClientConfig;
-use msgtrans::transport::client::TransportClientBuilder;
-use msgtrans::transport::TransportOptions;
 use msgtrans::ClientEvent;
+use msgtrans::TransportClientBuilder;
+use msgtrans::TransportOptions;
+use msgtrans::WebSocketClientConfig;
 use privchat_protocol::decode_message;
 use privchat_protocol::protocol::{MessageType, RpcRequest, RpcResponse};
 use privchat_protocol::rpc::qr_login::{
@@ -123,12 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[smoke] connecting to {}", args.url);
 
-    let cfg = WebSocketClientConfig::new(&args.url)?
-        .connect_timeout(Duration::from_secs(10));
-    let mut client = TransportClientBuilder::new()
-        .protocol(cfg)
-        .build()
-        .await?;
+    let cfg = WebSocketClientConfig::new(&args.url)?.connect_timeout(Duration::from_secs(10));
+    let mut client = TransportClientBuilder::new().protocol(cfg).build().await?;
     client.connect().await?;
 
     eprintln!("[smoke] connected, sending qr_login/create_scene");
@@ -195,63 +191,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ev = events.next() => {
                 let Some(ev) = ev else { continue };
-                match ev {
+                // msgtrans 2.0：数据事件拆成 Message(单向)/Request(请求)。qr_login
+                // push 两种传输形态都可能，统一归一到 (biz_type, payload) 再处理。
+                let (biz_type, data) = match ev {
                     ClientEvent::Connected { info } => {
                         eprintln!("[smoke] connected info={:?}", info.peer_addr);
+                        continue;
                     }
                     ClientEvent::Disconnected { reason } => {
                         eprintln!("[smoke] disconnected: {:?}", reason);
                         return Ok(());
                     }
-                    ClientEvent::MessageReceived(ctx) => {
-                        if ctx.biz_type != push_biz {
-                            continue;
-                        }
-                        let Ok(push) = decode_message::<privchat_protocol::protocol::PushMessageRequest>(&ctx.data) else {
-                            eprintln!("[smoke] PushMessageRequest decode failed");
-                            continue;
-                        };
-                        if !push.topic.starts_with("qr_login.") {
-                            // 其他 IM push 略过（unauth 连接不太可能收到，但保险起见）
-                            continue;
-                        }
-                        // payload = 我们 serde_json::to_vec(QrLoginPushEvent) 写进去的字节
-                        match serde_json::from_slice::<QrLoginPushEvent>(&push.payload) {
-                            Ok(qr_event) => {
-                                let data_preview = qr_event
-                                    .data
-                                    .as_ref()
-                                    .map(|v: &Value| v.to_string())
-                                    .unwrap_or_else(|| "null".to_string());
-                                eprintln!(
-                                    "[smoke] event={} scene_id={} state={} data={}",
-                                    qr_event.event,
-                                    qr_event.scene_id,
-                                    qr_event.state,
-                                    data_preview
-                                );
-                                // 终态自动退出
-                                let terminal = matches!(
-                                    qr_event.event.as_str(),
-                                    "qr_login.authorized" | "qr_login.rejected" | "qr_login.expired"
-                                );
-                                if terminal && qr_event.scene_id == scene_id {
-                                    eprintln!("[smoke] terminal event received, exiting");
-                                    let _ = client.disconnect().await;
-                                    return Ok(());
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[smoke] qr_login push payload decode failed: {} topic={}",
-                                    e, push.topic
-                                );
-                            }
-                        }
-                    }
-                    ClientEvent::MessageSent { .. } => {}
+                    ClientEvent::MessageSent { .. } => continue,
                     ClientEvent::Error { error } => {
                         eprintln!("[smoke] transport error: {}", error);
+                        continue;
+                    }
+                    ClientEvent::Message(msg) => (msg.biz_type(), msg.into_payload()),
+                    ClientEvent::Request(req) => (req.biz_type(), req.into_payload()),
+                };
+                if biz_type != push_biz {
+                    continue;
+                }
+                let Ok(push) =
+                    decode_message::<privchat_protocol::protocol::PushMessageRequest>(&data)
+                else {
+                    eprintln!("[smoke] PushMessageRequest decode failed");
+                    continue;
+                };
+                if !push.topic.starts_with("qr_login.") {
+                    // 其他 IM push 略过（unauth 连接不太可能收到，但保险起见）
+                    continue;
+                }
+                // payload = 我们 serde_json::to_vec(QrLoginPushEvent) 写进去的字节
+                match serde_json::from_slice::<QrLoginPushEvent>(&push.payload) {
+                    Ok(qr_event) => {
+                        let data_preview = qr_event
+                            .data
+                            .as_ref()
+                            .map(|v: &Value| v.to_string())
+                            .unwrap_or_else(|| "null".to_string());
+                        eprintln!(
+                            "[smoke] event={} scene_id={} state={} data={}",
+                            qr_event.event, qr_event.scene_id, qr_event.state, data_preview
+                        );
+                        // 终态自动退出
+                        let terminal = matches!(
+                            qr_event.event.as_str(),
+                            "qr_login.authorized" | "qr_login.rejected" | "qr_login.expired"
+                        );
+                        if terminal && qr_event.scene_id == scene_id {
+                            eprintln!("[smoke] terminal event received, exiting");
+                            let _ = client.disconnect().await;
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[smoke] qr_login push payload decode failed: {} topic={}",
+                            e, push.topic
+                        );
                     }
                 }
             }

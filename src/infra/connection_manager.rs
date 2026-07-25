@@ -171,17 +171,15 @@ enum SessionAttemptOutcome {
 
 #[derive(Debug)]
 enum SessionSendFailure {
-    Transport(msgtrans::error::TransportError),
+    Transport(msgtrans::TransportError),
     Classified {
         classification: DeliveryFailureClassification,
         detail: String,
     },
 }
 
-fn classify_transport_error(
-    error: &msgtrans::error::TransportError,
-) -> DeliveryFailureClassification {
-    use msgtrans::error::TransportError;
+fn classify_transport_error(error: &msgtrans::TransportError) -> DeliveryFailureClassification {
+    use msgtrans::TransportError;
     match error {
         TransportError::Connection {
             retryable: false, ..
@@ -282,7 +280,7 @@ pub struct ConnectionManager {
     ownership_registry: Arc<RwLock<Option<Arc<crate::infra::SessionOwnershipRegistry>>>>,
 
     /// TransportServer 引用（用于主动关闭连接）
-    pub transport_server: Arc<RwLock<Option<Arc<msgtrans::transport::TransportServer>>>>,
+    pub transport_server: Arc<RwLock<Option<Arc<msgtrans::TransportServer>>>>,
 }
 
 impl Default for ConnectionManager {
@@ -315,7 +313,7 @@ impl ConnectionManager {
         *self.ownership_registry.write().await = Some(registry);
     }
 
-    pub async fn set_transport_server(&self, server: Arc<msgtrans::transport::TransportServer>) {
+    pub async fn set_transport_server(&self, server: Arc<msgtrans::TransportServer>) {
         let mut transport = self.transport_server.write().await;
         *transport = Some(server);
         info!("✅ ConnectionManager: TransportServer 已设置");
@@ -1144,9 +1142,9 @@ impl ConnectionManager {
                 async move {
                     let packet_id = crate::infra::next_packet_id();
                     let mut packet = if receipt_required {
-                        msgtrans::packet::Packet::request(packet_id, payload)
+                        msgtrans::Packet::request(packet_id, payload)
                     } else {
-                        msgtrans::packet::Packet::one_way(packet_id, payload)
+                        msgtrans::Packet::one_way(packet_id, payload)
                     };
                     packet.set_biz_type(
                         privchat_protocol::protocol::MessageType::PushMessageRequest as u8,
@@ -1308,7 +1306,7 @@ impl ConnectionManager {
         };
         let payload = privchat_protocol::encode_message(message)
             .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
-        let mut packet = msgtrans::packet::Packet::one_way(crate::infra::next_packet_id(), payload);
+        let mut packet = msgtrans::Packet::one_way(crate::infra::next_packet_id(), payload);
         packet.set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
         match server.send_to_session(session_id, packet).await {
             Ok(()) => Ok(1),
@@ -1876,7 +1874,7 @@ mod tests {
 
     #[test]
     fn outbound_queue_overflow_is_classified_as_slow_consumer() {
-        let error = msgtrans::error::TransportError::resource_error("tcp_outbound_queue", 512, 512);
+        let error = msgtrans::TransportError::resource_error("tcp_outbound_queue", 512, 512);
         assert_eq!(
             classify_transport_error(&error),
             DeliveryFailureClassification::SlowConsumer

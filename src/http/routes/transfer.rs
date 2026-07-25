@@ -172,7 +172,7 @@ pub trait TransferSendBackend: Send + Sync {
     ///
     /// `encoded_packet` is exactly what comes off
     /// `privchat_protocol::encode_message(&TransferRequest{...})` —
-    /// implementations wrap it in a `msgtrans::packet::Packet` with
+    /// implementations wrap it in a `msgtrans::Packet` with
     /// `biz_type = MessageType::TransferRequest as u8` (= 19) and call the
     /// transport server.
     async fn deliver(&self, target_user_id: u64, channel_id: u64, encoded_packet: &[u8]) -> usize;
@@ -265,10 +265,8 @@ impl TransferSendBackend for DefaultTransferSendBackend {
 
         let mut delivered = 0usize;
         for sid in target_sessions {
-            let mut packet = msgtrans::packet::Packet::one_way(
-                crate::infra::next_packet_id(),
-                encoded_packet.to_vec(),
-            );
+            let mut packet =
+                msgtrans::Packet::one_way(crate::infra::next_packet_id(), encoded_packet.to_vec());
             packet.set_biz_type(privchat_protocol::protocol::MessageType::TransferRequest as u8);
             match server.send_to_session(sid, packet).await {
                 Ok(()) => delivered += 1,
