@@ -2350,15 +2350,14 @@ impl ChannelService {
             .and_then(|s| s.strip_prefix("cursor:"))
             .and_then(|s| s.parse::<u64>().ok())
             .map(|v| v as i64);
-        // hidden 是进程内状态，下推为排除数组；若 LIMIT 后再内存过滤会产生短页/空页。
-        let hidden_ids: Vec<i64> = {
-            let hidden_lock = self.hidden_channels.read().await;
-            hidden_lock
-                .iter()
-                .filter(|(uid, _)| *uid == user_id)
-                .map(|(_, cid)| *cid as i64)
-                .collect()
-        };
+        // 隐藏（临时清理会话列表）是**纯客户端本地状态**——见 RECOVERY_ENTITY_STATE_MATRIX
+        // 冻结条款：channel 实体必须同步「存在性 / 列表归属」，而 temporary hide 与
+        // HideOnly 的「有新消息即重新浮现」都不属于被同步的 channel 状态。
+        //
+        // 这里曾把服务端 hidden 集合下推成 `AND NOT (channel_id = ANY(...))`，实体同步
+        // 因此看不见这些会话；一旦有新消息到达，客户端会以 version=0 的桩记录建会话，
+        // 表现为**会话列表空白行 + get_channel_pts 10201**（2026-07-26 生产实测：25 条
+        // 隐藏会话产生 6 条桩）。存在性必须无条件同步，是否展示由客户端投影决定。
 
         let rows = sqlx::query_as::<_, ChannelSyncRow>(
             r#"
@@ -2411,15 +2410,13 @@ impl ChannelService {
                     $3
                 )
               )
-              AND NOT (c.channel_id = ANY($4::BIGINT[]))
             ORDER BY GREATEST(c.sync_version, uc.sync_version) ASC, c.channel_id ASC
-            LIMIT $5
+            LIMIT $4
             "#,
         )
         .bind(user_id as i64)
         .bind(since)
         .bind(after_id)
-        .bind(&hidden_ids)
         .bind(limit as i64 + 1)
         .fetch_all(self.pool())
         .await
@@ -4152,6 +4149,64 @@ mod tests {
             .bind(group_id as i64)
             .execute(service.pool())
             .await;
+    }
+
+    /// RECOVERY_ENTITY_STATE_MATRIX（冻结）：channel 实体必须同步「存在性 / 列表归属」，
+    /// 临时隐藏是纯客户端本地状态、**不属于被同步的 channel 状态**。
+    ///
+    /// 回归背景（2026-07-26 生产）：实体同步曾把服务端 hidden 集合下推成排除条件，
+    /// 被隐藏的会话对同步不可见；新消息一到，客户端只能建 version=0 的桩会话
+    /// → 会话列表空白行 + get_channel_pts 10201。
+    #[tokio::test]
+    async fn entity_sync_includes_hidden_channels() {
+        let Some(service) = open_test_service().await else {
+            eprintln!("skip entity_sync_includes_hidden_channels: DATABASE_URL not configured");
+            return;
+        };
+        let user_id = 930_101_u64;
+        let peer_id = 930_102_u64;
+        ensure_user(&service, user_id, "channel_test_hidden_owner").await;
+        ensure_user(&service, peer_id, "channel_test_hidden_peer").await;
+
+        let request = CreateChannelRequest {
+            channel_type: ChannelType::Direct,
+            name: None,
+            description: None,
+            member_ids: vec![peer_id],
+            is_public: None,
+            max_members: None,
+        };
+        let response = service.create_channel(user_id, request).await.unwrap();
+        assert!(response.success, "{:?}", response.error);
+        let channel_id = response.channel.id;
+
+        service
+            .hide_channel(user_id, channel_id, true)
+            .await
+            .expect("hide channel");
+        assert!(
+            service.is_channel_hidden(user_id, channel_id).await,
+            "precondition: channel is hidden server-side"
+        );
+
+        let page = service
+            .sync_entities_page_for_channels(user_id, None, None, 200)
+            .await
+            .expect("sync entities page");
+        assert!(
+            page.items
+                .iter()
+                .any(|item| item.entity_id == channel_id.to_string()),
+            "hidden channel must still be synced (existence is not hideable); got {:?}",
+            page.items
+                .iter()
+                .map(|i| i.entity_id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        cleanup_channel(&service, channel_id).await;
+        cleanup_user(&service, peer_id).await;
+        cleanup_user(&service, user_id).await;
     }
 
     #[tokio::test]

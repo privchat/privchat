@@ -59,8 +59,12 @@ pub async fn handle(
                     .channel_service
                     .get_channel(&channel_id)
                     .await
-                    .map(|channel| channel.channel_type.to_i16() as u8)
-                    .unwrap_or(1);
+                    // sync commit 要 wire 编号（Direct=1/Group=2/Room=3），
+                    // 不是 DB 编号（0/1/2）。直接传 DB 值会让 message_repo 的
+                    // 类型校验拒写（Direct 的 0 更是非法 wire 值），reaction
+                    // 的 pts commit 静默失败、客户端收不到表态更新。
+                    .map(|channel| channel.channel_type.to_wire_u8())
+                    .unwrap_or_else(|_| crate::model::channel::ChannelType::Direct.to_wire_u8());
                 if let Err(e) = services
                     .sync_service
                     .append_server_event_commit(
