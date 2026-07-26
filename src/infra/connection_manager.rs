@@ -1145,30 +1145,32 @@ impl ConnectionManager {
                 let server = server.clone();
                 let payload = payload.clone();
                 async move {
-                    let packet_id = crate::infra::next_packet_id();
-                    let mut packet = if receipt_required {
-                        msgtrans::Packet::request(packet_id, payload)
-                    } else {
-                        msgtrans::Packet::one_way(packet_id, payload)
-                    };
-                    packet.set_biz_type(
-                        privchat_protocol::protocol::MessageType::PushMessageRequest as u8,
-                    );
+                    let biz_type =
+                        privchat_protocol::protocol::MessageType::PushMessageRequest as u8;
                     if !receipt_required {
+                        let packet_id = crate::infra::next_packet_id();
+                        let mut packet = msgtrans::Packet::one_way(packet_id, payload);
+                        packet.set_biz_type(biz_type);
                         return server
                             .send_to_session(session_id, packet)
                             .await
                             .map(|_| false)
                             .map_err(SessionSendFailure::Transport);
                     }
+                    // msgtrans 2.0.0-alpha.4: request ids are allocated by the
+                    // transport (per session, strictly monotonic, never reused),
+                    // so requests are built through options rather than by
+                    // handing in a pre-numbered Packet.
+                    let options = msgtrans::TransportOptions::new().biz_type(biz_type);
 
                     // msgtrans owns request-tracker cleanup on its 10s timeout. Run
                     // it in a detached task so our stricter 5s route deadline can
                     // expire without cancelling and leaking the tracker entry.
-                    let request =
-                        tokio::spawn(
-                            async move { server.request_to_session(session_id, packet).await },
-                        );
+                    let request = tokio::spawn(async move {
+                        server
+                            .request_with_options(session_id, payload.into(), options)
+                            .await
+                    });
                     let response = request
                         .await
                         .map_err(|e| SessionSendFailure::Classified {
@@ -1178,7 +1180,7 @@ impl ConnectionManager {
                         .map_err(SessionSendFailure::Transport)?;
                     let ack = privchat_protocol::decode_message::<
                         privchat_protocol::protocol::PushMessageResponse,
-                    >(response.payload())
+                    >(&response)
                     .map_err(|e| SessionSendFailure::Classified {
                         classification: DeliveryFailureClassification::ProtocolAckMalformed,
                         detail: format!("invalid PushMessageResponse: {e}"),
