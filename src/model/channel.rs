@@ -64,9 +64,19 @@ impl ChannelType {
         }
     }
 
-    /// 转换为 i16
+    /// 转换为 i16（**DB 表示**：Direct=0, Group=1, Room=2）
     pub fn to_i16(self) -> i16 {
         self as i16
+    }
+
+    /// 转换为**线上（wire）表示**：Direct=1, Group=2, Room=3。
+    ///
+    /// DB 与 wire 的编号差 1，两者绝不能混用：把 DB 值当 wire 传下去时，
+    /// Group(DB 1) 会被读成 Direct(wire 1)、Room(DB 2) 会被读成 Group(wire 2)，
+    /// `message_repo` 的 channel-type 校验随即拒写（sync commit 静默失败，
+    /// 客户端收不到 revoke/reaction 更新）。任何需要 wire 值的地方都走这里。
+    pub fn to_wire_u8(self) -> u8 {
+        (self.to_i16() as u8) + 1
     }
 }
 
@@ -128,9 +138,19 @@ impl ChannelStatus {
         }
     }
 
-    /// 转换为 i16
+    /// 转换为 i16（**DB 表示**：Direct=0, Group=1, Room=2）
     pub fn to_i16(self) -> i16 {
         self as i16
+    }
+
+    /// 转换为**线上（wire）表示**：Direct=1, Group=2, Room=3。
+    ///
+    /// DB 与 wire 的编号差 1，两者绝不能混用：把 DB 值当 wire 传下去时，
+    /// Group(DB 1) 会被读成 Direct(wire 1)、Room(DB 2) 会被读成 Group(wire 2)，
+    /// `message_repo` 的 channel-type 校验随即拒写（sync commit 静默失败，
+    /// 客户端收不到 revoke/reaction 更新）。任何需要 wire 值的地方都走这里。
+    pub fn to_wire_u8(self) -> u8 {
+        (self.to_i16() as u8) + 1
     }
 }
 
@@ -162,9 +182,19 @@ impl MemberRole {
         }
     }
 
-    /// 转换为 i16
+    /// 转换为 i16（**DB 表示**：Direct=0, Group=1, Room=2）
     pub fn to_i16(self) -> i16 {
         self as i16
+    }
+
+    /// 转换为**线上（wire）表示**：Direct=1, Group=2, Room=3。
+    ///
+    /// DB 与 wire 的编号差 1，两者绝不能混用：把 DB 值当 wire 传下去时，
+    /// Group(DB 1) 会被读成 Direct(wire 1)、Room(DB 2) 会被读成 Group(wire 2)，
+    /// `message_repo` 的 channel-type 校验随即拒写（sync commit 静默失败，
+    /// 客户端收不到 revoke/reaction 更新）。任何需要 wire 值的地方都走这里。
+    pub fn to_wire_u8(self) -> u8 {
+        (self.to_i16() as u8) + 1
     }
 }
 

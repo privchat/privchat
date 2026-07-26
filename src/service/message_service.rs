@@ -514,15 +514,19 @@ impl MessageService {
             }
         }
 
-        // 解析 channel_type
+        // 解析 channel_type —— sync commit 要的是 **wire** 编号（Direct=1/
+        // Group=2/Room=3），不是 DB 编号（0/1/2）。此处曾直接把 DB 值当 wire 用
+        // （只把 0 特判成 1），于是 Group(DB 1) 被当成 Direct(wire 1)、
+        // Room(DB 2) 被当成 Group(wire 2)，revoke 的 pts commit 被
+        // message_repo 的类型校验拒写，只留一条 WARN——客户端因此永远收不到
+        // 撤回事件（私聊恰好因为 0→1 的特判而侥幸正确）。
         let channel_type = self
             .channel_service
             .get_channel(&channel_id)
             .await
             .ok()
-            .map(|ch| ch.channel_type.to_i16() as u8)
-            .unwrap_or(1);
-        let channel_type = if channel_type == 0 { 1 } else { channel_type };
+            .map(|ch| ch.channel_type.to_wire_u8())
+            .unwrap_or_else(|| crate::model::channel::ChannelType::Direct.to_wire_u8());
 
         // 4. 写 sync commit
         let revoke_ts_ms = Utc::now().timestamp_millis();
