@@ -137,8 +137,27 @@ impl PrivacyService {
         target_id: u64,
         source: UserDetailSource,
     ) -> Result<DetailAccessVerdict> {
+        // 本人查本人:无需任何来源。此前会走到下面的好友判定,得出「你不是你自己的好友」
+        // 而整体拒绝(生产实测 876 次/天),自查必须最先放行。
+        if searcher_id == target_id {
+            return Ok(DetailAccessVerdict {
+                is_friend: false,
+                can_add_friend: false,
+                deny_reason: Some("self"),
+                username_unlocked: true,
+            });
+        }
+
         // 好友是最高权限:来源无需再验,username 可见,不能重复添加。
-        if self.friend_service.is_friend(searcher_id, target_id).await {
+        //
+        // 必须用 try_is_friend:`is_friend` 内部 `unwrap_or(false)` 会把数据库错误吞成
+        // 「不是好友」,导致 DB 抖动期间好友被降级按来源校验(可能直接被拒)。权限判定
+        // 不能建立在「查不到就当没有」上。
+        if self
+            .friend_service
+            .try_is_friend(searcher_id, target_id)
+            .await?
+        {
             tracing::debug!("✅ 好友关系验证通过: {} -> {}", searcher_id, target_id);
             return Ok(DetailAccessVerdict {
                 is_friend: true,
@@ -149,6 +168,10 @@ impl PrivacyService {
         }
 
         match source {
+            // 客户端声称 self 但 searcher != target：来源不实（上面的 self 短路没命中）。
+            UserDetailSource::SelfProfile => Err(ServerError::Forbidden(
+                "Self source claimed but searcher is not the target".to_string(),
+            )),
             UserDetailSource::Search { search_session_id } => {
                 self.evaluate_search_source(searcher_id, target_id, search_session_id)
                     .await
@@ -178,21 +201,32 @@ impl PrivacyService {
                 })
             }
             UserDetailSource::Conversation { channel_id } => {
-                // 会话来源:能进入会话即有查看资格(既有语义)。加好友权限对
-                // 群会话套用 group 同款双闸(群聊 channel_id == group_id;DM 无
-                // policy 行,natural 放行)。
-                if let Ok(Some(policy)) = self.channel_service.get_group_policy(channel_id).await {
-                    if !policy.allow_member_add_friend {
-                        return Ok(DetailAccessVerdict::view_only("group_policy"));
-                    }
-                    let privacy = self
-                        .cache_manager
-                        .get_privacy_settings(target_id)
-                        .await?
-                        .unwrap_or_else(|| UserPrivacySettings::new(target_id));
-                    if !privacy.allow_add_by_group {
-                        return Ok(DetailAccessVerdict::view_only("personal_privacy"));
-                    }
+                // 来源真伪(PROFILE_VISIBILITY §2.5 表):**viewer ∈ channel ∧ target ∈ channel**。
+                // 此前这里完全没有成员校验,任何已认证用户传一个任意 channel_id 就能拿到
+                // 任意人的公开投影且 can_add_friend=true。
+                //
+                // 群会话直接**复用 group 来源的同一套判定**(evaluate_group_source):
+                // 双向成员校验 + 群策略 + 群主/管理员豁免 + 个人 allow_add_by_group。
+                // 两条路径共用一个函数,避免「同一个群、点进资料的入口不同结论不同」的漂移。
+                let channel = self.channel_service.get_channel(&channel_id).await?;
+                if channel.channel_type == crate::model::channel::ChannelType::Group {
+                    return self
+                        .evaluate_group_source(searcher_id, target_id, channel_id)
+                        .await;
+                }
+
+                // DM:双方即成员,校验后放行(DM 本就互通,不套群策略)。
+                if !channel.members.contains_key(&searcher_id) {
+                    return Err(ServerError::Forbidden(format!(
+                        "User {} is not a member of channel {}",
+                        searcher_id, channel_id
+                    )));
+                }
+                if !channel.members.contains_key(&target_id) {
+                    return Err(ServerError::Forbidden(format!(
+                        "User {} is not a member of channel {}",
+                        target_id, channel_id
+                    )));
                 }
                 Ok(DetailAccessVerdict::viewable_and_addable())
             }
@@ -445,4 +479,337 @@ pub struct PrivacySettingsUpdate {
     pub allow_search_by_qrcode: Option<bool>,
     pub allow_view_by_non_friend: Option<bool>,
     pub allow_receive_message_from_non_friend: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CacheConfig;
+    use crate::model::channel::{ChannelType, CreateChannelRequest};
+    use crate::repository::PgChannelRepository;
+    use crate::rpc::qr::generate_qr_key;
+    use sqlx::postgres::PgPoolOptions;
+
+    /// A1 验收门禁（PROFILE_VISIBILITY §2.5）。
+    ///
+    /// 背景：`conversation` 来源过去**完全没有成员校验**，任何已认证用户传一个任意
+    /// channel_id 就能拿到任意人的公开投影；而 `group` 来源一直是双向校验的。
+    /// 另外 self 查询会走到好友判定得出「你不是你自己的好友」而整体被拒。
+    /// 安全门禁不能靠「没数据库就跳过」显示绿色:CI 里设 `PRIVCHAT_REQUIRE_DB=1`,
+    /// 数据库不可用时**直接失败**,而不是静默 skip 出一个假绿。
+    async fn open_service() -> Option<PrivacyService> {
+        let require_db = std::env::var("PRIVCHAT_REQUIRE_DB").ok().as_deref() == Some("1");
+        let url = match std::env::var("PRIVCHAT_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+        {
+            Ok(u) => u,
+            Err(_) if require_db => {
+                panic!("PRIVCHAT_REQUIRE_DB=1 但没有配置 DATABASE_URL:权限门禁测试必须真跑")
+            }
+            Err(_) => return None,
+        };
+        let pool = match PgPoolOptions::new().max_connections(4).connect(&url).await {
+            Ok(p) => Arc::new(p),
+            Err(e) if require_db => panic!("PRIVCHAT_REQUIRE_DB=1 但连不上数据库: {e}"),
+            Err(_) => return None,
+        };
+        let cache = Arc::new(CacheManager::new(CacheConfig::default()).await.ok()?);
+        let channel_service = Arc::new(ChannelService::new_with_repository(Arc::new(
+            PgChannelRepository::new(pool.clone()),
+        )));
+        let friend_service = Arc::new(FriendService::new(pool));
+        Some(PrivacyService::new(cache, channel_service, friend_service))
+    }
+
+    /// 指向不存在的数据库：任何 DB 访问都会失败。用于证明权限判定**不会把数据库
+    /// 故障降级成「不是好友 / 没有权限」**。
+    async fn broken_service() -> PrivacyService {
+        let pool = Arc::new(
+            PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(std::time::Duration::from_millis(300))
+                .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nonexistent")
+                .expect("lazy pool"),
+        );
+        let cache = Arc::new(
+            CacheManager::new(CacheConfig::default())
+                .await
+                .expect("cache"),
+        );
+        let channel_service = Arc::new(ChannelService::new_with_repository(Arc::new(
+            PgChannelRepository::new(pool.clone()),
+        )));
+        let friend_service = Arc::new(FriendService::new(pool));
+        PrivacyService::new(cache, channel_service, friend_service)
+    }
+
+    async fn ensure_user(svc: &PrivacyService, user_id: u64, username: &str) {
+        let qr_key = generate_qr_key();
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+            VALUES ($1, $2, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(username)
+        .bind(&qr_key)
+        .execute(svc.channel_service.pool())
+        .await
+        .expect("ensure user");
+    }
+
+    async fn cleanup(svc: &PrivacyService, channel_id: u64, users: &[u64]) {
+        let _ = sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = $1")
+            .bind(channel_id as i64)
+            .execute(svc.channel_service.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(channel_id as i64)
+            .execute(svc.channel_service.pool())
+            .await;
+        for u in users {
+            let _ = sqlx::query("DELETE FROM privchat_users WHERE user_id = $1")
+                .bind(*u as i64)
+                .execute(svc.channel_service.pool())
+                .await;
+        }
+    }
+
+    async fn create_dm(svc: &PrivacyService, a: u64, b: u64) -> u64 {
+        let resp = svc
+            .channel_service
+            .create_channel(
+                a,
+                CreateChannelRequest {
+                    channel_type: ChannelType::Direct,
+                    name: None,
+                    description: None,
+                    member_ids: vec![b],
+                    is_public: None,
+                    max_members: None,
+                },
+            )
+            .await
+            .expect("create dm");
+        assert!(resp.success, "{:?}", resp.error);
+        resp.channel.id
+    }
+
+    #[tokio::test]
+    async fn self_lookup_is_allowed_without_any_source() {
+        let Some(svc) = open_service().await else {
+            eprintln!("skip: DATABASE_URL not configured");
+            return;
+        };
+        let uid = 940_101_u64;
+        ensure_user(&svc, uid, "privacy_self_940101").await;
+
+        // 传一个必然通不过真伪校验的来源，仍应因为「是本人」而放行。
+        let verdict = svc
+            .evaluate_detail_access(uid, uid, UserDetailSource::Friend { friend_id: Some(uid) })
+            .await
+            .expect("self lookup must not be denied");
+        assert!(verdict.username_unlocked, "本人可见自己的 username");
+        assert!(!verdict.can_add_friend, "不能加自己为好友");
+
+        cleanup(&svc, 0, &[uid]).await;
+    }
+
+    /// self 来源必须端到端可用:协议枚举 → RPC parser → 权限判定。
+    /// 第一版只在 service 层放行了本人,却给客户端造了一个协议根本不认的 "self" 字符串,
+    /// 请求会在 parser 就被打回 —— service 层单测绿不代表 RPC 通。
+    #[tokio::test]
+    async fn self_source_parses_and_only_works_for_the_owner() {
+        use privchat_protocol::rpc::account::user::DetailSourceType;
+        assert_eq!(
+            DetailSourceType::from_str("self"),
+            Some(DetailSourceType::SelfProfile),
+            "协议必须认识 self 来源"
+        );
+        assert_eq!(DetailSourceType::SelfProfile.as_str(), "self");
+
+        let Some(svc) = open_service().await else {
+            eprintln!("skip: DATABASE_URL not configured");
+            return;
+        };
+        let me = 940_601_u64;
+        let other = 940_602_u64;
+        ensure_user(&svc, me, "privacy_self_940601").await;
+        ensure_user(&svc, other, "privacy_self_940602").await;
+
+        svc.evaluate_detail_access(me, me, UserDetailSource::SelfProfile)
+            .await
+            .expect("本人用 self 来源必须放行");
+
+        // 冒用 self 去看别人:来源不实,拒绝。
+        let err = svc
+            .evaluate_detail_access(me, other, UserDetailSource::SelfProfile)
+            .await
+            .expect_err("self 来源不能用来看别人");
+        assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+
+        cleanup(&svc, 0, &[me, other]).await;
+    }
+
+    #[tokio::test]
+    async fn conversation_source_rejects_unknown_channel() {
+        let Some(svc) = open_service().await else {
+            eprintln!("skip: DATABASE_URL not configured");
+            return;
+        };
+        let a = 940_201_u64;
+        let b = 940_202_u64;
+        ensure_user(&svc, a, "privacy_conv_940201").await;
+        ensure_user(&svc, b, "privacy_conv_940202").await;
+
+        let err = svc
+            .evaluate_detail_access(
+                a,
+                b,
+                UserDetailSource::Conversation {
+                    channel_id: 949_999_999,
+                },
+            )
+            .await
+            .expect_err("伪造的 channel 必须被拒");
+        assert!(
+            matches!(err, ServerError::NotFound(_) | ServerError::Forbidden(_)),
+            "unexpected error: {err:?}"
+        );
+
+        cleanup(&svc, 0, &[a, b]).await;
+    }
+
+    #[tokio::test]
+    async fn conversation_source_requires_both_sides_to_be_members() {
+        let Some(svc) = open_service().await else {
+            eprintln!("skip: DATABASE_URL not configured");
+            return;
+        };
+        let a = 940_301_u64;
+        let b = 940_302_u64;
+        let outsider = 940_303_u64;
+        ensure_user(&svc, a, "privacy_conv_940301").await;
+        ensure_user(&svc, b, "privacy_conv_940302").await;
+        ensure_user(&svc, outsider, "privacy_conv_940303").await;
+        let channel_id = create_dm(&svc, a, b).await;
+
+        // viewer 在频道内、target 不在 → 拒绝
+        let err = svc
+            .evaluate_detail_access(a, outsider, UserDetailSource::Conversation { channel_id })
+            .await
+            .expect_err("target 不在频道必须被拒");
+        assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+
+        // target 在频道内、viewer 不在 → 拒绝（此前这条完全没人拦）
+        let err = svc
+            .evaluate_detail_access(outsider, b, UserDetailSource::Conversation { channel_id })
+            .await
+            .expect_err("viewer 不在频道必须被拒");
+        assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+
+        // 双方都是 DM 成员 → 放行
+        let verdict = svc
+            .evaluate_detail_access(a, b, UserDetailSource::Conversation { channel_id })
+            .await
+            .expect("DM 双方互查应放行");
+        assert!(!verdict.is_friend, "DM 成员不等于好友");
+
+        cleanup(&svc, channel_id, &[a, b, outsider]).await;
+    }
+
+    #[tokio::test]
+    async fn database_failure_is_not_downgraded_to_not_friend() {
+        let svc = broken_service().await;
+        // 好友表查不动时，绝不能得出「不是好友 → 来源不实 → Forbidden」这种把
+        // 基础设施故障说成权限问题的结论。
+        let err = svc
+            .evaluate_detail_access(940_401, 940_402, UserDetailSource::Friend { friend_id: None })
+            .await
+            .expect_err("DB 故障必须上抛");
+        assert!(
+            matches!(err, ServerError::Database(_)),
+            "expected Database error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_membership_pass_still_applies_group_and_privacy_gates() {
+        let Some(svc) = open_service().await else {
+            eprintln!("skip: DATABASE_URL not configured");
+            return;
+        };
+        let owner = 940_501_u64;
+        let member = 940_502_u64;
+        ensure_user(&svc, owner, "privacy_conv_940501").await;
+        ensure_user(&svc, member, "privacy_conv_940502").await;
+
+        let resp = svc
+            .channel_service
+            .create_channel(
+                owner,
+                CreateChannelRequest {
+                    channel_type: ChannelType::Group,
+                    name: Some("privacy-conv-group".to_string()),
+                    description: None,
+                    member_ids: vec![member],
+                    is_public: None,
+                    max_members: None,
+                },
+            )
+            .await
+            .expect("create group");
+        assert!(resp.success, "{:?}", resp.error);
+        let channel_id = resp.channel.id;
+
+        // 群成员互查:来源成立 → 可看公开投影。
+        let verdict = svc
+            .evaluate_detail_access(owner, member, UserDetailSource::Conversation { channel_id })
+            .await
+            .expect("群成员互查应放行");
+        assert!(verdict.can_add_friend, "默认群策略下允许加好友");
+
+        // 关掉「群成员互加好友」→ 仍可看资料,加好友能力按**群来源同一套规则**判定。
+        //
+        // ⚠️ 这里我第一版写错过:断言「owner 查 member 也不能加好友」。而
+        // evaluate_group_source 明确规定群主/管理员任一方**豁免**该策略,
+        // conversation 来源既然复用同一函数,就必须得出同样结论,否则同一个群
+        // 从会话进和从成员列表进会给出两种答案。
+        sqlx::query("UPDATE privchat_groups SET allow_member_add_friend = false WHERE group_id = $1")
+            .bind(channel_id as i64)
+            .execute(svc.channel_service.pool())
+            .await
+            .expect("tighten group policy");
+
+        let owner_view = svc
+            .evaluate_detail_access(owner, member, UserDetailSource::Conversation { channel_id })
+            .await
+            .expect("收紧策略后仍可查看公开投影");
+        assert!(
+            owner_view.can_add_friend,
+            "群主豁免 allow_member_add_friend(与 group 来源一致)",
+        );
+
+        // 两个普通成员之间才真正被策略挡住。
+        let plain = 940_503_u64;
+        ensure_user(&svc, plain, "privacy_conv_940503").await;
+        svc.channel_service
+            .add_member_to_group(channel_id, plain)
+            .await
+            .expect("add plain member");
+        let member_view = svc
+            .evaluate_detail_access(member, plain, UserDetailSource::Conversation { channel_id })
+            .await
+            .expect("普通成员互查仍可看公开投影");
+        assert!(!member_view.can_add_friend, "普通成员之间受群策略限制");
+        assert_eq!(member_view.deny_reason, Some("group_policy"));
+
+        let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
+            .bind(channel_id as i64)
+            .execute(svc.channel_service.pool())
+            .await;
+        cleanup(&svc, channel_id, &[owner, member, plain]).await;
+    }
 }
