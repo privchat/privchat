@@ -118,6 +118,9 @@ pub enum UserDetailSource {
     /// 临时会话来源（聊天界面查看对方资料）
     /// source_id: channel_id
     Conversation { channel_id: u64 },
+
+    /// 本人查本人（我的资料页 / 资料变更后刷新）。无需任何外部来源。
+    SelfProfile,
 }
 
 /// 搜索记录

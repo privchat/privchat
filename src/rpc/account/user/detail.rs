@@ -48,7 +48,7 @@ pub async fn handle(
     // 使用协议层枚举解析来源类型
     let source_type = DetailSourceType::from_str(source_str).ok_or_else(|| {
         RpcError::validation(format!(
-            "Invalid source type: {}. Must be one of: search, group, friend, card_share, friend_pending, conversation",
+            "Invalid source type: {}. Must be one of: search, group, friend, card_share, friend_pending, conversation, self",
             source_str
         ))
     })?;
@@ -88,6 +88,9 @@ pub async fn handle(
                 .map_err(|_| RpcError::validation(format!("Invalid channel_id: {}", source_id)))?;
             UserDetailSource::Conversation { channel_id }
         }
+        // 本人查本人：source_id 不参与判定（真伪由 ctx 里的 searcher_id 与 target 相等决定，
+        // 客户端说了不算）。
+        DetailSourceType::SelfProfile => UserDetailSource::SelfProfile,
     };
 
     // 验证访问权限 + 取加好友判定(PROFILE_VISIBILITY §2.5:查看与添加分离)

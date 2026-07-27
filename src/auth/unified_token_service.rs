@@ -353,14 +353,17 @@ impl UnifiedTokenService {
                     kid: self.rsa.kid().to_string(),
                 })
             }
-            SessionVerifyResult::DeviceNotFound => {
-                Err(ServerError::Unauthorized("设备不存在".to_string()))
-            }
-            SessionVerifyResult::SessionInactive { message, .. } => Err(ServerError::Unauthorized(
-                format!("设备会话已失效: {}", message),
+            SessionVerifyResult::DeviceNotFound => Err(ServerError::Unauthorized(
+                "REFRESH_SESSION_INVALID: 设备不存在".to_string(),
             )),
+            SessionVerifyResult::SessionInactive { message, .. } => Err(ServerError::Unauthorized(
+                format!("REFRESH_SESSION_INVALID: 设备会话已失效: {}", message),
+            )),
+            // 前缀是给上游 application 用的**可判别标记**:刷新失效(用户需重新登录)
+            // 必须能与「服务凭证配错」(运维故障,绝不能踢所有用户下线)区分开。
+            // ServerError::Unauthorized 统一映射成 AuthRequired(10000),仅凭 code 分不出来。
             SessionVerifyResult::VersionMismatch { .. } => Err(ServerError::Unauthorized(
-                "session_version 已 bump，refresh 已失效".to_string(),
+                "REFRESH_SESSION_INVALID: session_version 已 bump，refresh 已失效".to_string(),
             )),
         }
     }

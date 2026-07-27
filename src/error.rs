@@ -186,7 +186,7 @@ impl ServerError {
             ServerError::InvalidToken => P::InvalidToken,
             ServerError::TokenExpired => P::TokenExpired,
             ServerError::TokenRevoked => P::TokenRevoked,
-            ServerError::Unauthorized(_) => P::AuthRequired,
+            ServerError::Unauthorized(msg) => subcode_from_message(msg).unwrap_or(P::AuthRequired),
             ServerError::Protocol(_) => P::ProtocolError,
             ServerError::BadRequest(_) => P::InvalidParams,
             ServerError::NotFound(msg) => subcode_from_message(msg).unwrap_or(P::ResourceNotFound),
@@ -252,7 +252,12 @@ fn subcode_from_message(msg: &str) -> Option<privchat_protocol::ErrorCode> {
         .or_else(|| msg.strip_prefix("Not found: "))
         .or_else(|| msg.strip_prefix("Duplicate entry: "))
         .unwrap_or(msg);
-    if trimmed.starts_with("INVALID_USER_IDENTITY") {
+    if trimmed.starts_with("REFRESH_SESSION_INVALID") {
+        // 刷新会话失效(session_version bump / 设备会话失效 / 设备不存在):
+        // 上游据此让**该用户**重新登录。与「服务凭证配错」(仍是 AuthRequired)分开,
+        // 后者是运维故障,绝不能触发全量客户端登出。
+        Some(P::RefreshTokenExpired)
+    } else if trimmed.starts_with("INVALID_USER_IDENTITY") {
         Some(P::MissingRequiredParam)
     } else if trimmed.starts_with("INVALID_PHONE_FORMAT") {
         Some(P::InvalidFormat)
@@ -454,5 +459,31 @@ impl ErrorResponse {
             details: Some(details),
             timestamp: chrono::Utc::now().timestamp() as u64,
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_subcode_tests {
+    use super::*;
+    use privchat_protocol::ErrorCode as P;
+
+    /// 刷新会话失效必须携带可判别的协议码。
+    ///
+    /// 背景:application 侧把「refresh 失效」映射成 401 让用户重新登录。若服务凭证
+    /// (X-Service-Key)配错也返回同一个 AuthRequired,一次运维失误就会把**全部客户端**
+    /// 踢下线。两者必须在协议码上分开。
+    #[test]
+    fn refresh_session_invalid_maps_to_refresh_token_expired() {
+        let e = ServerError::Unauthorized(
+            "REFRESH_SESSION_INVALID: session_version 已 bump，refresh 已失效".to_string(),
+        );
+        assert_eq!(e.protocol_code(), P::RefreshTokenExpired);
+    }
+
+    #[test]
+    fn plain_unauthorized_stays_auth_required() {
+        // 服务凭证缺失/无效走这条:仍是 AuthRequired,上游据此判定为服务端故障而非用户失效。
+        let e = ServerError::Unauthorized("缺少 X-Service-Key 请求头".to_string());
+        assert_eq!(e.protocol_code(), P::AuthRequired);
     }
 }
