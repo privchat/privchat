@@ -109,7 +109,7 @@ pub async fn handle(
                 continue;
             }
 
-            let options = msgtrans::TransportOptions::new()
+            let options = msgtrans::SendOptions::new()
                 .biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
             match server
                 .send_with_options(sid.clone(), payload_bytes.clone().into(), options)

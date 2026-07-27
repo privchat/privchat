@@ -262,7 +262,7 @@ impl PresenceService {
 
             let mut delivered = 0usize;
             for session_id in sessions {
-                let options = msgtrans::TransportOptions::new()
+                let options = msgtrans::SendOptions::new()
                     .biz_type(MessageType::PublishRequest as u8);
                 match server
                     .send_with_options(session_id.clone(), encoded.clone().into(), options)
@@ -338,7 +338,7 @@ impl PresenceService {
                 continue;
             };
             let options =
-                msgtrans::TransportOptions::new().biz_type(MessageType::PublishRequest as u8);
+                msgtrans::SendOptions::new().biz_type(MessageType::PublishRequest as u8);
             if let Err(e) = server
                 .send_with_options(session_id, encoded.into(), options)
                 .await {

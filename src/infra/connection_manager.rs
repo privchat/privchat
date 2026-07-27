@@ -1152,7 +1152,7 @@ impl ConnectionManager {
                             .send_with_options(
                                 session_id,
                                 payload.into(),
-                                msgtrans::TransportOptions::new().biz_type(biz_type),
+                                msgtrans::SendOptions::new().biz_type(biz_type),
                             )
                             .await
                             .map(|_| false)
@@ -1162,7 +1162,7 @@ impl ConnectionManager {
                     // transport (per session, strictly monotonic, never reused),
                     // so requests are built through options rather than by
                     // handing in a pre-numbered Packet.
-                    let options = msgtrans::TransportOptions::new().biz_type(biz_type);
+                    let options = msgtrans::RequestOptions::new().biz_type(biz_type);
 
                     // msgtrans owns request-tracker cleanup on its 10s timeout. Run
                     // it in a detached task so our stricter 5s route deadline can
@@ -1314,7 +1314,7 @@ impl ConnectionManager {
         };
         let payload = privchat_protocol::encode_message(message)
             .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
-        let options = msgtrans::TransportOptions::new()
+        let options = msgtrans::SendOptions::new()
             .biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
         match server
             .send_with_options(session_id, payload.into(), options)
