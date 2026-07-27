@@ -1093,11 +1093,12 @@ async fn room_broadcast(
             let server = server.clone();
             let bytes = payload_bytes.clone();
             async move {
-                let mut packet =
-                    msgtrans::Packet::one_way(crate::infra::next_packet_id(), (*bytes).clone());
-                packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
-                match server.send_to_session(sid.clone(), packet).await {
-                    Ok(()) => {
+                let options = msgtrans::TransportOptions::new()
+                    .biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
+                match server
+                    .send_with_options(sid.clone(), (*bytes).clone().into(), options)
+                    .await {
+                    Ok(_) => {
                         debug!("📡 Room publish -> session {} 成功", sid);
                         true
                     }

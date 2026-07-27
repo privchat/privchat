@@ -265,11 +265,12 @@ impl TransferSendBackend for DefaultTransferSendBackend {
 
         let mut delivered = 0usize;
         for sid in target_sessions {
-            let mut packet =
-                msgtrans::Packet::one_way(crate::infra::next_packet_id(), encoded_packet.to_vec());
-            packet.set_biz_type(privchat_protocol::protocol::MessageType::TransferRequest as u8);
-            match server.send_to_session(sid, packet).await {
-                Ok(()) => delivered += 1,
+            let options = msgtrans::TransportOptions::new()
+                .biz_type(privchat_protocol::protocol::MessageType::TransferRequest as u8);
+            match server
+                .send_with_options(sid, encoded_packet.to_vec().into(), options)
+                .await {
+                Ok(_) => delivered += 1,
                 Err(e) => {
                     warn!(
                         "TransferSend: send_to_session failed user={} sid={} err={}",

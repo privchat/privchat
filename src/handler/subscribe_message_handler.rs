@@ -114,12 +114,15 @@ impl SubscribeMessageHandler {
                 }
             };
 
-            let mut packet =
-                msgtrans::Packet::one_way(crate::infra::next_packet_id(), payload_bytes);
-            packet.set_biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
+            // msgtrans 2.0: one-way sends take payload + options and the
+            // transport assigns the id (no caller-numbered packets on the wire).
+            let options = msgtrans::TransportOptions::new()
+                .biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
 
-            let send_ok = match server.send_to_session(session_id.clone(), packet).await {
-                Ok(()) => true,
+            let send_ok = match server
+                .send_with_options(session_id.clone(), payload_bytes.into(), options)
+                .await {
+                Ok(_) => true,
                 Err(e) => {
                     warn!(
                         "⚠️ SubscribeMessageHandler: 回放 Room 历史失败 channel_id={}, session={}, error={}",
