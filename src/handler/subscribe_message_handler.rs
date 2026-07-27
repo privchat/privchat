@@ -116,7 +116,7 @@ impl SubscribeMessageHandler {
 
             // msgtrans 2.0: one-way sends take payload + options and the
             // transport assigns the id (no caller-numbered packets on the wire).
-            let options = msgtrans::TransportOptions::new()
+            let options = msgtrans::SendOptions::new()
                 .biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
 
             let send_ok = match server

@@ -265,7 +265,7 @@ impl TransferSendBackend for DefaultTransferSendBackend {
 
         let mut delivered = 0usize;
         for sid in target_sessions {
-            let options = msgtrans::TransportOptions::new()
+            let options = msgtrans::SendOptions::new()
                 .biz_type(privchat_protocol::protocol::MessageType::TransferRequest as u8);
             match server
                 .send_with_options(sid, encoded_packet.to_vec().into(), options)

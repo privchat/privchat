@@ -49,7 +49,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use msgtrans::ClientEvent;
 use msgtrans::TransportClientBuilder;
-use msgtrans::TransportOptions;
+use msgtrans::RequestOptions;
 use msgtrans::WebSocketClientConfig;
 use privchat_protocol::decode_message;
 use privchat_protocol::protocol::{MessageType, RpcRequest, RpcResponse};
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 事件流是单消费者、只能取一次；在 request() 之前取走，避免漏掉早到的 push
     let mut events = client.events().await?;
 
-    let opt = TransportOptions::new()
+    let opt = RequestOptions::new()
         .biz_type(MessageType::RpcRequest as u8)
         .timeout(Duration::from_secs(15));
     let raw = client

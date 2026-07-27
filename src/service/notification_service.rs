@@ -62,7 +62,7 @@ impl NotificationService {
             .map_err(|e| ServerError::Protocol(format!("编码 PushMessageRequest 失败: {}", e)))?;
 
         let options =
-            msgtrans::TransportOptions::new().biz_type(MessageType::PushMessageRequest as u8);
+            msgtrans::SendOptions::new().biz_type(MessageType::PushMessageRequest as u8);
         transport
             .send_with_options(session_id.clone(), recv_data.into(), options)
             .await

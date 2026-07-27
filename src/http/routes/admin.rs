@@ -1093,7 +1093,7 @@ async fn room_broadcast(
             let server = server.clone();
             let bytes = payload_bytes.clone();
             async move {
-                let options = msgtrans::TransportOptions::new()
+                let options = msgtrans::SendOptions::new()
                     .biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
                 match server
                     .send_with_options(sid.clone(), (*bytes).clone().into(), options)
