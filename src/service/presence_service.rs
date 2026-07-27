@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use msgtrans::{Packet, SessionId};
+use msgtrans::SessionId;
 #[cfg(test)]
 use sqlx::postgres::PgPoolOptions;
 #[cfg(test)]
@@ -262,10 +262,12 @@ impl PresenceService {
 
             let mut delivered = 0usize;
             for session_id in sessions {
-                let mut packet = Packet::one_way(crate::infra::next_packet_id(), encoded.clone());
-                packet.set_biz_type(MessageType::PublishRequest as u8);
-                match server.send_to_session(session_id.clone(), packet).await {
-                    Ok(()) => delivered += 1,
+                let options = msgtrans::TransportOptions::new()
+                    .biz_type(MessageType::PublishRequest as u8);
+                match server
+                    .send_with_options(session_id.clone(), encoded.clone().into(), options)
+                    .await {
+                    Ok(_) => delivered += 1,
                     Err(e) => {
                         warn!(
                             "⚠️ PresenceService: failed to publish presence_changed to session {} for channel {}: {}",
@@ -335,9 +337,11 @@ impl PresenceService {
             let Ok(encoded) = privchat_protocol::encode_message(&publish_request) else {
                 continue;
             };
-            let mut packet = Packet::one_way(crate::infra::next_packet_id(), encoded);
-            packet.set_biz_type(MessageType::PublishRequest as u8);
-            if let Err(e) = server.send_to_session(session_id, packet).await {
+            let options =
+                msgtrans::TransportOptions::new().biz_type(MessageType::PublishRequest as u8);
+            if let Err(e) = server
+                .send_with_options(session_id, encoded.into(), options)
+                .await {
                 warn!(
                     "⚠️ PresenceService: push initial presence to session {} failed: {}",
                     session_id, e

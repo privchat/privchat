@@ -61,10 +61,10 @@ impl NotificationService {
         let recv_data = privchat_protocol::encode_message(message)
             .map_err(|e| ServerError::Protocol(format!("编码 PushMessageRequest 失败: {}", e)))?;
 
-        let mut packet = msgtrans::Packet::one_way(crate::infra::next_packet_id(), recv_data);
-        packet.set_biz_type(MessageType::PushMessageRequest as u8);
+        let options =
+            msgtrans::TransportOptions::new().biz_type(MessageType::PushMessageRequest as u8);
         transport
-            .send_to_session(session_id.clone(), packet)
+            .send_with_options(session_id.clone(), recv_data.into(), options)
             .await
             .map_err(|e| ServerError::Internal(format!("发送 PushMessageRequest 失败: {}", e)))?;
 

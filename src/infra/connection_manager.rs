@@ -1148,11 +1148,12 @@ impl ConnectionManager {
                     let biz_type =
                         privchat_protocol::protocol::MessageType::PushMessageRequest as u8;
                     if !receipt_required {
-                        let packet_id = crate::infra::next_packet_id();
-                        let mut packet = msgtrans::Packet::one_way(packet_id, payload);
-                        packet.set_biz_type(biz_type);
                         return server
-                            .send_to_session(session_id, packet)
+                            .send_with_options(
+                                session_id,
+                                payload.into(),
+                                msgtrans::TransportOptions::new().biz_type(biz_type),
+                            )
                             .await
                             .map(|_| false)
                             .map_err(SessionSendFailure::Transport);
@@ -1313,10 +1314,13 @@ impl ConnectionManager {
         };
         let payload = privchat_protocol::encode_message(message)
             .map_err(|e| anyhow::anyhow!("encode PushMessageRequest failed: {}", e))?;
-        let mut packet = msgtrans::Packet::one_way(crate::infra::next_packet_id(), payload);
-        packet.set_biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
-        match server.send_to_session(session_id, packet).await {
-            Ok(()) => Ok(1),
+        let options = msgtrans::TransportOptions::new()
+            .biz_type(privchat_protocol::protocol::MessageType::PushMessageRequest as u8);
+        match server
+            .send_with_options(session_id, payload.into(), options)
+            .await
+        {
+            Ok(_) => Ok(1),
             Err(e) => {
                 warn!(
                     "⚠️ ConnectionManager: 单点推送失败 sid={} server_message_id={} err={}",
