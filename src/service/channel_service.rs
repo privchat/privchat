@@ -2328,6 +2328,7 @@ impl ChannelService {
             group_avatar_url: Option<String>,
             peer_display_name: Option<String>,
             peer_username: Option<String>,
+            peer_avatar_url: Option<String>,
             unread_count: i32,
             is_pinned: bool,
             is_muted: bool,
@@ -2377,6 +2378,7 @@ impl ChannelService {
                 g.avatar_url AS group_avatar_url,
                 pu.display_name AS peer_display_name,
                 pu.username AS peer_username,
+                pu.avatar_url AS peer_avatar_url,
                 uc.unread_count,
                 uc.is_pinned,
                 uc.is_muted,
@@ -2442,17 +2444,25 @@ impl ChannelService {
                 } else {
                     None
                 };
+                // 会话列表实体必须自包含：带齐渲染该行所需的名称与头像
+                // （spec SDK_SYNC_RESUME_SPEC §自包含列表投影）。这样客户端 Phase 2
+                // 拿到 channel 增量就能直接渲染，不必再为每个新会话补一次 user。
                 let channel_name = if channel_type_enum == ChannelType::Direct {
-                    // DM 名下发对端显示名(display_name > username);两者皆空才回退
-                    // uid 字符串——否则新登录设备在 user 资料同步到达前会一直显示裸 id。
+                    // 只用真实身份。**不回退 uid**：原来那句注释说回退是为了避免
+                    // 「显示裸 id」，做法却正是显示裸 id。名字缺失时留空，由客户端
+                    // 显示 typed loading —— 宁可显示「加载中」也不显示一串数字。
                     row.peer_display_name
                         .clone()
                         .filter(|v| !v.is_empty())
                         .or_else(|| row.peer_username.clone().filter(|v| !v.is_empty()))
-                        .or_else(|| peer_user_id.map(|uid| uid.to_string()))
                         .unwrap_or_default()
                 } else {
                     row.group_name.clone().unwrap_or_default()
+                };
+                let channel_avatar = if channel_type_enum == ChannelType::Direct {
+                    row.peer_avatar_url.clone().unwrap_or_default()
+                } else {
+                    row.group_avatar_url.clone().unwrap_or_default()
                 };
 
                 // Conversation preview content is a client-side projection of
@@ -2471,7 +2481,7 @@ impl ChannelService {
                     type_field: Some(channel_type),
                     channel_name: Some(channel_name.clone()),
                     name: Some(channel_name),
-                    avatar: Some(row.group_avatar_url.clone().unwrap_or_default()),
+                    avatar: Some(channel_avatar),
                     unread_count: Some(row.unread_count),
                     last_msg_content: Some(String::new()),
                     last_msg_timestamp: Some(last_msg_timestamp),
