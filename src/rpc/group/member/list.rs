@@ -16,9 +16,29 @@
 // limitations under the License.
 
 use crate::rpc::error::{RpcError, RpcResult};
-use crate::rpc::{helpers, RpcServiceContext};
-use privchat_protocol::rpc::group::member::GroupMemberListRequest;
-use serde_json::{json, Value};
+use crate::rpc::RpcServiceContext;
+use privchat_protocol::rpc::group::member::{
+    GroupMemberInfo, GroupMemberListRequest, GroupMemberListResponse,
+};
+use serde_json::Value;
+use std::collections::HashMap;
+
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn resolve_display_name(
+    alias: Option<&str>,
+    nickname: Option<&str>,
+    visible_username: Option<&str>,
+    user_id: u64,
+) -> String {
+    non_blank(alias)
+        .or_else(|| non_blank(nickname))
+        .or_else(|| non_blank(visible_username))
+        .map(str::to_owned)
+        .unwrap_or_else(|| user_id.to_string())
+}
 
 /// 处理 群成员列表 请求
 pub async fn handle(
@@ -44,45 +64,97 @@ pub async fn handle(
         .await
     {
         Ok(members) => {
-            // 获取成员详细信息（从数据库读取）
-            let mut member_list = Vec::new();
-            for member in members {
-                if let Ok(Some(profile)) = helpers::get_user_profile_with_fallback(
-                    member.user_id,
-                    &services.user_repository,
-                    &services.cache_manager,
-                )
+            let user_ids = members
+                .iter()
+                .map(|member| member.user_id)
+                .collect::<Vec<_>>();
+            let profiles = services
+                .user_repository
+                .find_group_member_projections(&user_ids)
                 .await
-                {
-                    member_list.push(json!({
-                        "user_id": member.user_id,
-                        // PROFILE_VISIBILITY:批量面恒公开投影,username 仅本人
-                        // 行保留(好友的 username 由 friend 实体同步携带)。
-                        "username": if member.user_id == request.user_id { profile.username.clone() } else { String::new() },
-                        "nickname": profile.nickname, // 昵称
-                        "avatar_url": profile.avatar_url, // 头像
-                        // 稳定小写角色契约("owner"/"admin"/"member")——Debug 格式首字母
-                        // 大写曾导致 web/h5 权限判定全挂(canManage 恒 false)。
-                        "role": format!("{:?}", member.role).to_lowercase(),
-                        "joined_at": member.joined_at.timestamp_millis(),
-                        "is_muted": member.is_muted,
-                    }));
-                }
-            }
+                .map_err(|e| RpcError::internal(format!("批量读取群成员资料失败: {e}")))?;
+            let profiles = profiles
+                .into_iter()
+                .map(|profile| (profile.user_id as u64, profile))
+                .collect::<HashMap<_, _>>();
+
+            // Always preserve roster cardinality. A missing user projection is
+            // represented by the privacy-safe uid fallback, not by dropping the member.
+            let member_list = members
+                .into_iter()
+                .map(|member| {
+                    let profile = profiles.get(&member.user_id);
+                    let alias = non_blank(member.display_name.as_deref()).map(str::to_owned);
+                    let nickname = profile
+                        .and_then(|profile| non_blank(profile.display_name.as_deref()))
+                        .unwrap_or_default()
+                        .to_owned();
+                    // PROFILE_VISIBILITY: username remains visible only to the user themself.
+                    let username = if member.user_id == request.user_id {
+                        profile
+                            .and_then(|profile| non_blank(profile.username.as_deref()))
+                            .unwrap_or_default()
+                            .to_owned()
+                    } else {
+                        String::new()
+                    };
+                    GroupMemberInfo {
+                        user_id: member.user_id,
+                        display_name: resolve_display_name(
+                            alias.as_deref(),
+                            Some(&nickname),
+                            Some(&username),
+                            member.user_id,
+                        ),
+                        alias,
+                        username,
+                        nickname,
+                        avatar_url: profile.and_then(|profile| profile.avatar_url.clone()),
+                        user_type: profile.map(|profile| profile.user_type).unwrap_or_default(),
+                        // Stable lowercase role contract for every client permission gate.
+                        role: format!("{:?}", member.role).to_lowercase(),
+                        joined_at: member.joined_at.timestamp_millis().max(0) as u64,
+                        is_muted: member.is_muted,
+                    }
+                })
+                .collect::<Vec<_>>();
 
             tracing::debug!(
                 "✅ 获取群成员列表成功: {} 有 {} 个成员",
                 group_id,
                 member_list.len()
             );
-            Ok(json!({
-                "members": member_list,
-                "total": member_list.len(),
-            }))
+            serde_json::to_value(GroupMemberListResponse {
+                total: member_list.len(),
+                members: member_list,
+            })
+            .map_err(|e| RpcError::internal(format!("序列化群成员列表失败: {e}")))
         }
         Err(e) => {
             tracing::error!("❌ 获取群成员列表失败: {}", e);
             Err(RpcError::internal(format!("获取群成员列表失败: {}", e)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_display_name;
+
+    #[test]
+    fn display_name_uses_the_frozen_priority_without_exposing_hidden_username() {
+        assert_eq!(
+            resolve_display_name(Some(" group alias "), Some("nickname"), Some("username"), 7),
+            "group alias"
+        );
+        assert_eq!(
+            resolve_display_name(None, Some("nickname"), None, 7),
+            "nickname"
+        );
+        assert_eq!(
+            resolve_display_name(None, None, Some("username"), 7),
+            "username"
+        );
+        assert_eq!(resolve_display_name(None, None, None, 7), "7");
     }
 }

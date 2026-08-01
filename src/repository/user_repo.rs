@@ -34,6 +34,15 @@ pub struct RelatedUserSyncEntry {
     pub sync_version: u64,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GroupMemberUserProjection {
+    pub user_id: i64,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub user_type: i16,
+}
+
 impl UserRepository {
     /// 创建新的用户仓库
     pub fn new(pool: Arc<PgPool>) -> Self {
@@ -106,6 +115,36 @@ impl UserRepository {
             ))),
             None => Ok(None),
         }
+    }
+
+    /// Batch profile projection for a group roster. One roster request must not
+    /// degrade into one database query per member.
+    pub async fn find_group_member_projections(
+        &self,
+        user_ids: &[u64],
+    ) -> Result<Vec<GroupMemberUserProjection>, DatabaseError> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = user_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+        sqlx::query_as::<_, GroupMemberUserProjection>(
+            r#"
+            SELECT
+                user_id,
+                username,
+                display_name,
+                avatar_url,
+                COALESCE(user_type, 0) AS user_type
+            FROM privchat_users
+            WHERE user_id = ANY($1::BIGINT[])
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| {
+            DatabaseError::Database(format!("Failed to batch query group member profiles: {e}"))
+        })
     }
 
     /// 根据用户名查找用户
