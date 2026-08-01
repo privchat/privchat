@@ -134,7 +134,10 @@ impl UserRepository {
                 username,
                 display_name,
                 avatar_url,
-                COALESCE(user_type, 0) AS user_type
+                -- 字面量必须同型：`0` 是 INT4，会把 smallint 列的结果类型抬成 INT4，
+                -- 而 sqlx 按声明的 i16 解码 → 运行期 decode 失败。编译和单测都看不见
+                -- 这个提升（它发生在 Postgres 侧），只有连真实库才会炸。
+                COALESCE(user_type, 0::SMALLINT) AS user_type
             FROM privchat_users
             WHERE user_id = ANY($1::BIGINT[])
             "#,
