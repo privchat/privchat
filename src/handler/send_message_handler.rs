@@ -1368,10 +1368,13 @@ impl MessageHandler for SendMessageHandler {
                     "❌ SendMessageHandler: 事务化保存消息失败 channel_id={} user={} local_message_id={}: {}",
                     channel_id, from_uid, send_message_request.local_message_id, e
                 );
+                // 用 e 自己的码，别一律按 DatabaseError 报。事务里出的不一定是数据库故障：
+                // 附件引用不可用之类的终局判定也从这里出来，硬编码成 DatabaseError(7)
+                // 会把它送进客户端的**可重试**段——消息于是每十几秒重试一次、永远不失败。
                 return self
                     .create_error_response(
                         &send_message_request,
-                        ErrorCode::DatabaseError,
+                        e.protocol_code(),
                         &format!("保存消息失败: {}", e),
                     )
                     .await;
