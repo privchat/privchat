@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 
 use crate::error::{Result, ServerError};
 use crate::model::channel::{
-    Channel, ChannelListResponse, ChannelMember, ChannelResponse, ChannelStatus, ChannelType,
+    Channel, ChannelListResponse, ChannelResponse, ChannelStatus, ChannelType,
     CreateChannelRequest, MemberRole,
 };
 use crate::repository::{ChannelRepository, PgChannelRepository};
@@ -1974,11 +1974,12 @@ impl ChannelService {
                 // 将参与者添加到会话成员中
                 let mut conv_with_members = conv.clone();
                 for participant in participants {
-                    // 直接使用 participant 的 user_id (u64) 创建 ChannelMember
-                    let member = ChannelMember::new(participant.user_id, participant.role);
+                    // 用 to_channel_member() 而不是 ChannelMember::new()：后者把 joined_at
+                    // 打成 Utc::now()，于是每次重启后全群的入群时间都变成「服务启动那一刻」，
+                    // 依赖入群顺序的东西（成员排序、群头像九宫格）跟着一起错。
                     conv_with_members
                         .members
-                        .insert(participant.user_id, member);
+                        .insert(participant.user_id, participant.to_channel_member());
                 }
 
                 // P1-16 hydration：恢复只带基础行 + 成员 role 时，群名/群策略/成员禁言
@@ -2019,6 +2020,52 @@ impl ChannelService {
                         Err(e) => {
                             warn!(
                                 "hydrate group policy failed: group_id={} err={}",
+                                group_id, e
+                            )
+                        }
+                    }
+                    // 成员角色（privchat_group_members.role，建群/转让/设管理员的落库真源）。
+                    //
+                    // 群角色有两份存储：`privchat_group_members`（真源，所有写入路径都改它）
+                    // 与 `privchat_channel_participants`（投递用的镜像）。而**读**的一侧——
+                    // 成员列表 RPC 和每一处「是不是群主/管理员」的鉴权——走的都是这里 hydrate
+                    // 出来的 `channel.members`，即镜像。镜像一旦漂移，群主在所有端上既看不到
+                    // 管理入口、调 API 也会被 403，且没有任何报错能提示原因。
+                    // 生产上两个最大的群（807 人 / 622 人）正是这么废掉的。
+                    //
+                    // 以真源覆盖镜像，drift 在每次 hydrate 时自愈。
+                    match sqlx::query_as::<_, (i64, i16)>(
+                        "SELECT user_id, role FROM privchat_group_members \
+                         WHERE group_id = $1 AND left_at IS NULL",
+                    )
+                    .bind(group_id as i64)
+                    .fetch_all(self.pool())
+                    .await
+                    {
+                        Ok(rows) => {
+                            let truth = rows
+                                .into_iter()
+                                .map(|(uid, role)| {
+                                    (
+                                        uid as u64,
+                                        crate::model::channel::MemberRole::from_i16(role),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let repaired = crate::model::channel::apply_group_role_truth(
+                                &mut conv_with_members.members,
+                                &truth,
+                            );
+                            if repaired > 0 {
+                                warn!(
+                                    "group role drift repaired: group_id={} members={}",
+                                    group_id, repaired
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "hydrate member roles failed: group_id={} err={}",
                                 group_id, e
                             )
                         }

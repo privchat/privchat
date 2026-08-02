@@ -367,6 +367,30 @@ pub fn mute_is_active(
     is_muted && mute_until.map_or(true, |u| u > now)
 }
 
+/// 用群成员表（真源）里的角色覆盖投递镜像 hydrate 出来的角色，返回被修正的条目数。
+///
+/// 群角色写在 `privchat_group_members`，但**读**的一侧（成员列表 RPC + 每一处
+/// 「是不是群主/管理员」的鉴权）走的是 `privchat_channel_participants` 这份投递镜像。
+/// 两者一旦漂移，群主就会在所有端上既看不到管理入口、调 API 也被 403，而且没有任何
+/// 报错指向原因——生产上两个最大的群就是这么废掉的。真源覆盖镜像使漂移在 hydrate 时自愈。
+///
+/// 只覆盖两边都存在的成员：镜像里有而真源没有的（历史脏数据）保持原样，不在这里删人。
+pub fn apply_group_role_truth(
+    members: &mut HashMap<u64, ChannelMember>,
+    truth: &[(u64, MemberRole)],
+) -> usize {
+    let mut repaired = 0;
+    for (user_id, role) in truth {
+        if let Some(member) = members.get_mut(user_id) {
+            if member.role != *role {
+                member.role = *role;
+                repaired += 1;
+            }
+        }
+    }
+    repaired
+}
+
 /// 被禁言时的拒绝提示：区分「永久」与「剩余时长」（对标 QQ/Telegram 体验）。
 pub fn mute_reject_message(mute_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     const PERMANENT_THRESHOLD_SECS: i64 = 50 * 365 * 86_400; // rpc 层「永久」= now+100 年
@@ -1431,6 +1455,68 @@ mod tests {
 
         // 不能添加重复成员
         assert!(conv.add_member(2, None).is_err());
+    }
+
+    /// 生产事故的最小复现：投递镜像把群主记成了普通成员。
+    ///
+    /// 复现的是 807 人 / 622 人两个大群的真实形状——`privchat_group_members` 里
+    /// role=Owner，`privchat_channel_participants` 里 role=Member。修复前，鉴权和
+    /// 成员列表读的都是镜像，群主既看不到管理入口、调 API 也被 403。
+    #[test]
+    fn group_role_truth_overrides_a_mirror_that_demoted_the_owner() {
+        let mut members = HashMap::new();
+        members.insert(7, ChannelMember::new(7, MemberRole::Member)); // 镜像：群主被记成普通成员
+        members.insert(8, ChannelMember::new(8, MemberRole::Member));
+
+        let repaired = apply_group_role_truth(
+            &mut members,
+            &[(7, MemberRole::Owner), (8, MemberRole::Member)],
+        );
+
+        assert_eq!(repaired, 1, "只有漂移的那一条算修复");
+        assert_eq!(
+            members.get(&7).unwrap().role,
+            MemberRole::Owner,
+            "真源说他是群主，就必须是群主——否则管理入口和鉴权一起废掉",
+        );
+        assert_eq!(members.get(&8).unwrap().role, MemberRole::Member);
+    }
+
+    #[test]
+    fn group_role_truth_does_not_invent_members() {
+        let mut members = HashMap::new();
+        members.insert(7, ChannelMember::new(7, MemberRole::Owner));
+
+        // 真源里有一个镜像没有的人：这里只修角色，不负责补人/删人，
+        // 否则一次 hydrate 就会悄悄改变群的成员集合。
+        let repaired = apply_group_role_truth(&mut members, &[(9, MemberRole::Admin)]);
+
+        assert_eq!(repaired, 0);
+        assert_eq!(members.len(), 1, "不得凭真源往镜像里加人");
+        assert_eq!(members.get(&7).unwrap().role, MemberRole::Owner);
+    }
+
+    #[test]
+    fn hydrating_a_participant_keeps_the_real_join_time() {
+        // ChannelMember::new() 会把 joined_at 打成 now；hydrate 必须走
+        // to_channel_member() 保住入群时间，否则每次重启后全群的入群顺序
+        // 都变成「服务启动那一刻」，成员排序与群头像九宫格跟着一起错。
+        let joined_ms = 1_783_520_957_117_i64;
+        let participant = ChannelParticipant::from_db_row(
+            513,
+            100_000_156,
+            0,
+            None,
+            serde_json::Value::Object(serde_json::Map::new()),
+            None,
+            joined_ms,
+            None,
+        );
+
+        let member = participant.to_channel_member();
+
+        assert_eq!(member.joined_at.timestamp_millis(), joined_ms);
+        assert_eq!(member.role, MemberRole::Owner);
     }
 
     #[test]
