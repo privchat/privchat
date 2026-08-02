@@ -462,7 +462,18 @@ impl DeviceManagerDb {
                 os_version = EXCLUDED.os_version,
                 app_version = EXCLUDED.app_version,
                 last_active_at = EXCLUDED.last_active_at,
-                last_ip = EXCLUDED.last_ip
+                last_ip = EXCLUDED.last_ip,
+                -- 同一用户在同一设备上重新登录 = 之前那次会话作废。
+                --
+                -- 退出登录时客户端会通知服务端 bump 一次（account/auth/logout），但那个通知
+                -- 是尽力而为的：网络断了、进程被杀、应用被划掉，服务端就永远收不到，
+                -- 旧 access/refresh token 一直有效到自然过期。不 bump 的话，重新登录发下来的
+                -- 新 token 与旧 token 带着**同一个** session_version，旧的照样验得过——
+                -- 丢一次登出通知就等于那台设备上的旧凭证永久续命。
+                --
+                -- 这里 +1 让「重新登录」自己把上一次会话收掉，登出通知丢了也能自愈。
+                -- 只在 conflict 分支执行：新建设备走 VALUES 的 1，不受影响。
+                session_version = privchat_devices.session_version + 1
             RETURNING (xmax = 0) AS created, session_version
             "#,
             device_uuid,
