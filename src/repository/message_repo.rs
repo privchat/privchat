@@ -601,9 +601,15 @@ impl PgMessageRepository {
             })?;
 
             if updated.rows_affected() == 0 {
-                return Err(DatabaseError::Database(format!(
-                    "attachment file_id={} rejected while binding message_id={}: \
-                     not found, not uploaded by sender {}, or already bound to another business",
+                // 终局判定，不是数据库故障：文件不存在 / 不属于发送者 / 已被别的消息占用，
+                // 三种情形重试多少次都是同一个结果。走 ATTACHMENT_BINDING_REJECTED 哨兵
+                // 映射到不可重试码（见 error.rs::subcode_from_message），客户端据此把
+                // outbox 置为 failed 让用户重发；用 Database 会落进可重试段，客户端将
+                // 每十几秒重试一次直到天荒地老。
+                return Err(DatabaseError::Validation(format!(
+                    "ATTACHMENT_BINDING_REJECTED attachment file_id={} rejected while binding \
+                     message_id={}: not found, not uploaded by sender {}, or already bound to \
+                     another business",
                     file_id, message.message_id, message.sender_id
                 )));
             }

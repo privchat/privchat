@@ -265,6 +265,12 @@ fn subcode_from_message(msg: &str) -> Option<privchat_protocol::ErrorCode> {
         Some(P::UserNotFound)
     } else if trimmed.starts_with("IDENTITY_CONFLICT") {
         Some(P::OperationConflict)
+    } else if trimmed.starts_with("ATTACHMENT_BINDING_REJECTED") {
+        // 附件引用不可用（不存在 / 不属于发送者 / 已被别的消息占用）。
+        // **必须是不可重试码**：这是终局判定，重试一万次也是同一个结果。
+        // 曾经把它归到 DatabaseError(7)——那是可重试段——客户端于是每十几秒重试一次，
+        // 一条消息卡了好几天，用户看到的是永远转圈、既不成功也不失败。
+        Some(P::OperationConflict)
     } else {
         None
     }
@@ -485,5 +491,28 @@ mod refresh_subcode_tests {
         // 服务凭证缺失/无效走这条:仍是 AuthRequired,上游据此判定为服务端故障而非用户失效。
         let e = ServerError::Unauthorized("缺少 X-Service-Key 请求头".to_string());
         assert_eq!(e.protocol_code(), P::AuthRequired);
+    }
+
+    /// 附件绑定被拒必须落在**不可重试**码上。
+    ///
+    /// 生产事故：这条判定原本用 `ServerError::Database`，映射到 DatabaseError(7)——
+    /// 那是客户端的可重试段。于是「文件已被别的消息占用」这种终局拒绝被当成数据库抖动，
+    /// 客户端每十几秒重试一次，一条图片消息卡了好几天，用户看到的是永远转圈：
+    /// 既不成功、也不失败、连重发的机会都没有。
+    #[test]
+    fn a_rejected_attachment_binding_is_not_retryable() {
+        let e = ServerError::Validation(
+            "ATTACHMENT_BINDING_REJECTED attachment file_id=13322 rejected while binding \
+             message_id=606666485980463104: not found, not uploaded by sender 100000652, \
+             or already bound to another business"
+                .to_string(),
+        );
+
+        assert_eq!(e.protocol_code(), P::OperationConflict);
+        assert_ne!(
+            e.protocol_code(),
+            P::DatabaseError,
+            "落回 DatabaseError 就等于告诉客户端「稍后再试」，而这件事永远不会成功",
+        );
     }
 }
