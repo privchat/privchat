@@ -135,6 +135,23 @@ pub struct ChannelService {
     last_message_cache: Arc<RwLock<HashMap<u64, LastMessagePreview>>>,
 }
 
+/// server 模型/DB 角色 → 协议权威枚举。
+///
+/// 两套编号**不同**：DB 与 server 模型是 Owner=0/Admin=1/Member=2，
+/// 协议冻结的是 Member=0/Owner=1/Admin=2（0 必须是权限最低的）。
+/// 服务端是唯一需要转换的一侧，客户端直接吃协议值。
+fn db_role_to_wire(
+    role: crate::model::channel::MemberRole,
+) -> privchat_protocol::rpc::group::role::GroupMemberRole {
+    use crate::model::channel::MemberRole;
+    use privchat_protocol::rpc::group::role::GroupMemberRole;
+    match role {
+        MemberRole::Owner => GroupMemberRole::Owner,
+        MemberRole::Admin => GroupMemberRole::Admin,
+        MemberRole::Member => GroupMemberRole::Member,
+    }
+}
+
 impl ChannelService {
     /// 创建新的会话服务
     pub fn new(config: ChannelServiceConfig, channel_repository: Arc<PgChannelRepository>) -> Self {
@@ -2665,7 +2682,15 @@ impl ChannelService {
                             group_id: Some(row.group_id as u64),
                             user_id: Some(row.user_id as u64),
                             uid: Some(row.user_id as u64),
-                            role: Some(i32::from(row.role)),
+                            // DB 列是 Owner=0/Admin=1/Member=2；线上契约是
+                            // Member=0/Owner=1/Admin=2（0 必须是权限最低的，
+                            // 见 GroupMemberRole 文档）。两套编号不同，这里必须转换。
+                            role: Some(
+                                db_role_to_wire(
+                                    crate::model::channel::MemberRole::from_i16(row.role),
+                                )
+                                .to_wire_i32(),
+                            ),
                             status: Some(0),
                             alias: row.nickname,
                             is_muted: Some(
@@ -4074,6 +4099,27 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// DB 与线上是**两套编号**，服务端是唯一需要转换的一侧。
+    ///
+    /// 线上把 0 定成 Member（所有"没拿到"的情形都落在 0，让 0 代表群主
+    /// 等于把读取失败变成提权），而 DB 历史上 0 是 Owner。不转换就会
+    /// 把群主发成普通成员、把普通成员发成管理员。
+    #[test]
+    fn db_roles_are_translated_into_the_wire_contract() {
+        use crate::model::channel::MemberRole;
+        use privchat_protocol::rpc::group::role::GroupMemberRole;
+
+        assert_eq!(db_role_to_wire(MemberRole::Owner), GroupMemberRole::Owner);
+        assert_eq!(db_role_to_wire(MemberRole::Admin), GroupMemberRole::Admin);
+        assert_eq!(db_role_to_wire(MemberRole::Member), GroupMemberRole::Member);
+
+        // 数值确实不同——这正是必须转换的原因。
+        assert_eq!(MemberRole::Owner.to_i16(), 0);
+        assert_eq!(db_role_to_wire(MemberRole::Owner).to_wire_i32(), 1);
+        assert_eq!(MemberRole::Member.to_i16(), 2);
+        assert_eq!(db_role_to_wire(MemberRole::Member).to_wire_i32(), 0);
+    }
     use super::*;
     use crate::model::channel::ChannelType;
     use crate::repository::PgChannelRepository;

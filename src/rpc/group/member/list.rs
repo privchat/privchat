@@ -26,6 +26,37 @@ use std::collections::HashMap;
 /// 单页上限。防止「limit=100000」把分页绕过去。
 const MAX_PAGE: usize = 500;
 
+/// 角色的**线上字符串**，走协议里的权威定义。
+///
+/// 从前这里是 `format!("{:?}", role).to_lowercase()` —— 用 Debug 输出拼线上契约。
+/// 它今天恰好对，但枚举改个变体名就会静默改变线上值；而首字母大写的那一版
+/// 正是让三端 `canManage` 恒 false、群主在所有端看不到管理入口的那次事故。
+/// server 内部 [`MemberRole`] → 协议权威枚举 [`GroupMemberRole`]。
+///
+/// 两套编号**不一样**：server 模型与 DB 列是 Owner=0/Admin=1/Member=2，
+/// 协议冻结的是 Member=0/Owner=1/Admin=2（0 必须是权限最低的，见枚举文档）。
+/// 这里就是那个必须存在的转换点——服务端是唯一需要转换的一侧，客户端直接吃协议值。
+fn to_wire_role(
+    role: crate::model::channel::MemberRole,
+) -> privchat_protocol::rpc::group::role::GroupMemberRole {
+    use crate::model::channel::MemberRole;
+    use privchat_protocol::rpc::group::role::GroupMemberRole;
+    match role {
+        MemberRole::Owner => GroupMemberRole::Owner,
+        MemberRole::Admin => GroupMemberRole::Admin,
+        MemberRole::Member => GroupMemberRole::Member,
+    }
+}
+
+/// 角色的线上**字符串**（恒小写）。
+///
+/// 从前这里是 `format!("{:?}", role).to_lowercase()` —— 用 Debug 输出拼线上契约。
+/// 它今天恰好对，但枚举改个变体名就会静默改变线上值；而首字母大写的那一版
+/// 正是让三端 `canManage` 恒 false、群主在所有端看不到管理入口的那次事故。
+fn wire_role(role: crate::model::channel::MemberRole) -> String {
+    to_wire_role(role).as_str().to_string()
+}
+
 fn non_blank(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -131,7 +162,7 @@ pub async fn handle(
                         avatar_url: profile.and_then(|profile| profile.avatar_url.clone()),
                         user_type: profile.map(|profile| profile.user_type).unwrap_or_default(),
                         // Stable lowercase role contract for every client permission gate.
-                        role: format!("{:?}", member.role).to_lowercase(),
+                        role: wire_role(member.role),
                         joined_at: member.joined_at.timestamp_millis().max(0) as u64,
                         is_muted: member.is_muted,
                     }
