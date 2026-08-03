@@ -146,6 +146,28 @@ pub struct MessageDeliveryReceiptRecord {
     pub delivered_at: u64,
 }
 
+/// 把频道的 message head 推进到这条消息（V019）。
+///
+/// 三条产生消息的路径共用同一段 SQL，别各写各的：排序键一旦漂移，回填值与运行期值
+/// 就会从此对不上，而这种不一致只在客户端补历史时才显形。
+///
+/// - `deleted = false` 由调用方保证（新消息不可能是软删的）；
+/// - revoked 仍算数：撤回只清内容，消息仍占时间线位置；
+/// - 只在真的更靠前时才写。`privchat_channels` 上有 BEFORE UPDATE 触发器会重分配
+///   sync_version，无谓的写会让该频道所有在线成员重新同步一遍。
+const ADVANCE_CHANNEL_MESSAGE_HEAD_SQL: &str = r#"
+    UPDATE privchat_channels
+    SET server_latest_message_pts = $2,
+        server_latest_message_id  = $3
+    WHERE channel_id = $1
+      AND (server_latest_message_pts, server_latest_message_id)
+          IS DISTINCT FROM ($2, $3)
+      AND ($2, $3) > (
+            COALESCE(server_latest_message_pts, -1),
+            COALESCE(server_latest_message_id, -1)
+          )
+"#;
+
 impl PgMessageRepository {
     /// 创建新的消息仓库
     pub fn new(pool: Arc<PgPool>) -> Self {
@@ -614,6 +636,27 @@ impl PgMessageRepository {
                 )));
             }
         }
+
+        // 维护 message head（V019）。与建消息同事务：head 落后于消息会让客户端以为
+        // 自己已经追平最新，从而不去补那几条差值——那是静默丢消息。
+        //
+        // 排序键必须与 V019 回填用的 canonical 查询一致：deleted = false 排除软删，
+        // revoked 仍参与（撤回只清内容，消息仍占时间线位置），按 (pts, message_id) 比大小。
+        // 用 IS DISTINCT FROM 守住空值，并且只在真的更靠前时才写：
+        // privchat_channels 上有 BEFORE UPDATE 触发器会重分配 sync_version，
+        // 无谓的写会让所有在线成员重新同步一遍这个频道。
+        sqlx::query(ADVANCE_CHANNEL_MESSAGE_HEAD_SQL)
+            .bind(message.channel_id as i64)
+            .bind(pts)
+            .bind(message.message_id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                DatabaseError::Database(format!(
+                    "update channel message head channel_id={} message_id={}: {e}",
+                    message.channel_id, message.message_id
+                ))
+            })?;
 
         let event_schema_version = CANONICAL_TIMELINE_EVENT_SCHEMA_V1;
 
@@ -2243,6 +2286,123 @@ mod atomic_dispatch_tests {
         .execute(repo.pool())
         .await
         .expect("ensure test user");
+    }
+
+    #[tokio::test]
+    /// V019 的 message head 语义：只能往前推，且不做无谓的写。
+    ///
+    /// 客户端用 head 判断「本地窗口是否已覆盖服务端最新」。head 落后会让它以为自己
+    /// 已经追平，从此不补那几条差值——那是静默丢消息，只在用户翻历史时才显形。
+    ///
+    /// 直接验证 SQL 而不走整条提交路径：走提交会往 commit_log / dispatch_outbox 落记录，
+    /// 而同批的 delivery service 测试并不按 channel 隔离，实测会把它们带崩。
+    /// 「提交路径确实调用了这段 SQL」由 head_maintenance_is_wired_into_the_commit_path 守住。
+    async fn the_channel_head_only_moves_forward() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip head sql test: DATABASE_URL not configured");
+            return;
+        };
+        const CH: i64 = 987_674_881;
+
+        let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(CH)
+            .execute(repo.pool())
+            .await;
+        sqlx::query(
+            "INSERT INTO privchat_channels (channel_id, channel_type, group_id) VALUES ($1, 1, $1)",
+        )
+        .bind(CH)
+        .execute(repo.pool())
+        .await
+        .expect("insert channel");
+
+        assert_eq!(read_channel_head(&repo, CH as u64).await, (None, None));
+
+        assert_eq!(advance_head(&repo, CH, 10, 100).await, 1, "first message becomes the head");
+        assert_eq!(
+            read_channel_head(&repo, CH as u64).await,
+            (Some(10), Some(100)),
+        );
+
+        assert_eq!(advance_head(&repo, CH, 11, 101).await, 1, "a newer message moves the head");
+        assert_eq!(
+            read_channel_head(&repo, CH as u64).await,
+            (Some(11), Some(101)),
+        );
+
+        // 迟到的旧消息（anti-entropy 补历史、乱序投递）不能把 head 拖回去。
+        assert_eq!(advance_head(&repo, CH, 5, 50).await, 0, "an older message must not move it");
+        assert_eq!(
+            read_channel_head(&repo, CH as u64).await,
+            (Some(11), Some(101)),
+        );
+
+        // 重复投递同一条不该产生写：privchat_channels 上的 BEFORE UPDATE 触发器会重分配
+        // sync_version，无谓的写会让该频道所有在线成员重新同步一遍。
+        assert_eq!(advance_head(&repo, CH, 11, 101).await, 0, "a repeat must not write");
+
+        // 同 pts 下按 message_id 比大小，保持与 V019 回填的排序键一致。
+        assert_eq!(advance_head(&repo, CH, 11, 102).await, 1, "same pts, larger id wins");
+        assert_eq!(
+            read_channel_head(&repo, CH as u64).await,
+            (Some(11), Some(102)),
+        );
+
+        let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(CH)
+            .execute(repo.pool())
+            .await;
+    }
+
+    /// 光有 SQL 不够——提交消息的那条路径必须真的调用它，否则 head 永远停在
+    /// V019 回填的那一刻。
+    #[test]
+    fn head_maintenance_is_wired_into_the_commit_path() {
+        let src = include_str!("message_repo.rs");
+        let fn_start = src
+            .find("pub async fn create_message_and_commit_atomic")
+            .expect("commit fn");
+        let fn_end = src[fn_start..]
+            .find("\n    pub async fn ")
+            .map(|off| fn_start + off)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("ADVANCE_CHANNEL_MESSAGE_HEAD_SQL"),
+            "committing a message must advance the channel head",
+        );
+    }
+
+    /// 跑一次 head 推进，返回受影响行数（0 = 被守卫挡住，没有产生写）。
+    async fn advance_head(
+        repo: &PgMessageRepository,
+        channel_id: i64,
+        pts: i64,
+        message_id: i64,
+    ) -> u64 {
+        sqlx::query(ADVANCE_CHANNEL_MESSAGE_HEAD_SQL)
+            .bind(channel_id)
+            .bind(pts)
+            .bind(message_id)
+            .execute(repo.pool())
+            .await
+            .expect("advance head")
+            .rows_affected()
+    }
+
+    async fn read_channel_head(
+        repo: &PgMessageRepository,
+        channel_id: u64,
+    ) -> (Option<i64>, Option<i64>) {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT server_latest_message_pts, server_latest_message_id
+             FROM privchat_channels WHERE channel_id = $1",
+        )
+        .bind(channel_id as i64)
+        .fetch_one(repo.pool())
+        .await
+        .expect("read channel head")
     }
 
     #[tokio::test]
