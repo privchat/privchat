@@ -1220,6 +1220,7 @@ impl ChannelService {
                 nickname
             FROM privchat_group_members
             WHERE group_id = $1
+              AND left_at IS NULL
             ORDER BY joined_at ASC
             "#,
             group_id as i64,

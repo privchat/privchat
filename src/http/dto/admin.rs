@@ -320,6 +320,38 @@ pub struct AddGroupMemberResponse {
 }
 
 // =====================================================
+// 建群（service API）
+// =====================================================
+
+/// 创建群聊请求
+///
+/// 服务端授权建群：调用方指定群主与初始成员，被加入者无需同意、也无需互为好友。
+/// server 只被告知「哪些用户组成这个群」，不理解业务原因。
+#[derive(Debug, Deserialize)]
+pub struct CreateGroupRequest {
+    /// 群主 user_id
+    pub owner_id: u64,
+    /// 群名称
+    pub name: String,
+    /// 群描述（可选）
+    pub description: Option<String>,
+    /// 初始成员（可选，不含群主；重复项与群主自身会被忽略）
+    #[serde(default)]
+    pub member_ids: Vec<u64>,
+}
+
+/// 创建群聊响应
+#[derive(Debug, Serialize)]
+pub struct CreateGroupResponse {
+    pub success: bool,
+    pub group_id: u64,
+    pub owner_id: u64,
+    pub name: String,
+    /// 实际入群的初始成员（不含群主）
+    pub member_ids: Vec<u64>,
+}
+
+// =====================================================
 // 好友管理
 // =====================================================
 

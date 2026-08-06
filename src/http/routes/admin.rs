@@ -123,7 +123,8 @@ pub fn create_route() -> Router<AdminServerState> {
             "/users/{user_id}/revoke-all-devices",
             post(revoke_all_user_devices),
         )
-        // === P0: 群组成员管理 ===
+        // === P0: 群组管理 ===
+        .route("/groups", post(create_group))
         .route(
             "/groups/{group_id}/members",
             get(list_group_members).post(add_group_member),
@@ -2341,6 +2342,106 @@ async fn send_message(
         sender_id: request.sender_id,
         created_at: result.created_at,
         message: "消息已发送".to_string(),
+    }))
+}
+
+// =====================================================
+// 建群（service API）
+// =====================================================
+
+/// 创建群聊
+///
+/// POST /api/service/groups
+///
+/// 服务端授权建群：调用方指定群主与初始成员，被加入者无需同意、无需互为好友。
+/// 与 RPC `group/group/create` 走同一套原语（create_channel 落库 → 建频道缓存 →
+/// 逐个 add_participant + add_member_to_group），差别只是授权来源是 service key
+/// 而非发起人的 IM 会话。后续加人/踢人用既有的
+/// `POST|DELETE /api/service/groups/:group_id/members[/:user_id]`。
+async fn create_group(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(request): Json<dto::CreateGroupRequest>,
+) -> ApiResult<dto::CreateGroupResponse> {
+    verify_service_key(&headers, &state).await?;
+
+    let owner_id = request.owner_id;
+    let name = request.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ServerError::Validation("群名称不能为空".to_string()));
+    }
+    if !state.user_service.exists(owner_id).await? {
+        return Err(ServerError::NotFound(format!("用户 {} 不存在", owner_id)));
+    }
+
+    // 去重并剔除群主自身（群主由 Channel::new_group 直接持有）
+    let mut initial_members: Vec<u64> = Vec::new();
+    for uid in request.member_ids {
+        if uid != owner_id && !initial_members.contains(&uid) {
+            if !state.user_service.exists(uid).await? {
+                return Err(ServerError::NotFound(format!("用户 {} 不存在", uid)));
+            }
+            initial_members.push(uid);
+        }
+    }
+
+    // 1. 落库建 channel（由数据库分配 channel_id）
+    let response = state
+        .channel_service
+        .create_channel(
+            owner_id,
+            crate::model::channel::CreateChannelRequest {
+                channel_type: crate::model::channel::ChannelType::Group,
+                name: Some(name.clone()),
+                description: request.description.clone(),
+                member_ids: vec![],
+                is_public: Some(false),
+                max_members: None,
+            },
+        )
+        .await?;
+
+    if !response.success {
+        let err = response.error.unwrap_or_else(|| "创建会话失败".to_string());
+        return Err(ServerError::Internal(format!("创建群聊会话失败: {}", err)));
+    }
+    let group_id = response.channel.id;
+    if group_id == 0 {
+        return Err(ServerError::Internal(
+            "创建群聊会话失败: channel_id 为 0".to_string(),
+        ));
+    }
+
+    // 2. 建频道缓存
+    state
+        .channel_service
+        .create_group_chat_with_id(owner_id, name.clone(), group_id)
+        .await?;
+
+    // 3. 逐个加入初始成员
+    for &uid in &initial_members {
+        state
+            .channel_service
+            .add_participant(group_id, uid, crate::model::channel::MemberRole::Member)
+            .await
+            .map_err(|e| ServerError::Database(format!("初始成员 {} 入库失败: {}", uid, e)))?;
+        state
+            .channel_service
+            .add_member_to_group(group_id, uid)
+            .await?;
+    }
+
+    info!(
+        "✅ service 建群成功: group_id={}, owner={}, name={}, members={:?}",
+        group_id, owner_id, name, initial_members
+    );
+
+    Ok(ApiEnvelope::ok(dto::CreateGroupResponse {
+        success: true,
+        group_id,
+        owner_id,
+        name,
+        member_ids: initial_members,
     }))
 }
 
