@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::auth::token_capability;
 use crate::infra::{auth_whitelist, SessionManager};
 use msgtrans::SessionId;
 use privchat_protocol::protocol::MessageType;
@@ -63,8 +64,22 @@ impl AuthMiddleware {
         }
 
         // 2. 检查会话是否已认证
-        match self.session_manager.get_user_id(session_id).await {
-            Some(user_id) => {
+        match self.session_manager.get_session_info(session_id).await {
+            Some(info) => {
+                let user_id = info.user_id.clone();
+
+                // 3. 按 token scope 授权（认证之后、分发之前）
+                if !token_capability::allows_message_type(&info.jwt_claims.scope, msg_type) {
+                    tracing::warn!(
+                        "⛔ 消息类型 {:?} 超出 token 能力: session={}, user={}, scope={:?}",
+                        msg_type,
+                        session_id,
+                        user_id,
+                        info.jwt_claims.scope
+                    );
+                    return Err(ErrorCode::PermissionDenied);
+                }
+
                 // 更新活跃时间
                 self.session_manager.update_active_time(session_id).await;
 
@@ -115,8 +130,22 @@ impl AuthMiddleware {
         }
 
         // 2. 检查会话是否已认证
-        match self.session_manager.get_user_id(session_id).await {
-            Some(user_id) => {
+        match self.session_manager.get_session_info(session_id).await {
+            Some(info) => {
+                let user_id = info.user_id.clone();
+
+                // 3. 按 token scope 授权（认证之后、分发之前）
+                if !token_capability::allows_rpc_route(&info.jwt_claims.scope, route) {
+                    tracing::warn!(
+                        "⛔ RPC '{}' 超出 token 能力: session={}, user={}, scope={:?}",
+                        route,
+                        session_id,
+                        user_id,
+                        info.jwt_claims.scope
+                    );
+                    return Err(ErrorCode::PermissionDenied);
+                }
+
                 // 更新活跃时间
                 self.session_manager.update_active_time(session_id).await;
 
@@ -267,6 +296,117 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some("1001".to_string()));
+    }
+
+    /// 受限 scope 的会话（能力矩阵在中间件里真正生效，而不只是矩阵单测通过）
+    async fn bind_messaging_session(
+        session_manager: &Arc<SessionManager>,
+        session_id: &SessionId,
+    ) {
+        let mut claims = create_test_claims(2001, "device-visitor");
+        claims.scope = vec![crate::auth::token_capability::SCOPE_MESSAGING.to_string()];
+        session_manager
+            .bind_session(
+                session_id.clone(),
+                "2001".to_string(),
+                "device-visitor".to_string(),
+                claims,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_messaging_scope_allows_conversation_rpc() {
+        let session_manager = Arc::new(SessionManager::new(24));
+        let auth_middleware = AuthMiddleware::new(session_manager.clone());
+        let session_id = SessionId::new(2);
+        bind_messaging_session(&session_manager, &session_id).await;
+
+        let result = auth_middleware
+            .check_rpc_route("message/history/get", &session_id)
+            .await;
+
+        assert_eq!(result.unwrap(), Some("2001".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_messaging_scope_denies_group_create_rpc() {
+        let session_manager = Arc::new(SessionManager::new(24));
+        let auth_middleware = AuthMiddleware::new(session_manager.clone());
+        let session_id = SessionId::new(3);
+        bind_messaging_session(&session_manager, &session_id).await;
+
+        // 已认证但超出 token 能力：拒绝原因必须是授权失败而非未认证
+        let result = auth_middleware
+            .check_rpc_route("group/group/create", &session_id)
+            .await;
+
+        assert_eq!(result.unwrap_err(), ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn test_messaging_scope_denies_direct_channel_self_service() {
+        let session_manager = Arc::new(SessionManager::new(24));
+        let auth_middleware = AuthMiddleware::new(session_manager.clone());
+        let session_id = SessionId::new(4);
+        bind_messaging_session(&session_manager, &session_id).await;
+
+        let result = auth_middleware
+            .check_rpc_route("channel/direct/get_or_create", &session_id)
+            .await;
+
+        assert_eq!(result.unwrap_err(), ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn test_messaging_scope_message_types() {
+        let session_manager = Arc::new(SessionManager::new(24));
+        let auth_middleware = AuthMiddleware::new(session_manager.clone());
+        let session_id = SessionId::new(5);
+        bind_messaging_session(&session_manager, &session_id).await;
+
+        // 发消息允许
+        assert_eq!(
+            auth_middleware
+                .check_message_type(&MessageType::SendMessageRequest, &session_id)
+                .await
+                .unwrap(),
+            Some("2001".to_string())
+        );
+        // 订阅/发布不允许
+        assert_eq!(
+            auth_middleware
+                .check_message_type(&MessageType::PublishRequest, &session_id)
+                .await
+                .unwrap_err(),
+            ErrorCode::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_scope_session_is_unaffected() {
+        let session_manager = Arc::new(SessionManager::new(24));
+        let auth_middleware = AuthMiddleware::new(session_manager.clone());
+        let session_id = SessionId::new(6);
+        // create_test_claims 用的是既有的 ["im"] scope：存量会话必须完全不受影响
+        let claims = create_test_claims(1001, "device-1");
+        session_manager
+            .bind_session(
+                session_id.clone(),
+                "1001".to_string(),
+                "device-1".to_string(),
+                claims,
+            )
+            .await;
+
+        assert!(auth_middleware
+            .check_rpc_route("group/group/create", &session_id)
+            .await
+            .is_ok());
+        assert!(auth_middleware
+            .check_message_type(&MessageType::PublishRequest, &session_id)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
