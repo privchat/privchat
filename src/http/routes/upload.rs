@@ -73,9 +73,11 @@ fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
 pub fn create_route() -> Router<FileServerState> {
     Router::new()
         .route("/api/app/files/upload", post(upload_file))
-        // Keep this above token max_size (100MB) so multipart parsing won't fail
-        // before business validation runs.
-        .layer(DefaultBodyLimit::max(120 * 1024 * 1024))
+        // 从业务硬顶推导，不再写死一个会跟业务限额分家的数字：body limit 必须高于最大
+        // 硬顶，否则 multipart 会在业务校验跑起来之前被拒，用户拿到一个没有业务含义的 413。
+        .layer(DefaultBodyLimit::max(
+            crate::model::file_upload::FileType::http_body_limit_bytes(),
+        ))
 }
 
 /// 流式接收 multipart：file 字段按 chunk 直写存储（大小硬顶即时校验），
