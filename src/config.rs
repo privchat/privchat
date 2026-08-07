@@ -1289,6 +1289,8 @@ struct TomlLoggingConfig {
     level: Option<String>,
     format: Option<String>,
     file: Option<String>,
+    /// 归档日志保留天数；缺省 7，0 = 不清理
+    retention_days: Option<u32>,
 }
 
 /// 早期日志配置（在完整 ServerConfig 加载之前，快速读取 [logging] 段）
@@ -1297,6 +1299,8 @@ pub struct EarlyLoggingConfig {
     pub level: Option<String>,
     pub format: Option<String>,
     pub file: Option<String>,
+    /// 归档日志保留天数；None = 用 `logging::DEFAULT_LOG_RETENTION_DAYS`
+    pub retention_days: Option<u32>,
 }
 
 /// 仅用于快速反序列化 config.toml 中的 [logging] 段
@@ -1324,6 +1328,7 @@ pub fn load_early_logging_config(config_file: Option<&str>) -> EarlyLoggingConfi
             level: log.level,
             format: log.format,
             file: log.file,
+            retention_days: log.retention_days,
         },
         None => EarlyLoggingConfig::default(),
     }

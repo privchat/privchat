@@ -61,7 +61,17 @@ async fn main() -> Result<()> {
     let log_format = cli.get_log_format().or(early_log.format);
     let log_file = cli.log_file.as_deref().or(early_log.file.as_deref());
 
-    logging::init_logging(&log_level, log_format.as_deref(), log_file, cli.quiet)?;
+    let log_retention_days = early_log
+        .retention_days
+        .unwrap_or(logging::DEFAULT_LOG_RETENTION_DAYS);
+
+    logging::init_logging(
+        &log_level,
+        log_format.as_deref(),
+        log_file,
+        cli.quiet,
+        log_retention_days,
+    )?;
 
     tracing::info!("🚀 PrivChat Server starting...");
 
@@ -238,6 +248,10 @@ auto_send_welcome = true
 level = "info"
 format = "compact"
 # file = "./logs/server.log"
+# 归档日志保留天数（含今天）：7 = 今天 + 往前 6 个归档，更早的自动删除。
+# 0 = 不清理。跨天归档时和进程启动时各清一次。
+# 没有这个限制的后果：server.log.* 只涨不删，生产上攒到过 40.5GB。
+# retention_days = 7
 
 [push]
 enabled = false
@@ -390,7 +404,7 @@ async fn run_migrate(cli: &Cli) -> Result<()> {
 /// 显示最终配置（合并后的配置）
 fn show_config(cli: &Cli) -> Result<()> {
     // 初始化基本日志（用于显示配置）
-    logging::init_logging("info", None, None, false)?;
+    logging::init_logging("info", None, None, false, logging::DEFAULT_LOG_RETENTION_DAYS)?;
 
     let config = ServerConfig::load(cli).context("加载配置失败")?;
 
