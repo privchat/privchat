@@ -406,14 +406,11 @@ impl FileService {
     }
 
     /// 按文件类型的服务端大小硬顶（流式路径在 write_chunk 中即时校验）。
+    ///
+    /// 与签发 token 时用的是同一个函数（[`FileType::max_size_bytes`]）——两处一旦分家，
+    /// 松的那个会放进来一批注定失败的上传。
     fn max_size_for_type(file_type: &FileType) -> usize {
-        match file_type {
-            FileType::Image => 10 * 1024 * 1024,
-            FileType::Video => 100 * 1024 * 1024,
-            FileType::Voice => 10 * 1024 * 1024,
-            FileType::File => 50 * 1024 * 1024,
-            FileType::Other => 10 * 1024 * 1024,
-        }
+        file_type.max_size_bytes() as usize
     }
 
     fn generate_file_path(&self, file_id: u64, file_type: &FileType, filename: &str) -> String {

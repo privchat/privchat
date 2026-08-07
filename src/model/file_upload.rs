@@ -55,6 +55,53 @@ impl FileType {
             _ => None,
         }
     }
+
+    /// 单个文件的大小硬顶。**这是唯一的一份**。
+    ///
+    /// 曾经有三份互相不一致的限额：签发 token 时按一套（视频 200MB），axum body limit
+    /// 一套（120MB），流式写入时又一套（视频 100MB）。把关的永远是最松的那个，于是一个
+    /// 150MB 的视频能拿到 token，客户端老老实实传了几分钟，再被写入侧掐断——用户等了很久
+    /// 才失败，而这本可以在第一秒就拒绝。
+    ///
+    /// 所以：签发 token 和写入校验必须读同一个函数，谁都不许再写自己的表。
+    pub const fn max_size_bytes(&self) -> u64 {
+        const MB: u64 = 1024 * 1024;
+        match self {
+            FileType::Image => 10 * MB,
+            FileType::Video => 100 * MB,
+            FileType::Voice => 10 * MB,
+            FileType::File => 50 * MB,
+            FileType::Other => 10 * MB,
+        }
+    }
+
+    /// 所有类型里最大的那个硬顶，用于推导 HTTP body limit。
+    pub const fn max_size_bytes_any() -> u64 {
+        let mut max = FileType::Image.max_size_bytes();
+        // const fn 里不能用迭代器，逐个比。新增类型时编译器不会提醒，所以下面有测试兜底。
+        if FileType::Video.max_size_bytes() > max {
+            max = FileType::Video.max_size_bytes();
+        }
+        if FileType::Voice.max_size_bytes() > max {
+            max = FileType::Voice.max_size_bytes();
+        }
+        if FileType::File.max_size_bytes() > max {
+            max = FileType::File.max_size_bytes();
+        }
+        if FileType::Other.max_size_bytes() > max {
+            max = FileType::Other.max_size_bytes();
+        }
+        max
+    }
+
+    /// HTTP body 的上限：最大硬顶再留一点余量。
+    ///
+    /// body 里除了文件本体还有 multipart 的边界、字段名、以及附件加密 v1 的
+    /// `encryption_version` / `cek` 两个文本字段。余量必须留够，否则 multipart 会在
+    /// 业务校验跑起来之前就被 axum 拒掉，用户拿到的是一个没有业务含义的 413。
+    pub const fn http_body_limit_bytes() -> usize {
+        (Self::max_size_bytes_any() + 4 * 1024 * 1024) as usize
+    }
 }
 
 /// 文件上传记录元数据
@@ -88,4 +135,57 @@ pub struct FileMetadata {
     /// 内容密钥 CEK：base64url(no-pad) 的 32 字节；nonce 在密文 blob 头部，不入库。
     /// 仅在鉴权后的 get_url 响应返回，绝不进日志/URL。version=0 时为 None。
     pub cek: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [FileType; 5] = [
+        FileType::Image,
+        FileType::Video,
+        FileType::Voice,
+        FileType::File,
+        FileType::Other,
+    ];
+
+    /// 签发 token 用的限额，必须**就是**写入时掐断用的限额。
+    ///
+    /// 这两处曾经分家（视频 200MB vs 100MB），后果不是「拒绝得不够严」，而是
+    /// 「先放进来再掐断」：客户端拿到 token，把 150MB 传了几分钟，才在写入侧失败。
+    #[test]
+    fn issuing_and_enforcing_read_the_same_limit() {
+        for ft in ALL {
+            let issued = crate::rpc::file::request_upload_token::max_size_for_type_for_tests(&ft);
+            assert_eq!(
+                issued as u64,
+                ft.max_size_bytes(),
+                "{:?}: 签发限额与写入硬顶必须同源",
+                ft
+            );
+        }
+    }
+
+    /// body limit 必须高于任何一个业务硬顶。
+    ///
+    /// 反过来的话，超限文件会在 multipart 解析阶段就被 axum 打回一个 413，
+    /// 业务校验根本没机会跑，客户端拿到的错误里没有「哪个类型、超了多少」。
+    #[test]
+    fn the_body_limit_leaves_room_above_every_business_cap() {
+        for ft in ALL {
+            assert!(
+                (FileType::http_body_limit_bytes() as u64) > ft.max_size_bytes(),
+                "{:?}: body limit 必须高于业务硬顶",
+                ft
+            );
+        }
+    }
+
+    /// `max_size_bytes_any` 是手写展开的（const fn 里没有迭代器），新增类型时
+    /// 编译器不会提醒。这条测试就是那个提醒。
+    #[test]
+    fn the_hand_rolled_max_actually_covers_every_type() {
+        let expected = ALL.iter().map(|ft| ft.max_size_bytes()).max().unwrap();
+        assert_eq!(FileType::max_size_bytes_any(), expected);
+    }
 }

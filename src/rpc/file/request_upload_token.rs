@@ -22,6 +22,7 @@ use tracing::warn;
 
 use crate::rpc::{RpcContext, RpcError, RpcResult, RpcServiceContext};
 use crate::service::FileType;
+use privchat_protocol::error_code::ErrorCode;
 use privchat_protocol::rpc::{FileRequestUploadTokenRequest, FileRequestUploadTokenResponse};
 
 /// 请求上传 token
@@ -61,10 +62,13 @@ pub async fn request_upload_token(
     let max_size = get_max_size_for_type(&file_type);
     if file_size > max_size {
         warn!("❌ 文件大小超限: {} bytes > {} bytes", file_size, max_size);
-        return Err(RpcError::validation(format!(
-            "文件大小超过限制（最大 {} MB）",
-            max_size / 1024 / 1024
-        )));
+        // 用协议里的 FileTooLarge，别再混进 InvalidParams：这是客户端唯一能在
+        // 「传之前」拿到的超限信号，必须可被识别成一句具体的提示，而不是通用的
+        // 「发送失败」。参数不合法和文件太大对用户是两件完全不同的事。
+        return Err(RpcError::from_code(
+            ErrorCode::FileTooLarge,
+            format!("文件大小超过限制（最大 {} MB）", max_size / 1024 / 1024),
+        ));
     }
 
     // 生成上传 token（将 u64 转换为 String）
@@ -97,13 +101,16 @@ pub async fn request_upload_token(
     serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
 
-/// 根据文件类型获取最大文件大小限制
+/// 根据文件类型获取最大文件大小限制。
+///
+/// 唯一来源是 [`FileType::max_size_bytes`]，这里不再维护第二张表——签发时说 200MB、
+/// 写入时按 100MB 掐断，等于让用户白传几分钟才失败。
 fn get_max_size_for_type(file_type: &FileType) -> i64 {
-    match file_type {
-        FileType::Image => 10 * 1024 * 1024,  // 10 MB
-        FileType::Video => 200 * 1024 * 1024, // 200 MB
-        FileType::Voice => 20 * 1024 * 1024,  // 20 MB（录音远小于视频，单独限额）
-        FileType::File => 100 * 1024 * 1024,  // 100 MB
-        FileType::Other => 50 * 1024 * 1024,  // 50 MB
-    }
+    file_type.max_size_bytes() as i64
+}
+
+/// 让「签发限额 == 写入硬顶」这条不变量可被测试直接盯住，而不是靠人肉对两张表。
+#[cfg(test)]
+pub(crate) fn max_size_for_type_for_tests(file_type: &FileType) -> i64 {
+    get_max_size_for_type(file_type)
 }
