@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod forward;
 pub mod history;
 pub mod pin;
 pub mod reaction;
@@ -42,6 +43,17 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
+    // 注册单条转发路由（MEDIA_REFERENCE_AND_FORWARD_SPEC §6）
+    GLOBAL_RPC_ROUTER
+        .register(routes::message::FORWARD, {
+            let services = services.clone();
+            move |params, ctx| {
+                let services = services.clone();
+                Box::pin(async move { forward::handle(params, services, ctx).await })
+            }
+        })
+        .await;
+
     // 注册群消息置顶 / 取消置顶路由（P1）
     GLOBAL_RPC_ROUTER
         .register(routes::message::PIN, {
@@ -65,6 +77,6 @@ pub async fn register_routes(services: RpcServiceContext) {
         .await;
 
     tracing::debug!(
-        "📋 Message 系统路由注册完成 (history, status, reaction, revoke, pin, pin/list)"
+        "📋 Message 系统路由注册完成 (history, status, reaction, revoke, forward, pin, pin/list)"
     );
 }

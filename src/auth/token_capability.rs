@@ -68,6 +68,9 @@ lazy_static::lazy_static! {
 
         // 会话内消息操作
         set.insert(routes::message::REVOKE);
+        // 转发只在「转发人自己已经在两个会话里」时才成立，服务端逐条校验，
+        // 因此属于会话内消息操作。
+        set.insert(routes::message::FORWARD);
         set.insert(routes::message_reaction::ADD);
         set.insert(routes::message_reaction::REMOVE);
         set.insert(routes::message_reaction::LIST);

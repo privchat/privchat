@@ -22,6 +22,7 @@ pub mod auth_service;
 pub mod channel_service; // ChannelService 在这里
 pub mod committed_timeline_delivery_service;
 pub mod entity_invalidation_publisher;
+pub mod forward_service;
 pub mod friend_service;
 pub mod group_service;
 pub mod legacy_media_refs;

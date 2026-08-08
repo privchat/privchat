@@ -97,6 +97,46 @@ pub struct PgMessageRepository {
     pool: Arc<PgPool>,
 }
 
+/// 附件引用的来源。决定要不要跑「把文件绑到这条消息」的归属守卫。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentOrigin {
+    /// 普通发送：文件是发送者刚上传的，必须过归属守卫
+    /// （只能绑自己的、未被占用的文件）。
+    FreshUpload,
+    /// 转发：引用是服务端从源消息复制的，文件早就绑在源消息上了。
+    ///
+    /// 🔴 这条路径**必须跳过**归属守卫。守卫要求 `uploader_id = sender_id`，
+    /// 而转发人和上传者本来就是两个人——不跳过的话，转发他人图片必然
+    /// `ATTACHMENT_BINDING_REJECTED`。这正是转发在生产上 100% 失败的原因。
+    ///
+    /// 安全性不靠守卫，靠「客户端从不提交 file_id」：引用是服务端读源消息得到的，
+    /// 而读源消息之前已经校验过转发人有权读它。
+    CopiedFromExistingMessage,
+}
+
+/// 转发时读到的源消息投影。
+#[derive(Debug, Clone)]
+pub struct ForwardSource {
+    pub message_id: u64,
+    pub channel_id: u64,
+    pub sender_id: u64,
+    pub message_type: i16,
+    pub content: String,
+    pub metadata: serde_json::Value,
+    pub deleted: bool,
+    pub revoked: bool,
+    pub created_at: i64,
+}
+
+/// 转发来源快照（spec §3.3）。
+#[derive(Debug, Clone)]
+pub struct ForwardOrigin {
+    pub root_message_id: Option<u64>,
+    pub root_author_id: u64,
+    pub root_channel_id: Option<u64>,
+    pub display_snapshot: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AtomicMessageCommitRequest {
     pub message: Message,
@@ -109,6 +149,16 @@ pub struct AtomicMessageCommitRequest {
     /// **只有一个来源**：`service::legacy_media_refs`（裸 JSON 或 typed 两个入口）。
     /// 事务里按两个维度消费——绑定守卫按去重后的 file_id，引用表按 (role, ordinal)。
     pub attachment_refs: Vec<privchat_protocol::MediaRef>,
+    /// 这些引用是新上传的文件，还是从既有消息复制来的。
+    pub attachment_origin: AttachmentOrigin,
+    /// 转发来源（仅转发路径填；spec §3.3）。与消息同事务写入。
+    pub forward_origin: Option<ForwardOrigin>,
+    /// 转发前置条件：源消息必须仍然有效（spec §6.4 行锁定序）。
+    ///
+    /// 🔴 为什么在事务里再查一次：构造副本时读过一次源消息，但那次读之后、
+    /// 这次插入之前，源消息可能被撤回。把 `FOR UPDATE` 放进同一个事务，
+    /// 撤回与转发就被行锁排成序——谁先提交谁生效。
+    pub require_live_source_message: Option<u64>,
     pub channel_type: i16,
     pub event: CanonicalTimelineEvent,
     pub sender_username: Option<String>,
@@ -461,6 +511,33 @@ impl PgMessageRepository {
             })?;
 
         let created_at = request.message.created_at.timestamp_millis();
+
+        // 转发前置条件（spec §6.4）：在**本事务内**锁住源消息并复查存活。
+        // 放在最前面，任何写入之前 —— 失败时事务里还没有东西要回滚。
+        if let Some(source_message_id) = request.require_live_source_message {
+            let source: Option<(bool, bool)> = sqlx::query_as(
+                "SELECT deleted, revoked FROM privchat_messages WHERE message_id = $1 FOR UPDATE",
+            )
+            .bind(source_message_id as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::Database(format!("锁定转发源消息失败: {}", e)))?;
+
+            match source {
+                Some((false, false)) => {}
+                Some(_) => {
+                    return Err(DatabaseError::Validation(format!(
+                        "FORWARD_SOURCE_GONE source message {source_message_id} was deleted or revoked"
+                    )));
+                }
+                None => {
+                    return Err(DatabaseError::Validation(format!(
+                        "FORWARD_SOURCE_NOT_FOUND source message {source_message_id} does not exist"
+                    )));
+                }
+            }
+        }
+
         // dedup_key=None（local_message_id=0）时不 claim：无幂等键的发送不做判重。
         if let Some(dedup_key) = request.dedup_key.as_deref() {
             let claim = sqlx::query(
@@ -590,8 +667,13 @@ impl PgMessageRepository {
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
 
-        let bind_file_ids =
-            crate::service::legacy_media_refs::unique_file_ids_of(&request.attachment_refs);
+        let bind_file_ids = match request.attachment_origin {
+            AttachmentOrigin::FreshUpload => {
+                crate::service::legacy_media_refs::unique_file_ids_of(&request.attachment_refs)
+            }
+            // 转发：文件已经绑在源消息上，这里只加引用，不改归属。
+            AttachmentOrigin::CopiedFromExistingMessage => Vec::new(),
+        };
         for file_id in bind_file_ids {
             // P1-19 归属守卫：file_id 来自客户端可控的 metadata，必须校验
             // ① 上传者就是发送者（不能引用他人的 file）
@@ -673,6 +755,34 @@ impl PgMessageRepository {
                 DatabaseError::Database(format!(
                     "Failed to record media ref file_id={} role={:?} for message_id={}: {}",
                     media_ref.file_id, media_ref.role, message.message_id, e
+                ))
+            })?;
+        }
+
+        // 转发来源（spec §3.3）。与消息同事务：来源记录晚于消息落库，
+        // 中间那一瞬间副本会显示成「原创」。
+        if let Some(origin) = &request.forward_origin {
+            sqlx::query(
+                r#"
+                INSERT INTO privchat_message_forward_origin
+                    (message_id, root_message_id, root_author_id, root_channel_id,
+                     display_snapshot, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (message_id) DO NOTHING
+                "#,
+            )
+            .bind(message.message_id as i64)
+            .bind(origin.root_message_id.map(|id| id as i64))
+            .bind(origin.root_author_id as i64)
+            .bind(origin.root_channel_id.map(|id| id as i64))
+            .bind(origin.display_snapshot.clone())
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                DatabaseError::Database(format!(
+                    "Failed to record forward origin for message_id={}: {}",
+                    message.message_id, e
                 ))
             })?;
         }
@@ -904,6 +1014,106 @@ impl PgMessageRepository {
 
     /// 按 message_id 取 channel_id（附件访问授权用：file→message→channel）。
     /// 返回 None 表示消息不存在（授权方应据此拒绝）。
+    /// 读一条消息用于构造转发副本（不加锁）。
+    ///
+    /// 存活性在**提交事务里**用 `require_live_source_message` 再复查一次
+    /// （spec §6.4），这里读到的只是构造副本用的快照。
+    pub async fn get_message_for_forward(
+        &self,
+        message_id: u64,
+    ) -> Result<Option<ForwardSource>, DatabaseError> {
+        let row: Option<(i64, i64, i16, String, serde_json::Value, bool, bool, i64)> =
+            sqlx::query_as(
+                r#"
+                SELECT channel_id, sender_id, message_type, content, metadata,
+                       deleted, revoked, created_at
+                FROM privchat_messages
+                WHERE message_id = $1
+                "#,
+            )
+            .bind(message_id as i64)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| DatabaseError::Database(format!("读取源消息失败: {}", e)))?;
+
+        Ok(row.map(
+            |(channel_id, sender_id, message_type, content, metadata, deleted, revoked, created_at)| {
+                ForwardSource {
+                    message_id,
+                    channel_id: channel_id as u64,
+                    sender_id: sender_id as u64,
+                    message_type,
+                    content,
+                    metadata,
+                    deleted,
+                    revoked,
+                    created_at,
+                }
+            },
+        ))
+    }
+
+    /// 一条消息的媒体引用（权威来源：引用表）。
+    pub async fn message_media_refs(
+        &self,
+        message_id: u64,
+    ) -> Result<Vec<privchat_protocol::MediaRef>, DatabaseError> {
+        let rows: Vec<(i64, i16, i32)> = sqlx::query_as(
+            r#"
+            SELECT file_id, role, ordinal
+            FROM privchat_message_file_refs
+            WHERE message_id = $1
+            ORDER BY role, ordinal
+            "#,
+        )
+        .bind(message_id as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("查询消息媒体引用失败: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(file_id, role, ordinal)| privchat_protocol::MediaRef {
+                file_id: file_id as u64,
+                role: if role == 1 {
+                    privchat_protocol::MediaRole::Thumbnail
+                } else {
+                    privchat_protocol::MediaRole::Original
+                },
+                ordinal,
+            })
+            .collect())
+    }
+
+    /// 转发来源快照：这条消息本身是不是转发来的。
+    /// 转发一条转发消息时，`root_*` 沿用它的 root，不是上一手（对齐微信/Telegram）。
+    pub async fn forward_origin_of(
+        &self,
+        message_id: u64,
+    ) -> Result<Option<ForwardOrigin>, DatabaseError> {
+        let row: Option<(Option<i64>, i64, Option<i64>, Option<serde_json::Value>)> =
+            sqlx::query_as(
+                r#"
+                SELECT root_message_id, root_author_id, root_channel_id, display_snapshot
+                FROM privchat_message_forward_origin
+                WHERE message_id = $1
+                "#,
+            )
+            .bind(message_id as i64)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| DatabaseError::Database(format!("查询转发来源失败: {}", e)))?;
+
+        Ok(row.map(
+            |(root_message_id, root_author_id, root_channel_id, display_snapshot)| ForwardOrigin {
+                root_message_id: root_message_id.map(|id| id as u64),
+                root_author_id: root_author_id as u64,
+                root_channel_id: root_channel_id.map(|id| id as u64),
+                display_snapshot,
+            },
+        ))
+    }
+
     /// 引用了该文件的消息所在会话，以及那条消息是否仍然有效
     /// （MEDIA_REFERENCE_AND_FORWARD_SPEC §4.1）。
     ///
@@ -2603,6 +2813,9 @@ mod atomic_dispatch_tests {
             message,
             dedup_key: Some("test:p2:group-snapshot".to_string()),
             client_registry_claim: None,
+            attachment_origin: AttachmentOrigin::FreshUpload,
+            forward_origin: None,
+            require_live_source_message: None,
             attachment_refs: vec![
                 MediaRef {
                     file_id: 100,
@@ -2745,6 +2958,9 @@ mod atomic_dispatch_tests {
             message,
             dedup_key: Some("test:p2:group-snapshot".to_string()),
             client_registry_claim: None,
+            attachment_origin: AttachmentOrigin::FreshUpload,
+            forward_origin: None,
+            require_live_source_message: None,
             attachment_refs: vec![MediaRef {
                 file_id: 4242,
                 role: MediaRole::Original,
@@ -2904,6 +3120,9 @@ mod atomic_dispatch_tests {
                 dedup_key: Some("test:p2:group-snapshot".to_string()),
                 client_registry_claim: None,
                 attachment_refs: Vec::new(),
+                attachment_origin: AttachmentOrigin::FreshUpload,
+                forward_origin: None,
+                require_live_source_message: None,
                 channel_type: 2,
                 event: CanonicalTimelineEvent::NewMessage(privchat_protocol::NewMessageEvent {
                     message_type: privchat_protocol::ContentMessageType::Text,

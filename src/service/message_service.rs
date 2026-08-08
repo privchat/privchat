@@ -91,6 +91,16 @@ pub struct ServerSendMessageRequest {
     /// RP-12 幂等键（资金消息卡片注入用，如 `red_packet:{id}` / `money_transfer:{id}`）。
     /// 普通消息为 None。重复注入返回既有 message_id，不重复落库/推送。
     pub dedup_key: Option<String>,
+    /// 媒体引用的来源。默认 `FreshUpload`；转发路径传
+    /// `CopiedFromExistingMessage`，跳过「文件必须属于发送者」的归属守卫。
+    pub attachment_origin: crate::repository::message_repo::AttachmentOrigin,
+    /// 服务端给定的媒体引用。`None` = 从 metadata 解析（普通发送）。
+    /// 转发路径显式传源消息的引用，不靠对复制后的 metadata 再解析一次。
+    pub attachment_refs_override: Option<Vec<privchat_protocol::MediaRef>>,
+    /// 转发来源快照（spec §3.3）。
+    pub forward_origin: Option<crate::repository::message_repo::ForwardOrigin>,
+    /// 转发前置条件：提交事务里复查源消息仍然有效（spec §6.4）。
+    pub require_live_source_message: Option<u64>,
 }
 
 /// 服务端发消息的结果
@@ -101,6 +111,11 @@ pub struct ServerSendMessageResult {
     pub pts: u64,
     /// 创建时间（毫秒时间戳）
     pub created_at: i64,
+    /// 本次是否真的新建了消息。`false` = 幂等命中，返回的是既有那条。
+    ///
+    /// 调用方需要这个来区分「转发成功」和「重复请求」——两者都返回消息 id，
+    /// 但后者不该再算一次转发。
+    pub inserted: bool,
 }
 
 /// 撤回成功后的摘要——供 HTTP / RPC 入口层装配响应。
@@ -173,8 +188,9 @@ impl MessageService {
         let now = Utc::now();
         let message_id = crate::infra::next_message_id();
         let typed_metadata = MessageMetadata::from_json_value(req.message_type, &req.metadata);
-        let attachment_refs =
-            crate::service::legacy_media_refs::typed_media_refs(typed_metadata.as_ref());
+        let attachment_refs = req.attachment_refs_override.clone().unwrap_or_else(|| {
+            crate::service::legacy_media_refs::typed_media_refs(typed_metadata.as_ref())
+        });
         let canonical_event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
             message_type: req.message_type,
             payload: MessagePayloadEnvelope {
@@ -213,6 +229,9 @@ impl MessageService {
                 dedup_key: req.dedup_key.clone(),
                 client_registry_claim: None,
                 attachment_refs,
+                attachment_origin: req.attachment_origin,
+                forward_origin: req.forward_origin.clone(),
+                require_live_source_message: req.require_live_source_message,
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
                 sender_username: None,
@@ -226,6 +245,7 @@ impl MessageService {
                 message_id: message.message_id,
                 pts,
                 created_at: message.created_at.timestamp_millis(),
+                inserted: false,
             });
         }
 
@@ -322,6 +342,7 @@ impl MessageService {
             message_id: message.message_id,
             pts,
             created_at: message.created_at.timestamp_millis(),
+            inserted: true,
         })
     }
 
@@ -358,6 +379,10 @@ impl MessageService {
             channel_type: 2, // Group
             recipient_user_ids,
             dedup_key: None,
+            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
+            attachment_refs_override: None,
+            forward_origin: None,
+            require_live_source_message: None,
         };
 
         self.send_message(req)
