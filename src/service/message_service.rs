@@ -173,8 +173,8 @@ impl MessageService {
         let now = Utc::now();
         let message_id = crate::infra::next_message_id();
         let typed_metadata = MessageMetadata::from_json_value(req.message_type, &req.metadata);
-        let attachment_file_ids =
-            crate::service::legacy_media_refs::typed_media_file_ids(typed_metadata.as_ref());
+        let attachment_refs =
+            crate::service::legacy_media_refs::typed_media_refs(typed_metadata.as_ref());
         let canonical_event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
             message_type: req.message_type,
             payload: MessagePayloadEnvelope {
@@ -212,7 +212,7 @@ impl MessageService {
                 message,
                 dedup_key: req.dedup_key.clone(),
                 client_registry_claim: None,
-                attachment_file_ids,
+                attachment_refs,
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
                 sender_username: None,

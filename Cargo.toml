@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "qr_login_smoke"
 path = "examples/qr_login_smoke.rs"
 
+[[example]]
+name = "media_ref_prod_sweep"
+path = "examples/media_ref_prod_sweep.rs"
+
 [dependencies]
 # 传输层
 msgtrans = { version = "2.0.0-alpha.4", path = "../msgtrans" }

@@ -104,7 +104,11 @@ pub struct AtomicMessageCommitRequest {
     pub dedup_key: Option<String>,
     /// sync/submit durable idempotency claim. Mutually exclusive with dedup_key.
     pub client_registry_claim: Option<ClientRegistryClaim>,
-    pub attachment_file_ids: Vec<u64>,
+    /// 这条消息用到的媒体引用（带 role/ordinal）。
+    ///
+    /// **只有一个来源**：`service::legacy_media_refs`（裸 JSON 或 typed 两个入口）。
+    /// 事务里按两个维度消费——绑定守卫按去重后的 file_id，引用表按 (role, ordinal)。
+    pub attachment_refs: Vec<privchat_protocol::MediaRef>,
     pub channel_type: i16,
     pub event: CanonicalTimelineEvent,
     pub sender_username: Option<String>,
@@ -586,7 +590,9 @@ impl PgMessageRepository {
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
 
-        for file_id in request.attachment_file_ids {
+        let bind_file_ids =
+            crate::service::legacy_media_refs::unique_file_ids_of(&request.attachment_refs);
+        for file_id in bind_file_ids {
             // P1-19 归属守卫：file_id 来自客户端可控的 metadata，必须校验
             // ① 上传者就是发送者（不能引用他人的 file）
             // ② 未绑定到其它业务（不能把已绑定的附件重绑劫持；同消息重绑幂等放行）
@@ -635,6 +641,40 @@ impl PgMessageRepository {
                     file_id, message.message_id, message.sender_id
                 )));
             }
+        }
+
+        // 引用表双写（MEDIA_REFERENCE_AND_FORWARD_SPEC §10 第 4 步）。
+        //
+        // 与上面的 business_id 绑定**同事务**：两者一致是后续「按引用存在性授权」
+        // 能安全切换的前提。此刻 get_url 仍读旧鉴权，这张表只写不读；先写满，
+        // 回填补齐存量，校验零缺口之后才切读。
+        //
+        // 冲突即幂等：同一条消息重试提交（同 message_id/role/ordinal）不该报错。
+        for media_ref in &request.attachment_refs {
+            sqlx::query(
+                r#"
+                INSERT INTO privchat_message_file_refs
+                    (message_id, message_created_at, file_id, role, ordinal, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (message_id, role, ordinal) DO NOTHING
+                "#,
+            )
+            .bind(message.message_id as i64)
+            // 列是 bigint 毫秒时间戳，不是 timestamptz。整条提交路径统一用
+            // 上面算好的 created_at，直接 bind DateTime 会被数据库拒掉。
+            .bind(created_at)
+            .bind(media_ref.file_id as i64)
+            .bind(media_ref.role as i16)
+            .bind(media_ref.ordinal)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                DatabaseError::Database(format!(
+                    "Failed to record media ref file_id={} role={:?} for message_id={}: {}",
+                    media_ref.file_id, media_ref.role, message.message_id, e
+                ))
+            })?;
         }
 
         // 维护 message head（V019）。与建消息同事务：head 落后于消息会让客户端以为
@@ -2405,6 +2445,150 @@ mod atomic_dispatch_tests {
         .expect("read channel head")
     }
 
+    /// 【发布门禁】提交一条图片消息，引用表必须在**同一事务**里拿到两条带角色的引用。
+    ///
+    /// 这条只能在真库上验证：字段类型（`role` 是 SMALLINT）、外键指向分区表的
+    /// 复合主键、`ON CONFLICT` 的幂等——三样都是编译期和纯函数测试看不见的。
+    /// 回填 job 就在这上面栽过一次（`message_type` 按 i32 取，真库直接解码失败）。
+    #[tokio::test]
+    async fn committing_a_media_message_records_its_refs_in_the_same_transaction() {
+        use privchat_protocol::{MediaRef, MediaRole};
+
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip media ref dual-write test: DATABASE_URL not configured");
+            return;
+        };
+        cleanup(&repo).await;
+        ensure_user(&repo, OWNER_ID).await;
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_groups
+                (group_id, name, owner_id, member_count, created_at, updated_at, qr_key)
+            VALUES ($1, 'media-ref-group', $2, 1, $3, $3, $4)
+            "#,
+        )
+        .bind(GROUP_ID)
+        .bind(OWNER_ID)
+        .bind(Utc::now().timestamp_millis())
+        .bind(format!("q{GROUP_ID}"))
+        .execute(repo.pool())
+        .await
+        .expect("insert group");
+        sqlx::query(
+            "INSERT INTO privchat_channels (channel_id, channel_type, group_id) VALUES ($1, 1, $1)",
+        )
+        .bind(GROUP_ID)
+        .execute(repo.pool())
+        .await
+        .expect("insert channel");
+        // 提交路径会冻结一份收件人快照，成员为空会直接拒绝提交。
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_group_members
+                (group_id, user_id, role, joined_at, updated_at)
+            VALUES ($1, $2, 2, $3, $3)
+            "#,
+        )
+        .bind(GROUP_ID)
+        .bind(OWNER_ID)
+        .bind(Utc::now().timestamp_millis())
+        .execute(repo.pool())
+        .await
+        .expect("insert group member");
+
+        let now = Utc::now();
+        let legacy = privchat_protocol::LocalMessagePayloadEnvelope {
+            content: String::new(),
+            ..Default::default()
+        };
+        let message = Message {
+            message_id: MESSAGE_ID,
+            channel_id: GROUP_ID as u64,
+            sender_id: OWNER_ID as u64,
+            pts: None,
+            local_message_id: Some(MESSAGE_ID),
+            content: String::new(),
+            message_type: privchat_protocol::ContentMessageType::Image,
+            metadata: serde_json::json!({ "file_id": 100u64, "thumbnail_file_id": 200u64 }),
+            reply_to_message_id: None,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+            deleted_at: None,
+            revoked: false,
+            revoked_at: None,
+            revoked_by: None,
+        };
+        // 附件绑定守卫要求文件属于发送者且尚未被占用——先造出这两个文件行，
+        // 否则提交会以 ATTACHMENT_BINDING_REJECTED 失败，测不到引用写入。
+        for file_id in [100i64, 200i64] {
+            sqlx::query(
+                r#"
+                INSERT INTO privchat_file_uploads
+                    (file_id, original_filename, file_size, file_type, mime_type,
+                     file_path, uploader_id, business_type)
+                VALUES ($1, 'x.jpg', 1, 'image', 'image/jpeg', '/x.jpg', $2, 'message')
+                ON CONFLICT (file_id) DO NOTHING
+                "#,
+            )
+            .bind(file_id)
+            .bind(OWNER_ID)
+            .execute(repo.pool())
+            .await
+            .expect("seed file row");
+        }
+
+        repo.create_message_and_commit_atomic(AtomicMessageCommitRequest {
+            message,
+            dedup_key: Some("test:p2:group-snapshot".to_string()),
+            client_registry_claim: None,
+            attachment_refs: vec![
+                MediaRef {
+                    file_id: 100,
+                    role: MediaRole::Original,
+                    ordinal: 0,
+                },
+                MediaRef {
+                    file_id: 200,
+                    role: MediaRole::Thumbnail,
+                    ordinal: 0,
+                },
+            ],
+            channel_type: 2,
+            event: CanonicalTimelineEvent::NewMessage(privchat_protocol::NewMessageEvent {
+                message_type: privchat_protocol::ContentMessageType::Image,
+                payload: privchat_protocol::MessagePayloadEnvelope::from_legacy(
+                    &legacy,
+                    privchat_protocol::ContentMessageType::Image,
+                ),
+            }),
+            sender_username: None,
+        })
+        .await
+        .expect("atomic media message commit");
+
+        let refs: Vec<(i64, i16)> = sqlx::query_as(
+            "SELECT file_id, role FROM privchat_message_file_refs \
+             WHERE message_id = $1 ORDER BY role",
+        )
+        .bind(MESSAGE_ID as i64)
+        .fetch_all(repo.pool())
+        .await
+        .expect("read media refs");
+        assert_eq!(
+            refs,
+            vec![(100, MediaRole::Original as i16), (200, MediaRole::Thumbnail as i16)],
+            "图片消息必须同事务写入原图与缩略图两条带角色的引用",
+        );
+
+        let _ = sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = ANY($1)")
+            .bind(vec![100i64, 200i64])
+            .execute(repo.pool())
+            .await;
+        cleanup(&repo).await;
+    }
+
     #[tokio::test]
     async fn atomic_commit_freezes_group_recipients_and_outbox() {
         let _fixture_guard = crate::database_fixture_lock().lock().await;
@@ -2481,7 +2665,7 @@ mod atomic_dispatch_tests {
                 message,
                 dedup_key: Some("test:p2:group-snapshot".to_string()),
                 client_registry_claim: None,
-                attachment_file_ids: Vec::new(),
+                attachment_refs: Vec::new(),
                 channel_type: 2,
                 event: CanonicalTimelineEvent::NewMessage(privchat_protocol::NewMessageEvent {
                     message_type: privchat_protocol::ContentMessageType::Text,

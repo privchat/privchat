@@ -47,6 +47,13 @@ async fn main() -> Result<()> {
             privchat::cli::Commands::ShowConfig => {
                 return show_config(&cli);
             }
+            privchat::cli::Commands::BackfillMediaRefs {
+                batch_size,
+                since,
+                verify_only,
+            } => {
+                return run_backfill_media_refs(&cli, *batch_size, *since, *verify_only).await;
+            }
         }
     }
 
@@ -411,5 +418,60 @@ fn show_config(cli: &Cli) -> Result<()> {
     println!("📊 最终配置（合并后的配置）:");
     println!("{}", serde_json::to_string_pretty(&config)?);
 
+    Ok(())
+}
+
+/// 回填消息 → 文件引用表，并做零缺口校验。
+///
+/// 校验结果**决定 `get_url` 能不能切到引用表**：缺口不为零就切，等于让那部分
+/// 消息的附件在切换那一刻起下不动。所以这里把缺口数打出来，而不是只报成功。
+async fn run_backfill_media_refs(
+    cli: &Cli,
+    batch_size: i64,
+    since: i64,
+    verify_only: bool,
+) -> Result<()> {
+    let _ = dotenvy::dotenv();
+    let database_url = cli
+        .database_url
+        .clone()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .context("需要 DATABASE_URL，请在 .env 或环境变量中配置")?;
+
+    println!("🔌 连接数据库...");
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .context("数据库连接失败，请检查 DATABASE_URL")?;
+
+    if !verify_only {
+        println!("▶ 回填引用表（batch={batch_size}, since={since}）...");
+        let report = privchat::service::media_ref_backfill::backfill_from(&pool, batch_size, since)
+            .await
+            .context("回填失败")?;
+        println!("  扫描消息        {}", report.scanned);
+        println!("  含引用消息      {}", report.messages_with_refs);
+        println!("  新写入引用行    {}", report.refs_inserted);
+        println!(
+            "  需人工复核      {}（metadata 解不出 {} / 无引用 {} / 缺主体文件 {}）",
+            report.audited(),
+            report.audit_undecodable,
+            report.audit_no_refs,
+            report.audit_missing_original
+        );
+    }
+
+    println!("▶ 零缺口校验...");
+    let missing = privchat::service::media_ref_backfill::verify_no_gaps(&pool, batch_size)
+        .await
+        .context("校验失败")?;
+    if missing.is_empty() {
+        println!("✅ 零缺口：每条能解析出引用的消息，引用都已在表中。");
+    } else {
+        println!("❌ 缺口 {} 条，前 20 条 message_id：", missing.len());
+        for message_id in missing.iter().take(20) {
+            println!("   {message_id}");
+        }
+        anyhow::bail!("引用表存在缺口，不得切换 get_url 授权来源");
+    }
     Ok(())
 }
