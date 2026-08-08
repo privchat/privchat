@@ -508,17 +508,14 @@ async fn a_policy_lookup_failure_refuses_as_a_retryable_service_error() {
     cleanup(&pool).await;
 }
 
-/// 频道设置禁止成员发言。
+/// 群设为「仅群主/管理员可发言」（公告群）→ 普通成员被拦，管理层不受限。
 ///
-/// ⚠️ 这里直接改**内存里的 Channel**，而不是改数据库：`allow_member_post`
-/// 至今没有任何持久化路径——`ChannelSettings::default()` 给 true，
-/// hydration 只从 `privchat_groups` 补 name/allow_search/join_policy/
-/// allow_member_invite/allow_member_add_friend/all_muted，没有这一项。
-/// 也就是说**这条策略分支目前在生产上不可达**。
-/// 造一条假的 DB 状态去测它只会得到一个骗人的绿；这里退而测策略本身，
-/// 并把「缺持久化」这件事留在这段说明里。
+/// 这条策略此前**在生产上不可达**：`allow_member_post` 只活在 `ChannelSettings`
+/// 这份内存缓存里，没有写入入口，也没有任何东西让它跨重启存活——读它的代码存在，
+/// 值永远是默认的 true。所以这里走的是真正的写入路径（`update_group_policy`，
+/// 即 `group/settings/update` 落库用的那个），不是手动改内存字段。
 #[tokio::test]
-async fn a_channel_that_forbids_member_posting_refuses_ordinary_members() {
+async fn a_group_that_forbids_member_posting_refuses_ordinary_members() {
     let _guard = fixture_lock().lock().await;
     let Some((deps, pool)) = deps().await else {
         return;
@@ -528,26 +525,63 @@ async fn a_channel_that_forbids_member_posting_refuses_ordinary_members() {
     ensure_user(&pool, MEMBER, "sa_member").await;
     seed_group(&pool).await;
 
-    let mut channel = deps
+    deps.channel_service
+        .update_group_policy(GROUP_ID as u64, None, None, None, None, None, Some(false), None)
+        .await
+        .expect("落库 allow_member_post=false");
+
+    let channel = deps
         .channel_service
         .get_channel_opt(GROUP_ID as u64)
         .await
         .expect("channel");
-    let settings = channel
-        .settings
-        .get_or_insert_with(privchat::model::channel::ChannelSettings::default);
-    settings.allow_member_post = false;
 
     assert_eq!(
         authorize_send_to_channel(&deps, &channel, MEMBER as u64).await,
         Err(SendRefusal::ChannelForbidsPosting),
-        "频道禁止成员发言时普通成员必须被拦",
+        "只读群里普通成员必须被拦",
     );
     assert!(
         authorize_send_to_channel(&deps, &channel, OWNER as u64)
             .await
             .is_ok(),
         "群主不受 allow_member_post 限制",
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 🔴 只读设置必须跨重启存活。
+///
+/// 这正是它此前形同虚设的地方：限制活在内存里，进程一重启就回到默认的「允许发言」，
+/// 而默认值是放开的一侧。一个限制性策略只要重启就消失，等于没有这个策略。
+#[tokio::test]
+async fn a_read_only_group_survives_a_fresh_service_instance() {
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_group(&pool).await;
+
+    deps.channel_service
+        .update_group_policy(GROUP_ID as u64, None, None, None, None, None, Some(false), None)
+        .await
+        .expect("落库 allow_member_post=false");
+
+    // 全新实例：自带空的频道缓存，只能从 DB 读。
+    let (fresh, _) = deps_fresh().await.expect("fresh deps");
+    let channel = fresh
+        .channel_service
+        .get_channel_opt(GROUP_ID as u64)
+        .await
+        .expect("channel");
+    assert_eq!(
+        authorize_send_to_channel(&fresh, &channel, MEMBER as u64).await,
+        Err(SendRefusal::ChannelForbidsPosting),
+        "重启后只读群仍然只读——限制不能随进程一起消失",
     );
 
     cleanup(&pool).await;

@@ -96,6 +96,8 @@ pub async fn handle(
         allow_search: policy.allow_search,
         join_policy: policy.join_policy as u8,
         all_muted: policy.all_muted,
+        allow_member_post: policy.allow_member_post,
+        forbid_forward: policy.forbid_forward,
         max_members: s
             .and_then(|s| s.max_members.map(|m| m as usize))
             .or(channel.metadata.max_members)

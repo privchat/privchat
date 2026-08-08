@@ -626,6 +626,10 @@ pub struct GroupPolicy {
     pub allow_member_invite: bool,
     pub allow_member_add_friend: bool,
     pub all_muted: bool,
+    /// 普通成员是否可以发言。false = 本群常态只读（公告群），只有群主/管理员能发。
+    ///
+    /// 与 `all_muted` 正交：那是「临时闭麦」，这是「常态只读」。任一为限制态即拒绝发送。
+    pub allow_member_post: bool,
     /// 内容保护：禁止把本群的消息转发出去（spec §6.3）。
     ///
     /// 服务端在创建副本**之前**拒绝。已完成的转发不追溯——副本是目标会话里的
@@ -641,6 +645,7 @@ impl Default for GroupPolicy {
             allow_member_invite: true,
             allow_member_add_friend: true,
             all_muted: false,
+            allow_member_post: true,
             forbid_forward: false,
         }
     }
