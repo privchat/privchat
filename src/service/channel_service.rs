@@ -3825,7 +3825,7 @@ impl ChannelService {
         }
         // P1-16：先落库（真源）。send 校验与重启恢复都读 privchat_groups.all_muted，
         // 此前只写内存导致 mute-all 跨重启失效。channel_id == group_id（005 id 统一）。
-        self.update_group_policy(*channel_id, None, None, None, None, Some(muted))
+        self.update_group_policy(*channel_id, None, None, None, None, Some(muted), None, None)
             .await?;
         // 再刷内存缓存
         let mut channels = self.channels.write().await;
@@ -3965,8 +3965,8 @@ impl ChannelService {
         &self,
         group_id: u64,
     ) -> Result<Option<crate::model::channel::GroupPolicy>> {
-        let row = sqlx::query_as::<_, (bool, i16, bool, bool, bool, bool)>(
-            "SELECT allow_search, join_policy, allow_member_invite, allow_member_add_friend, all_muted, forbid_forward \
+        let row = sqlx::query_as::<_, (bool, i16, bool, bool, bool, bool, bool)>(
+            "SELECT allow_search, join_policy, allow_member_invite, allow_member_add_friend, all_muted, allow_member_post, forbid_forward \
              FROM privchat_groups WHERE group_id = $1",
         )
         .bind(group_id as i64)
@@ -3981,6 +3981,7 @@ impl ChannelService {
                 allow_member_invite,
                 allow_member_add_friend,
                 all_muted,
+                allow_member_post,
                 forbid_forward,
             )| {
                 crate::model::channel::GroupPolicy {
@@ -3989,6 +3990,7 @@ impl ChannelService {
                     allow_member_invite,
                     allow_member_add_friend,
                     all_muted,
+                    allow_member_post,
                     forbid_forward,
                 }
             },
@@ -4006,6 +4008,8 @@ impl ChannelService {
         allow_member_invite: Option<bool>,
         allow_member_add_friend: Option<bool>,
         all_muted: Option<bool>,
+        allow_member_post: Option<bool>,
+        forbid_forward: Option<bool>,
     ) -> Result<()> {
         sqlx::query(
             "UPDATE privchat_groups SET \
@@ -4014,7 +4018,9 @@ impl ChannelService {
              allow_member_invite = COALESCE($4, allow_member_invite), \
              allow_member_add_friend = COALESCE($5, allow_member_add_friend), \
              all_muted = COALESCE($6, all_muted), \
-             updated_at = $7 \
+             allow_member_post = COALESCE($7, allow_member_post), \
+             forbid_forward = COALESCE($8, forbid_forward), \
+             updated_at = $9 \
              WHERE group_id = $1",
         )
         .bind(group_id as i64)
@@ -4023,6 +4029,8 @@ impl ChannelService {
         .bind(allow_member_invite)
         .bind(allow_member_add_friend)
         .bind(all_muted)
+        .bind(allow_member_post)
+        .bind(forbid_forward)
         .bind(chrono::Utc::now().timestamp_millis())
         .execute(self.pool())
         .await

@@ -158,21 +158,28 @@ pub async fn authorize_send_to_channel(
             // 判定不出来时按**拒绝**处理（禁言是限制性策略，宁可多拦一条）。
             // 🔴 查询失败拒绝，但**不能报成 GroupMuted**：那会让用户看到「群已禁言」
             // 这个假事实，客户端也不会重试。故障要有故障的样子。
-            let all_muted = if let Some(group_id) = channel.group_id {
+            //
+            // 一次查询同时供全员禁言与「仅群主/管理员可发言」使用：两条都是 DB 真源，
+            // 分两次查只会多一次往返，还多一个「两次读到不一致状态」的窗口。
+            let policy = if let Some(group_id) = channel.group_id {
                 match deps.channel_service.get_group_policy(group_id).await {
-                    Ok(Some(policy)) => policy.all_muted,
-                    // 群不存在：没有群策略可言，不拦。
-                    Ok(None) => false,
+                    Ok(policy) => policy,
                     Err(e) => {
                         tracing::error!("查询群 {group_id} 策略失败: {e}");
                         return Err(SendRefusal::PolicyUnavailable);
                     }
                 }
             } else {
-                false
+                // 群不存在 group_id：没有群策略可言，不拦。
+                None
             };
-            if all_muted {
+            if policy.map(|p| p.all_muted).unwrap_or(false) {
                 return Err(SendRefusal::GroupAllMuted);
+            }
+            // 常态只读（公告群）。与全员禁言分开报，两者的用户预期不同：
+            // 一个是「现在别说话」，一个是「这个群本来就只有管理员发言」。
+            if !policy.map(|p| p.allow_member_post).unwrap_or(true) {
+                return Err(SendRefusal::ChannelForbidsPosting);
             }
         }
 
@@ -181,8 +188,17 @@ pub async fn authorize_send_to_channel(
         }
     }
 
-    // 频道级设置（如群的 allow_member_post）。放在角色权限之后，与历史顺序一致。
-    if !channel.can_user_post(&sender_id) {
+    // 频道级设置。群的 allow_member_post 已在上面按 DB 真源判过——这里只剩
+    // 成员自身的 can_send_message 权限位。
+    //
+    // 🔴 不能退回 `channel.can_user_post`：它读的是 `ChannelSettings` 这份内存缓存，
+    // 重启即回到默认值，而默认值是放开。限制性策略靠内存缓存等于没有。
+    if !channel
+        .members
+        .get(&sender_id)
+        .map(|m| m.permissions.can_send_message)
+        .unwrap_or(false)
+    {
         return Err(SendRefusal::ChannelForbidsPosting);
     }
 

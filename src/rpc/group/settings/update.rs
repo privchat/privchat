@@ -71,12 +71,18 @@ pub async fn handle(
     let allow_member_add_friend = patch.allow_member_add_friend;
     let allow_search = patch.allow_search;
     let join_policy = patch.join_policy;
+    let allow_member_post = patch.allow_member_post;
+    let forbid_forward = patch.forbid_forward;
     let max_members = patch.max_members;
     let announcement = patch.announcement.clone();
     let description = patch.description.clone();
 
     // 5. 更新群设置
     let mut update_count = 0;
+    // 只落库、没有对应内存 setter 的策略项单独计数。
+    // 🔴 allow_member_post / forbid_forward **只**有 DB 真源，没有内存镜像——
+    // 内存镜像正是它们此前形同虚设的原因（重启回默认值 = 限制消失）。
+    let mut update_count_policy = 0;
 
     // 5.0. 群业务策略先落库（DB 为真源），再由下方 setter 同步内存缓存。
     //      仅当存在 policy 字段变更时才写库，避免无谓 UPDATE。
@@ -98,6 +104,8 @@ pub async fn handle(
         || member_can_invite.is_some()
         || allow_member_add_friend.is_some()
         || all_muted.is_some()
+        || allow_member_post.is_some()
+        || forbid_forward.is_some()
     {
         services
             .channel_service
@@ -108,9 +116,17 @@ pub async fn handle(
                 member_can_invite,
                 allow_member_add_friend,
                 all_muted,
+                allow_member_post,
+                forbid_forward,
             )
             .await
             .map_err(|e| RpcError::internal(format!("群设置落库失败: {}", e)))?;
+        if allow_member_post.is_some() {
+            update_count_policy += 1;
+        }
+        if forbid_forward.is_some() {
+            update_count_policy += 1;
+        }
         tracing::debug!("✅ 群设置已落库: group_id={}", group_id);
     }
 
@@ -247,6 +263,8 @@ pub async fn handle(
         update_count += 1;
         tracing::debug!("✅ 更新成员上限成功: {}", max);
     }
+
+    update_count += update_count_policy;
 
     tracing::debug!(
         "✅ 群设置更新成功: group_id={}, 更新项数={}",
