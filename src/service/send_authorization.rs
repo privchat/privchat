@@ -254,8 +254,6 @@ pub async fn authorize_send_to_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::channel::{Channel, ChannelMember, ChannelType, MemberRole};
-    use std::collections::HashMap;
 
     /// 每种拒绝都有自己的错误码：客户端据此决定「稍后再试」还是「别再发了」。
     #[test]
