@@ -68,15 +68,23 @@ pub async fn get_file_url(
         user_id,
     )
     .await
-    .map_err(|error| RpcError::internal(error.to_string()))?;
+    .map_err(|error| {
+        // 🔴 底层错误原文不回客户端：router 会把 message 原样透传，
+        // 数据库连接串、表名、SQL 片段就这样漏到了外面。
+        // 详情进服务端日志，客户端只拿一个稳定标识。
+        tracing::error!(
+            "附件授权判定不可用 file_id={} user_id={}: {}",
+            request.file_id,
+            user_id,
+            error
+        );
+        RpcError::internal("ATTACHMENT_AUTHORIZATION_UNAVAILABLE".to_string())
+    })?;
 
     if decision.authorized {
         // fallback 命中率是「回填够不够」的唯一读数。归零之前不能删掉第 2 条发现路径，
         // 归零之后才谈得上移除 business_id 兼容（spec §10 第 9 步）。
-        crate::infra::metrics::record_file_access_authorized(matches!(
-            decision.source,
-            crate::service::attachment_authorization::CandidateSource::LegacyBusinessId
-        ));
+        crate::infra::metrics::record_file_access_authorized(decision.source);
     } else {
         tracing::warn!(
             "🚫 拒绝访问附件: file_id={}, user_id={}, candidates={}, source={:?}",

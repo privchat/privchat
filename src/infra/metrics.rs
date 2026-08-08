@@ -191,12 +191,16 @@ impl Drop for DurationRecorder {
 /// 附件下载授权通过一次。`via_legacy_fallback=true` 表示候选消息是靠老的
 /// `business_id` 单点绑定找到的，而不是引用表——**这个计数归零才代表回填补齐**
 /// （MEDIA_REFERENCE_AND_FORWARD_SPEC §10.1）。
-pub fn record_file_access_authorized(via_legacy_fallback: bool) {
-    metrics::counter!(
-        COUNTER_FILE_ACCESS_AUTHORIZED,
-        "source" => if via_legacy_fallback { "legacy_business_id" } else { "reference_table" }
-    )
-    .increment(1);
+pub fn record_file_access_authorized(source: crate::service::attachment_authorization::CandidateSource) {
+    use crate::service::attachment_authorization::CandidateSource;
+    let label = match source {
+        CandidateSource::ReferenceTable => "reference_table",
+        CandidateSource::LegacyBusinessId => "legacy_business_id",
+        // pending 上传单独一档：它不是「回填没覆盖」，混进 legacy 会让
+        // 「legacy 归零 = 回填补齐」这个判据永远无法成立。
+        CandidateSource::PendingUpload => "pending_upload",
+    };
+    metrics::counter!(COUNTER_FILE_ACCESS_AUTHORIZED, "source" => label).increment(1);
 }
 
 /// 附件下载授权被拒一次。撤回/删除后仍来取 CEK 的请求会落在这里。

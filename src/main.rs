@@ -461,11 +461,31 @@ async fn run_backfill_media_refs(
     }
 
     println!("▶ 零缺口校验...");
-    let missing = privchat::service::media_ref_backfill::verify_no_gaps(&pool, batch_size)
+    let report = privchat::service::media_ref_backfill::verify_no_gaps(&pool, batch_size)
         .await
         .context("校验失败")?;
-    if missing.is_empty() {
-        println!("✅ 引用集合逐条一致：没有缺失，也没有多余。");
+    let missing = &report.mismatches;
+    // 🔴 审计条数也是判据：解析不出引用的媒体消息「期望集合」本来就空，
+    // 表里也空，集合比对当然一致——那条消息的附件却永远下不动。
+    // 只报数字不影响退出码，等于把问题埋进成功日志。
+    if report.audited > 0 {
+        println!(
+            "⚠️ 需人工复核 {} 条（metadata 解不出 {} / 无引用 {} / 缺主体文件 {}）",
+            report.audited,
+            report.audit_undecodable,
+            report.audit_no_refs,
+            report.audit_missing_original
+        );
+    }
+    if report.is_clean() {
+        println!("✅ 引用集合逐条一致，且没有解析审计问题。");
+    } else if missing.is_empty() {
+        anyhow::bail!(
+            "引用集合一致，但有 {} 条消息的媒体解析不出引用；\
+             这些消息的附件在切换后会下不动。要么修数据，要么提供一份\
+             经过审批的隔离清单，再谈切换 get_url 授权来源",
+            report.audited
+        );
     } else {
         // 只报「差了几条」会漏掉「数量对但内容错位」，而 ON CONFLICT DO NOTHING
         // 恰恰会把写错的那条原样留着。所以这里逐条打出 missing / unexpected。

@@ -195,10 +195,33 @@ pub struct ReferenceMismatch {
 ///
 /// 这是「敢不敢把 get_url 切到引用表」的判据。切换前必须为空——
 /// 不为空意味着有消息的附件在切换那一刻开始下不动，或者下到别的文件。
+/// 一次校验的完整结论。
+///
+/// 🔴 只有 `mismatches.is_empty()` **不足以**放行：解析不出引用的媒体消息，
+/// 「期望集合」本来就是空的，表里也空，集合比对当然一致——于是一条永远
+/// 下不动附件的消息被判定为「零缺口」。审计条数必须一并成为判据。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VerificationReport {
+    pub mismatches: Vec<ReferenceMismatch>,
+    /// 解析阶段发现问题的消息条数（metadata 解不出 / 无引用 / 缺主体文件）。
+    pub audited: usize,
+    pub audit_undecodable: usize,
+    pub audit_no_refs: usize,
+    pub audit_missing_original: usize,
+}
+
+impl VerificationReport {
+    /// 可以切换 `get_url` 授权来源吗？
+    pub fn is_clean(&self) -> bool {
+        self.mismatches.is_empty() && self.audited == 0
+    }
+}
+
 pub async fn verify_no_gaps(
     pool: &PgPool,
     batch_size: i64,
-) -> Result<Vec<ReferenceMismatch>, anyhow::Error> {
+) -> Result<VerificationReport, anyhow::Error> {
+    let mut report = VerificationReport::default();
     let mut mismatches = Vec::new();
     let mut cursor = Cursor {
         created_at: 0,
@@ -248,12 +271,26 @@ pub async fn verify_no_gaps(
                 message_id,
             };
 
-            let expected: BTreeSet<(u64, i16, i32)> =
-                parse_legacy_media_refs_by_code(i32::from(message_type), &metadata)
-                    .refs
-                    .into_iter()
-                    .map(|r| (r.file_id, r.role as i16, r.ordinal))
-                    .collect();
+            let parsed = parse_legacy_media_refs_by_code(i32::from(message_type), &metadata);
+            if !parsed.audits.is_empty() {
+                report.audited += 1;
+                for audit in &parsed.audits {
+                    match audit {
+                        LegacyAudit::MetadataUndecodable { .. } => {
+                            report.audit_undecodable += 1
+                        }
+                        LegacyAudit::NoRefsForMediaType { .. } => report.audit_no_refs += 1,
+                        LegacyAudit::MissingOriginal { .. } => {
+                            report.audit_missing_original += 1
+                        }
+                    }
+                }
+            }
+            let expected: BTreeSet<(u64, i16, i32)> = parsed
+                .refs
+                .into_iter()
+                .map(|r| (r.file_id, r.role as i16, r.ordinal))
+                .collect();
 
             let actual: BTreeSet<(u64, i16, i32)> = stored
                 .as_array()
@@ -286,7 +323,8 @@ pub async fn verify_no_gaps(
         }
     }
 
-    Ok(mismatches)
+    report.mismatches = mismatches;
+    Ok(report)
 }
 
 #[cfg(test)]

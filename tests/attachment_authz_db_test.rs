@@ -52,11 +52,13 @@ async fn open_test_pool() -> Option<Arc<sqlx::PgPool>> {
     // 🔴 缺库默认 panic。评审实测过：没有 DATABASE_URL 时这三条测试全部跳过，
     // 结果却显示通过——那样的「绿」不能证明 SQL 契约执行过。
     let url = privchat::require_test_database_url()?;
+    // 🔴 连接失败也不能吞：地址配了但连不上时，`.ok()?` 会让测试跳过并记「通过」。
+    // 这比缺变量更隐蔽——CI 里数据库没起来，门禁照样是绿的。
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
         .await
-        .ok()?;
+        .unwrap_or_else(|e| panic!("连接测试数据库失败（{url}）: {e}"));
     Some(Arc::new(pool))
 }
 

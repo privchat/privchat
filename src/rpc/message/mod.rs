@@ -43,25 +43,18 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    // 单条转发路由（MEDIA_REFERENCE_AND_FORWARD_SPEC §6）。
+    // 单条转发路由（MEDIA_REFERENCE_AND_FORWARD_SPEC §6）：**无条件不注册**。
     //
-    // 🔴 **默认不注册**。「官方客户端还没做入口」不是安全边界——路由一旦注册，
-    // 任何自定义客户端都能直接调。在 §6.3 内容保护与「与普通发送共用的
-    // 权限策略（禁言 / 黑名单 / 角色）」落地并验证之前，这个开关保持关闭。
-    if services.config.message.forward_enabled {
-        GLOBAL_RPC_ROUTER
-            .register(routes::message::FORWARD, {
-                let services = services.clone();
-                move |params, ctx| {
-                    let services = services.clone();
-                    Box::pin(async move { forward::handle(params, services, ctx).await })
-                }
-            })
-            .await;
-        tracing::warn!("⚠️ message/forward 已启用（[message] forward_enabled = true）");
-    } else {
-        tracing::info!("🔒 message/forward 未注册（[message] forward_enabled 默认 false）");
-    }
+    // 🔴 这里曾经是个配置开关（`[message] forward_enabled`）。开关本身没错，
+    // 错在它当时是「未完成的安全边界」的唯一闸门——一行配置就能启用一个
+    // 明确缺少发送权限校验（禁言/黑名单/角色）、缺少内容保护、且非原子的 RPC。
+    // 运行期开关的正当用途是**安全功能做完之后**的灰度放量，不是替代没做完的活。
+    //
+    // 恢复注册的前提（spec §15 发布门禁）：
+    //   1. 转发与普通发送共用同一个 `authorize_send_to_channel()`
+    //   2. §6.3 内容保护（FORWARDS_RESTRICTED）落地
+    //   3. 单事务 `forward_message_atomic`（锁源 → 校验 → 幂等 → 写入）
+    // 三项齐了再把开关加回来，作为灰度手段。
 
     // 注册群消息置顶 / 取消置顶路由（P1）
     GLOBAL_RPC_ROUTER
@@ -86,6 +79,6 @@ pub async fn register_routes(services: RpcServiceContext) {
         .await;
 
     tracing::debug!(
-        "📋 Message 系统路由注册完成 (history, status, reaction, revoke, forward, pin, pin/list)"
+        "📋 Message 系统路由注册完成 (history, status, reaction, revoke, pin, pin/list；forward 未注册)"
     );
 }
