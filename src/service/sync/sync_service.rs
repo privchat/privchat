@@ -343,9 +343,7 @@ impl SyncService {
     }
 
     fn attachment_file_ids(metadata: Option<&MessageMetadata>) -> Vec<u64> {
-        metadata
-            .map(MessageMetadata::attachment_file_ids)
-            .unwrap_or_default()
+        crate::service::legacy_media_refs::typed_media_file_ids(metadata)
     }
 
     fn message_from_submit(
