@@ -392,6 +392,20 @@ impl FileService {
             return Err(ServerError::Forbidden("无权删除此文件".to_string()));
         }
 
+        // 🔴 只允许删除**没有被任何消息引用过**的 pending 文件
+        // （MEDIA_REFERENCE_AND_FORWARD_SPEC §8.2）。
+        //
+        // 「我上传的文件我能删」在单点绑定模型下成立，在共享引用模型下不成立：
+        // 一个文件可能同时被自己的原消息和若干转发副本引用，上传者删掉物理文件，
+        // 那些副本会一起变成打不开的图。已被引用的文件只能由引用计数 GC 回收。
+        //
+        // 已撤回的引用也算数——引用行保留是为了审计，而且撤回可能被撤销/被管理端复核。
+        if self.file_upload_repo.reference_count(file_id).await? > 0 {
+            return Err(ServerError::Forbidden(
+                "文件已被消息引用，不能直接删除".to_string(),
+            ));
+        }
+
         let metadata = self
             .get_file_metadata(file_id)
             .await?

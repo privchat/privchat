@@ -170,6 +170,21 @@ impl FileUploadRepository {
     }
 
     /// 按 file_id 删除
+    /// 这个文件当前被多少条消息引用（含已撤回/已删除的引用）。
+    ///
+    /// 用于删除守卫：**被引用过的文件不允许按上传者意愿删除**。
+    /// 共享引用上线后，一个上传者删掉自己的原图，会让所有转发副本一起损坏。
+    pub async fn reference_count(&self, file_id: u64) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM privchat_message_file_refs WHERE file_id = $1",
+        )
+        .bind(file_id as i64)
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询文件引用数失败: {}", e)))?;
+        Ok(count)
+    }
+
     pub async fn delete(&self, file_id: u64) -> Result<bool> {
         let result = sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = $1")
             .bind(file_id as i64)

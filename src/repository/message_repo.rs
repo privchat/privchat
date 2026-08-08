@@ -2801,6 +2801,32 @@ mod atomic_dispatch_tests {
         cleanup(&repo).await;
     }
 
+    /// 【spec §8.2】被消息引用过的文件，上传者不能直接删。
+    ///
+    /// 共享引用之前这条不成立也没事（一个文件只挂一条消息）；共享之后，
+    /// 上传者删掉原图会让所有转发副本一起变成打不开的图。
+    /// `delete_file` 目前还没有 RPC 调用方——这是拆定时炸弹，不是灭火。
+    #[tokio::test]
+    async fn a_referenced_file_cannot_be_deleted_by_its_uploader() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip delete guard test: DATABASE_URL not configured");
+            return;
+        };
+        let file_id = 4243i64;
+        let repo_files = crate::repository::file_upload_repo::FileUploadRepository::new(
+            std::sync::Arc::new(repo.pool().clone()),
+        );
+        assert_eq!(
+            repo_files
+                .reference_count(file_id as u64)
+                .await
+                .expect("count"),
+            0,
+            "未被引用的文件计数应为 0（可以删）",
+        );
+    }
+
     #[tokio::test]
     async fn atomic_commit_freezes_group_recipients_and_outbox() {
         let _fixture_guard = crate::database_fixture_lock().lock().await;

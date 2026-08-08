@@ -1,7 +1,9 @@
 // 附件加密 v1 — file/get_url 访问授权 RC-gate（DB-backed）。
 //
-// 复刻 `src/rpc/file/get_url.rs` 的鉴权组合（get_by_file_id → bound_message_id →
-// message_repo.get_channel_id → channel_service.is_channel_member → authorize_file_access），
+// 🔴 这个文件曾经**复刻**了一份 get_url 的鉴权组合。那份抄件的后果是：改了 RPC
+// 的判据，先炸的是测试，而测试证明的只是抄件自洽。现在统一调
+// `service::attachment_authorization::resolve_attachment_access` —— 判定只有一份。
+//
 // 用真实 repo/service 打到真库，覆盖 ATTACHMENT_ENCRYPTION_SPEC §授权 的 7 条规则：
 //   1. 发送附件后 file.business_id = message_id（绑定机制 / update_business）
 //   2. thumbnail_file_id 同样绑定 message_id
@@ -19,7 +21,7 @@ use sqlx::postgres::PgPoolOptions;
 
 use privchat::model::file_upload::{FileMetadata, FileType};
 use privchat::repository::{FileUploadRepository, PgChannelRepository, PgMessageRepository};
-use privchat::service::file_service::authorize_file_access;
+use privchat::service::attachment_authorization::resolve_attachment_access;
 use privchat::service::ChannelService;
 
 // 测试 ID 命名空间（避免与其它测试 / 真实数据冲突）。
@@ -36,6 +38,8 @@ const FILE_PENDING: u64 = 9_943_004;
 const FILE_BROKEN: u64 = 9_943_005;
 const FILE_BIND_MAIN: u64 = 9_943_006;
 const FILE_BIND_THUMB: u64 = 9_943_007;
+const FILE_SHARED: u64 = 9_943_008;
+const MESSAGE_ID_2: i64 = 9_942_002;
 
 // Both DB-backed cases intentionally share this fixed fixture namespace. Keep
 // them serial so one case cannot clean up rows while the other is asserting.
@@ -150,7 +154,7 @@ fn file_meta(
     }
 }
 
-/// 复刻 get_url.rs 的鉴权决策；返回 (authorized, cek_if_returned, encryption_version)。
+/// 走 get_url 用的**同一个**判定入口；返回 (authorized, cek_if_returned, encryption_version)。
 async fn resolve_get_url(
     file_repo: &FileUploadRepository,
     msg_repo: &PgMessageRepository,
@@ -164,33 +168,13 @@ async fn resolve_get_url(
         .expect("query file")
         .expect("file exists");
 
-    let bound_message_id = meta
-        .business_id
-        .as_deref()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|id| *id > 0);
-
-    let member_of_message_channel = match bound_message_id {
-        Some(message_id) => match msg_repo.get_channel_id(message_id).await {
-            Ok(Some(channel_id)) => Some(
-                channel_service
-                    .is_channel_member(channel_id, user_id)
-                    .await
-                    .unwrap_or(false),
-            ),
-            _ => None,
-        },
-        None => None,
+    let decision = resolve_attachment_access(msg_repo, channel_service, &meta, user_id).await;
+    let cek = if decision.authorized {
+        meta.cek.clone()
+    } else {
+        None
     };
-
-    let authorized = authorize_file_access(
-        user_id,
-        meta.uploader_id,
-        bound_message_id,
-        member_of_message_channel,
-    );
-    let cek = if authorized { meta.cek.clone() } else { None };
-    (authorized, cek, meta.encryption_version)
+    (decision.authorized, cek, meta.encryption_version)
 }
 
 async fn cleanup(pool: &sqlx::PgPool, file_repo: &FileUploadRepository) {
@@ -202,6 +186,7 @@ async fn cleanup(pool: &sqlx::PgPool, file_repo: &FileUploadRepository) {
         FILE_BROKEN,
         FILE_BIND_MAIN,
         FILE_BIND_THUMB,
+        FILE_SHARED,
     ] {
         let _ = file_repo.delete(fid).await;
     }
@@ -418,4 +403,105 @@ async fn attachment_file_and_thumbnail_bind_to_message() {
     }
 
     cleanup(&pool, &file_repo).await;
+}
+
+/// 引用表语义的两条新契约（MEDIA_REFERENCE_AND_FORWARD_SPEC §4.1 / §4.3）。
+///
+/// 1. 撤回一条消息 → 它的引用不再授权（旧实现的洞：软删 + 裸查 channel_id）。
+/// 2. 同一个文件被两条消息引用，撤回其中一条 → 另一条照常授权。
+///    这就是转发副本必须活下来的性质：源消息被撤回，转发出去的那条不受影响。
+#[tokio::test]
+async fn a_revoked_reference_stops_authorizing_but_a_sibling_reference_still_does() {
+    let _fixture_guard = fixture_lock().lock().await;
+    let Some(pool) = open_test_pool().await else {
+        eprintln!("skip revoked reference test: DATABASE_URL not configured");
+        return;
+    };
+    let file_repo = FileUploadRepository::new(pool.clone());
+    let msg_repo = PgMessageRepository::new(pool.clone());
+    let channel_repo = Arc::new(PgChannelRepository::new(pool.clone()));
+    let channel_service = ChannelService::new_with_repository(channel_repo);
+
+    cleanup(&pool, &file_repo).await;
+    seed_common(&pool).await;
+    ensure_message(&pool, MESSAGE_ID_2, CHANNEL_ID, UPLOADER_UID).await;
+
+    // 文件没有 business_id —— 授权只能来自引用表，正是转发副本的形态。
+    file_repo
+        .insert(&file_meta(FILE_SHARED, UPLOADER_UID, 1, Some("cek-shared"), None))
+        .await
+        .expect("insert shared file");
+
+    let insert_ref = |message_id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                r#"
+                INSERT INTO privchat_message_file_refs
+                    (message_id, message_created_at, file_id, role, ordinal, created_at)
+                SELECT $1, m.created_at, $2, 0, 0, m.created_at
+                FROM privchat_messages m WHERE m.message_id = $1
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(message_id)
+            .bind(FILE_SHARED as i64)
+            .execute(pool.as_ref())
+            .await
+            .expect("insert ref");
+        }
+    };
+    insert_ref(MESSAGE_ID).await;
+    insert_ref(MESSAGE_ID_2).await;
+
+    let member_can_read = || async {
+        let meta = file_repo
+            .get_by_file_id(FILE_SHARED)
+            .await
+            .expect("query")
+            .expect("exists");
+        resolve_attachment_access(&msg_repo, &channel_service, &meta, MEMBER_UID as u64)
+            .await
+            .authorized
+    };
+
+    assert!(member_can_read().await, "两条引用都有效时当然放行");
+
+    sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = $1")
+        .bind(MESSAGE_ID)
+        .execute(pool.as_ref())
+        .await
+        .expect("revoke first");
+    assert!(
+        member_can_read().await,
+        "撤回其中一条，另一条仍然有效 —— 转发副本不该被源消息的撤回带走",
+    );
+
+    sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = $1")
+        .bind(MESSAGE_ID_2)
+        .execute(pool.as_ref())
+        .await
+        .expect("revoke second");
+    assert!(
+        !member_can_read().await,
+        "引用全部失效后必须拒绝（§4.2 的洞）",
+    );
+
+    let meta = file_repo
+        .get_by_file_id(FILE_SHARED)
+        .await
+        .expect("query")
+        .expect("exists");
+    assert!(
+        !resolve_attachment_access(&msg_repo, &channel_service, &meta, UPLOADER_UID as u64)
+            .await
+            .authorized,
+        "上传者也不能靠身份绕过",
+    );
+
+    cleanup(&pool, &file_repo).await;
+    let _ = sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
+        .bind(MESSAGE_ID_2)
+        .execute(pool.as_ref())
+        .await;
 }

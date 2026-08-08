@@ -58,71 +58,28 @@ pub async fn get_file_url(
         .map_err(|e| RpcError::internal(format!("查询文件失败: {}", e)))?
         .ok_or_else(|| RpcError::validation("文件不存在".to_string()))?;
 
-    let mut candidates = services
-        .message_repository
-        .file_reference_channels(request.file_id)
-        .await
-        .map_err(|e| RpcError::internal(format!("查询文件引用失败: {}", e)))?;
+    let decision = crate::service::attachment_authorization::resolve_attachment_access(
+        &services.message_repository,
+        &services.channel_service,
+        &file_meta,
+        user_id,
+    )
+    .await;
 
-    let used_legacy_fallback = candidates.is_empty();
-    if used_legacy_fallback {
-        // 引用表里没有 —— 可能是回填尚未覆盖的存量消息。按 business_id 找候选，
-        // 找到之后走同一套判据（含存活过滤）。
-        if let Some(message_id) = file_meta
-            .business_id
-            .as_deref()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|id| *id > 0)
-        {
-            if let Ok(Some(entry)) = services
-                .message_repository
-                .live_channel_of_message(message_id)
-                .await
-            {
-                candidates.push(entry);
-            }
-        }
-    }
-
-    let has_any_reference = !candidates.is_empty();
-    let mut requester_is_member_of_a_live_reference = false;
-    for (channel_id, live) in &candidates {
-        if !*live {
-            continue;
-        }
-        if services
-            .channel_service
-            .is_channel_member(*channel_id, user_id)
-            .await
-            .unwrap_or(false)
-        {
-            requester_is_member_of_a_live_reference = true;
-            break;
-        }
-    }
-
-    let authorized = crate::service::file_service::authorize_file_access(
-        crate::service::file_service::FileAccessFacts {
-            requester_id: user_id,
-            uploader_id: file_meta.uploader_id,
-            has_any_reference,
-            requester_is_member_of_a_live_reference,
-        },
-    );
-
-    if authorized && has_any_reference {
-        // fallback 命中率是「回填够不够」的唯一读数。归零之前不能删掉第 2 条路径，
+    if decision.authorized {
+        // fallback 命中率是「回填够不够」的唯一读数。归零之前不能删掉第 2 条发现路径，
         // 归零之后才谈得上移除 business_id 兼容（spec §10 第 9 步）。
-        crate::infra::metrics::record_file_access_authorized(used_legacy_fallback);
-    }
-
-    if !authorized {
+        crate::infra::metrics::record_file_access_authorized(matches!(
+            decision.source,
+            crate::service::attachment_authorization::CandidateSource::LegacyBusinessId
+        ));
+    } else {
         tracing::warn!(
-            "🚫 拒绝访问附件: file_id={}, user_id={}, references={}, live_member={}",
+            "🚫 拒绝访问附件: file_id={}, user_id={}, candidates={}, source={:?}",
             request.file_id,
             user_id,
-            candidates.len(),
-            requester_is_member_of_a_live_reference
+            decision.candidate_count,
+            decision.source
         );
         crate::infra::metrics::record_file_access_denied();
         return Err(RpcError::forbidden("无权访问该附件".to_string()));
