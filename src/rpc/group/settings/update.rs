@@ -28,6 +28,25 @@ use serde_json::Value;
 ///
 /// 请求/响应均使用 privchat-protocol 的 typed 类型
 /// ([`GroupSettingsUpdateRequest`] / [`GroupSettingsUpdateResponse`])，不手写 JSON 解析。
+/// 谁可以改群设置：**必须是本群成员，且必须是群主**。
+///
+/// 抽成函数是为了能对它写行为用例——它是这条写入路径上唯一的权限闸口，
+/// 而 handler 本体要跑起来得先造出三十多个服务依赖。
+fn authorize_settings_update(
+    channel: &crate::model::channel::Channel,
+    operator_id: u64,
+) -> RpcResult<()> {
+    let member = channel
+        .members
+        .get(&operator_id)
+        .ok_or_else(|| RpcError::forbidden("您不是群组成员".to_string()))?;
+
+    if !matches!(member.role, crate::model::channel::MemberRole::Owner) {
+        return Err(RpcError::forbidden("只有群主可以修改群设置".to_string()));
+    }
+    Ok(())
+}
+
 pub async fn handle(
     body: Value,
     services: RpcServiceContext,
@@ -40,8 +59,12 @@ pub async fn handle(
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
     let group_id = request.group_id;
 
-    // operator_id 以连接上下文为准，避免客户端伪造越权
-    let operator_id = crate::rpc::get_current_user_id(&ctx).unwrap_or(request.operator_id);
+    // operator_id **只**取连接上下文。
+    //
+    // 🔴 原来是 `.unwrap_or(request.operator_id)`：认证上下文缺失时回落到客户端
+    // 自报的 id。那不是兜底，是把「你说你是谁就是谁」写进了唯一一处权限判定的入口——
+    // 下面的群主校验拿这个 id 去比，等于可以指定自己是群主。
+    let operator_id = crate::rpc::get_current_user_id(&ctx)?;
     let patch = &request.settings;
 
     // 2. 获取群组信息
@@ -52,17 +75,7 @@ pub async fn handle(
         .map_err(|e| RpcError::not_found(format!("群组不存在: {}", e)))?;
 
     // 3. 验证操作者权限（仅群主可以修改群设置）
-    let operator_member = channel
-        .members
-        .get(&operator_id)
-        .ok_or_else(|| RpcError::forbidden("您不是群组成员".to_string()))?;
-
-    if !matches!(
-        operator_member.role,
-        crate::model::channel::MemberRole::Owner
-    ) {
-        return Err(RpcError::forbidden("只有群主可以修改群设置".to_string()));
-    }
+    authorize_settings_update(&channel, operator_id)?;
 
     // 4. 从 typed patch 取各可选项
     let join_need_approval = patch.join_need_approval;
@@ -282,4 +295,72 @@ pub async fn handle(
     };
 
     serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::channel::{Channel, ChannelMember, MemberRole};
+    use privchat_protocol::ErrorCode;
+
+    const OWNER: u64 = 9_100_001;
+    const ADMIN: u64 = 9_100_002;
+    const MEMBER: u64 = 9_100_003;
+    const OUTSIDER: u64 = 9_100_004;
+
+    fn group() -> Channel {
+        let mut channel = Channel::new_group(9_100_000, OWNER, Some("公告群".to_string()));
+        channel
+            .members
+            .insert(ADMIN, ChannelMember::new(ADMIN, MemberRole::Admin));
+        channel
+            .members
+            .insert(MEMBER, ChannelMember::new(MEMBER, MemberRole::Member));
+        channel
+    }
+
+    /// 群设置的写入闸口：只有群主过得去。
+    ///
+    /// 管理员单列一条，是因为「管理员算不算」正是这类闸口最容易被悄悄放宽的地方。
+    #[test]
+    fn only_the_owner_may_change_group_settings() {
+        let channel = group();
+
+        assert!(authorize_settings_update(&channel, OWNER).is_ok(), "群主可改");
+
+        for (uid, who) in [(ADMIN, "管理员"), (MEMBER, "普通成员"), (OUTSIDER, "非成员")] {
+            let err = authorize_settings_update(&channel, uid)
+                .expect_err(&format!("{who}不该能改群设置"));
+            assert_eq!(err.code, ErrorCode::PermissionDenied, "{who}");
+        }
+    }
+
+    /// 认证上下文缺失 → 未认证，**不能**回落到客户端自报的 operator_id。
+    ///
+    /// 原实现是 `.unwrap_or(request.operator_id)`：没有认证信息时用请求体里的 id
+    /// 去做上面那个群主判定，等于让调用方自己声明「我是群主」。
+    #[test]
+    fn a_request_without_authentication_is_rejected_not_taken_at_its_word() {
+        let err = crate::rpc::get_current_user_id(&crate::rpc::RpcContext::new())
+            .expect_err("没有认证上下文必须失败");
+        assert_eq!(err.code, ErrorCode::AuthRequired);
+    }
+
+    /// 协议反序列化：新增的两项按 typed 字段解析，缺省即 `None`（不改动老客户端行为）。
+    #[test]
+    fn the_patch_carries_the_new_settings_and_leaves_absent_ones_alone() {
+        let request: GroupSettingsUpdateRequest = serde_json::from_value(serde_json::json!({
+            "group_id": 9_100_000u64,
+            "operator_id": OWNER,
+            "settings": { "allow_member_post": false, "forbid_forward": true },
+        }))
+        .expect("解析请求");
+
+        assert_eq!(request.settings.allow_member_post, Some(false));
+        assert_eq!(request.settings.forbid_forward, Some(true));
+        assert_eq!(
+            request.settings.all_muted, None,
+            "没提到的项必须是 None，否则一次改一项会顺手把别的项覆盖成默认值",
+        );
+    }
 }

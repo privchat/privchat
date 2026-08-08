@@ -30,7 +30,8 @@
 //! ```
 //!
 //! 幂等：DB 里已有的键**不被覆盖**（`patch || existing`，DB 侧优先），
-//! 只补 Redis 有、DB 没有的部分。重复跑安全。
+//! 只补 Redis 有、DB 没有的部分。重复跑**不产生副作用**——值没变就不 UPDATE，
+//! 因此不会触发 `privchat_users` 的 sync_version trigger 把用户重新推进增量同步。
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
@@ -47,6 +48,11 @@ pub struct PrivacyBackfillReport {
     pub undecodable: usize,
     /// 对应用户在 DB 里已不存在的条数。
     pub user_missing: usize,
+    /// DB 里已经是目标值、这次一个字节都没改的条数。
+    ///
+    /// 单列出来是因为它和 `written` 的运维含义不同：重跑一次全是 `unchanged`
+    /// 才说明回填真的收敛了，而不只是又写了一遍同样的值。
+    pub unchanged: usize,
 }
 
 /// 从 Redis 把隐私设置回填进 DB。
@@ -96,22 +102,44 @@ pub async fn backfill_from_entries(
         //
         // `$2 || COALESCE(privacy_settings,'{}')` 的顺序让 **DB 已有键优先**
         // （用户在新版本改的不被旧值盖掉），同时补齐 DB 缺的键。
-        let updated = sqlx::query(
+        // 🔴 `WHERE ... IS DISTINCT FROM` 让重复执行**没有副作用**，而不只是结果相同。
+        //
+        // `privchat_users` 上挂着 sync_version trigger：只要 UPDATE 命中行就会 bump 版本，
+        // 于是「再跑一遍确认一下」会把所有回填过的用户重新推进一轮增量同步。
+        // 幂等的判据是不产生新的可观察效果，不是「JSON 比对下来一样」。
+        //
+        // 代价是 rows_affected=0 不再等于「用户不存在」，所以用 RETURNING 区分：
+        // 有行返回 = 真写了；无行返回再查一次存在性。
+        let written: Option<(i64,)> = sqlx::query_as(
             "UPDATE privchat_users \
              SET privacy_settings = $2::jsonb || COALESCE(privacy_settings, '{}'::jsonb) \
-             WHERE user_id = $1",
+             WHERE user_id = $1 \
+               AND privacy_settings IS DISTINCT FROM \
+                   ($2::jsonb || COALESCE(privacy_settings, '{}'::jsonb)) \
+             RETURNING user_id",
         )
         .bind(user_id as i64)
         .bind(&value)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
         .context("回填隐私设置失败")?;
 
-        if updated.rows_affected() == 0 {
-            report.user_missing += 1;
+        if written.is_some() {
+            report.written += 1;
             continue;
         }
-        report.written += 1;
+
+        // 没写：要么本来就已是目标值（幂等命中），要么用户不存在。
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT user_id FROM privchat_users WHERE user_id = $1")
+                .bind(user_id as i64)
+                .fetch_optional(pool)
+                .await
+                .context("查询用户是否存在失败")?;
+        match exists {
+            Some(_) => report.unchanged += 1,
+            None => report.user_missing += 1,
+        }
     }
 
     Ok(report)

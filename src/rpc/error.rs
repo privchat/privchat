@@ -127,7 +127,37 @@ impl From<crate::error::ServerError> for RpcError {
             crate::error::ServerError::FullRebuildRequired(msg) => {
                 RpcError::from_code(ErrorCode::SyncFullRebuildRequired, msg)
             }
+            // 🔴 「暂时不可用」必须原样传到客户端。压成 InternalError 会让两端 SDK
+            // 把它当终局失败：不重试、直接回滚用户刚做的修改。
+            // 割接停写窗口正是靠这个码告诉客户端「稍后再试」而不是「你改失败了」。
+            crate::error::ServerError::ServiceUnavailable(msg) => {
+                RpcError::from_code(ErrorCode::ServiceUnavailable, msg)
+            }
             _ => RpcError::internal(err.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod service_error_mapping_tests {
+    use super::*;
+    use privchat_protocol::ErrorCode;
+
+    /// 「暂时不可用」必须原样传到客户端，不能被压成 InternalError。
+    ///
+    /// 🔴 两端 SDK 的可重试白名单里有 `ServiceUnavailable(3)`，没有 `InternalError(4)`。
+    /// 压成 4 之后，服务端说的「稍后再试」在客户端表现为「你这次修改失败了」——
+    /// App 会直接回滚用户刚拨的开关，割接停写窗口期的所有修改就此丢掉。
+    #[test]
+    fn a_temporary_outage_stays_retryable_through_the_rpc_layer() {
+        let mapped = RpcError::from(crate::error::ServerError::ServiceUnavailable(
+            "隐私设置正在维护，请稍后重试".to_string(),
+        ));
+        assert_eq!(mapped.code, ErrorCode::ServiceUnavailable);
+        assert_ne!(
+            mapped.code,
+            ErrorCode::InternalError,
+            "压成 InternalError 会让客户端把可重试的故障当成终局拒绝",
+        );
     }
 }

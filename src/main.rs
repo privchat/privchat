@@ -540,6 +540,7 @@ async fn run_backfill_privacy_settings(cli: &Cli, input: &str, dry_run: bool) ->
             .context("回填失败")?;
     println!("  扫描        {}", report.scanned);
     println!("  写入        {}{}", report.written, if dry_run { "（dry-run，未写）" } else { "" });
+    println!("  未变更      {}（DB 已是目标值，未写、未 bump sync_version）", report.unchanged);
     println!("  解析不出    {}", report.undecodable);
     println!("  用户不存在  {}", report.user_missing);
     if report.undecodable > 0 {

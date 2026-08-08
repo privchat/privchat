@@ -587,6 +587,50 @@ async fn a_read_only_group_survives_a_fresh_service_instance() {
     cleanup(&pool).await;
 }
 
+/// 「通过名片添加」开关必须真的落库。
+///
+/// 🔴 它此前是**静默丢弃**：App 有开关、也发了 `allow_add_by_card`，但 protocol 请求体、
+/// server 映射、get 响应三处都没有这个字段。用户关掉后 UI 先显示成功，重新读又回到
+/// 默认的 true——不是「没保存」，是隐私开关看起来生效、实际一直开着。
+#[tokio::test]
+async fn turning_off_add_by_card_is_actually_persisted() {
+    use privchat::service::privacy_service::PrivacySettingsUpdate;
+
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+
+    let updated = deps
+        .privacy_service
+        .update_privacy_settings(
+            MEMBER as u64,
+            PrivacySettingsUpdate {
+                allow_add_by_card: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    assert!(!updated.allow_add_by_card, "更新响应必须回显新值");
+
+    // 全新实例：空缓存，只能从 DB 读回来。
+    let (fresh, _) = deps_fresh().await.expect("fresh deps");
+    let reread = fresh
+        .privacy_service
+        .get_or_create_privacy_settings(MEMBER as u64)
+        .await
+        .expect("re-read");
+    assert!(
+        !reread.allow_add_by_card,
+        "重新读取必须仍是关闭——回到 true 就是开关形同虚设",
+    );
+
+    cleanup(&pool).await;
+}
+
 /// 隐私存储损坏（脏 JSON）→ 拒绝且可重试，**不能**回落成「允许非好友消息」。
 #[tokio::test]
 async fn corrupt_privacy_storage_refuses_instead_of_falling_back_to_permissive() {
