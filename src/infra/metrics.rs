@@ -37,6 +37,8 @@ const HISTOGRAM_AUTHENTICATE_DURATION: &str = "privchat_authenticate_duration_se
 /// 建连/认证延迟 bucket：覆盖 10ms→10s。
 const CONN_AUTH_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 const COUNTER_MESSAGES_SENT: &str = "privchat_messages_sent_total";
+const COUNTER_FILE_ACCESS_AUTHORIZED: &str = "privchat_file_access_authorized_total";
+const COUNTER_FILE_ACCESS_DENIED: &str = "privchat_file_access_denied_total";
 const GAUGE_HANDLER_INFLIGHT: &str = "privchat_handler_inflight";
 const COUNTER_HANDLER_REJECTED: &str = "privchat_handler_rejected_total";
 const COUNTER_EVENT_BUS_LAGGED: &str = "privchat_event_bus_lagged_total";
@@ -184,6 +186,22 @@ impl Drop for DurationRecorder {
     fn drop(&mut self) {
         (self.record)(self.start.elapsed().as_secs_f64());
     }
+}
+
+/// 附件下载授权通过一次。`via_legacy_fallback=true` 表示候选消息是靠老的
+/// `business_id` 单点绑定找到的，而不是引用表——**这个计数归零才代表回填补齐**
+/// （MEDIA_REFERENCE_AND_FORWARD_SPEC §10.1）。
+pub fn record_file_access_authorized(via_legacy_fallback: bool) {
+    metrics::counter!(
+        COUNTER_FILE_ACCESS_AUTHORIZED,
+        "source" => if via_legacy_fallback { "legacy_business_id" } else { "reference_table" }
+    )
+    .increment(1);
+}
+
+/// 附件下载授权被拒一次。撤回/删除后仍来取 CEK 的请求会落在这里。
+pub fn record_file_access_denied() {
+    metrics::counter!(COUNTER_FILE_ACCESS_DENIED).increment(1);
 }
 
 /// 记录发送消息数 +1。
