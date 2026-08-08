@@ -1325,7 +1325,7 @@ impl MessageHandler for SendMessageHandler {
         // 附件 file→message 绑定（ATTACHMENT_ENCRYPTION_SPEC §授权）：把
         // file_id / thumbnail_file_id 绑定到 message_id（business_type="message"），使接收端
         // get_url 能按 channel 成员授权访问/拿 CEK。绑定、消息、commit 在同一 DB tx 内提交。
-        let bind_file_ids = Self::extract_attachment_file_ids(&message.metadata);
+        let bind_file_ids = Self::extract_attachment_file_ids(message.message_type, &message.metadata);
         let channel_type_code = Self::channel_type_code(channel.channel_type);
         let mut canonical_payload = privchat_protocol::decode_message::<MessagePayloadEnvelope>(
             &send_message_request.payload,
@@ -1973,24 +1973,22 @@ impl SendMessageHandler {
         }
     }
 
-    /// 从消息 metadata 提取所有附件 file_id（原文件 + 缩略图），用于 file→message 绑定授权。
-    /// 覆盖 image/video/voice/file 的 `file_id` 与 video/link/location 的 `thumbnail_file_id`。
-    /// 数字或字符串均兼容；去重；忽略 0/缺失。
-    fn extract_attachment_file_ids(metadata: &serde_json::Value) -> Vec<u64> {
-        let mut ids = Vec::new();
-        for key in ["file_id", "thumbnail_file_id"] {
-            if let Some(v) = metadata.get(key) {
-                let id = v
-                    .as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()));
-                if let Some(id) = id {
-                    if id > 0 && !ids.contains(&id) {
-                        ids.push(id);
-                    }
-                }
-            }
-        }
-        ids
+    /// 从消息 metadata 提取所有附件 file_id，用于 file→message 绑定授权。
+    ///
+    /// 解析收敛到 [`crate::service::legacy_media_refs`] → 协议层的类型化
+    /// `MessageMetadata::attachment_refs`。**类型决定哪些字段算附件**——
+    /// 这里曾经是一份在任意 JSON 上找 `file_id` / `thumbnail_file_id` 的裸解析，
+    /// 文本消息伪造这两个字段也会被当成附件；而 `sync/submit` 走的一直是协议层
+    /// 那一份类型化的。两套解析并存正是 spec §13 冻结分层边界要根除的东西。
+    ///
+    /// 返回**去重后的 file_id**：绑定守卫按「文件」算，同一文件兼任原图与缩略图
+    /// 时只需绑定一次（引用表按 `(role, ordinal)` 记两条，那是另一个维度）。
+    fn extract_attachment_file_ids(
+        message_type: privchat_protocol::ContentMessageType,
+        metadata: &serde_json::Value,
+    ) -> Vec<u64> {
+        crate::service::legacy_media_refs::parse_legacy_media_refs(message_type, metadata)
+            .unique_file_ids()
     }
 
     /// 验证文件类型消息的 metadata（image/video/audio/file）
@@ -2373,21 +2371,23 @@ mod attachment_bind_tests {
     use super::SendMessageHandler;
     use serde_json::json;
 
+    use privchat_protocol::ContentMessageType;
+
     // 原图 + 缩略图都要被提取（缩略图同等绑定 → 接收方能授权下载缩略图）
     #[test]
     fn extracts_file_and_thumbnail() {
         let meta = json!({ "file_id": 100u64, "thumbnail_file_id": 200u64, "width": 800 });
-        let ids = SendMessageHandler::extract_attachment_file_ids(&meta);
+        let ids = SendMessageHandler::extract_attachment_file_ids(ContentMessageType::Image, &meta);
         assert!(ids.contains(&100));
         assert!(ids.contains(&200));
         assert_eq!(ids.len(), 2);
     }
 
-    // 字符串形式 id 兼容
+    // 字符串形式 id 兼容（老客户端把雪花 id 序列化成字符串；认不出就整条消息绑不上附件）
     #[test]
     fn accepts_string_ids() {
         let meta = json!({ "file_id": "300", "thumbnail_file_id": "0" });
-        let ids = SendMessageHandler::extract_attachment_file_ids(&meta);
+        let ids = SendMessageHandler::extract_attachment_file_ids(ContentMessageType::Image, &meta);
         assert_eq!(ids, vec![300]); // 0 被忽略
     }
 
@@ -2395,17 +2395,46 @@ mod attachment_bind_tests {
     #[test]
     fn text_message_has_no_attachments() {
         let meta = json!({ "text": "hello" });
-        assert!(SendMessageHandler::extract_attachment_file_ids(&meta).is_empty());
+        assert!(
+            SendMessageHandler::extract_attachment_file_ids(ContentMessageType::Text, &meta)
+                .is_empty()
+        );
     }
 
-    // 去重：原图与缩略图同 id 只保留一个
+    // 类型决定字段：文本消息即使伪造 file_id 也绑不到任何文件。
+    // 旧的裸 JSON 解析只看字段名不看类型，这条是那个漏洞的守卫（spec 门禁 2）。
+    #[test]
+    fn a_text_message_forging_a_file_id_binds_nothing() {
+        let meta = json!({ "text": "hi", "file_id": 100u64, "thumbnail_file_id": 200u64 });
+        assert!(
+            SendMessageHandler::extract_attachment_file_ids(ContentMessageType::Text, &meta)
+                .is_empty()
+        );
+    }
+
+    // 去重：原图与缩略图同 id 时，**绑定守卫**按文件算只有一个。
+    // （引用视图里仍是两条——角色不同，见 legacy_media_refs 的门禁 3。）
     #[test]
     fn dedups_same_id() {
         let meta = json!({ "file_id": 5u64, "thumbnail_file_id": 5u64 });
         assert_eq!(
-            SendMessageHandler::extract_attachment_file_ids(&meta),
+            SendMessageHandler::extract_attachment_file_ids(ContentMessageType::Image, &meta),
             vec![5]
         );
+    }
+
+    /// 【发布门禁 1】发送路径必须与共享用例表逐条一致。
+    /// 这条测试是「第三份解析」的防线：谁在这里再写一份自己的 JSON 扫描，
+    /// 文本伪造 file_id 那一条立刻会红。
+    #[test]
+    fn the_send_path_matches_the_shared_fixture() {
+        for (name, kind, meta, expected) in crate::service::legacy_media_refs::shared_cases() {
+            assert_eq!(
+                SendMessageHandler::extract_attachment_file_ids(kind, &meta),
+                expected,
+                "发送路径结果不符：{name}"
+            );
+        }
     }
 
     // CODEX-8 复审 P0#3/P1#4：sender/device 认证权威 + 冒充/缺失拒绝（纯函数回归）。
