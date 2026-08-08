@@ -42,7 +42,13 @@ pub enum CandidateSource {
     /// 引用表（权威）。
     ReferenceTable,
     /// 老的 `business_id` 单点绑定（过渡期兜底）。
+    ///
+    /// 🔴 只有**真的走了这条路**才算：文件确实带 `business_id`。
+    /// 把「引用表为空」一律记成 legacy，会让正常的 pending 上传也计进来，
+    /// 于是这个指标永远归不了零，而它的唯一用途就是「归零 = 回填补齐」。
     LegacyBusinessId,
+    /// 文件还没被任何消息引用，也没有 `business_id`——正常的待发送上传。
+    PendingUpload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,13 +86,16 @@ pub async fn resolve_attachment_access(
     let mut has_broken_legacy_binding = false;
 
     if candidates.is_empty() {
-        source = CandidateSource::LegacyBusinessId;
-        if let Some(message_id) = file_meta
+        let legacy_message_id = file_meta
             .business_id
             .as_deref()
             .and_then(|s| s.parse::<u64>().ok())
-            .filter(|id| *id > 0)
-        {
+            .filter(|id| *id > 0);
+        source = match legacy_message_id {
+            Some(_) => CandidateSource::LegacyBusinessId,
+            None => CandidateSource::PendingUpload,
+        };
+        if let Some(message_id) = legacy_message_id {
             match message_repository.live_channel_of_message(message_id).await {
                 Ok(Some(entry)) => candidates.push(entry),
                 // 消息不存在：broken binding，不猜、不放行。

@@ -1570,9 +1570,6 @@ impl From<TomlConfig> for ServerConfig {
                 // 允许 0 表示不限制时效；负数归一化为 0。
                 config.message.recall_time_limit_secs = limit.max(0);
             }
-            if let Some(enabled) = message.forward_enabled {
-                config.message.forward_enabled = enabled;
-            }
         }
 
         if let Some(push) = toml.push {
@@ -2340,15 +2337,6 @@ pub struct MessageConfig {
     /// - `0`（或配置为 null / 省略）：**不限制时效**，普通用户任意时间均可撤回自己的消息
     #[serde(default = "default_recall_time_limit_secs")]
     pub recall_time_limit_secs: i64,
-
-    /// 是否启用 `message/forward`（MEDIA_REFERENCE_AND_FORWARD_SPEC §6）。
-    ///
-    /// 🔴 **默认关闭**。新 RPC 一旦注册就可被任意自定义客户端调用——
-    /// 「官方客户端还没做入口」不是安全边界。在 §6.3 内容保护、
-    /// 与普通发送共用的权限策略（禁言/黑名单/角色）落地并验证之前，
-    /// 这个开关必须保持 false。
-    #[serde(default)]
-    pub forward_enabled: bool,
 }
 
 fn default_recall_time_limit_secs() -> i64 {
@@ -2360,7 +2348,6 @@ impl Default for MessageConfig {
     fn default() -> Self {
         Self {
             recall_time_limit_secs: default_recall_time_limit_secs(),
-            forward_enabled: false,
         }
     }
 }
@@ -2368,7 +2355,6 @@ impl Default for MessageConfig {
 #[derive(Debug, Deserialize)]
 struct TomlMessageConfig {
     recall_time_limit_secs: Option<i64>,
-    forward_enabled: Option<bool>,
 }
 
 // =====================================================

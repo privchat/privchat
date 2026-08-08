@@ -25,6 +25,7 @@
 
 use privchat_protocol::message::ContentMessageType;
 use privchat_protocol::MediaRef;
+use std::collections::BTreeSet;
 
 use crate::repository::message_repo::{AttachmentOrigin, ForwardOrigin};
 
@@ -45,6 +46,12 @@ pub enum ForwardRefusal {
     SourceChannelMismatch,
     /// 源消息的媒体引用不完整（存量破损数据）。转发会把坏账复制成新消息。
     SourceMediaIncomplete(crate::service::legacy_media_refs::LegacyAudit),
+    /// 引用表与 metadata 互相矛盾。复制过去会产出一条「客户端按 metadata 渲染、
+    /// 服务端按引用表授权」两边指向不同文件的消息。
+    SourceMediaInconsistent {
+        in_reference_table: Vec<(u64, i16, i32)>,
+        in_metadata: Vec<(u64, i16, i32)>,
+    },
 }
 
 impl ForwardRefusal {
@@ -58,6 +65,7 @@ impl ForwardRefusal {
             ForwardRefusal::TargetNotWritable => "FORWARD_TARGET_NOT_WRITABLE",
             ForwardRefusal::SourceChannelMismatch => "FORWARD_SOURCE_CHANNEL_MISMATCH",
             ForwardRefusal::SourceMediaIncomplete(_) => "FORWARD_SOURCE_MEDIA_INCOMPLETE",
+            ForwardRefusal::SourceMediaInconsistent { .. } => "FORWARD_SOURCE_MEDIA_INCONSISTENT",
         }
     }
 }
@@ -104,28 +112,48 @@ pub fn root_origin_for_copy(
 
 /// 复制到目标消息的媒体引用。
 ///
-/// 优先用源消息的**引用表**行（权威）；引用表为空时（存量消息、回填尚未覆盖）
-/// 退回按源 metadata 解析。两条路径都走同一个 canonical parser。
+/// 🔴 **永远 strict 解析 metadata，然后要求引用表与之完全一致。**
 ///
-/// 🔴 **strict**：转发是**新的写入路径**，不是读路径。存量消息里那些
-/// 「metadata 解不出」「只有缩略图没有原图」的破损引用，读的时候可以容忍
-/// （历史已经这样了），但**不能再复制出一条新的破损消息**——那等于用新数据
-/// 把历史坏账固化下来，而且用户会看到一张永远转不出圈的裂图。
-/// 媒体类型解析有任何审计问题就拒绝转发。
+/// 我第一版写成「引用表非空就直接采用」，于是 strict 校验被整条路径绕过：
+/// 引用表说 file 7、metadata 说 file 99/98，照样转发成功，产出一条
+/// **metadata 与授权引用互相矛盾**的消息——客户端按 metadata 渲染缩略图，
+/// 服务端按引用表授权下载，两边指向不同的文件，就是一张永远修不好的裂图。
+/// 更糟的是当时的测试把这个行为写成了断言，等于给错误盖章。
+///
+/// 规则：
+/// ```text
+/// 永远 strict 解析 metadata
+/// 引用表为空   → 用解析结果（存量消息，回填尚未覆盖）
+/// 引用表非空   → 必须与解析结果**集合相等**，否则拒绝
+/// ```
 pub fn refs_for_copy(
     refs_from_table: Vec<MediaRef>,
     source_message_type: i32,
     source_metadata: &serde_json::Value,
 ) -> Result<Vec<MediaRef>, ForwardRefusal> {
-    if !refs_from_table.is_empty() {
-        return Ok(refs_from_table);
-    }
-    crate::service::legacy_media_refs::parse_legacy_media_refs_by_code(
+    let parsed = crate::service::legacy_media_refs::parse_legacy_media_refs_by_code(
         source_message_type,
         source_metadata,
     )
     .into_strict()
-    .map_err(ForwardRefusal::SourceMediaIncomplete)
+    .map_err(ForwardRefusal::SourceMediaIncomplete)?;
+
+    if refs_from_table.is_empty() {
+        return Ok(parsed);
+    }
+
+    let as_set = |refs: &[MediaRef]| -> BTreeSet<(u64, i16, i32)> {
+        refs.iter()
+            .map(|r| (r.file_id, r.role as i16, r.ordinal))
+            .collect()
+    };
+    if as_set(&refs_from_table) != as_set(&parsed) {
+        return Err(ForwardRefusal::SourceMediaInconsistent {
+            in_reference_table: as_set(&refs_from_table).into_iter().collect(),
+            in_metadata: as_set(&parsed).into_iter().collect(),
+        });
+    }
+    Ok(refs_from_table)
 }
 
 /// 转发路径给提交请求用的附件来源。抽成常量是为了让「转发必须跳过归属守卫」
@@ -231,29 +259,68 @@ mod tests {
         assert_eq!(copied.root_channel_id, Some(2222));
     }
 
-    /// 引用表有行就用它；没有才回落解析 metadata（存量消息）。
+    /// 引用表与 metadata 必须一致；一致时采用，冲突时拒绝。
+    ///
+    /// 🔴 这条测试之前写反了：它断言「引用表 file 7 / metadata file 99、98」
+    /// 可以通过，等于给「产出一条自相矛盾的消息」盖了章。
     #[test]
-    fn refs_come_from_the_table_first_and_the_metadata_only_as_a_fallback() {
+    fn the_reference_table_and_the_metadata_must_agree() {
         use privchat_protocol::MediaRole;
-        let from_table = vec![MediaRef {
+        let metadata = serde_json::json!({ "file_id": 99, "thumbnail_file_id": 98 });
+        let consistent = vec![
+            MediaRef {
+                file_id: 99,
+                role: MediaRole::Original,
+                ordinal: 0,
+            },
+            MediaRef {
+                file_id: 98,
+                role: MediaRole::Thumbnail,
+                ordinal: 0,
+            },
+        ];
+        assert_eq!(
+            refs_for_copy(
+                consistent.clone(),
+                ContentMessageType::Image as i32,
+                &metadata
+            )
+            .expect("两边一致时采用引用表"),
+            consistent,
+        );
+
+        let conflicting = vec![MediaRef {
             file_id: 7,
             role: MediaRole::Original,
             ordinal: 0,
         }];
-        let metadata = serde_json::json!({ "file_id": 99, "thumbnail_file_id": 98 });
-        assert_eq!(
-            refs_for_copy(from_table.clone(), ContentMessageType::Image as i32, &metadata)
-                .expect("引用表有行时直接采用"),
-            from_table,
-            "引用表是权威，不该被 metadata 覆盖",
-        );
+        let refusal = refs_for_copy(conflicting, ContentMessageType::Image as i32, &metadata)
+            .expect_err("引用表与 metadata 冲突必须拒绝");
+        assert_eq!(refusal.code(), "FORWARD_SOURCE_MEDIA_INCONSISTENT");
 
         let fallback = refs_for_copy(Vec::new(), ContentMessageType::Image as i32, &metadata)
-            .expect("干净的存量 metadata 可以回落解析");
+            .expect("引用表为空时回落解析 metadata");
         assert_eq!(
             fallback.iter().map(|r| r.file_id).collect::<Vec<_>>(),
             vec![99, 98],
-            "存量消息（回填未覆盖）回落解析 metadata",
+        );
+    }
+
+    /// 引用表非空**也要**过 strict：破损 metadata 不能靠「表里有行」绕过去。
+    #[test]
+    fn a_non_empty_reference_table_does_not_bypass_strict_parsing() {
+        use privchat_protocol::MediaRole;
+        let undecodable = serde_json::json!({ "not": "an image" });
+        let refs = vec![MediaRef {
+            file_id: 7,
+            role: MediaRole::Original,
+            ordinal: 0,
+        }];
+        assert_eq!(
+            refs_for_copy(refs, ContentMessageType::Image as i32, &undecodable)
+                .expect_err("metadata 解不出就该拒绝，哪怕引用表有行")
+                .code(),
+            "FORWARD_SOURCE_MEDIA_INCOMPLETE",
         );
     }
 
