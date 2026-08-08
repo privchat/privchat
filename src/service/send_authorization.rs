@@ -52,6 +52,10 @@ pub enum SendRefusal {
     PeerRejectsNonFriends,
     /// 频道设置不允许该成员发言（如群 `allow_member_post=false`）。
     ChannelForbidsPosting,
+    /// 策略判定不出来（数据库故障等）。**不是「有权」也不是「无权」**——
+    /// 限制性策略查不到时按拒绝处理，但错误码要能和真正的无权区分开，
+    /// 否则客户端会引导用户去申请权限，而真实原因是服务异常。
+    PolicyUnavailable,
 }
 
 impl SendRefusal {
@@ -65,6 +69,7 @@ impl SendRefusal {
             SendRefusal::PeerInMyBlacklist => ErrorCode::UserInBlacklist,
             SendRefusal::PeerRejectsNonFriends => ErrorCode::PermissionDenied,
             SendRefusal::ChannelForbidsPosting => ErrorCode::PermissionDenied,
+            SendRefusal::PolicyUnavailable => ErrorCode::InternalError,
         }
     }
 
@@ -80,6 +85,7 @@ impl SendRefusal {
                 "对方设置了仅接收好友消息，无法发送".to_string()
             }
             SendRefusal::ChannelForbidsPosting => "无权限发送消息".to_string(),
+            SendRefusal::PolicyUnavailable => "服务暂时不可用，请稍后重试".to_string(),
         }
     }
 }
@@ -178,16 +184,22 @@ pub async fn authorize_send_to_channel(
             .find(|id| *id != sender_id);
 
         if let Some(peer_id) = peer_id {
-            // 好友直接放行，跳过拉黑与隐私检查（与历史行为一致）。
-            if deps.friend_service.is_friend(sender_id, peer_id).await {
-                return Ok(());
-            }
-
+            // 🔴 黑名单**先于**好友判定（BLACKLIST_SPEC §5）。
+            //
+            // 原实现是「好友直接放行，跳过拉黑与隐私」。但拉黑并不解除好友关系，
+            // 于是「仍是好友、已被拉黑」的人照样能发消息——正是拉黑要挡住的那件事。
+            // 我抽取策略时原样保留了这个顺序，等于把 bug 一起搬了过来。
+            //
+            // 查询失败不能当成「没拉黑」：`.unwrap_or((false, false))` 会让数据库
+            // 抖动变成一次放行。限制性策略判定不出来时按拒绝处理。
             let (sender_blocks_peer, peer_blocks_sender) = deps
                 .blacklist_service
                 .check_mutual_block(sender_id, peer_id)
                 .await
-                .unwrap_or((false, false));
+                .map_err(|e| {
+                    tracing::error!("查询 {sender_id}↔{peer_id} 拉黑关系失败: {e}");
+                    SendRefusal::PolicyUnavailable
+                })?;
             if peer_blocks_sender {
                 return Err(SendRefusal::BlockedByPeer);
             }
@@ -195,20 +207,34 @@ pub async fn authorize_send_to_channel(
                 return Err(SendRefusal::PeerInMyBlacklist);
             }
 
-            match deps
+            // 好友之间不再看「仅接收好友消息」——那条设置本来就是给非好友用的。
+            //
+            // 用 `try_is_friend` 而不是 `is_friend`：后者把查询失败吞成 false，
+            // 于是好友会被当成陌生人去过隐私闸门，得到一个莫名其妙的拒绝。
+            let are_friends = deps
+                .friend_service
+                .try_is_friend(sender_id, peer_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("查询 {sender_id}↔{peer_id} 好友关系失败: {e}");
+                    SendRefusal::PolicyUnavailable
+                })?;
+            if are_friends {
+                return Ok(());
+            }
+
+            // 🔴 隐私设置取不到同样按拒绝：原来的「默认允许」会让「仅接收好友消息」
+            // 在数据库抖动时形同虚设。
+            let settings = deps
                 .privacy_service
                 .get_or_create_privacy_settings(peer_id)
                 .await
-            {
-                Ok(settings) => {
-                    if !settings.allow_receive_message_from_non_friend {
-                        return Err(SendRefusal::PeerRejectsNonFriends);
-                    }
-                }
-                Err(e) => {
-                    // 与历史行为一致：隐私设置取不到时默认允许。
-                    tracing::warn!("获取用户 {peer_id} 隐私设置失败: {e}，默认允许非好友消息");
-                }
+                .map_err(|e| {
+                    tracing::error!("获取用户 {peer_id} 隐私设置失败: {e}");
+                    SendRefusal::PolicyUnavailable
+                })?;
+            if !settings.allow_receive_message_from_non_friend {
+                return Err(SendRefusal::PeerRejectsNonFriends);
             }
         }
     }
@@ -219,9 +245,10 @@ pub async fn authorize_send_to_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::channel::{Channel, ChannelMember, ChannelType, MemberRole};
+    use std::collections::HashMap;
 
     /// 每种拒绝都有自己的错误码：客户端据此决定「稍后再试」还是「别再发了」。
-    /// 全部压成 PermissionDenied 会让禁言和被拉黑长得一模一样。
     #[test]
     fn each_refusal_carries_its_own_error_code() {
         assert_eq!(
@@ -244,10 +271,24 @@ mod tests {
         );
     }
 
-    /// 禁言文案带解禁时间，直接透传给用户。
+    /// 🔴 策略判定不出来 ≠ 无权：错误码必须能区分，否则客户端会引导用户
+    /// 去申请权限，而真实原因是数据库抖了一下。
+    #[test]
+    fn an_unavailable_policy_is_not_reported_as_a_permission_problem() {
+        assert_eq!(
+            SendRefusal::PolicyUnavailable.error_code(),
+            ErrorCode::InternalError
+        );
+        assert_ne!(
+            SendRefusal::PolicyUnavailable.error_code(),
+            SendRefusal::NotAMember.error_code(),
+        );
+    }
+
     #[test]
     fn a_mute_refusal_keeps_the_generated_text() {
         let refusal = SendRefusal::MemberMuted("你已被禁言至 12:00".into());
         assert_eq!(refusal.message(), "你已被禁言至 12:00");
     }
+
 }
