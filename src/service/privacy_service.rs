@@ -427,20 +427,26 @@ impl PrivacyService {
                 .await
                 .map_err(|e| ServerError::Database(format!("查询隐私设置失败: {e}")))?;
 
-        // 🔴 DB 里存的往往是**部分字段**（只写用户改过的那几项）。整体
-        // `from_value` 会因缺字段失败，回落成全默认——用户关掉的「接收非好友
-        // 消息」又变回打开。正确做法是把 DB 的键**合并**到默认值上。
-        let mut merged = serde_json::to_value(UserPrivacySettings::new(user_id))
-            .map_err(|e| ServerError::Internal(format!("序列化默认隐私设置失败: {e}")))?;
-        if let (Some(base), Some((stored,))) = (merged.as_object_mut(), row.as_ref()) {
-            if let Some(stored) = stored.as_object() {
-                for (key, value) in stored {
-                    base.insert(key.clone(), value.clone());
-                }
+        // DB 里存的往往是**部分字段**（只写用户改过的那几项），所以先按 typed
+        // partial DTO 解析，再合并到默认值上。
+        //
+        // 🔴 解析失败**不能回落全默认**：默认是「允许非好友消息」，于是一条脏数据
+        // 就把用户的限制悄悄关掉了。存着的字段格式不对属于「判定不出来」，
+        // 必须报错，让发送策略拿到 PolicyUnavailable（拒绝且可重试）。
+        let stored: Option<StoredPrivacySettings> = match row {
+            Some((value,)) if !value.is_null() => {
+                Some(serde_json::from_value(value).map_err(|e| {
+                    ServerError::Database(format!(
+                        "用户 {user_id} 的隐私设置无法解析（脏数据，不按默认放行）: {e}"
+                    ))
+                })?)
             }
+            _ => None,
+        };
+        let mut settings = UserPrivacySettings::new(user_id);
+        if let Some(stored) = stored {
+            stored.apply_to(&mut settings);
         }
-        let mut settings: UserPrivacySettings = serde_json::from_value(merged)
-            .unwrap_or_else(|_| UserPrivacySettings::new(user_id));
         settings.user_id = user_id;
         self.cache_manager
             .set_privacy_settings(user_id, settings.clone())
@@ -485,12 +491,79 @@ impl PrivacyService {
         // 更新更新时间
         settings.updated_at = Utc::now();
 
-        // 保存到缓存
+        // 🔴 顺序：**先落库**（真源），再跨实例失效，最后回写本实例缓存。
+        //
+        // 原实现只写缓存：Redis/L1 一过期或重启，用户改过的设置就回到旧值或默认值。
+        // 「DB 为真源」不能只体现在读路径上——只读不写等于真源永远是空的。
+        let settings_json = serde_json::to_value(&settings)
+            .map_err(|e| ServerError::Internal(format!("序列化隐私设置失败: {e}")))?;
+        let affected = sqlx::query(
+            "UPDATE privchat_users SET privacy_settings = $2, updated_at = now_millis() \
+             WHERE user_id = $1",
+        )
+        .bind(user_id as i64)
+        .bind(&settings_json)
+        .execute(self.channel_service.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("写入隐私设置失败: {e}")))?
+        .rows_affected();
+        if affected == 0 {
+            return Err(ServerError::NotFound(format!("用户 {user_id} 不存在")));
+        }
+
+        // 别的实例的 L1 里可能还留着旧策略，TTL 到期前一直放行。显式失效。
+        self.cache_manager
+            .invalidate_privacy_settings(user_id)
+            .await?;
         self.cache_manager
             .set_privacy_settings(user_id, settings.clone())
             .await?;
 
         Ok(settings)
+    }
+}
+
+/// DB 里存着的隐私设置（**部分字段**）。
+///
+/// 单独一个 DTO 而不是直接反序列化 [`UserPrivacySettings`]：存的是增量，
+/// 缺字段属正常，字段类型不对属脏数据——两者必须区分开，
+/// 否则「缺字段」和「坏数据」都会走到同一个「回落默认」，把限制策略关掉。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPrivacySettings {
+    allow_add_by_group: Option<bool>,
+    allow_add_by_card: Option<bool>,
+    allow_search_by_phone: Option<bool>,
+    allow_search_by_username: Option<bool>,
+    allow_search_by_email: Option<bool>,
+    allow_search_by_qrcode: Option<bool>,
+    allow_view_by_non_friend: Option<bool>,
+    allow_receive_message_from_non_friend: Option<bool>,
+    #[serde(default)]
+    user_id: Option<u64>,
+    #[serde(default)]
+    created_at: Option<serde_json::Value>,
+    #[serde(default)]
+    updated_at: Option<serde_json::Value>,
+}
+
+impl StoredPrivacySettings {
+    fn apply_to(self, settings: &mut UserPrivacySettings) {
+        macro_rules! apply {
+            ($($field:ident),+ $(,)?) => {
+                $(if let Some(value) = self.$field { settings.$field = value; })+
+            };
+        }
+        apply!(
+            allow_add_by_group,
+            allow_add_by_card,
+            allow_search_by_phone,
+            allow_search_by_username,
+            allow_search_by_email,
+            allow_search_by_qrcode,
+            allow_view_by_non_friend,
+            allow_receive_message_from_non_friend,
+        );
     }
 }
 

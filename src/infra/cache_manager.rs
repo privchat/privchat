@@ -847,6 +847,19 @@ impl CacheManager {
         Ok(())
     }
 
+    /// 让隐私设置的缓存失效。
+    ///
+    /// 🔴 安全策略不能只靠 TTL 最终一致：用户关掉「接收非好友消息」之后，
+    /// 别的实例的 L1 里还留着旧的允许值，最长一小时内那些实例照样放行。
+    /// 更新落库后必须**显式失效**——本实例删 L1，共享的 L2（Redis/KeyDB）删掉
+    /// 之后，其它实例的 L1 miss 会重新从 L2/DB 读到新值。
+    pub async fn invalidate_privacy_settings(&self, user_id: u64) -> Result<(), ServerError> {
+        self.l1_privacy_settings.invalidate(&user_id).await;
+        let redis_key = Self::privacy_settings_cache_key(user_id);
+        self.delete_from_redis(&redis_key).await?;
+        Ok(())
+    }
+
     // ========== 搜索记录管理 ==========
 
     /// 创建搜索记录
