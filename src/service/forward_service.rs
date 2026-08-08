@@ -43,6 +43,8 @@ pub enum ForwardRefusal {
     TargetNotWritable,
     /// 客户端声称的 source_channel_id 与源消息真实所在会话不符。
     SourceChannelMismatch,
+    /// 源消息的媒体引用不完整（存量破损数据）。转发会把坏账复制成新消息。
+    SourceMediaIncomplete(crate::service::legacy_media_refs::LegacyAudit),
 }
 
 impl ForwardRefusal {
@@ -55,6 +57,7 @@ impl ForwardRefusal {
             ForwardRefusal::TypeNotAllowed(_) => "FORWARD_TYPE_NOT_ALLOWED",
             ForwardRefusal::TargetNotWritable => "FORWARD_TARGET_NOT_WRITABLE",
             ForwardRefusal::SourceChannelMismatch => "FORWARD_SOURCE_CHANNEL_MISMATCH",
+            ForwardRefusal::SourceMediaIncomplete(_) => "FORWARD_SOURCE_MEDIA_INCOMPLETE",
         }
     }
 }
@@ -103,19 +106,26 @@ pub fn root_origin_for_copy(
 ///
 /// 优先用源消息的**引用表**行（权威）；引用表为空时（存量消息、回填尚未覆盖）
 /// 退回按源 metadata 解析。两条路径都走同一个 canonical parser。
+///
+/// 🔴 **strict**：转发是**新的写入路径**，不是读路径。存量消息里那些
+/// 「metadata 解不出」「只有缩略图没有原图」的破损引用，读的时候可以容忍
+/// （历史已经这样了），但**不能再复制出一条新的破损消息**——那等于用新数据
+/// 把历史坏账固化下来，而且用户会看到一张永远转不出圈的裂图。
+/// 媒体类型解析有任何审计问题就拒绝转发。
 pub fn refs_for_copy(
     refs_from_table: Vec<MediaRef>,
     source_message_type: i32,
     source_metadata: &serde_json::Value,
-) -> Vec<MediaRef> {
+) -> Result<Vec<MediaRef>, ForwardRefusal> {
     if !refs_from_table.is_empty() {
-        return refs_from_table;
+        return Ok(refs_from_table);
     }
     crate::service::legacy_media_refs::parse_legacy_media_refs_by_code(
         source_message_type,
         source_metadata,
     )
-    .refs
+    .into_strict()
+    .map_err(ForwardRefusal::SourceMediaIncomplete)
 }
 
 /// 转发路径给提交请求用的附件来源。抽成常量是为了让「转发必须跳过归属守卫」
@@ -180,6 +190,24 @@ mod tests {
         assert_eq!(allowed.len(), 7, "白名单变了就必须显式改这条断言：{allowed:?}");
     }
 
+    /// 【P0】源消息媒体破损 → 拒绝转发，不复制出一条新的裂图消息。
+    #[test]
+    fn a_source_with_broken_media_is_refused_instead_of_copied() {
+        // 图片消息但 metadata 解不出 typed variant（历史坏账）
+        let undecodable = serde_json::json!({ "not": "an image" });
+        let refusal = refs_for_copy(Vec::new(), ContentMessageType::Image as i32, &undecodable)
+            .expect_err("破损媒体必须拒绝");
+        assert_eq!(refusal.code(), "FORWARD_SOURCE_MEDIA_INCOMPLETE");
+
+        // 只有缩略图、缺原图
+        let thumb_only =
+            serde_json::json!({ "file_id": 0, "thumbnail_file_id": 22244, "duration": 3 });
+        assert!(
+            refs_for_copy(Vec::new(), ContentMessageType::Video as i32, &thumb_only).is_err(),
+            "缺主体文件的媒体不能被转发成新消息",
+        );
+    }
+
     /// 转发一条转发消息：root 沿用源消息的 root，不是上一手。
     #[test]
     fn forwarding_a_forward_keeps_the_original_author() {
@@ -214,12 +242,14 @@ mod tests {
         }];
         let metadata = serde_json::json!({ "file_id": 99, "thumbnail_file_id": 98 });
         assert_eq!(
-            refs_for_copy(from_table.clone(), ContentMessageType::Image as i32, &metadata),
+            refs_for_copy(from_table.clone(), ContentMessageType::Image as i32, &metadata)
+                .expect("引用表有行时直接采用"),
             from_table,
             "引用表是权威，不该被 metadata 覆盖",
         );
 
-        let fallback = refs_for_copy(Vec::new(), ContentMessageType::Image as i32, &metadata);
+        let fallback = refs_for_copy(Vec::new(), ContentMessageType::Image as i32, &metadata)
+            .expect("干净的存量 metadata 可以回落解析");
         assert_eq!(
             fallback.iter().map(|r| r.file_id).collect::<Vec<_>>(),
             vec![99, 98],
@@ -231,8 +261,8 @@ mod tests {
     #[test]
     fn a_forwarded_text_message_copies_no_attachments() {
         let metadata = serde_json::json!({ "text": "hi", "file_id": 5 });
-        assert!(
-            refs_for_copy(Vec::new(), ContentMessageType::Text as i32, &metadata).is_empty()
-        );
+        assert!(refs_for_copy(Vec::new(), ContentMessageType::Text as i32, &metadata)
+            .expect("文本消息不是媒体类型，没有审计问题")
+            .is_empty());
     }
 }

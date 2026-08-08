@@ -35,6 +35,7 @@ use crate::repository::PgMessageRepository;
 use crate::service::file_service::{authorize_file_access, FileAccessFacts};
 use crate::service::ChannelService;
 
+
 /// 候选消息的来源。`Legacy` 归零才代表回填补齐（spec §10.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateSource {
@@ -62,11 +63,14 @@ pub async fn resolve_attachment_access(
     channel_service: &ChannelService,
     file_meta: &FileMetadata,
     requester_id: u64,
-) -> AttachmentAccessDecision {
+) -> Result<AttachmentAccessDecision, AttachmentAccessError> {
+    // 🔴 fail closed：查询失败**必须**变成拒绝，不能 `unwrap_or_default()`。
+    // 吞成空列表的后果不是「少放行一次」，而是文件被当成从未被引用（pending），
+    // 于是回落到「uploader 可读」——数据库一抖动，授权就松一档。
     let mut candidates = message_repository
         .file_reference_channels(file_meta.file_id)
         .await
-        .unwrap_or_default();
+        .map_err(|error| AttachmentAccessError::Unavailable(error.to_string()))?;
 
     let mut source = CandidateSource::ReferenceTable;
     // 「有过绑定但解析不出消息」与「从未绑定过」必须分开。前者是 broken binding：
@@ -85,8 +89,12 @@ pub async fn resolve_attachment_access(
         {
             match message_repository.live_channel_of_message(message_id).await {
                 Ok(Some(entry)) => candidates.push(entry),
-                // 消息不存在 / 查询失败：都算 broken，不猜、不放行。
-                _ => has_broken_legacy_binding = true,
+                // 消息不存在：broken binding，不猜、不放行。
+                Ok(None) => has_broken_legacy_binding = true,
+                // 查询失败是「不知道」，不是「不存在」——同样不能放行。
+                Err(error) => {
+                    return Err(AttachmentAccessError::Unavailable(error.to_string()));
+                }
             }
         }
     }
@@ -96,10 +104,20 @@ pub async fn resolve_attachment_access(
         if !*live {
             continue;
         }
+        // 成员关系查不到同样是「不知道」。原来的 `unwrap_or(false)` 方向上确实是
+        // 拒绝，但把故障伪装成了「你不是成员」——客户端据此提示「无权访问」，
+        // 用户跑去申请权限，真实原因却是数据库抖了一下。
+        //
+        // ⚠️ 已知问题（未修，故意）：这里按候选会话逐个问成员关系，会话多时是 N+1。
+        // 不改成一条 `EXISTS JOIN` 的原因是**成员判定只能有一份实现**：
+        // `is_channel_member` 背后有 channel 缓存与 participants 表两层语义，
+        // 自己写 SQL 等于在授权路径上复制一份成员规则——今天已经在
+        // 「附件解析」和「get_url 判定」上各栽过一次。要优化就把批量判定做进
+        // ChannelService 本身，让两边仍然共用一份规则。
         if channel_service
             .is_channel_member(*channel_id, requester_id)
             .await
-            .unwrap_or(false)
+            .map_err(|error| AttachmentAccessError::Unavailable(error.to_string()))?
         {
             requester_is_member_of_a_live_reference = true;
             break;
@@ -113,9 +131,26 @@ pub async fn resolve_attachment_access(
         requester_is_member_of_a_live_reference,
     });
 
-    AttachmentAccessDecision {
+    Ok(AttachmentAccessDecision {
         authorized,
         source,
         candidate_count: candidates.len(),
+    })
+}
+
+/// 判定不出来（数据库故障等）。**不是拒绝**，也**不是放行**——
+/// 调用方必须把它映射成 5xx / 内部错误，让客户端知道这是可重试的服务异常。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachmentAccessError {
+    Unavailable(String),
+}
+
+impl std::fmt::Display for AttachmentAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachmentAccessError::Unavailable(detail) => {
+                write!(f, "附件授权判定不可用: {detail}")
+            }
+        }
     }
 }

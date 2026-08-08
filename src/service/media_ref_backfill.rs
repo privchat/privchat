@@ -31,6 +31,7 @@
 //! 要等用户投诉才暴露。
 
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use sqlx::{PgPool, Row};
 
 use crate::service::legacy_media_refs::{parse_legacy_media_refs_by_code, LegacyAudit};
@@ -178,12 +179,27 @@ pub async fn backfill_from(
     Ok(report)
 }
 
-/// 零缺口校验（spec §10 第 5 步）：**每一条**能解析出引用的消息，其引用是否都在表里。
+/// 一条消息的引用对不上的具体形态。**只报「差了几条」是不够的**——
+/// 数量相等但内容错位（file_id / role / ordinal 写错）会让校验通过，
+/// 而 `ON CONFLICT DO NOTHING` 恰恰会把错误那条原样留着。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceMismatch {
+    pub message_id: i64,
+    /// 应该有、表里没有的引用。
+    pub missing: Vec<(u64, i16, i32)>,
+    /// 表里有、按 metadata 解析不该有的引用。
+    pub unexpected: Vec<(u64, i16, i32)>,
+}
+
+/// 零缺口校验（spec §10 第 5 步）：**逐条比对引用集合**，不是比数量。
 ///
-/// 这是「敢不敢把 get_url 切到引用表」的判据。切换前这个数必须是 0——
-/// 不为 0 就意味着有消息的附件在切换那一刻开始下不动。
-pub async fn verify_no_gaps(pool: &PgPool, batch_size: i64) -> Result<Vec<i64>> {
-    let mut missing = Vec::new();
+/// 这是「敢不敢把 get_url 切到引用表」的判据。切换前必须为空——
+/// 不为空意味着有消息的附件在切换那一刻开始下不动，或者下到别的文件。
+pub async fn verify_no_gaps(
+    pool: &PgPool,
+    batch_size: i64,
+) -> Result<Vec<ReferenceMismatch>, anyhow::Error> {
+    let mut mismatches = Vec::new();
     let mut cursor = Cursor {
         created_at: 0,
         message_id: i64::MIN,
@@ -196,8 +212,12 @@ pub async fn verify_no_gaps(pool: &PgPool, batch_size: i64) -> Result<Vec<i64>> 
                    m.created_at,
                    m.message_type,
                    m.metadata,
-                   (SELECT count(*) FROM privchat_message_file_refs r
-                     WHERE r.message_id = m.message_id) AS ref_count
+                   COALESCE(
+                     (SELECT json_agg(json_build_array(r.file_id, r.role, r.ordinal))
+                        FROM privchat_message_file_refs r
+                       WHERE r.message_id = m.message_id),
+                     '[]'::json
+                   ) AS refs
             FROM privchat_messages m
             WHERE (m.created_at, m.message_id) > ($1, $2)
             ORDER BY m.created_at, m.message_id
@@ -222,18 +242,43 @@ pub async fn verify_no_gaps(pool: &PgPool, batch_size: i64) -> Result<Vec<i64>> 
             // 这条只有真库能发现，编译和单测都拦不住。
             let message_type: i16 = row.try_get("message_type")?;
             let metadata: serde_json::Value = row.try_get("metadata")?;
+            let stored: serde_json::Value = row.try_get("refs")?;
             cursor = Cursor {
                 created_at,
                 message_id,
             };
 
-            let expected = parse_legacy_media_refs_by_code(i32::from(message_type), &metadata)
-                .refs
-                .len() as i64;
-            let actual: i64 = row.try_get("ref_count")?;
-            if actual < expected {
-                missing.push(message_id);
+            let expected: BTreeSet<(u64, i16, i32)> =
+                parse_legacy_media_refs_by_code(i32::from(message_type), &metadata)
+                    .refs
+                    .into_iter()
+                    .map(|r| (r.file_id, r.role as i16, r.ordinal))
+                    .collect();
+
+            let actual: BTreeSet<(u64, i16, i32)> = stored
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|entry| {
+                            let cols = entry.as_array()?;
+                            Some((
+                                cols.first()?.as_i64()? as u64,
+                                cols.get(1)?.as_i64()? as i16,
+                                cols.get(2)?.as_i64()? as i32,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if expected == actual {
+                continue;
             }
+            mismatches.push(ReferenceMismatch {
+                message_id,
+                missing: expected.difference(&actual).copied().collect(),
+                unexpected: actual.difference(&expected).copied().collect(),
+            });
         }
 
         if (rows.len() as i64) < batch_size {
@@ -241,7 +286,7 @@ pub async fn verify_no_gaps(pool: &PgPool, batch_size: i64) -> Result<Vec<i64>> 
         }
     }
 
-    Ok(missing)
+    Ok(mismatches)
 }
 
 #[cfg(test)]

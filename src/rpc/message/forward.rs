@@ -93,7 +93,8 @@ pub async fn handle(
         refs_from_table,
         source.message_type as i32,
         &source.metadata,
-    );
+    )
+    .map_err(refusal)?;
 
     let source_origin = services
         .message_repository

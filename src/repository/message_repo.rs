@@ -512,32 +512,6 @@ impl PgMessageRepository {
 
         let created_at = request.message.created_at.timestamp_millis();
 
-        // 转发前置条件（spec §6.4）：在**本事务内**锁住源消息并复查存活。
-        // 放在最前面，任何写入之前 —— 失败时事务里还没有东西要回滚。
-        if let Some(source_message_id) = request.require_live_source_message {
-            let source: Option<(bool, bool)> = sqlx::query_as(
-                "SELECT deleted, revoked FROM privchat_messages WHERE message_id = $1 FOR UPDATE",
-            )
-            .bind(source_message_id as i64)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| DatabaseError::Database(format!("锁定转发源消息失败: {}", e)))?;
-
-            match source {
-                Some((false, false)) => {}
-                Some(_) => {
-                    return Err(DatabaseError::Validation(format!(
-                        "FORWARD_SOURCE_GONE source message {source_message_id} was deleted or revoked"
-                    )));
-                }
-                None => {
-                    return Err(DatabaseError::Validation(format!(
-                        "FORWARD_SOURCE_NOT_FOUND source message {source_message_id} does not exist"
-                    )));
-                }
-            }
-        }
-
         // dedup_key=None（local_message_id=0）时不 claim：无幂等键的发送不做判重。
         if let Some(dedup_key) = request.dedup_key.as_deref() {
             let claim = sqlx::query(
@@ -590,6 +564,36 @@ impl PgMessageRepository {
                     event_schema_version: None,
                     canonical_event: None,
                 });
+            }
+        }
+
+        // 转发前置条件（spec §6.4）：在**本事务内**锁住源消息并复查存活。
+        //
+        // 🔴 顺序必须在**幂等判定之后**。反过来的后果：第一次转发已经提交、
+        // 但响应在网络上丢了，随后源消息被撤回；客户端用同一个 request id 重试时，
+        // 会先撞上「源消息已撤回」而报错——明明那条转发早就成功了。
+        // 幂等结果代表「这件事已经发生过」，它优先于任何前置条件。
+        if let Some(source_message_id) = request.require_live_source_message {
+            let source: Option<(bool, bool)> = sqlx::query_as(
+                "SELECT deleted, revoked FROM privchat_messages WHERE message_id = $1 FOR UPDATE",
+            )
+            .bind(source_message_id as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::Database(format!("锁定转发源消息失败: {}", e)))?;
+
+            match source {
+                Some((false, false)) => {}
+                Some(_) => {
+                    return Err(DatabaseError::Validation(format!(
+                        "FORWARD_SOURCE_GONE source message {source_message_id} was deleted or revoked"
+                    )));
+                }
+                None => {
+                    return Err(DatabaseError::Validation(format!(
+                        "FORWARD_SOURCE_NOT_FOUND source message {source_message_id} does not exist"
+                    )));
+                }
             }
         }
 
@@ -2520,9 +2524,8 @@ mod atomic_dispatch_tests {
     const DIRECT_MESSAGE_ID: u64 = 987_674_501;
 
     async fn open_repo() -> Option<PgMessageRepository> {
-        let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .ok()?;
+        // 缺库默认 panic（见 require_test_database_url）：静默跳过会被记成通过。
+        let url = crate::require_test_database_url()?;
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&url)
@@ -3298,9 +3301,8 @@ mod client_search_tests {
     const KW: &str = "biggram红包雨测试";
 
     async fn open_repo() -> Option<PgMessageRepository> {
-        let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .ok()?;
+        // 缺库默认 panic（见 require_test_database_url）：静默跳过会被记成通过。
+        let url = crate::require_test_database_url()?;
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&url)
