@@ -1974,13 +1974,23 @@ impl SendMessageHandler {
     }
 
     /// 从消息 metadata 提取所有附件 file_id（原文件 + 缩略图），用于 file→message 绑定授权。
-    ///
-    /// 解析本身收敛在 [`crate::service::message_file_refs`]——发送、转发、存量回填
-    /// 必须共用同一份实现。这里曾经是一份独立的私有解析，它只给得出 `Vec<u64>`，
-    /// 没有 role / ordinal，填不满引用表；而回填如果另写一份，两份必然漂移。
-    /// 见 spec `foundation/MEDIA_REFERENCE_AND_FORWARD_SPEC` §9.2。
+    /// 覆盖 image/video/voice/file 的 `file_id` 与 video/link/location 的 `thumbnail_file_id`。
+    /// 数字或字符串均兼容；去重；忽略 0/缺失。
     fn extract_attachment_file_ids(metadata: &serde_json::Value) -> Vec<u64> {
-        crate::service::message_file_refs::extract_attachment_file_ids(metadata)
+        let mut ids = Vec::new();
+        for key in ["file_id", "thumbnail_file_id"] {
+            if let Some(v) = metadata.get(key) {
+                let id = v
+                    .as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()));
+                if let Some(id) = id {
+                    if id > 0 && !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        ids
     }
 
     /// 验证文件类型消息的 metadata（image/video/audio/file）
