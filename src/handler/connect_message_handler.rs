@@ -651,7 +651,7 @@ impl ConnectMessageHandler {
                 attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
                 attachment_refs_override: None,
                 forward_origin: None,
-            require_live_source_message: None,
+            forward_precondition: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("send login notice failed: {}", e))?;

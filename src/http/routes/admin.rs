@@ -2018,7 +2018,7 @@ async fn send_system_message(
             attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
             forward_origin: None,
-            require_live_source_message: None,
+            forward_precondition: None,
         })
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
@@ -2088,7 +2088,7 @@ async fn send_system_message_to_user(
             attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
             forward_origin: None,
-            require_live_source_message: None,
+            forward_precondition: None,
         })
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
@@ -2331,7 +2331,7 @@ async fn send_message(
             attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
             forward_origin: None,
-            require_live_source_message: None,
+            forward_precondition: None,
         })
         .await
         .map_err(|e| {

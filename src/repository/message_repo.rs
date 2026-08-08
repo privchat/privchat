@@ -114,6 +114,18 @@ pub enum AttachmentOrigin {
     CopiedFromExistingMessage,
 }
 
+/// 提交事务内要复查的转发前置条件。
+#[derive(Debug, Clone)]
+pub struct ForwardPrecondition {
+    pub source_message_id: u64,
+    /// 事务外读到的源正文——事务内必须仍然一致。
+    pub expected_content: String,
+    /// 事务外读到的源 metadata。
+    pub expected_metadata: serde_json::Value,
+    /// 事务外读到的源引用集合（file_id, role, ordinal），已排序去重。
+    pub expected_refs: Vec<(u64, i16, i32)>,
+}
+
 /// 转发时读到的源消息投影。
 #[derive(Debug, Clone)]
 pub struct ForwardSource {
@@ -153,12 +165,14 @@ pub struct AtomicMessageCommitRequest {
     pub attachment_origin: AttachmentOrigin,
     /// 转发来源（仅转发路径填；spec §3.3）。与消息同事务写入。
     pub forward_origin: Option<ForwardOrigin>,
-    /// 转发前置条件：源消息必须仍然有效（spec §6.4 行锁定序）。
+    /// 转发前置条件（spec §6.4）：源消息必须仍然有效，且**内容与副本一致**。
     ///
-    /// 🔴 为什么在事务里再查一次：构造副本时读过一次源消息，但那次读之后、
-    /// 这次插入之前，源消息可能被撤回。把 `FOR UPDATE` 放进同一个事务，
-    /// 撤回与转发就被行锁排成序——谁先提交谁生效。
-    pub require_live_source_message: Option<u64>,
+    /// 🔴 只复查 `deleted/revoked` 不够。构造副本时在事务外读过源消息，那次读
+    /// 之后源消息可能被撤回、被编辑、引用被改。这里在同一个事务里 `FOR UPDATE`
+    /// 锁住源消息，把内容与引用重新读一遍并与副本比对——对不上就整条回滚。
+    /// 撤回、编辑与转发因此被行锁排成序：谁先提交谁生效，不存在
+    /// 「读到的是旧内容、写下去的是新消息」这种中间态。
+    pub forward_precondition: Option<ForwardPrecondition>,
     pub channel_type: i16,
     pub event: CanonicalTimelineEvent,
     pub sender_username: Option<String>,
@@ -567,33 +581,63 @@ impl PgMessageRepository {
             }
         }
 
-        // 转发前置条件（spec §6.4）：在**本事务内**锁住源消息并复查存活。
+        // 转发前置条件（spec §6.4）：在**本事务内**锁住源消息，复查存活 + 内容 + 引用。
         //
         // 🔴 顺序必须在**幂等判定之后**。反过来的后果：第一次转发已经提交、
         // 但响应在网络上丢了，随后源消息被撤回；客户端用同一个 request id 重试时，
         // 会先撞上「源消息已撤回」而报错——明明那条转发早就成功了。
         // 幂等结果代表「这件事已经发生过」，它优先于任何前置条件。
-        if let Some(source_message_id) = request.require_live_source_message {
-            let source: Option<(bool, bool)> = sqlx::query_as(
-                "SELECT deleted, revoked FROM privchat_messages WHERE message_id = $1 FOR UPDATE",
+        if let Some(precondition) = &request.forward_precondition {
+            let source: Option<(bool, bool, String, serde_json::Value)> = sqlx::query_as(
+                "SELECT deleted, revoked, content, metadata FROM privchat_messages \
+                 WHERE message_id = $1 FOR UPDATE",
             )
-            .bind(source_message_id as i64)
+            .bind(precondition.source_message_id as i64)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| DatabaseError::Database(format!("锁定转发源消息失败: {}", e)))?;
 
+            let source_message_id = precondition.source_message_id;
             match source {
-                Some((false, false)) => {}
-                Some(_) => {
-                    return Err(DatabaseError::Validation(format!(
-                        "FORWARD_SOURCE_GONE source message {source_message_id} was deleted or revoked"
-                    )));
-                }
                 None => {
                     return Err(DatabaseError::Validation(format!(
                         "FORWARD_SOURCE_NOT_FOUND source message {source_message_id} does not exist"
                     )));
                 }
+                Some((deleted, revoked, _, _)) if deleted || revoked => {
+                    return Err(DatabaseError::Validation(format!(
+                        "FORWARD_SOURCE_GONE source message {source_message_id} was deleted or revoked"
+                    )));
+                }
+                Some((_, _, content, metadata)) => {
+                    // 内容在我们读完之后被改过 → 副本会与源不符，整条拒绝重来。
+                    if content != precondition.expected_content
+                        || metadata != precondition.expected_metadata
+                    {
+                        return Err(DatabaseError::Validation(format!(
+                            "FORWARD_SOURCE_CHANGED source message {source_message_id} changed while forwarding"
+                        )));
+                    }
+                }
+            }
+
+            // 引用同样要复查：源消息的媒体引用被改过时，副本会指向一组已经不存在的文件。
+            let current_refs: Vec<(i64, i16, i32)> = sqlx::query_as(
+                "SELECT file_id, role, ordinal FROM privchat_message_file_refs \
+                 WHERE message_id = $1 ORDER BY role, ordinal",
+            )
+            .bind(source_message_id as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::Database(format!("复查源消息引用失败: {}", e)))?;
+            let current: Vec<(u64, i16, i32)> = current_refs
+                .into_iter()
+                .map(|(file_id, role, ordinal)| (file_id as u64, role, ordinal))
+                .collect();
+            if current != precondition.expected_refs {
+                return Err(DatabaseError::Validation(format!(
+                    "FORWARD_SOURCE_CHANGED source message {source_message_id} media references changed while forwarding"
+                )));
             }
         }
 
@@ -1020,7 +1064,7 @@ impl PgMessageRepository {
     /// 返回 None 表示消息不存在（授权方应据此拒绝）。
     /// 读一条消息用于构造转发副本（不加锁）。
     ///
-    /// 存活性在**提交事务里**用 `require_live_source_message` 再复查一次
+    /// 存活性与内容一致性在**提交事务里**用 `forward_precondition` 复查
     /// （spec §6.4），这里读到的只是构造副本用的快照。
     pub async fn get_message_for_forward(
         &self,
@@ -2818,7 +2862,7 @@ mod atomic_dispatch_tests {
             client_registry_claim: None,
             attachment_origin: AttachmentOrigin::FreshUpload,
             forward_origin: None,
-            require_live_source_message: None,
+            forward_precondition: None,
             attachment_refs: vec![
                 MediaRef {
                     file_id: 100,
@@ -2963,7 +3007,7 @@ mod atomic_dispatch_tests {
             client_registry_claim: None,
             attachment_origin: AttachmentOrigin::FreshUpload,
             forward_origin: None,
-            require_live_source_message: None,
+            forward_precondition: None,
             attachment_refs: vec![MediaRef {
                 file_id: 4242,
                 role: MediaRole::Original,
@@ -3125,7 +3169,7 @@ mod atomic_dispatch_tests {
                 attachment_refs: Vec::new(),
                 attachment_origin: AttachmentOrigin::FreshUpload,
                 forward_origin: None,
-                require_live_source_message: None,
+                forward_precondition: None,
                 channel_type: 2,
                 event: CanonicalTimelineEvent::NewMessage(privchat_protocol::NewMessageEvent {
                     message_type: privchat_protocol::ContentMessageType::Text,

@@ -108,30 +108,18 @@ pub async fn resolve_attachment_access(
         }
     }
 
-    let mut requester_is_member_of_a_live_reference = false;
-    for (channel_id, live) in &candidates {
-        if !*live {
-            continue;
-        }
-        // 成员关系查不到同样是「不知道」。原来的 `unwrap_or(false)` 方向上确实是
-        // 拒绝，但把故障伪装成了「你不是成员」——客户端据此提示「无权访问」，
-        // 用户跑去申请权限，真实原因却是数据库抖了一下。
-        //
-        // ⚠️ 已知问题（未修，故意）：这里按候选会话逐个问成员关系，会话多时是 N+1。
-        // 不改成一条 `EXISTS JOIN` 的原因是**成员判定只能有一份实现**：
-        // `is_channel_member` 背后有 channel 缓存与 participants 表两层语义，
-        // 自己写 SQL 等于在授权路径上复制一份成员规则——今天已经在
-        // 「附件解析」和「get_url 判定」上各栽过一次。要优化就把批量判定做进
-        // ChannelService 本身，让两边仍然共用一份规则。
-        if channel_service
-            .is_channel_member(*channel_id, requester_id)
-            .await
-            .map_err(|error| AttachmentAccessError::Unavailable(error.to_string()))?
-        {
-            requester_is_member_of_a_live_reference = true;
-            break;
-        }
-    }
+    // 只问一次「这些有效引用所在的会话里，我是不是任一成员」——存在性判定，
+    // 命中即止。逐个查在热门文件被转发到大量会话后是 N+1；批量入口做在
+    // ChannelService 里，两边共用同一份成员规则，不在授权路径复制一份成员 SQL。
+    let live_channels: Vec<u64> = candidates
+        .iter()
+        .filter(|(_, live)| *live)
+        .map(|(channel_id, _)| *channel_id)
+        .collect();
+    let requester_is_member_of_a_live_reference = channel_service
+        .is_member_of_any(&live_channels, requester_id)
+        .await
+        .map_err(|error| AttachmentAccessError::Unavailable(error.to_string()))?;
 
     let authorized = authorize_file_access(FileAccessFacts {
         requester_id,

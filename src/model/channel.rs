@@ -626,6 +626,11 @@ pub struct GroupPolicy {
     pub allow_member_invite: bool,
     pub allow_member_add_friend: bool,
     pub all_muted: bool,
+    /// 内容保护：禁止把本群的消息转发出去（spec §6.3）。
+    ///
+    /// 服务端在创建副本**之前**拒绝。已完成的转发不追溯——副本是目标会话里的
+    /// 独立消息，追溯删除等于让第三方的会话被源群单方面改写。
+    pub forbid_forward: bool,
 }
 
 impl Default for GroupPolicy {
@@ -636,6 +641,7 @@ impl Default for GroupPolicy {
             allow_member_invite: true,
             allow_member_add_friend: true,
             all_muted: false,
+            forbid_forward: false,
         }
     }
 }

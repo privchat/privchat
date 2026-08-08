@@ -32,6 +32,7 @@ pub mod notification_service;
 pub mod presence_service;
 pub mod push_service;
 // pub mod sync_service; // 已废弃，已迁移到 sync/sync_service.rs
+pub mod send_authorization;
 pub mod sync; // Phase 8 同步服务（P0/P1/P2全部完成）
 pub mod user_service;
 

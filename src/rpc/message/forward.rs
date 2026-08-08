@@ -65,22 +65,57 @@ pub async fn handle(
         return Err(refusal(ForwardRefusal::TypeNotAllowed(source_type)));
     }
 
-    // 转发人必须读得到源消息，也必须写得进目标会话。两边都按会话成员判定。
+    // 读源消息的资格：转发人必须是源会话成员。
     if !services
         .channel_service
         .is_channel_member(source.channel_id, forwarder_id)
         .await
-        .unwrap_or(false)
+        .map_err(|e| RpcError::internal(format!("查询源会话成员失败: {e}")))?
     {
         return Err(refusal(ForwardRefusal::SourceNotReadable));
     }
-    if !services
+
+    // §6.3 内容保护：源会话禁止转发时，在创建副本**之前**拒绝。
+    if let Some(group_id) = services
         .channel_service
-        .is_channel_member(request.target_channel_id, forwarder_id)
+        .get_channel_opt(source.channel_id)
         .await
-        .unwrap_or(false)
+        .and_then(|channel| channel.group_id)
     {
-        return Err(refusal(ForwardRefusal::TargetNotWritable));
+        let forbids = services
+            .channel_service
+            .get_group_policy(group_id)
+            .await
+            .map_err(|e| RpcError::internal(format!("查询群策略失败: {e}")))?
+            .map(|policy| policy.forbid_forward)
+            .unwrap_or(false);
+        if forbids {
+            return Err(refusal(ForwardRefusal::ForwardsRestricted));
+        }
+    }
+
+    let target_channel = services
+        .channel_service
+        .get_channel_opt(request.target_channel_id)
+        .await
+        .ok_or_else(|| refusal(ForwardRefusal::TargetNotWritable))?;
+
+    // 🔴 写入目标会话的资格走**与普通发送同一个**策略：禁言、全员禁言、角色权限、
+    // 频道设置、私聊的好友/拉黑/隐私，一条不少。只查会话成员是不够的——
+    // 被禁言或被拉黑的用户会从转发这条路把消息发出去。
+    if let Err(send_refusal) = crate::service::send_authorization::authorize_send_to_channel(
+        &crate::service::send_authorization::SendAuthorizationDeps {
+            channel_service: services.channel_service.clone(),
+            friend_service: services.friend_service.clone(),
+            blacklist_service: services.blacklist_service.clone(),
+            privacy_service: services.privacy_service.clone(),
+        },
+        &target_channel,
+        forwarder_id,
+    )
+    .await
+    {
+        return Err(RpcError::forbidden(send_refusal.message()));
     }
 
     // 媒体引用由服务端复制，客户端一个 file_id 都没提交（§6 的安全前提）。
@@ -89,6 +124,11 @@ pub async fn handle(
         .message_media_refs(request.source_message_id)
         .await
         .map_err(|e| RpcError::internal(format!("读取源消息媒体引用失败: {}", e)))?;
+    // 事务内要拿这份快照复查源消息有没有在中途被改。
+    let expected_source_refs: Vec<(u64, i16, i32)> = refs_from_table
+        .iter()
+        .map(|r| (r.file_id, r.role as i16, r.ordinal))
+        .collect();
     let attachment_refs = refs_for_copy(
         refs_from_table,
         source.message_type as i32,
@@ -101,18 +141,26 @@ pub async fn handle(
         .forward_origin_of(request.source_message_id)
         .await
         .map_err(|e| RpcError::internal(format!("读取源消息转发来源失败: {}", e)))?;
-    let forward_origin = root_origin_for_copy(
+    let mut forward_origin = root_origin_for_copy(
         source.message_id,
         source.channel_id,
         source.sender_id,
         source_origin,
     );
+    // 作者名做成快照：接收方未必有权读源会话，事后查不到就只能显示 uid。
+    if forward_origin.display_snapshot.is_none() {
+        if let Ok(Some(user)) = services
+            .user_service
+            .find_by_id(forward_origin.root_author_id)
+            .await
+        {
+            if let Some(name) = user.display_name.or(user.username) {
+                forward_origin.display_snapshot =
+                    Some(serde_json::json!({ "root_author_name": name }));
+            }
+        }
+    }
 
-    let target_channel = services
-        .channel_service
-        .get_channel_opt(request.target_channel_id)
-        .await
-        .ok_or_else(|| refusal(ForwardRefusal::TargetNotWritable))?;
     let recipient_user_ids: Vec<u64> = target_channel.members.keys().copied().collect();
 
     // 幂等键的作用域是 (uid, device, client_request_id)。做成全局键会让两个账号
@@ -141,7 +189,14 @@ pub async fn handle(
             attachment_origin: FORWARD_ATTACHMENT_ORIGIN,
             attachment_refs_override: Some(attachment_refs),
             forward_origin: Some(forward_origin),
-            require_live_source_message: Some(request.source_message_id),
+            forward_precondition: Some(
+                crate::repository::message_repo::ForwardPrecondition {
+                    source_message_id: request.source_message_id,
+                    expected_content: source.content.clone(),
+                    expected_metadata: source.metadata.clone(),
+                    expected_refs: expected_source_refs,
+                },
+            ),
         })
         .await
         .map_err(|e| {
@@ -150,6 +205,8 @@ pub async fn handle(
                 refusal(ForwardRefusal::SourceGone)
             } else if text.contains("FORWARD_SOURCE_NOT_FOUND") {
                 refusal(ForwardRefusal::SourceNotFound)
+            } else if text.contains("FORWARD_SOURCE_CHANGED") {
+                refusal(ForwardRefusal::SourceChanged)
             } else {
                 RpcError::internal(format!("转发失败: {text}"))
             }
