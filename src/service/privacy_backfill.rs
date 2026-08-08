@@ -26,7 +26,7 @@
 //!
 //! 用法：
 //! ```bash
-//! ./privchat --database-url "$DATABASE_URL" backfill-privacy-settings [--dry-run]
+//! ./privchat --database-url "$DATABASE_URL" backfill-privacy-settings --input privacy.jsonl [--dry-run]
 //! ```
 //!
 //! 幂等：DB 里已有的键**不被覆盖**（`patch || existing`，DB 侧优先），
@@ -43,8 +43,6 @@ pub struct PrivacyBackfillReport {
     pub scanned: usize,
     /// 实际写进 DB 的条数。
     pub written: usize,
-    /// DB 里已经有值、因此跳过的条数。
-    pub already_in_db: usize,
     /// Redis 里的值解析不出来的条数（不写，留待人工看）。
     pub undecodable: usize,
     /// 对应用户在 DB 里已不存在的条数。
@@ -74,29 +72,31 @@ pub async fn backfill_from_entries(
             continue;
         }
 
-        let existing: Option<(serde_json::Value,)> =
-            sqlx::query_as("SELECT privacy_settings FROM privchat_users WHERE user_id = $1")
-                .bind(user_id as i64)
-                .fetch_optional(pool)
-                .await
-                .context("查询现有隐私设置失败")?;
-
-        let Some((existing,)) = existing else {
-            report.user_missing += 1;
-            continue;
-        };
-        if existing.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
-            // DB 已经有值：说明这个用户在新版本上改过，不要用 Redis 的旧值盖掉。
-            report.already_in_db += 1;
-            continue;
-        }
-
         if dry_run {
-            report.written += 1;
+            // dry-run 也要确认用户存在，否则「预演全绿、真跑一半用户不存在」。
+            let exists: Option<(i64,)> =
+                sqlx::query_as("SELECT user_id FROM privchat_users WHERE user_id = $1")
+                    .bind(user_id as i64)
+                    .fetch_optional(pool)
+                    .await
+                    .context("dry-run 查询用户失败")?;
+            match exists {
+                Some(_) => report.written += 1,
+                None => report.user_missing += 1,
+            }
             continue;
         }
 
-        sqlx::query(
+        // 🔴 **永远执行 `redis || db`**，不能因为 DB 非空就整个用户跳过。
+        //
+        // DB 侧用的是部分字段 patch：用户在新版本上改过**一个**字段，
+        // `privacy_settings` 就非空了。此时跳过，Redis 里那些**其它**限制字段
+        // 就永久丢失——上一版注释写着「只补缺失字段」，实现却是整用户跳过，
+        // 声明与实现相反。
+        //
+        // `$2 || COALESCE(privacy_settings,'{}')` 的顺序让 **DB 已有键优先**
+        // （用户在新版本改的不被旧值盖掉），同时补齐 DB 缺的键。
+        let updated = sqlx::query(
             "UPDATE privchat_users \
              SET privacy_settings = $2::jsonb || COALESCE(privacy_settings, '{}'::jsonb) \
              WHERE user_id = $1",
@@ -106,22 +106,13 @@ pub async fn backfill_from_entries(
         .execute(pool)
         .await
         .context("回填隐私设置失败")?;
+
+        if updated.rows_affected() == 0 {
+            report.user_missing += 1;
+            continue;
+        }
         report.written += 1;
     }
 
     Ok(report)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 解析不出来的条目不写、计入审计——不猜、也不静默跳过。
-    #[test]
-    fn undecodable_entries_are_audited_rather_than_guessed() {
-        let mut report = PrivacyBackfillReport::default();
-        report.undecodable += 1;
-        assert_eq!(report.written, 0);
-        assert_eq!(report.undecodable, 1);
-    }
 }

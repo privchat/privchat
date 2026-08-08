@@ -55,6 +55,24 @@ impl DetailAccessVerdict {
 }
 
 /// 隐私和权限验证服务
+/// 割接期停写开关：`PRIVCHAT_PRIVACY_WRITES_FROZEN=1`。
+///
+/// 存在的理由是 `PRIVACY_SETTINGS_CUTOVER_SOP` 路线 B 需要一个「旧服务不再产生
+/// 只落 Redis 的新写入」的窗口。没有这个开关，那条流程就只是文档里的一句话——
+/// 导出快照之后到新版本上线之前的用户修改照样会丢。
+///
+/// 只读一次：割接窗口靠重启进出，不做热切换（热切换会带来「一半请求写、一半请求拒」
+/// 的中间态，正是这个开关要消灭的东西）。
+fn privacy_writes_frozen() -> bool {
+    static FROZEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FROZEN.get_or_init(|| {
+        matches!(
+            std::env::var("PRIVCHAT_PRIVACY_WRITES_FROZEN").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 pub struct PrivacyService {
     cache_manager: Arc<CacheManager>,
     channel_service: Arc<ChannelService>,
@@ -460,6 +478,16 @@ impl PrivacyService {
         user_id: u64,
         updates: PrivacySettingsUpdate,
     ) -> Result<UserPrivacySettings> {
+        // 割接停写窗口（PRIVACY_SETTINGS_CUTOVER_SOP 路线 B 的 B1）。
+        //
+        // 🔴 必须是**可重试**错误码：返回终局失败会让客户端把这次修改当作被拒绝而丢弃，
+        // 窗口期的用户操作就真没了——那跟不做停写一样糟。
+        if privacy_writes_frozen() {
+            return Err(ServerError::ServiceUnavailable(
+                "隐私设置正在维护，请稍后重试".to_string(),
+            ));
+        }
+
         let patch = updates.to_patch_json();
 
         let mut tx = self

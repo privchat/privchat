@@ -710,23 +710,36 @@ async fn concurrent_updates_to_different_fields_do_not_overwrite_each_other() {
     cleanup(&pool).await;
     ensure_user(&pool, MEMBER, "sa_member").await;
 
+    // 🔴 确定性屏障：两个 update 在同一个点起跑。
+    // 只用 `tokio::join!` 的话，谁先谁后取决于调度，退化成 read-modify-write 时
+    // 未必每次都撞出丢更新窗口——那样这条测试会时灵时不灵。
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let a = deps.privacy_service.clone();
     let b = deps.privacy_service.clone();
+    let (ba, bb) = (barrier.clone(), barrier.clone());
     let (first, second) = tokio::join!(
-        a.update_privacy_settings(
-            MEMBER as u64,
-            PrivacySettingsUpdate {
-                allow_receive_message_from_non_friend: Some(false),
-                ..Default::default()
-            },
-        ),
-        b.update_privacy_settings(
-            MEMBER as u64,
-            PrivacySettingsUpdate {
-                allow_search_by_phone: Some(false),
-                ..Default::default()
-            },
-        ),
+        async {
+            ba.wait().await;
+            a.update_privacy_settings(
+                MEMBER as u64,
+                PrivacySettingsUpdate {
+                    allow_receive_message_from_non_friend: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+        },
+        async {
+            bb.wait().await;
+            b.update_privacy_settings(
+                MEMBER as u64,
+                PrivacySettingsUpdate {
+                    allow_search_by_phone: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+        },
     );
     first.expect("first update");
     second.expect("second update");
