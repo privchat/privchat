@@ -801,26 +801,25 @@ impl CacheManager {
     // ========== 隐私设置管理 ==========
 
     /// 获取用户隐私设置
+    /// 读隐私设置缓存。
+    ///
+    /// 🔴 **故意不走进程内 L1**（虽然 `l1_privacy_settings` 还在，供将来带失效
+    /// 广播时再启用）。理由：删掉共享的 L2 key **不会**让别的实例已经命中的
+    /// L1 失效——那些实例还会拿着旧策略放行最长一个 TTL。用户关掉「接收非好友
+    /// 消息」之后，另一台机器上继续收到陌生人消息，这不是「最终一致」能糊过去的。
+    ///
+    /// 代价是每次判定多一次 Redis 往返。要拿回 L1，前提是先有跨实例失效广播
+    /// （Redis Pub/Sub 或版本号），不是把 L1 直接加回来。
     pub async fn get_privacy_settings(
         &self,
         user_id: u64,
     ) -> Result<Option<crate::model::privacy::UserPrivacySettings>, ServerError> {
-        // 先查 L1 缓存（使用 u64 key）
-        if let Some(settings) = self.l1_privacy_settings.get(&user_id).await {
-            debug!("L1 cache hit for privacy settings: {}", user_id);
-            return Ok(Some(settings));
-        }
-
-        // 查 L2 缓存（使用字符串 key）
         let redis_key = Self::privacy_settings_cache_key(user_id);
         if let Some(settings) = self
             .get_from_redis::<crate::model::privacy::UserPrivacySettings>(&redis_key)
             .await?
         {
             debug!("L2 cache hit for privacy settings: {}", user_id);
-            self.l1_privacy_settings
-                .insert(user_id, settings.clone())
-                .await;
             return Ok(Some(settings));
         }
 
@@ -834,12 +833,8 @@ impl CacheManager {
         user_id: u64,
         settings: crate::model::privacy::UserPrivacySettings,
     ) -> Result<(), ServerError> {
-        // 更新 L1 缓存（使用 u64 key）
-        self.l1_privacy_settings
-            .insert(user_id, settings.clone())
-            .await;
-
-        // 更新 L2 缓存（使用字符串 key）
+        // 只写共享的 L2：读路径不走 L1（见 get_privacy_settings 的说明），
+        // 写 L1 只会制造一份没人读、却会误导后来者的状态。
         let redis_key = Self::privacy_settings_cache_key(user_id);
         self.set_to_redis(&redis_key, &settings).await?;
 
@@ -854,6 +849,8 @@ impl CacheManager {
     /// 更新落库后必须**显式失效**——本实例删 L1，共享的 L2（Redis/KeyDB）删掉
     /// 之后，其它实例的 L1 miss 会重新从 L2/DB 读到新值。
     pub async fn invalidate_privacy_settings(&self, user_id: u64) -> Result<(), ServerError> {
+        // 读路径只看共享 L2，所以删掉这一个 key 对**所有实例**立即生效。
+        // （L1 也顺手清一下，避免将来有人把 L1 读回来时踩到陈旧值。）
         self.l1_privacy_settings.invalidate(&user_id).await;
         let redis_key = Self::privacy_settings_cache_key(user_id);
         self.delete_from_redis(&redis_key).await?;

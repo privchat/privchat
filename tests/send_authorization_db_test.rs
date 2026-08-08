@@ -634,3 +634,115 @@ async fn a_privacy_change_survives_a_fresh_service_instance() {
 async fn deps_fresh() -> Option<(SendAuthorizationDeps, Arc<sqlx::PgPool>)> {
     deps().await
 }
+
+/// 🔴 跨实例失效：实例 B **先预热**旧策略，实例 A 改设置，B 必须立刻看到新值。
+///
+/// 上一版只用「全新空缓存实例」验证，那只能证明落库了。真正要防的是
+/// 「B 已经缓存了旧值，于是在 TTL 到期前继续放行」——安全策略不能靠 TTL 收敛。
+#[tokio::test]
+async fn an_updated_privacy_setting_reaches_an_instance_that_already_cached_the_old_one() {
+    use privchat::service::privacy_service::PrivacySettingsUpdate;
+
+    let _guard = fixture_lock().lock().await;
+    let Some((instance_a, pool)) = deps().await else {
+        return;
+    };
+    let (instance_b, _) = deps().await.expect("second instance");
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_dm(&pool).await;
+
+    let channel_b = instance_b
+        .channel_service
+        .get_channel_opt(DM_CHANNEL as u64)
+        .await
+        .expect("dm on b");
+
+    // B 先判定一次，把「允许非好友消息」这个旧值读进它的缓存。
+    assert!(
+        authorize_send_to_channel(&instance_b, &channel_b, OWNER as u64)
+            .await
+            .is_ok(),
+        "改之前是允许的",
+    );
+
+    // A 关掉它。
+    instance_a
+        .privacy_service
+        .update_privacy_settings(
+            MEMBER as u64,
+            PrivacySettingsUpdate {
+                allow_receive_message_from_non_friend: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update on a");
+
+    // B **立刻**必须拒绝，不能等 TTL。
+    assert_eq!(
+        authorize_send_to_channel(&instance_b, &channel_b, OWNER as u64).await,
+        Err(SendRefusal::PeerRejectsNonFriends),
+        "另一个实例的缓存必须被失效掉；靠 TTL 收敛意味着最长一小时内陌生人照发",
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 并发改**不同字段**不得互相覆盖（原子 JSONB patch 的存在理由）。
+#[tokio::test]
+async fn concurrent_updates_to_different_fields_do_not_overwrite_each_other() {
+    use privchat::service::privacy_service::PrivacySettingsUpdate;
+
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+
+    deps.privacy_service
+        .update_privacy_settings(
+            MEMBER as u64,
+            PrivacySettingsUpdate {
+                allow_receive_message_from_non_friend: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("first field");
+
+    // 第二台设备只改另一个字段。读改写整份覆盖的话，上面那个 false 会被写回 true。
+    let after = deps
+        .privacy_service
+        .update_privacy_settings(
+            MEMBER as u64,
+            PrivacySettingsUpdate {
+                allow_search_by_phone: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("second field");
+
+    assert!(!after.allow_search_by_phone, "本次改的字段生效");
+    assert!(
+        !after.allow_receive_message_from_non_friend,
+        "上一次改的字段必须保留——整份覆盖会把它悄悄改回允许",
+    );
+
+    let (stored,): (serde_json::Value,) =
+        sqlx::query_as("SELECT privacy_settings FROM privchat_users WHERE user_id = $1")
+            .bind(MEMBER)
+            .fetch_one(pool.as_ref())
+            .await
+            .expect("read back");
+    assert_eq!(
+        stored.get("allow_receive_message_from_non_friend"),
+        Some(&serde_json::Value::Bool(false)),
+        "DB 里也必须两个字段都在",
+    );
+
+    cleanup(&pool).await;
+}

@@ -488,30 +488,39 @@ impl PrivacyService {
             settings.allow_receive_message_from_non_friend = allow_receive_message_from_non_friend;
         }
 
-        // 更新更新时间
-        settings.updated_at = Utc::now();
-
-        // 🔴 顺序：**先落库**（真源），再跨实例失效，最后回写本实例缓存。
+        // 🔴 **单条 SQL 的原子 patch**，不是「读整份 → 改 → 整份覆盖」。
         //
-        // 原实现只写缓存：Redis/L1 一过期或重启，用户改过的设置就回到旧值或默认值。
-        // 「DB 为真源」不能只体现在读路径上——只读不写等于真源永远是空的。
-        let settings_json = serde_json::to_value(&settings)
-            .map_err(|e| ServerError::Internal(format!("序列化隐私设置失败: {e}")))?;
-        let affected = sqlx::query(
-            "UPDATE privchat_users SET privacy_settings = $2, updated_at = now_millis() \
-             WHERE user_id = $1",
+        // 读改写有两个真实故障：两台设备同时改**不同字段**时后写者整份覆盖，
+        // 前一个改动凭空消失；缓存陈旧时还会把旧字段重新写回 DB，
+        // 把用户已经改过的设置回滚。
+        //
+        // `privacy_settings || patch` 由数据库合并，只动 patch 里出现的键。
+        let patch = updates.to_patch_json();
+        let (stored,): (serde_json::Value,) = sqlx::query_as(
+            "UPDATE privchat_users \
+             SET privacy_settings = COALESCE(privacy_settings, '{}'::jsonb) || $2::jsonb, \
+                 updated_at = now_millis() \
+             WHERE user_id = $1 \
+             RETURNING privacy_settings",
         )
         .bind(user_id as i64)
-        .bind(&settings_json)
-        .execute(self.channel_service.pool())
+        .bind(&patch)
+        .fetch_optional(self.channel_service.pool())
         .await
         .map_err(|e| ServerError::Database(format!("写入隐私设置失败: {e}")))?
-        .rows_affected();
-        if affected == 0 {
-            return Err(ServerError::NotFound(format!("用户 {user_id} 不存在")));
-        }
+        .ok_or_else(|| ServerError::NotFound(format!("用户 {user_id} 不存在")))?;
 
-        // 别的实例的 L1 里可能还留着旧策略，TTL 到期前一直放行。显式失效。
+        // 以 DB 返回的**最终值**为准构造结果，而不是本地那份可能已经过时的副本。
+        let mut settings = UserPrivacySettings::new(user_id);
+        if !stored.is_null() {
+            let parsed: StoredPrivacySettings = serde_json::from_value(stored).map_err(|e| {
+                ServerError::Database(format!("写入后的隐私设置无法解析: {e}"))
+            })?;
+            parsed.apply_to(&mut settings);
+        }
+        settings.updated_at = Utc::now();
+
+        // 别的实例读的是共享 L2，删掉这一个 key 对所有实例立即生效。
         self.cache_manager
             .invalidate_privacy_settings(user_id)
             .await?;
@@ -528,8 +537,10 @@ impl PrivacyService {
 /// 单独一个 DTO 而不是直接反序列化 [`UserPrivacySettings`]：存的是增量，
 /// 缺字段属正常，字段类型不对属脏数据——两者必须区分开，
 /// 否则「缺字段」和「坏数据」都会走到同一个「回落默认」，把限制策略关掉。
+/// 🔴 **不加 `deny_unknown_fields`**：滚动升级期间新版本会写入老版本不认识的
+/// 字段，拒绝未知字段等于让老实例把整行判成脏数据、进而拒发消息。
+/// 边界是「未知字段忽略，已知字段类型错误拒绝」。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StoredPrivacySettings {
     allow_add_by_group: Option<bool>,
     allow_add_by_card: Option<bool>,
@@ -577,6 +588,33 @@ pub struct PrivacySettingsUpdate {
     pub allow_search_by_qrcode: Option<bool>,
     pub allow_view_by_non_friend: Option<bool>,
     pub allow_receive_message_from_non_friend: Option<bool>,
+}
+
+impl PrivacySettingsUpdate {
+    /// 只把**本次真正要改的字段**变成 JSON patch。
+    ///
+    /// 没设的字段不出现在 patch 里，因此 `privacy_settings || patch` 不会碰它们——
+    /// 这正是「两台设备同时改不同字段不会互相覆盖」的来源。
+    fn to_patch_json(&self) -> serde_json::Value {
+        let mut patch = serde_json::Map::new();
+        macro_rules! put {
+            ($($field:ident),+ $(,)?) => {
+                $(if let Some(value) = self.$field {
+                    patch.insert(stringify!($field).to_string(), serde_json::Value::Bool(value));
+                })+
+            };
+        }
+        put!(
+            allow_add_by_group,
+            allow_search_by_phone,
+            allow_search_by_username,
+            allow_search_by_email,
+            allow_search_by_qrcode,
+            allow_view_by_non_friend,
+            allow_receive_message_from_non_friend,
+        );
+        serde_json::Value::Object(patch)
+    }
 }
 
 #[cfg(test)]
