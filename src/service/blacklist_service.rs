@@ -205,8 +205,24 @@ impl BlacklistService {
     /// # Returns
     /// (A是否拉黑B, B是否拉黑A)
     pub async fn check_mutual_block(&self, user_a: u64, user_b: u64) -> Result<(bool, bool)> {
-        let a_blocks_b = self.is_blocked(user_a, user_b).await?;
-        let b_blocks_a = self.is_blocked(user_b, user_a).await?;
+        // 🔴 一条 SQL 取两个方向，不做两次 `is_blocked`。
+        //
+        // 两个理由：这是每条私聊消息都要过的热路径，两次串行往返白白加一倍延迟；
+        // 而且两次查询来自**两个快照**——中间有人取消拉黑时，会读出一个
+        // 从未真实存在过的组合状态。
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT user_id, blocked_user_id FROM privchat_blacklist \
+             WHERE (user_id = $1 AND blocked_user_id = $2) \
+                OR (user_id = $2 AND blocked_user_id = $1)",
+        )
+        .bind(user_a as i64)
+        .bind(user_b as i64)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| crate::error::ServerError::Database(format!("查询双向拉黑失败: {e}")))?;
+
+        let a_blocks_b = rows.iter().any(|(u, t)| *u == user_a as i64 && *t == user_b as i64);
+        let b_blocks_a = rows.iter().any(|(u, t)| *u == user_b as i64 && *t == user_a as i64);
         Ok((a_blocks_b, b_blocks_a))
     }
 

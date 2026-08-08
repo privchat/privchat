@@ -120,6 +120,13 @@ async fn cleanup(pool: &sqlx::PgPool) {
         .execute(pool)
         .await
         .expect("clean group");
+    // 🔴 隐私设置必须一起重置：用例共享固定 UID，隐私用例写下的 false
+    // 会留给后面的用例，让「非好友也能发」那类断言以错误的原因通过或失败。
+    sqlx::query("UPDATE privchat_users SET privacy_settings = '{}' WHERE user_id = ANY($1)")
+        .bind(&users)
+        .execute(pool)
+        .await
+        .expect("reset privacy settings");
 }
 
 async fn seed_group(pool: &sqlx::PgPool) {
@@ -499,4 +506,131 @@ async fn a_policy_lookup_failure_refuses_as_a_retryable_service_error() {
     );
 
     cleanup(&pool).await;
+}
+
+/// 频道设置禁止成员发言。
+///
+/// ⚠️ 这里直接改**内存里的 Channel**，而不是改数据库：`allow_member_post`
+/// 至今没有任何持久化路径——`ChannelSettings::default()` 给 true，
+/// hydration 只从 `privchat_groups` 补 name/allow_search/join_policy/
+/// allow_member_invite/allow_member_add_friend/all_muted，没有这一项。
+/// 也就是说**这条策略分支目前在生产上不可达**。
+/// 造一条假的 DB 状态去测它只会得到一个骗人的绿；这里退而测策略本身，
+/// 并把「缺持久化」这件事留在这段说明里。
+#[tokio::test]
+async fn a_channel_that_forbids_member_posting_refuses_ordinary_members() {
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_group(&pool).await;
+
+    let mut channel = deps
+        .channel_service
+        .get_channel_opt(GROUP_ID as u64)
+        .await
+        .expect("channel");
+    let settings = channel
+        .settings
+        .get_or_insert_with(privchat::model::channel::ChannelSettings::default);
+    settings.allow_member_post = false;
+
+    assert_eq!(
+        authorize_send_to_channel(&deps, &channel, MEMBER as u64).await,
+        Err(SendRefusal::ChannelForbidsPosting),
+        "频道禁止成员发言时普通成员必须被拦",
+    );
+    assert!(
+        authorize_send_to_channel(&deps, &channel, OWNER as u64)
+            .await
+            .is_ok(),
+        "群主不受 allow_member_post 限制",
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 隐私存储损坏（脏 JSON）→ 拒绝且可重试，**不能**回落成「允许非好友消息」。
+#[tokio::test]
+async fn corrupt_privacy_storage_refuses_instead_of_falling_back_to_permissive() {
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_dm(&pool).await;
+
+    // 字段类型不对 = 脏数据。缺字段是正常的增量存储，不算脏。
+    sqlx::query(
+        r#"UPDATE privchat_users
+           SET privacy_settings = '{"allow_receive_message_from_non_friend": "nope"}'
+           WHERE user_id = $1"#,
+    )
+    .bind(MEMBER)
+    .execute(pool.as_ref())
+    .await
+    .expect("corrupt privacy");
+
+    let channel = deps
+        .channel_service
+        .get_channel_opt(DM_CHANNEL as u64)
+        .await
+        .expect("dm");
+    assert_eq!(
+        authorize_send_to_channel(&deps, &channel, OWNER as u64).await,
+        Err(SendRefusal::PolicyUnavailable),
+        "脏数据必须拒绝：回落默认等于把用户的限制悄悄关掉",
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 隐私设置必须**落库**：换一个全新 service（模拟重启/另一实例）仍然生效。
+#[tokio::test]
+async fn a_privacy_change_survives_a_fresh_service_instance() {
+    use privchat::service::privacy_service::PrivacySettingsUpdate;
+
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_dm(&pool).await;
+
+    deps.privacy_service
+        .update_privacy_settings(
+            MEMBER as u64,
+            PrivacySettingsUpdate {
+                allow_receive_message_from_non_friend: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update privacy");
+
+    // 全新实例：自带空缓存，只能从 DB 读。
+    let (fresh, _) = deps_fresh().await.expect("fresh deps");
+    let channel = fresh
+        .channel_service
+        .get_channel_opt(DM_CHANNEL as u64)
+        .await
+        .expect("dm");
+    assert_eq!(
+        authorize_send_to_channel(&fresh, &channel, OWNER as u64).await,
+        Err(SendRefusal::PeerRejectsNonFriends),
+        "只写缓存的话，重启或另一个实例上这条设置就没了",
+    );
+
+    cleanup(&pool).await;
+}
+
+async fn deps_fresh() -> Option<(SendAuthorizationDeps, Arc<sqlx::PgPool>)> {
+    deps().await
 }
