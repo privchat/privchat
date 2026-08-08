@@ -342,8 +342,10 @@ impl SyncService {
         }
     }
 
-    fn attachment_file_ids(metadata: Option<&MessageMetadata>) -> Vec<u64> {
-        crate::service::legacy_media_refs::typed_media_file_ids(metadata)
+    fn attachment_refs(
+        metadata: Option<&MessageMetadata>,
+    ) -> Vec<privchat_protocol::MediaRef> {
+        crate::service::legacy_media_refs::typed_media_refs(metadata)
     }
 
     fn message_from_submit(
@@ -351,7 +353,7 @@ impl SyncService {
         sender_id: u64,
         server_message_id: u64,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(Message, Vec<u64>, CanonicalTimelineEvent)> {
+    ) -> Result<(Message, Vec<privchat_protocol::MediaRef>, CanonicalTimelineEvent)> {
         let content_type = Self::normalize_submit_content_type(&req.command_type);
         let event = CanonicalTimelineEvent::from_legacy(
             content_type.as_str(),
@@ -376,7 +378,7 @@ impl SyncService {
             ));
         };
 
-        let attachment_file_ids = Self::attachment_file_ids(event.payload.metadata.as_ref());
+        let attachment_refs = Self::attachment_refs(event.payload.metadata.as_ref());
         let metadata = event
             .payload
             .metadata
@@ -403,7 +405,7 @@ impl SyncService {
         };
         Ok((
             message,
-            attachment_file_ids,
+            attachment_refs,
             CanonicalTimelineEvent::NewMessage(event),
         ))
     }
@@ -489,7 +491,7 @@ impl SyncService {
         // 6. 生成 server_msg_id（使用 snowflake）并构造权威消息投影。
         let server_msg_id = self.generate_msg_id().await;
         let now = chrono::Utc::now();
-        let (message, attachment_file_ids, canonical_event) =
+        let (message, attachment_refs, canonical_event) =
             Self::message_from_submit(&req, sender_id, server_msg_id, now)?;
         let (_, commit_content) = canonical_event
             .to_legacy_commit(req.channel_id, req.channel_type)
@@ -507,7 +509,7 @@ impl SyncService {
                     device_id: device_id.to_string(),
                     decision: "accepted".to_string(),
                 }),
-                attachment_file_ids,
+                attachment_refs,
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
                 sender_username: None,

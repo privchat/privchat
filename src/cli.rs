@@ -138,6 +138,21 @@ pub enum Commands {
     },
     /// 显示最终配置（合并后的配置）
     ShowConfig,
+    /// 回填消息 → 文件引用表（MEDIA_REFERENCE_AND_FORWARD_SPEC §9）。
+    ///
+    /// 可断点续跑、可重复执行。**不是 migration**：回填必须走与发送路径同一个
+    /// extractor，而 migration runner 只能执行 SQL。
+    BackfillMediaRefs {
+        /// 一次事务处理多少条消息。
+        #[arg(long, default_value_t = 1000)]
+        batch_size: i64,
+        /// 只回填该毫秒时间戳之后创建的消息（双写上线后的 catch-up 扫描）。
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+        /// 跳过写入，只跑零缺口校验。
+        #[arg(long, default_value_t = false)]
+        verify_only: bool,
+    },
 }
 
 impl Cli {

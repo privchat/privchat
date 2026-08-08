@@ -152,8 +152,21 @@ fn parse_by_kind(
 /// 与 [`parse_legacy_media_refs`] 是**同一个协议层事实的两个入口**：一个从裸 JSON
 /// 进，一个从 typed 进，出口都是 `MessageMetadata::unique_file_ids`。
 /// 冻结点（spec §13）：绑定守卫只允许有这两个入口，不许再出现第三份解析。
+pub fn typed_media_refs(metadata: Option<&MessageMetadata>) -> Vec<MediaRef> {
+    metadata.map(MessageMetadata::attachment_refs).unwrap_or_default()
+}
+
+/// 同上，但只要去重后的 file_id（绑定守卫视角）。
 pub fn typed_media_file_ids(metadata: Option<&MessageMetadata>) -> Vec<u64> {
     metadata.map(MessageMetadata::unique_file_ids).unwrap_or_default()
+}
+
+/// 一组引用去重后的 file_id。绑定守卫按「文件」算，引用表按「角色」算。
+pub fn unique_file_ids_of(refs: &[MediaRef]) -> Vec<u64> {
+    let mut ids: Vec<u64> = refs.iter().map(|r| r.file_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// 三条写入路径共享的用例表（spec §12 门禁 1）。

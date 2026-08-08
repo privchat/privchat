@@ -1325,7 +1325,8 @@ impl MessageHandler for SendMessageHandler {
         // 附件 file→message 绑定（ATTACHMENT_ENCRYPTION_SPEC §授权）：把
         // file_id / thumbnail_file_id 绑定到 message_id（business_type="message"），使接收端
         // get_url 能按 channel 成员授权访问/拿 CEK。绑定、消息、commit 在同一 DB tx 内提交。
-        let bind_file_ids = Self::extract_attachment_file_ids(message.message_type, &message.metadata);
+        let attachment_refs =
+            Self::extract_attachment_refs(message.message_type, &message.metadata);
         let channel_type_code = Self::channel_type_code(channel.channel_type);
         let mut canonical_payload = privchat_protocol::decode_message::<MessagePayloadEnvelope>(
             &send_message_request.payload,
@@ -1355,7 +1356,7 @@ impl MessageHandler for SendMessageHandler {
                 // None（local_message_id=0）时事务内不 claim dedup key，退化为无幂等发送。
                 dedup_key: client_dedup_key.clone(),
                 client_registry_claim: None,
-                attachment_file_ids: bind_file_ids,
+                attachment_refs,
                 channel_type: channel_type_code as i16,
                 event: canonical_event,
                 sender_username: None,
@@ -1983,12 +1984,23 @@ impl SendMessageHandler {
     ///
     /// 返回**去重后的 file_id**：绑定守卫按「文件」算，同一文件兼任原图与缩略图
     /// 时只需绑定一次（引用表按 `(role, ordinal)` 记两条，那是另一个维度）。
+    fn extract_attachment_refs(
+        message_type: privchat_protocol::ContentMessageType,
+        metadata: &serde_json::Value,
+    ) -> Vec<privchat_protocol::MediaRef> {
+        crate::service::legacy_media_refs::parse_legacy_media_refs(message_type, metadata).refs
+    }
+
+    /// 去重后的 file_id 视图（绑定守卫口径），测试与日志用。
+    #[cfg(test)]
     fn extract_attachment_file_ids(
         message_type: privchat_protocol::ContentMessageType,
         metadata: &serde_json::Value,
     ) -> Vec<u64> {
-        crate::service::legacy_media_refs::parse_legacy_media_refs(message_type, metadata)
-            .unique_file_ids()
+        crate::service::legacy_media_refs::unique_file_ids_of(&Self::extract_attachment_refs(
+            message_type,
+            metadata,
+        ))
     }
 
     /// 验证文件类型消息的 metadata（image/video/audio/file）

@@ -24,6 +24,7 @@ pub mod entity_invalidation_publisher;
 pub mod friend_service;
 pub mod group_service;
 pub mod legacy_media_refs;
+pub mod media_ref_backfill;
 pub mod message_service;
 pub mod notification_service;
 pub mod presence_service;
