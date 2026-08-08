@@ -2015,6 +2015,10 @@ async fn send_system_message(
             channel_type,
             recipient_user_ids: recipients,
             dedup_key: None, // 系统灰条通知不需要卡片幂等
+            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
+            attachment_refs_override: None,
+            forward_origin: None,
+            require_live_source_message: None,
         })
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
@@ -2081,6 +2085,10 @@ async fn send_system_message_to_user(
             channel_type: 1, // 1 = Direct
             recipient_user_ids: vec![sender_id, request.user_id],
             dedup_key: None,
+            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
+            attachment_refs_override: None,
+            forward_origin: None,
+            require_live_source_message: None,
         })
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
@@ -2320,6 +2328,10 @@ async fn send_message(
             channel_type,
             recipient_user_ids: recipients,
             dedup_key: request.dedup_key.clone(),
+            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
+            attachment_refs_override: None,
+            forward_origin: None,
+            require_live_source_message: None,
         })
         .await
         .map_err(|e| {
