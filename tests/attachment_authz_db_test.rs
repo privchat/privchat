@@ -49,9 +49,9 @@ fn fixture_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 async fn open_test_pool() -> Option<Arc<sqlx::PgPool>> {
-    let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .ok()?;
+    // 🔴 缺库默认 panic。评审实测过：没有 DATABASE_URL 时这三条测试全部跳过，
+    // 结果却显示通过——那样的「绿」不能证明 SQL 契约执行过。
+    let url = privchat::require_test_database_url()?;
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
@@ -168,7 +168,9 @@ async fn resolve_get_url(
         .expect("query file")
         .expect("file exists");
 
-    let decision = resolve_attachment_access(msg_repo, channel_service, &meta, user_id).await;
+    let decision = resolve_attachment_access(msg_repo, channel_service, &meta, user_id)
+        .await
+        .expect("授权判定不该因数据库故障而不可用");
     let cek = if decision.authorized {
         meta.cek.clone()
     } else {
@@ -462,6 +464,7 @@ async fn a_revoked_reference_stops_authorizing_but_a_sibling_reference_still_doe
             .expect("exists");
         resolve_attachment_access(&msg_repo, &channel_service, &meta, MEMBER_UID as u64)
             .await
+            .expect("授权判定可用")
             .authorized
     };
 
@@ -495,6 +498,7 @@ async fn a_revoked_reference_stops_authorizing_but_a_sibling_reference_still_doe
     assert!(
         !resolve_attachment_access(&msg_repo, &channel_service, &meta, UPLOADER_UID as u64)
             .await
+            .expect("授权判定可用")
             .authorized,
         "上传者也不能靠身份绕过",
     );

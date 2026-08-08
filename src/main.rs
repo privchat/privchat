@@ -465,13 +465,18 @@ async fn run_backfill_media_refs(
         .await
         .context("校验失败")?;
     if missing.is_empty() {
-        println!("✅ 零缺口：每条能解析出引用的消息，引用都已在表中。");
+        println!("✅ 引用集合逐条一致：没有缺失，也没有多余。");
     } else {
-        println!("❌ 缺口 {} 条，前 20 条 message_id：", missing.len());
-        for message_id in missing.iter().take(20) {
-            println!("   {message_id}");
+        // 只报「差了几条」会漏掉「数量对但内容错位」，而 ON CONFLICT DO NOTHING
+        // 恰恰会把写错的那条原样留着。所以这里逐条打出 missing / unexpected。
+        println!("❌ 引用不一致 {} 条，前 20 条：", missing.len());
+        for mismatch in missing.iter().take(20) {
+            println!(
+                "   message_id={} missing={:?} unexpected={:?}",
+                mismatch.message_id, mismatch.missing, mismatch.unexpected
+            );
         }
-        anyhow::bail!("引用表存在缺口，不得切换 get_url 授权来源");
+        anyhow::bail!("引用表与 metadata 不一致，不得切换 get_url 授权来源");
     }
     Ok(())
 }

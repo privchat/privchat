@@ -58,13 +58,17 @@ pub async fn get_file_url(
         .map_err(|e| RpcError::internal(format!("查询文件失败: {}", e)))?
         .ok_or_else(|| RpcError::validation("文件不存在".to_string()))?;
 
+    // 🔴 判定失败是 5xx，不是 403：把「服务异常」映射成「无权」会让用户
+    // 去申请权限，而真实原因是数据库抖了一下；更糟的是反过来——旧实现把
+    // 查询失败吞成空结果，文件被当成 pending，于是上传者反而拿得到 CEK。
     let decision = crate::service::attachment_authorization::resolve_attachment_access(
         &services.message_repository,
         &services.channel_service,
         &file_meta,
         user_id,
     )
-    .await;
+    .await
+    .map_err(|error| RpcError::internal(error.to_string()))?;
 
     if decision.authorized {
         // fallback 命中率是「回填够不够」的唯一读数。归零之前不能删掉第 2 条发现路径，

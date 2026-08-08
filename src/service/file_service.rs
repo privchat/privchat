@@ -392,19 +392,27 @@ impl FileService {
             return Err(ServerError::Forbidden("无权删除此文件".to_string()));
         }
 
-        // 🔴 只允许删除**没有被任何消息引用过**的 pending 文件
-        // （MEDIA_REFERENCE_AND_FORWARD_SPEC §8.2）。
+        // 🔴 **直接物理删除已停用**（MEDIA_REFERENCE_AND_FORWARD_SPEC §8.2）。
         //
-        // 「我上传的文件我能删」在单点绑定模型下成立，在共享引用模型下不成立：
-        // 一个文件可能同时被自己的原消息和若干转发副本引用，上传者删掉物理文件，
-        // 那些副本会一起变成打不开的图。已被引用的文件只能由引用计数 GC 回收。
+        // 共享引用模型下「我上传的文件我能删」不再成立：一个文件可能同时被原消息
+        // 和若干转发副本引用，删掉物理文件会让那些副本一起变成打不开的图。
         //
-        // 已撤回的引用也算数——引用行保留是为了审计，而且撤回可能被撤销/被管理端复核。
-        if self.file_upload_repo.reference_count(file_id).await? > 0 {
-            return Err(ServerError::Forbidden(
-                "文件已被消息引用，不能直接删除".to_string(),
-            ));
-        }
+        // 先数引用再删除**也不够**——两步之间可以插入一条新引用（转发只需要一个
+        // 事务），删除照样发生，副本照样坏。要做对必须是 GC 状态机：
+        // `status=gc_pending` + 宽限期 + 到点复查引用，全程可被新引用取消。
+        //
+        // 在那套状态机落地之前，这里**一律拒绝**，而不是给一个看起来安全的检查。
+        // 现状：`delete_file` 尚无 RPC 调用方，所以这是拆引信，不是砍功能。
+        let references = self.file_upload_repo.reference_count(file_id).await?;
+        tracing::warn!(
+            "🚫 拒绝直接删除文件 file_id={file_id}（引用 {references} 条）：\
+             引用计数 GC 未落地前不提供物理删除"
+        );
+        return Err(ServerError::Forbidden(
+            "直接删除文件已停用，等待引用计数 GC".to_string(),
+        ));
+        #[allow(unreachable_code)]
+        {
 
         let metadata = self
             .get_file_metadata(file_id)
@@ -425,6 +433,7 @@ impl FileService {
 
         self.file_upload_repo.delete(file_id).await?;
         Ok(())
+        }
     }
 
     fn detect_file_type(&self, mime_type: &str) -> Result<FileType> {

@@ -43,16 +43,25 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    // 注册单条转发路由（MEDIA_REFERENCE_AND_FORWARD_SPEC §6）
-    GLOBAL_RPC_ROUTER
-        .register(routes::message::FORWARD, {
-            let services = services.clone();
-            move |params, ctx| {
+    // 单条转发路由（MEDIA_REFERENCE_AND_FORWARD_SPEC §6）。
+    //
+    // 🔴 **默认不注册**。「官方客户端还没做入口」不是安全边界——路由一旦注册，
+    // 任何自定义客户端都能直接调。在 §6.3 内容保护与「与普通发送共用的
+    // 权限策略（禁言 / 黑名单 / 角色）」落地并验证之前，这个开关保持关闭。
+    if services.config.message.forward_enabled {
+        GLOBAL_RPC_ROUTER
+            .register(routes::message::FORWARD, {
                 let services = services.clone();
-                Box::pin(async move { forward::handle(params, services, ctx).await })
-            }
-        })
-        .await;
+                move |params, ctx| {
+                    let services = services.clone();
+                    Box::pin(async move { forward::handle(params, services, ctx).await })
+                }
+            })
+            .await;
+        tracing::warn!("⚠️ message/forward 已启用（[message] forward_enabled = true）");
+    } else {
+        tracing::info!("🔒 message/forward 未注册（[message] forward_enabled 默认 false）");
+    }
 
     // 注册群消息置顶 / 取消置顶路由（P1）
     GLOBAL_RPC_ROUTER
