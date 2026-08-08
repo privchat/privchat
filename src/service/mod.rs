@@ -41,6 +41,7 @@ pub mod user_service;
 // 新增消息历史服务
 pub mod message_history_service;
 // 新增隐私服务
+pub mod privacy_backfill;
 pub mod privacy_service;
 // 新增已读回执服务
 pub mod read_receipt_service;

@@ -189,11 +189,7 @@ impl PrivacyService {
             UserDetailSource::CardShare { share_id } => {
                 self.validate_card_share_source(searcher_id, target_id, share_id)
                     .await?;
-                let privacy = self
-                    .cache_manager
-                    .get_privacy_settings(target_id)
-                    .await?
-                    .unwrap_or_else(|| UserPrivacySettings::new(target_id));
+                let privacy = self.get_or_create_privacy_settings(target_id).await?;
                 Ok(if privacy.allow_add_by_card {
                     DetailAccessVerdict::viewable_and_addable()
                 } else {
@@ -277,11 +273,7 @@ impl PrivacyService {
             ));
         }
 
-        let privacy = self
-            .cache_manager
-            .get_privacy_settings(target_id)
-            .await?
-            .unwrap_or_else(|| UserPrivacySettings::new(target_id));
+        let privacy = self.get_or_create_privacy_settings(target_id).await?;
 
         // 按真实命中方式查对应开关;老记录无 hit_by 时退回"任一允许"旧语义。
         let allowed = match record.hit_by {
@@ -355,11 +347,7 @@ impl PrivacyService {
         }
 
         // 个人「添加我的方式」:允许通过群聊添加我(§2.5,20312)。
-        let privacy = self
-            .cache_manager
-            .get_privacy_settings(target_id)
-            .await?
-            .unwrap_or_else(|| UserPrivacySettings::new(target_id));
+        let privacy = self.get_or_create_privacy_settings(target_id).await?;
         if !privacy.allow_add_by_group {
             return Ok(DetailAccessVerdict::view_only("personal_privacy"));
         }
@@ -408,18 +396,21 @@ impl PrivacyService {
     }
 
     /// 获取或创建默认隐私设置
+    /// 读用户隐私设置。**直读数据库，不走任何缓存。**
+    ///
+    /// 🔴 为什么不缓存：这是发送授权的判据。缓存一旦引入，就要回答
+    /// 「另一个实例什么时候看到新值」——而删共享 key 管不住别的实例的进程内
+    /// 缓存，做对需要 Pub/Sub 或版本号那一整套。为一次数据库往返引入分布式
+    /// 一致性机制不划算；而做不对的后果是用户关掉「接收非好友消息」之后，
+    /// 在另一台机器上继续收到陌生人消息。
+    ///
+    /// 要加缓存的前提是先有失效广播，并且有一个**用真 Redis 双实例**跑的测试
+    /// （用 `CacheConfig::default()` 的测试证明不了任何跨实例行为——那里
+    /// `redis=None`，根本没有共享缓存）。
     pub async fn get_or_create_privacy_settings(
         &self,
         user_id: u64,
     ) -> Result<UserPrivacySettings> {
-        if let Some(settings) = self.cache_manager.get_privacy_settings(user_id).await? {
-            return Ok(settings);
-        }
-
-        // 🔴 缓存未命中要读 **DB**（`privchat_users.privacy_settings`），不能直接
-        // 造一份默认值。原实现缓存一miss就返回全默认并写回缓存，等于
-        // 「仅接收好友消息」这类设置在重启后、在没预热的实例上一律失效——
-        // 用户改过的设置从来没有真正被读过。
         let row: Option<(serde_json::Value,)> =
             sqlx::query_as("SELECT privacy_settings FROM privchat_users WHERE user_id = $1")
                 .bind(user_id as i64)
@@ -427,76 +418,58 @@ impl PrivacyService {
                 .await
                 .map_err(|e| ServerError::Database(format!("查询隐私设置失败: {e}")))?;
 
-        // DB 里存的往往是**部分字段**（只写用户改过的那几项），所以先按 typed
-        // partial DTO 解析，再合并到默认值上。
-        //
-        // 🔴 解析失败**不能回落全默认**：默认是「允许非好友消息」，于是一条脏数据
-        // 就把用户的限制悄悄关掉了。存着的字段格式不对属于「判定不出来」，
-        // 必须报错，让发送策略拿到 PolicyUnavailable（拒绝且可重试）。
-        let stored: Option<StoredPrivacySettings> = match row {
-            Some((value,)) if !value.is_null() => {
-                Some(serde_json::from_value(value).map_err(|e| {
-                    ServerError::Database(format!(
-                        "用户 {user_id} 的隐私设置无法解析（脏数据，不按默认放行）: {e}"
-                    ))
-                })?)
-            }
-            _ => None,
-        };
+        Self::settings_from_stored(user_id, row.map(|(value,)| value))
+    }
+
+    /// 把 DB 里存的（部分字段）JSON 解析成完整设置。
+    ///
+    /// 缺字段是正常的增量存储；**已知字段类型不对是脏数据，必须报错**——
+    /// 回落默认等于把用户的限制悄悄关掉（默认允许非好友消息）。
+    /// 未知字段忽略：滚动升级期间新版本会写老版本不认识的键，
+    /// 拒绝未知字段会让老实例把整行判脏、进而拒发消息。
+    fn settings_from_stored(
+        user_id: u64,
+        stored: Option<serde_json::Value>,
+    ) -> Result<UserPrivacySettings> {
         let mut settings = UserPrivacySettings::new(user_id);
-        if let Some(stored) = stored {
-            stored.apply_to(&mut settings);
+        if let Some(value) = stored {
+            if !value.is_null() {
+                let parsed: StoredPrivacySettings =
+                    serde_json::from_value(value).map_err(|e| {
+                        ServerError::Database(format!(
+                            "用户 {user_id} 的隐私设置无法解析（脏数据，不按默认放行）: {e}"
+                        ))
+                    })?;
+                parsed.apply_to(&mut settings);
+            }
         }
-        settings.user_id = user_id;
-        self.cache_manager
-            .set_privacy_settings(user_id, settings.clone())
-            .await?;
         Ok(settings)
     }
 
     /// 更新隐私设置
+    /// 更新隐私设置。**事务内 patch → 解析 → 提交。**
+    ///
+    /// 🔴 解析放在提交之前：写进去的东西如果解析不出来，事务直接回滚，
+    /// 不会留下一行「已落库但没人能读」的脏数据。
+    ///
+    /// 也不再先读一遍旧值：那一次读的结果随后会被整份覆盖（编译器都报了
+    /// unused assignment），白多一次往返；更糟的是已知字段损坏时，
+    /// 读会先报错，于是用户**连改回正确值都做不到**。
     pub async fn update_privacy_settings(
         &self,
         user_id: u64,
         updates: PrivacySettingsUpdate,
     ) -> Result<UserPrivacySettings> {
-        // 获取现有设置或创建默认设置
-        let mut settings = self.get_or_create_privacy_settings(user_id).await?;
-
-        // 应用更新
-        if let Some(allow_add_by_group) = updates.allow_add_by_group {
-            settings.allow_add_by_group = allow_add_by_group;
-        }
-        if let Some(allow_search_by_phone) = updates.allow_search_by_phone {
-            settings.allow_search_by_phone = allow_search_by_phone;
-        }
-        if let Some(allow_search_by_username) = updates.allow_search_by_username {
-            settings.allow_search_by_username = allow_search_by_username;
-        }
-        if let Some(allow_search_by_email) = updates.allow_search_by_email {
-            settings.allow_search_by_email = allow_search_by_email;
-        }
-        if let Some(allow_search_by_qrcode) = updates.allow_search_by_qrcode {
-            settings.allow_search_by_qrcode = allow_search_by_qrcode;
-        }
-        if let Some(allow_view_by_non_friend) = updates.allow_view_by_non_friend {
-            settings.allow_view_by_non_friend = allow_view_by_non_friend;
-        }
-        if let Some(allow_receive_message_from_non_friend) =
-            updates.allow_receive_message_from_non_friend
-        {
-            settings.allow_receive_message_from_non_friend = allow_receive_message_from_non_friend;
-        }
-
-        // 🔴 **单条 SQL 的原子 patch**，不是「读整份 → 改 → 整份覆盖」。
-        //
-        // 读改写有两个真实故障：两台设备同时改**不同字段**时后写者整份覆盖，
-        // 前一个改动凭空消失；缓存陈旧时还会把旧字段重新写回 DB，
-        // 把用户已经改过的设置回滚。
-        //
-        // `privacy_settings || patch` 由数据库合并，只动 patch 里出现的键。
         let patch = updates.to_patch_json();
-        let (stored,): (serde_json::Value,) = sqlx::query_as(
+
+        let mut tx = self
+            .channel_service
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启隐私设置事务失败: {e}")))?;
+
+        let updated: Option<(serde_json::Value,)> = sqlx::query_as(
             "UPDATE privchat_users \
              SET privacy_settings = COALESCE(privacy_settings, '{}'::jsonb) || $2::jsonb, \
                  updated_at = now_millis() \
@@ -505,29 +478,28 @@ impl PrivacyService {
         )
         .bind(user_id as i64)
         .bind(&patch)
-        .fetch_optional(self.channel_service.pool())
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| ServerError::Database(format!("写入隐私设置失败: {e}")))?
-        .ok_or_else(|| ServerError::NotFound(format!("用户 {user_id} 不存在")))?;
+        .map_err(|e| ServerError::Database(format!("写入隐私设置失败: {e}")))?;
 
-        // 以 DB 返回的**最终值**为准构造结果，而不是本地那份可能已经过时的副本。
-        let mut settings = UserPrivacySettings::new(user_id);
-        if !stored.is_null() {
-            let parsed: StoredPrivacySettings = serde_json::from_value(stored).map_err(|e| {
-                ServerError::Database(format!("写入后的隐私设置无法解析: {e}"))
-            })?;
-            parsed.apply_to(&mut settings);
-        }
+        let Some((stored,)) = updated else {
+            tx.rollback().await.ok();
+            return Err(ServerError::NotFound(format!("用户 {user_id} 不存在")));
+        };
+
+        // 解析失败就回滚：宁可这次更新失败，也不留一行读不出来的设置。
+        let mut settings = match Self::settings_from_stored(user_id, Some(stored)) {
+            Ok(settings) => settings,
+            Err(e) => {
+                tx.rollback().await.ok();
+                return Err(e);
+            }
+        };
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交隐私设置失败: {e}")))?;
+
         settings.updated_at = Utc::now();
-
-        // 别的实例读的是共享 L2，删掉这一个 key 对所有实例立即生效。
-        self.cache_manager
-            .invalidate_privacy_settings(user_id)
-            .await?;
-        self.cache_manager
-            .set_privacy_settings(user_id, settings.clone())
-            .await?;
-
         Ok(settings)
     }
 }
