@@ -47,6 +47,9 @@ async fn main() -> Result<()> {
             privchat::cli::Commands::ShowConfig => {
                 return show_config(&cli);
             }
+            privchat::cli::Commands::BackfillPrivacySettings { input, dry_run } => {
+                return run_backfill_privacy_settings(&cli, input, *dry_run).await;
+            }
             privchat::cli::Commands::BackfillMediaRefs {
                 batch_size,
                 since,
@@ -497,6 +500,55 @@ async fn run_backfill_media_refs(
             );
         }
         anyhow::bail!("引用表与 metadata 不一致，不得切换 get_url 授权来源");
+    }
+    Ok(())
+}
+
+/// 把只存在于 Redis 里的隐私设置回填进数据库（上线 DB 真源前的必做步骤）。
+async fn run_backfill_privacy_settings(cli: &Cli, input: &str, dry_run: bool) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+
+    let _ = dotenvy::dotenv();
+    let database_url = cli
+        .database_url
+        .clone()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .context("需要 DATABASE_URL")?;
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .context("数据库连接失败")?;
+
+    let file = std::fs::File::open(input).with_context(|| format!("打不开 {input}"))?;
+    let mut entries = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.context("读行失败")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_str(&line).context("导出行不是 JSON")?;
+        let user_id = row
+            .get("user_id")
+            .and_then(|v| v.as_u64())
+            .context("缺 user_id")?;
+        let settings = row.get("settings").cloned().context("缺 settings")?;
+        entries.push((user_id, settings));
+    }
+
+    let report =
+        privchat::service::privacy_backfill::backfill_from_entries(&pool, entries, dry_run)
+            .await
+            .context("回填失败")?;
+    println!("  扫描        {}", report.scanned);
+    println!("  写入        {}{}", report.written, if dry_run { "（dry-run，未写）" } else { "" });
+    println!("  DB 已有跳过 {}", report.already_in_db);
+    println!("  解析不出    {}", report.undecodable);
+    println!("  用户不存在  {}", report.user_missing);
+    if report.undecodable > 0 {
+        anyhow::bail!(
+            "有 {} 条 Redis 里的隐私设置解析不出来；这些用户的设置会回落默认（允许陌生人消息），\
+             必须人工确认后再上线",
+            report.undecodable
+        );
     }
     Ok(())
 }

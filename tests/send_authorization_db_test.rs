@@ -635,10 +635,15 @@ async fn deps_fresh() -> Option<(SendAuthorizationDeps, Arc<sqlx::PgPool>)> {
     deps().await
 }
 
-/// 🔴 跨实例失效：实例 B **先预热**旧策略，实例 A 改设置，B 必须立刻看到新值。
+/// 一个实例改了设置，另一个实例必须**立刻**看到。
 ///
-/// 上一版只用「全新空缓存实例」验证，那只能证明落库了。真正要防的是
-/// 「B 已经缓存了旧值，于是在 TTL 到期前继续放行」——安全策略不能靠 TTL 收敛。
+/// ⚠️ 名实说明：隐私判定现在**直读数据库、完全不缓存**，所以这条在当前实现下
+/// 是平凡成立的。它留在这里是**防回归**——谁要是为了省一次往返把缓存加回来，
+/// 这条会立刻红，除非同时做了跨实例失效。
+///
+/// 🔴 也记下我在这条上犯过的错：早先的版本用 `CacheConfig::default()`
+/// （`redis=None`）构造两个实例，号称「B 预热了旧缓存」——那里根本没有共享缓存，
+/// 整条测试什么都没验证。要真验缓存一致性，必须连真 Redis。
 #[tokio::test]
 async fn an_updated_privacy_setting_reaches_an_instance_that_already_cached_the_old_one() {
     use privchat::service::privacy_service::PrivacySettingsUpdate;
@@ -690,7 +695,10 @@ async fn an_updated_privacy_setting_reaches_an_instance_that_already_cached_the_
     cleanup(&pool).await;
 }
 
-/// 并发改**不同字段**不得互相覆盖（原子 JSONB patch 的存在理由）。
+/// 并发改**不同字段**不得互相覆盖 —— 两个 update **同时** await。
+///
+/// 上一版两次 update 是顺序 await 的，只证明了 JSONB patch 不覆盖已有键，
+/// 没有制造过任何真实交错。这里用 `tokio::join!` 让它们真的并发。
 #[tokio::test]
 async fn concurrent_updates_to_different_fields_do_not_overwrite_each_other() {
     use privchat::service::privacy_service::PrivacySettingsUpdate;
@@ -702,36 +710,28 @@ async fn concurrent_updates_to_different_fields_do_not_overwrite_each_other() {
     cleanup(&pool).await;
     ensure_user(&pool, MEMBER, "sa_member").await;
 
-    deps.privacy_service
-        .update_privacy_settings(
+    let a = deps.privacy_service.clone();
+    let b = deps.privacy_service.clone();
+    let (first, second) = tokio::join!(
+        a.update_privacy_settings(
             MEMBER as u64,
             PrivacySettingsUpdate {
                 allow_receive_message_from_non_friend: Some(false),
                 ..Default::default()
             },
-        )
-        .await
-        .expect("first field");
-
-    // 第二台设备只改另一个字段。读改写整份覆盖的话，上面那个 false 会被写回 true。
-    let after = deps
-        .privacy_service
-        .update_privacy_settings(
+        ),
+        b.update_privacy_settings(
             MEMBER as u64,
             PrivacySettingsUpdate {
                 allow_search_by_phone: Some(false),
                 ..Default::default()
             },
-        )
-        .await
-        .expect("second field");
-
-    assert!(!after.allow_search_by_phone, "本次改的字段生效");
-    assert!(
-        !after.allow_receive_message_from_non_friend,
-        "上一次改的字段必须保留——整份覆盖会把它悄悄改回允许",
+        ),
     );
+    first.expect("first update");
+    second.expect("second update");
 
+    // 无论谁先提交，两个字段都必须留在 DB 里。
     let (stored,): (serde_json::Value,) =
         sqlx::query_as("SELECT privacy_settings FROM privchat_users WHERE user_id = $1")
             .bind(MEMBER)
@@ -741,7 +741,69 @@ async fn concurrent_updates_to_different_fields_do_not_overwrite_each_other() {
     assert_eq!(
         stored.get("allow_receive_message_from_non_friend"),
         Some(&serde_json::Value::Bool(false)),
-        "DB 里也必须两个字段都在",
+        "并发交错下第一个字段不能丢",
+    );
+    assert_eq!(
+        stored.get("allow_search_by_phone"),
+        Some(&serde_json::Value::Bool(false)),
+        "并发交错下第二个字段不能丢",
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 【serde 边界回归】未知字段忽略；已知字段类型错误拒绝。
+///
+/// 两个方向都要钉住：只钉一边的话，下次有人为了「更严格」把
+/// `deny_unknown_fields` 加回来，滚动升级期间老实例会把新版本写的字段
+/// 判成脏数据、进而拒发消息。
+#[tokio::test]
+async fn unknown_fields_are_ignored_but_wrongly_typed_known_fields_are_refused() {
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+
+    // 未来版本新增的字段：老实例必须照常工作。
+    sqlx::query(
+        r#"UPDATE privchat_users
+           SET privacy_settings = '{"allow_receive_message_from_non_friend": false,
+                                    "a_field_from_a_newer_version": true}'
+           WHERE user_id = $1"#,
+    )
+    .bind(MEMBER)
+    .execute(pool.as_ref())
+    .await
+    .expect("write forward-compatible settings");
+
+    let settings = deps
+        .privacy_service
+        .get_or_create_privacy_settings(MEMBER as u64)
+        .await
+        .expect("未知字段必须忽略，不能把整行判脏");
+    assert!(
+        !settings.allow_receive_message_from_non_friend,
+        "认识的字段照常生效",
+    );
+
+    // 已知字段类型不对：脏数据，必须拒绝。
+    sqlx::query(
+        r#"UPDATE privchat_users
+           SET privacy_settings = '{"allow_receive_message_from_non_friend": 42}'
+           WHERE user_id = $1"#,
+    )
+    .bind(MEMBER)
+    .execute(pool.as_ref())
+    .await
+    .expect("write corrupt settings");
+    assert!(
+        deps.privacy_service
+            .get_or_create_privacy_settings(MEMBER as u64)
+            .await
+            .is_err(),
+        "已知字段类型错误必须报错，回落默认等于把限制关掉",
     );
 
     cleanup(&pool).await;

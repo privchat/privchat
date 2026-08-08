@@ -138,6 +138,27 @@ pub enum Commands {
     },
     /// 显示最终配置（合并后的配置）
     ShowConfig,
+    /// 把只存在于 Redis 里的隐私设置回填进数据库。
+    ///
+    /// 🔴 上线「DB 为真源」之前**必须先跑**：旧实现只写缓存，线上此刻
+    /// 用户改过的隐私设置只存在于 Redis；直接上线会让它们在缓存过期或
+    /// 重启后回落成默认值——而默认是允许陌生人发消息。
+    ///
+    /// 输入是 ops 从 Redis 导出的 JSONL，每行 `{"user_id": 1, "settings": {...}}`：
+    ///
+    /// ```bash
+    /// redis-cli --scan --pattern 'privacy_settings:*' | while read k; do
+    ///   printf '{"user_id": %s, "settings": %s}\n' "${k##*:}" "$(redis-cli get "$k")"
+    /// done > privacy.jsonl
+    /// ```
+    BackfillPrivacySettings {
+        /// JSONL 文件路径。
+        #[arg(long)]
+        input: String,
+        /// 只统计不写入。
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// 回填消息 → 文件引用表（MEDIA_REFERENCE_AND_FORWARD_SPEC §9）。
     ///
     /// 可断点续跑、可重复执行。**不是 migration**：回填必须走与发送路径同一个
