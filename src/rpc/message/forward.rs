@@ -115,7 +115,13 @@ pub async fn handle(
     )
     .await
     {
-        return Err(RpcError::forbidden(send_refusal.message()));
+        // 🔴 保留 typed 错误码：转发被禁言挡住和被拉黑挡住，客户端的处理不同
+        // （一个是「等一会儿」，一个是「别再发了」）。全压成 PermissionDenied
+        // 等于让转发比普通发送少一档信息。
+        return Err(RpcError::from_code(
+            send_refusal.error_code(),
+            send_refusal.message(),
+        ));
     }
 
     // 媒体引用由服务端复制，客户端一个 file_id 都没提交（§6 的安全前提）。
