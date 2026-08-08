@@ -111,7 +111,6 @@ pub struct CacheManager {
     /// L1 缓存 - qrcode 索引（qrcode -> user_id）
     l1_qrcode_index: Cache<String, u64>,
     /// L1 缓存 - 隐私设置
-    l1_privacy_settings: Cache<u64, crate::model::privacy::UserPrivacySettings>,
     /// L1 缓存 - 搜索记录
     l1_search_records: Cache<u64, crate::model::privacy::SearchRecord>,
     /// L1 缓存 - 名片分享记录
@@ -259,10 +258,6 @@ impl CacheManager {
             .build();
 
         // 隐私设置缓存
-        let l1_privacy_settings = Cache::builder()
-            .max_capacity(profiles_capacity)
-            .time_to_live(config.l1_ttl())
-            .build();
 
         // 搜索记录缓存（容量较大，因为搜索频繁）
         let l1_search_records = Cache::builder()
@@ -319,7 +314,6 @@ impl CacheManager {
             l1_user_profiles,
             l1_channels,
             l1_qrcode_index,
-            l1_privacy_settings,
             l1_search_records,
             l1_card_shares,
             redis_pool,
@@ -801,61 +795,13 @@ impl CacheManager {
     // ========== 隐私设置管理 ==========
 
     /// 获取用户隐私设置
-    /// 读隐私设置缓存。
-    ///
-    /// 🔴 **故意不走进程内 L1**（虽然 `l1_privacy_settings` 还在，供将来带失效
-    /// 广播时再启用）。理由：删掉共享的 L2 key **不会**让别的实例已经命中的
-    /// L1 失效——那些实例还会拿着旧策略放行最长一个 TTL。用户关掉「接收非好友
-    /// 消息」之后，另一台机器上继续收到陌生人消息，这不是「最终一致」能糊过去的。
-    ///
-    /// 代价是每次判定多一次 Redis 往返。要拿回 L1，前提是先有跨实例失效广播
-    /// （Redis Pub/Sub 或版本号），不是把 L1 直接加回来。
-    pub async fn get_privacy_settings(
-        &self,
-        user_id: u64,
-    ) -> Result<Option<crate::model::privacy::UserPrivacySettings>, ServerError> {
-        let redis_key = Self::privacy_settings_cache_key(user_id);
-        if let Some(settings) = self
-            .get_from_redis::<crate::model::privacy::UserPrivacySettings>(&redis_key)
-            .await?
-        {
-            debug!("L2 cache hit for privacy settings: {}", user_id);
-            return Ok(Some(settings));
-        }
-
-        debug!("Cache miss for privacy settings: {}", user_id);
-        Ok(None)
-    }
-
-    /// 设置用户隐私设置
-    pub async fn set_privacy_settings(
-        &self,
-        user_id: u64,
-        settings: crate::model::privacy::UserPrivacySettings,
-    ) -> Result<(), ServerError> {
-        // 只写共享的 L2：读路径不走 L1（见 get_privacy_settings 的说明），
-        // 写 L1 只会制造一份没人读、却会误导后来者的状态。
-        let redis_key = Self::privacy_settings_cache_key(user_id);
-        self.set_to_redis(&redis_key, &settings).await?;
-
-        debug!("Updated privacy settings: {}", user_id);
-        Ok(())
-    }
-
-    /// 让隐私设置的缓存失效。
-    ///
-    /// 🔴 安全策略不能只靠 TTL 最终一致：用户关掉「接收非好友消息」之后，
-    /// 别的实例的 L1 里还留着旧的允许值，最长一小时内那些实例照样放行。
-    /// 更新落库后必须**显式失效**——本实例删 L1，共享的 L2（Redis/KeyDB）删掉
-    /// 之后，其它实例的 L1 miss 会重新从 L2/DB 读到新值。
-    pub async fn invalidate_privacy_settings(&self, user_id: u64) -> Result<(), ServerError> {
-        // 读路径只看共享 L2，所以删掉这一个 key 对**所有实例**立即生效。
-        // （L1 也顺手清一下，避免将来有人把 L1 读回来时踩到陈旧值。）
-        self.l1_privacy_settings.invalidate(&user_id).await;
-        let redis_key = Self::privacy_settings_cache_key(user_id);
-        self.delete_from_redis(&redis_key).await?;
-        Ok(())
-    }
+    // 隐私设置**不进缓存**（`service::privacy_service` 直读数据库）。
+    //
+    // 🔴 这里曾有 get/set/invalidate 三个方法。删掉不是因为没人调，而是因为
+    // 留着就会被接回去：删共享 key 管不住别的实例的进程内缓存，做对需要
+    // Pub/Sub 或版本号那一整套；为一次数据库往返引入分布式一致性机制不划算，
+    // 而做不对的后果是用户关掉「接收非好友消息」后在另一台机器上继续收到陌生人消息。
+    // 要加回来，先有失效广播，并且用**真 Redis 双实例**证明它有效。
 
     // ========== 搜索记录管理 ==========
 
