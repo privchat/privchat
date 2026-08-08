@@ -26,7 +26,11 @@
 //!
 //! 1. 是不是会话成员
 //! 2. 群：个人禁言 → 全员禁言（群主/管理员豁免）→ 角色发言权限
-//! 3. 私聊：好友直接放行；非好友再看双向拉黑、对方的「仅接收好友消息」
+//! 3. 私聊：**先看双向拉黑**（拉黑不解除好友关系，好友也可能已被拉黑），
+//!    再看好友；非好友才过对方的「仅接收好友消息」
+//!
+//! 限制性策略查不到时一律 [`SendRefusal::PolicyUnavailable`]，映射成可重试的
+//! `ServiceUnavailable`——既不放行，也不冒充「无权」或「已禁言」。
 
 use std::sync::Arc;
 
@@ -69,7 +73,10 @@ impl SendRefusal {
             SendRefusal::PeerInMyBlacklist => ErrorCode::UserInBlacklist,
             SendRefusal::PeerRejectsNonFriends => ErrorCode::PermissionDenied,
             SendRefusal::ChannelForbidsPosting => ErrorCode::PermissionDenied,
-            SendRefusal::PolicyUnavailable => ErrorCode::InternalError,
+            // 🔴 必须是 ServiceUnavailable(3) 而不是 InternalError(4)：
+            // 两端 SDK 的可重试白名单里有 3、没有 4。用 4 的话文案说「稍后重试」，
+            // outbox 却按终局失败处理——用户看到的是一条永远发不出去的消息。
+            SendRefusal::PolicyUnavailable => ErrorCode::ServiceUnavailable,
         }
     }
 
@@ -149,14 +156,16 @@ pub async fn authorize_send_to_channel(
             // 🔴 查询失败不能当成「没禁言」。`.ok().flatten()` 把数据库抖动
             // 变成一次放行——全员禁言期间只要 DB 抖一下，消息就发出去了。
             // 判定不出来时按**拒绝**处理（禁言是限制性策略，宁可多拦一条）。
+            // 🔴 查询失败拒绝，但**不能报成 GroupMuted**：那会让用户看到「群已禁言」
+            // 这个假事实，客户端也不会重试。故障要有故障的样子。
             let all_muted = if let Some(group_id) = channel.group_id {
                 match deps.channel_service.get_group_policy(group_id).await {
                     Ok(Some(policy)) => policy.all_muted,
                     // 群不存在：没有群策略可言，不拦。
                     Ok(None) => false,
                     Err(e) => {
-                        tracing::error!("查询群 {group_id} 策略失败，按全员禁言处理: {e}");
-                        true
+                        tracing::error!("查询群 {group_id} 策略失败: {e}");
+                        return Err(SendRefusal::PolicyUnavailable);
                     }
                 }
             } else {
@@ -275,9 +284,11 @@ mod tests {
     /// 去申请权限，而真实原因是数据库抖了一下。
     #[test]
     fn an_unavailable_policy_is_not_reported_as_a_permission_problem() {
+        // ServiceUnavailable(3) 在两端 SDK 的可重试白名单里；InternalError(4) 不在。
+        // 用 4 会让「稍后重试」的文案配上终局失败的 outbox 行为。
         assert_eq!(
             SendRefusal::PolicyUnavailable.error_code(),
-            ErrorCode::InternalError
+            ErrorCode::ServiceUnavailable
         );
         assert_ne!(
             SendRefusal::PolicyUnavailable.error_code(),

@@ -596,7 +596,10 @@ impl ChatServer {
 
         // 创建黑名单服务
         let blacklist_service =
-            Arc::new(crate::service::BlacklistService::new(cache_manager.clone()));
+            Arc::new(crate::service::BlacklistService::new(
+                pool.clone(),
+                cache_manager.clone(),
+            ));
         info!("✅ 黑名单服务初始化完成");
 
         // 创建二维码服务

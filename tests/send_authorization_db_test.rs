@@ -44,7 +44,7 @@ async fn deps() -> Option<(SendAuthorizationDeps, Arc<sqlx::PgPool>)> {
             .await
             .expect("cache"),
     );
-    let blacklist_service = Arc::new(BlacklistService::new(cache.clone()));
+    let blacklist_service = Arc::new(BlacklistService::new(pool.clone(), cache.clone()));
     let channel_service = Arc::new(ChannelService::new_with_repository(Arc::new(
         PgChannelRepository::new(pool.clone()),
     )));
@@ -80,24 +80,49 @@ async fn ensure_user(pool: &sqlx::PgPool, user_id: i64, username: &str) {
     .expect("ensure user");
 }
 
+/// 清理。
+///
+/// 🔴 每条 SQL **各自绑定自己的参数**，并且 `expect` 结果。
+/// 上一版给每条语句都绑了三组参数、又用 `let _ =` 吞掉错误，于是 Postgres
+/// 因参数个数不符全部拒绝——清理从未真正执行过。配上固定主键和
+/// `ON CONFLICT DO NOTHING`，测试就会复用上一轮的残留状态，绿得毫无意义。
 async fn cleanup(pool: &sqlx::PgPool) {
-    for sql in [
-        "DELETE FROM privchat_friendships WHERE user_id = ANY($1) OR friend_id = ANY($1)",
-        "DELETE FROM privchat_group_members WHERE group_id = $2",
-        "DELETE FROM privchat_channel_participants WHERE channel_id = ANY($3)",
-        "DELETE FROM privchat_channels WHERE channel_id = ANY($3)",
-        "DELETE FROM privchat_groups WHERE group_id = $2",
-    ] {
-        let _ = sqlx::query(sql)
-            .bind(vec![OWNER, MEMBER, STRANGER])
-            .bind(GROUP_ID)
-            .bind(vec![GROUP_ID, DM_CHANNEL])
-            .execute(pool)
-            .await;
-    }
+    let users = vec![OWNER, MEMBER, STRANGER];
+    let channels = vec![GROUP_ID, DM_CHANNEL];
+
+    sqlx::query("DELETE FROM privchat_blacklist WHERE user_id = ANY($1) OR blocked_user_id = ANY($1)")
+        .bind(&users)
+        .execute(pool)
+        .await
+        .expect("clean blacklist");
+    sqlx::query("DELETE FROM privchat_friendships WHERE user_id = ANY($1) OR friend_id = ANY($1)")
+        .bind(&users)
+        .execute(pool)
+        .await
+        .expect("clean friendships");
+    sqlx::query("DELETE FROM privchat_group_members WHERE group_id = $1")
+        .bind(GROUP_ID)
+        .execute(pool)
+        .await
+        .expect("clean group members");
+    sqlx::query("DELETE FROM privchat_channel_participants WHERE channel_id = ANY($1)")
+        .bind(&channels)
+        .execute(pool)
+        .await
+        .expect("clean participants");
+    sqlx::query("DELETE FROM privchat_channels WHERE channel_id = ANY($1)")
+        .bind(&channels)
+        .execute(pool)
+        .await
+        .expect("clean channels");
+    sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
+        .bind(GROUP_ID)
+        .execute(pool)
+        .await
+        .expect("clean group");
 }
 
-async fn seed_group(pool: &sqlx::PgPool, channel_service: &ChannelService) {
+async fn seed_group(pool: &sqlx::PgPool) {
     sqlx::query(
         r#"
         INSERT INTO privchat_groups (group_id, name, owner_id, member_count, qr_key)
@@ -166,7 +191,7 @@ async fn group_send_policy_matrix() {
     ] {
         ensure_user(&pool, uid, name).await;
     }
-    seed_group(&pool, &deps.channel_service).await;
+    seed_group(&pool).await;
 
     let channel = deps
         .channel_service
@@ -211,6 +236,31 @@ async fn group_send_policy_matrix() {
 ///
 /// 拉黑不解除好友关系。原实现「好友直接放行」把这种情况漏了过去，
 /// 而这正是拉黑要挡的那件事（BLACKLIST_SPEC §5 的流程里没有好友快捷放行）。
+async fn seed_dm(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "INSERT INTO privchat_channels (channel_id, channel_type, direct_user1_id, direct_user2_id) \
+         VALUES ($1, 0, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(DM_CHANNEL)
+    .bind(OWNER)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .expect("dm channel");
+    for uid in [OWNER, MEMBER] {
+        sqlx::query(
+            "INSERT INTO privchat_channel_participants (channel_id, user_id, role, joined_at) \
+             VALUES ($1, $2, 2, now_millis()) \
+             ON CONFLICT (channel_id, user_id) DO UPDATE SET left_at = NULL",
+        )
+        .bind(DM_CHANNEL)
+        .bind(uid)
+        .execute(pool)
+        .await
+        .expect("dm participant");
+    }
+}
+
 #[tokio::test]
 async fn a_blocked_friend_still_cannot_send() {
     let _guard = fixture_lock().lock().await;
@@ -270,6 +320,182 @@ async fn a_blocked_friend_still_cannot_send() {
         authorize_send_to_channel(&deps, &channel, OWNER as u64).await,
         Err(SendRefusal::BlockedByPeer),
         "仍是好友但被拉黑 → 必须拦住（拉黑先于好友判定）",
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 个人禁言：被禁言的成员发不出，同群其他人不受影响。
+#[tokio::test]
+async fn a_muted_member_is_refused_while_others_are_not() {
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_group(&pool).await;
+
+    // 禁言只有 mute_until 一列：NULL = 未禁言，未来时间 = 禁言中。
+    sqlx::query(
+        "UPDATE privchat_channel_participants SET mute_until = now_millis() + 3600000 \
+         WHERE channel_id = $1 AND user_id = $2",
+    )
+    .bind(GROUP_ID)
+    .bind(MEMBER)
+    .execute(pool.as_ref())
+    .await
+    .expect("mute member");
+
+    let channel = deps
+        .channel_service
+        .get_channel_opt(GROUP_ID as u64)
+        .await
+        .expect("channel");
+    assert!(
+        matches!(
+            authorize_send_to_channel(&deps, &channel, MEMBER as u64).await,
+            Err(SendRefusal::MemberMuted(_))
+        ),
+        "被禁言的成员必须被拦住",
+    );
+    assert!(
+        authorize_send_to_channel(&deps, &channel, OWNER as u64)
+            .await
+            .is_ok(),
+        "禁言只作用于被禁的那个人",
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 双向拉黑的**两个方向**要分别报告：被对方拉黑 vs 自己拉黑了对方。
+/// 文案与后续动作不同，压成同一个码就分不出来了。
+#[tokio::test]
+async fn both_directions_of_blocking_are_reported_distinctly() {
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_dm(&pool).await;
+    let channel = deps
+        .channel_service
+        .get_channel_opt(DM_CHANNEL as u64)
+        .await
+        .expect("dm");
+
+    // 我拉黑对方
+    deps.blacklist_service
+        .add_to_blacklist(OWNER as u64, MEMBER as u64, None)
+        .await
+        .expect("block peer");
+    assert_eq!(
+        authorize_send_to_channel(&deps, &channel, OWNER as u64).await,
+        Err(SendRefusal::PeerInMyBlacklist),
+    );
+    // 对方也拉黑我 —— 「被拉黑」优先，因为那是对方的意愿
+    deps.blacklist_service
+        .add_to_blacklist(MEMBER as u64, OWNER as u64, None)
+        .await
+        .expect("blocked by peer");
+    assert_eq!(
+        authorize_send_to_channel(&deps, &channel, OWNER as u64).await,
+        Err(SendRefusal::BlockedByPeer),
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 非好友 + 对方「仅接收好友消息」→ 拒绝。
+#[tokio::test]
+async fn a_stranger_is_refused_when_the_peer_only_accepts_friends() {
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_dm(&pool).await;
+    sqlx::query(
+        r#"
+        INSERT INTO privchat_users (user_id, username, qr_key, privacy_settings)
+        VALUES ($1, 'sa_member', $2, '{"allow_receive_message_from_non_friend": false}')
+        ON CONFLICT (user_id) DO UPDATE
+            SET privacy_settings = '{"allow_receive_message_from_non_friend": false}'
+        "#,
+    )
+    .bind(MEMBER)
+    .bind(privchat::rpc::qr::generate_qr_key())
+    .execute(pool.as_ref())
+    .await
+    .expect("privacy");
+
+    let channel = deps
+        .channel_service
+        .get_channel_opt(DM_CHANNEL as u64)
+        .await
+        .expect("dm");
+    assert_eq!(
+        authorize_send_to_channel(&deps, &channel, OWNER as u64).await,
+        Err(SendRefusal::PeerRejectsNonFriends),
+        "非好友遇到「仅接收好友消息」必须被拦",
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 🔴 限制性策略查不到时**拒绝**，而且报的是可重试的服务异常，
+/// 不是「无权」也不是「已禁言」——那两种都会让用户走错路。
+#[tokio::test]
+async fn a_policy_lookup_failure_refuses_as_a_retryable_service_error() {
+    use privchat_protocol::error_code::ErrorCode;
+
+    let _guard = fixture_lock().lock().await;
+    let Some((good, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_dm(&pool).await;
+    let channel = good
+        .channel_service
+        .get_channel_opt(DM_CHANNEL as u64)
+        .await
+        .expect("dm");
+
+    // 黑名单查询打到一个连不上的库（黑名单已是 DB 真源，这条故障是真的）。
+    let broken_pool = Arc::new(
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(300))
+            .connect_lazy("postgres://nobody@127.0.0.1:59999/nope")
+            .expect("lazy pool"),
+    );
+    let cache = Arc::new(
+        CacheManager::new(CacheConfig::default())
+            .await
+            .expect("cache"),
+    );
+    let broken = SendAuthorizationDeps {
+        blacklist_service: Arc::new(BlacklistService::new(broken_pool, cache)),
+        ..good.clone()
+    };
+
+    assert_eq!(
+        authorize_send_to_channel(&broken, &channel, OWNER as u64).await,
+        Err(SendRefusal::PolicyUnavailable),
+    );
+    assert_eq!(
+        SendRefusal::PolicyUnavailable.error_code(),
+        ErrorCode::ServiceUnavailable,
+        "必须落在两端 SDK 的可重试白名单里；InternalError(4) 不在白名单，\
+         会让「稍后重试」的文案配上终局失败的行为",
     );
 
     cleanup(&pool).await;

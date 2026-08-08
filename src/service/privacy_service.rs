@@ -413,14 +413,39 @@ impl PrivacyService {
         user_id: u64,
     ) -> Result<UserPrivacySettings> {
         if let Some(settings) = self.cache_manager.get_privacy_settings(user_id).await? {
-            Ok(settings)
-        } else {
-            let settings = UserPrivacySettings::new(user_id);
-            self.cache_manager
-                .set_privacy_settings(user_id, settings.clone())
-                .await?;
-            Ok(settings)
+            return Ok(settings);
         }
+
+        // 🔴 缓存未命中要读 **DB**（`privchat_users.privacy_settings`），不能直接
+        // 造一份默认值。原实现缓存一miss就返回全默认并写回缓存，等于
+        // 「仅接收好友消息」这类设置在重启后、在没预热的实例上一律失效——
+        // 用户改过的设置从来没有真正被读过。
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT privacy_settings FROM privchat_users WHERE user_id = $1")
+                .bind(user_id as i64)
+                .fetch_optional(self.channel_service.pool())
+                .await
+                .map_err(|e| ServerError::Database(format!("查询隐私设置失败: {e}")))?;
+
+        // 🔴 DB 里存的往往是**部分字段**（只写用户改过的那几项）。整体
+        // `from_value` 会因缺字段失败，回落成全默认——用户关掉的「接收非好友
+        // 消息」又变回打开。正确做法是把 DB 的键**合并**到默认值上。
+        let mut merged = serde_json::to_value(UserPrivacySettings::new(user_id))
+            .map_err(|e| ServerError::Internal(format!("序列化默认隐私设置失败: {e}")))?;
+        if let (Some(base), Some((stored,))) = (merged.as_object_mut(), row.as_ref()) {
+            if let Some(stored) = stored.as_object() {
+                for (key, value) in stored {
+                    base.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        let mut settings: UserPrivacySettings = serde_json::from_value(merged)
+            .unwrap_or_else(|_| UserPrivacySettings::new(user_id));
+        settings.user_id = user_id;
+        self.cache_manager
+            .set_privacy_settings(user_id, settings.clone())
+            .await?;
+        Ok(settings)
     }
 
     /// 更新隐私设置
