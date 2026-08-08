@@ -25,7 +25,7 @@ path = "examples/media_ref_prod_sweep.rs"
 
 [dependencies]
 # 传输层
-msgtrans = { version = "2.0.0-alpha.4", path = "../msgtrans" }
+msgtrans = { version = "2.0.0-alpha.5", path = "../msgtrans" }
 
 # 协议
 privchat-protocol = { git = "https://github.com/privchat/privchat-protocol.git", rev = "c85937d3a325ea76c105b8166916e45b67ee53d7" }
