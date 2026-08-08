@@ -67,6 +67,7 @@ pub async fn handle(
     // 构建更新对象（只更新提供的字段）
     let updates = PrivacySettingsUpdate {
         allow_add_by_group: request.allow_add_by_group,
+        allow_add_by_card: request.allow_add_by_card,
         allow_search_by_phone: request.allow_search_by_phone,
         allow_search_by_username: request.allow_search_by_username,
         allow_search_by_email: request.allow_search_by_email,
@@ -88,6 +89,7 @@ pub async fn handle(
                 "user_id": settings.user_id,
                 "message": "隐私设置更新成功",
                 "allow_add_by_group": settings.allow_add_by_group,
+                "allow_add_by_card": settings.allow_add_by_card,
                 "allow_search_by_phone": settings.allow_search_by_phone,
                 "allow_search_by_username": settings.allow_search_by_username,
                 "allow_search_by_email": settings.allow_search_by_email,
@@ -99,7 +101,9 @@ pub async fn handle(
         }
         Err(e) => {
             tracing::error!("❌ 更新隐私设置失败: {}", e);
-            Err(RpcError::internal(format!("更新隐私设置失败: {}", e)))
+            // 🔴 走 From<ServerError>，不要一律 internal：ServiceUnavailable / 校验类
+            // 错误各有各的客户端行为，压成 InternalError(4) 就全变成「终局失败」了。
+            Err(RpcError::from(e))
         }
     }
 }

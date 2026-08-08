@@ -76,6 +76,16 @@ async fn reset(pool: &sqlx::PgPool) {
         .expect("ensure missing user absent");
 }
 
+async fn sync_version(pool: &sqlx::PgPool) -> i64 {
+    let (version,): (i64,) =
+        sqlx::query_as("SELECT sync_version FROM privchat_users WHERE user_id = $1")
+            .bind(USER)
+            .fetch_one(pool)
+            .await
+            .expect("read sync_version");
+    version
+}
+
 async fn stored(pool: &sqlx::PgPool) -> serde_json::Value {
     let (value,): (serde_json::Value,) =
         sqlx::query_as("SELECT privacy_settings FROM privchat_users WHERE user_id = $1")
@@ -182,9 +192,13 @@ async fn a_dry_run_reports_without_writing() {
     assert_eq!(stored(&pool).await, serde_json::json!({}), "但一个字节都不写");
 }
 
-/// 重复执行幂等：第二次不改变结果。
+/// 重复执行幂等——包括**没有副作用**，不只是结果相同。
+///
+/// 🔴 只比 JSON 是不够的：`privchat_users` 上挂着 sync_version trigger，
+/// 第二次照写一遍同样的值也会 bump 版本，把所有回填过的用户重新推进一轮增量同步。
+/// 所以这里连 `sync_version` 一起断言。
 #[tokio::test]
-async fn running_twice_changes_nothing_the_second_time() {
+async fn running_twice_has_no_second_effect() {
     let _guard = fixture_lock().lock().await;
     let Some(pool) = pool().await else { return };
     reset(&pool).await;
@@ -194,10 +208,23 @@ async fn running_twice_changes_nothing_the_second_time() {
         .await
         .expect("first");
     let first = stored(&pool).await;
-    backfill_from_entries(&pool, vec![(USER as u64, entry)], false)
+    let first_version = sync_version(&pool).await;
+
+    let report = backfill_from_entries(&pool, vec![(USER as u64, entry)], false)
         .await
         .expect("second");
-    assert_eq!(stored(&pool).await, first, "重复跑必须幂等");
+
+    assert_eq!(stored(&pool).await, first, "重复跑结果必须一致");
+    assert_eq!(
+        sync_version(&pool).await,
+        first_version,
+        "第二次不能再 UPDATE：会 bump sync_version，把用户重新推进一轮增量同步",
+    );
+    assert_eq!(
+        (report.written, report.unchanged),
+        (0, 1),
+        "第二次应报「未变更」，而不是又写了一遍",
+    );
 }
 
 /// 用户已不存在：计入审计，不报成功。

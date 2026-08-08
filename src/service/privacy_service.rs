@@ -55,13 +55,16 @@ impl DetailAccessVerdict {
 }
 
 /// 隐私和权限验证服务
-/// 割接期停写开关：`PRIVCHAT_PRIVACY_WRITES_FROZEN=1`。
+/// 维护期停写开关：`PRIVCHAT_PRIVACY_WRITES_FROZEN=1`。
 ///
-/// 存在的理由是 `PRIVACY_SETTINGS_CUTOVER_SOP` 路线 B 需要一个「旧服务不再产生
-/// 只落 Redis 的新写入」的窗口。没有这个开关，那条流程就只是文档里的一句话——
-/// 导出快照之后到新版本上线之前的用户修改照样会丢。
+/// ⚠️ **对 Redis→DB 那次割接帮不上忙**：线上跑的旧 binary 里没有这个开关。
+/// 那次割接按 `PRIVACY_SETTINGS_CUTOVER_SOP` 方案甲执行（完全停掉旧服务）。
+/// 它留在这里是为了以后再需要停写窗口时不用改代码。
 ///
-/// 只读一次：割接窗口靠重启进出，不做热切换（热切换会带来「一半请求写、一半请求拒」
+/// 返回**可重试**错误码（`ServiceUnavailable`）。终局错误码会让客户端把这次修改
+/// 当作被拒绝而丢弃，窗口期的用户操作就真没了——那跟不做停写一样糟。
+///
+/// 只读一次：窗口靠重启进出，不做热切换（热切换会造出「一半请求写、一半请求拒」
 /// 的中间态，正是这个开关要消灭的东西）。
 fn privacy_writes_frozen() -> bool {
     static FROZEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -582,6 +585,7 @@ impl StoredPrivacySettings {
 #[derive(Debug, Clone, Default)]
 pub struct PrivacySettingsUpdate {
     pub allow_add_by_group: Option<bool>,
+    pub allow_add_by_card: Option<bool>,
     pub allow_search_by_phone: Option<bool>,
     pub allow_search_by_username: Option<bool>,
     pub allow_search_by_email: Option<bool>,
@@ -606,6 +610,7 @@ impl PrivacySettingsUpdate {
         }
         put!(
             allow_add_by_group,
+            allow_add_by_card,
             allow_search_by_phone,
             allow_search_by_username,
             allow_search_by_email,

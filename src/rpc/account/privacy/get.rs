@@ -72,6 +72,7 @@ pub async fn handle(
             Ok(json!({
                 "user_id": settings.user_id,
                 "allow_add_by_group": settings.allow_add_by_group,
+                "allow_add_by_card": settings.allow_add_by_card,
                 "allow_search_by_phone": settings.allow_search_by_phone,
                 "allow_search_by_username": settings.allow_search_by_username,
                 "allow_search_by_email": settings.allow_search_by_email,
@@ -83,7 +84,7 @@ pub async fn handle(
         }
         Err(e) => {
             tracing::error!("❌ 获取隐私设置失败: {}", e);
-            Err(RpcError::internal(format!("获取隐私设置失败: {}", e)))
+            Err(RpcError::from(e))
         }
     }
 }
