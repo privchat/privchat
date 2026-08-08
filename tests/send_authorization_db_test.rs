@@ -551,6 +551,52 @@ async fn a_group_that_forbids_member_posting_refuses_ordinary_members() {
     cleanup(&pool).await;
 }
 
+/// 内容保护（禁止转发）也必须落库、也必须跨重启存活。
+///
+/// 它此前有列、有闸口，但**没有任何写入入口**——没人能把它打开，闸口读到的永远是 false。
+/// 和只读群一起走同一个写入路径，这里一起验。
+#[tokio::test]
+async fn forbidding_forwards_is_persisted_and_survives_a_restart() {
+    let _guard = fixture_lock().lock().await;
+    let Some((deps, pool)) = deps().await else {
+        return;
+    };
+    cleanup(&pool).await;
+    ensure_user(&pool, OWNER, "sa_owner").await;
+    ensure_user(&pool, MEMBER, "sa_member").await;
+    seed_group(&pool).await;
+
+    assert!(
+        !deps
+            .channel_service
+            .get_group_policy(GROUP_ID as u64)
+            .await
+            .expect("policy")
+            .expect("group")
+            .forbid_forward,
+        "默认不限制转发",
+    );
+
+    deps.channel_service
+        .update_group_policy(GROUP_ID as u64, None, None, None, None, None, None, Some(true))
+        .await
+        .expect("落库 forbid_forward=true");
+
+    let (fresh, _) = deps_fresh().await.expect("fresh deps");
+    assert!(
+        fresh
+            .channel_service
+            .get_group_policy(GROUP_ID as u64)
+            .await
+            .expect("policy")
+            .expect("group")
+            .forbid_forward,
+        "重启后内容保护仍然生效",
+    );
+
+    cleanup(&pool).await;
+}
+
 /// 🔴 只读设置必须跨重启存活。
 ///
 /// 这正是它此前形同虚设的地方：限制活在内存里，进程一重启就回到默认的「允许发言」，
