@@ -953,129 +953,27 @@ impl MessageHandler for SendMessageHandler {
             }
         }
 
-        // 3. ✅ 群组权限检查（禁言、全员禁言、发送权限）- 在 can_user_post 之前检查，以便返回正确的错误码
-        if channel.channel_type == crate::model::channel::ChannelType::Group {
-            // 获取成员信息
-            if let Some(member) = channel.members.get(&from_uid) {
-                // 3.1.1. 检查个人禁言状态（优先检查，返回错误码5）
-                if member.is_muted {
-                    let now = chrono::Utc::now();
-                    if crate::model::channel::mute_is_active(
-                        member.is_muted,
-                        member.mute_until,
-                        now,
-                    ) {
-                        let reject =
-                            crate::model::channel::mute_reject_message(member.mute_until, now);
-                        warn!(
-                            "❌ SendMessageHandler: 用户 {} 在群 {} 中被禁言（mute_until={:?}）",
-                            send_message_request.from_uid,
-                            send_message_request.channel_id,
-                            member.mute_until
-                        );
-                        return self
-                            .create_error_response(
-                                &send_message_request,
-                                ErrorCode::MemberMuted,
-                                &reject,
-                            )
-                            .await;
-                    }
-                    // 临时禁言已到期：放行本条消息，异步懒清理 DB + 缓存（此处持成员引用，不能同步取写锁）。
-                    let cs = self.channel_service.clone();
-                    let (lazy_channel_id, lazy_uid) = (channel.id, from_uid);
-                    tokio::spawn(async move {
-                        if let Err(e) = cs
-                            .set_member_muted(&lazy_channel_id, &lazy_uid, false, None)
-                            .await
-                        {
-                            tracing::warn!(
-                                "mute lazy-clear failed: channel={} uid={} err={}",
-                                lazy_channel_id,
-                                lazy_uid,
-                                e
-                            );
-                        }
-                    });
-                }
-
-                // 3.1.2. 检查全员禁言（群主/管理员不受影响）。
-                //   全员禁言是强权限：以 DB(privchat_groups.all_muted) 为真源，server 重启后仍生效，
-                //   不依赖可能丢失的内存缓存。仅对非群主/管理员成员查询，避免拖慢热路径。
-                let is_privileged = matches!(
-                    member.role,
-                    crate::model::channel::MemberRole::Owner
-                        | crate::model::channel::MemberRole::Admin
-                );
-                if !is_privileged {
-                    let all_muted = if let Some(gid) = channel.group_id {
-                        self.channel_service
-                            .get_group_policy(gid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|p| p.all_muted)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
-                    if all_muted {
-                        warn!(
-                            "❌ SendMessageHandler: 群 {} 全员禁言中，用户 {} 无权发言",
-                            send_message_request.channel_id, send_message_request.from_uid
-                        );
-                        return self
-                            .create_error_response(
-                                &send_message_request,
-                                ErrorCode::GroupMuted,
-                                "群组全员禁言中",
-                            )
-                            .await;
-                    }
-                }
-
-                // 3.1.3. 检查发送消息权限（基于角色的细粒度权限）
-                let channel_role = match member.role {
-                    crate::model::channel::MemberRole::Owner => {
-                        crate::model::channel::MemberRole::Owner
-                    }
-                    crate::model::channel::MemberRole::Admin => {
-                        crate::model::channel::MemberRole::Admin
-                    }
-                    crate::model::channel::MemberRole::Member => {
-                        crate::model::channel::MemberRole::Member
-                    }
-                };
-                let permissions = crate::model::channel::MemberPermissions::from_role(channel_role);
-                if !permissions.can_send_message {
-                    warn!(
-                        "❌ SendMessageHandler: 用户 {} 在群 {} 中没有发送消息权限",
-                        send_message_request.from_uid, send_message_request.channel_id
-                    );
-                    return self
-                        .create_error_response(
-                            &send_message_request,
-                            ErrorCode::PermissionDenied,
-                            "您没有发送消息权限",
-                        )
-                        .await;
-                }
-            }
-        }
-
-        // 3.2. 检查用户是否可以发送消息（基础权限检查）- 在禁言检查之后
-        if !channel.can_user_post(&from_uid) {
-            // 如果用户不在成员列表中，错误已经在前面处理了
-            // 这里主要是检查频道设置（如 allow_member_post）
+        // 3. 发送权限：禁言 / 全员禁言 / 角色 / 频道设置 / 私聊好友与拉黑与隐私。
+        //
+        // 🔴 这套判定**只有一份**，在 `service::send_authorization`。曾经它内联在这里，
+        // 于是每条新的写入路径都得自己重想一遍——`message/forward` 第一版就只校验了
+        // 「是不是目标会话成员」，被禁言、被拉黑的用户能从转发那条路把消息发出去。
+        if let Err(refusal) = crate::service::send_authorization::authorize_send_to_channel(
+            &self.send_authorization_deps(),
+            &channel,
+            from_uid,
+        )
+        .await
+        {
             warn!(
-                "❌ SendMessageHandler: 用户 {} 无权限在频道 {} 发送消息（频道设置限制）",
-                send_message_request.from_uid, send_message_request.channel_id
+                "❌ SendMessageHandler: 用户 {} 向频道 {} 发送被拒: {:?}",
+                from_uid, send_message_request.channel_id, refusal
             );
             return self
                 .create_error_response(
                     &send_message_request,
-                    ErrorCode::PermissionDenied,
-                    "无权限发送消息",
+                    refusal.error_code(),
+                    &refusal.message(),
                 )
                 .await;
         }
@@ -1114,99 +1012,6 @@ impl MessageHandler for SendMessageHandler {
             mentioned_user_ids,
             message_source
         );
-
-        // 3.5. ✅ 检查好友关系、黑名单和非好友消息权限（仅限私聊）
-        if channel.channel_type == crate::model::channel::ChannelType::Direct {
-            // 获取频道的所有成员（私聊应该只有2个成员）
-            let members: Vec<u64> = channel.get_member_ids();
-
-            // 找出接收者（不是发送者的那个用户）
-            let receiver_id = members.iter().find(|&id| *id != from_uid).copied();
-
-            if let Some(receiver_id) = receiver_id {
-                // 3.5.1. 先检查好友关系 — 好友直接放行，跳过黑名单和隐私检查
-                let are_friends = self.friend_service.is_friend(from_uid, receiver_id).await;
-
-                if !are_friends {
-                    // 非好友 → 检查黑名单和隐私设置
-                    // 3.5.2. 检查双向拉黑关系
-                    let (sender_blocks_receiver, receiver_blocks_sender) = self
-                        .blacklist_service
-                        .check_mutual_block(from_uid, receiver_id)
-                        .await
-                        .unwrap_or((false, false));
-
-                    if receiver_blocks_sender {
-                        warn!(
-                            "🚫 SendMessageHandler: 用户 {} 已被 {} 拉黑，无法发送消息",
-                            from_uid, receiver_id
-                        );
-                        return self
-                            .create_error_response(
-                                &send_message_request,
-                                ErrorCode::BlockedByUser,
-                                "您已被对方拉黑，无法发送消息",
-                            )
-                            .await;
-                    }
-
-                    if sender_blocks_receiver {
-                        warn!(
-                            "🚫 SendMessageHandler: 用户 {} 已拉黑 {}，无法发送消息",
-                            from_uid, receiver_id
-                        );
-                        return self
-                            .create_error_response(
-                                &send_message_request,
-                                ErrorCode::UserInBlacklist,
-                                "您已拉黑该用户，无法发送消息",
-                            )
-                            .await;
-                    }
-
-                    // 3.5.3. 检查非好友消息权限
-                    match self
-                        .privacy_service
-                        .get_or_create_privacy_settings(receiver_id)
-                        .await
-                    {
-                        Ok(privacy_settings) => {
-                            if !privacy_settings.allow_receive_message_from_non_friend {
-                                warn!(
-                                    "🚫 SendMessageHandler: 用户 {} 不允许接收非好友消息，发送者 {} 不是好友",
-                                    receiver_id, from_uid
-                                );
-                                return self
-                                    .create_error_response(
-                                        &send_message_request,
-                                        ErrorCode::PermissionDenied,
-                                        "对方设置了仅接收好友消息，无法发送",
-                                    )
-                                    .await;
-                            } else {
-                                info!(
-                                    "✅ SendMessageHandler: 用户 {} 允许接收非好友消息，发送者 {} 可以发送",
-                                    receiver_id, from_uid
-                                );
-
-                                if let Some(ref source) = message_source {
-                                    info!(
-                                        "📝 SendMessageHandler: 记录非好友消息来源: {} -> {} (source: {:?})",
-                                        from_uid, receiver_id, source
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "⚠️ SendMessageHandler: 获取用户 {} 隐私设置失败: {}，默认允许非好友消息",
-                                receiver_id, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         // 4.5. reply_to_message_id 只做格式校验，不校验存在性/归属频道
         // 按 REPLY_SPEC / local-first 语义：服务端仅转发引用的 server_message_id；
@@ -1340,6 +1145,7 @@ impl MessageHandler for SendMessageHandler {
             reply_to_message_id: reply_to_id,
             mentioned_user_ids: mentioned_user_ids.clone(),
             message_source: None,
+            forward_origin: None,
         });
         canonical_payload.content = content.clone();
         let canonical_event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
@@ -1359,7 +1165,7 @@ impl MessageHandler for SendMessageHandler {
                 attachment_refs,
                 attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
                 forward_origin: None,
-                require_live_source_message: None,
+                forward_precondition: None,
                 channel_type: channel_type_code as i16,
                 event: canonical_event,
                 sender_username: None,
@@ -1974,6 +1780,16 @@ impl SendMessageHandler {
             privchat_protocol::ContentMessageType::Link => {
                 self.validate_link_metadata(&metadata).await
             }
+        }
+    }
+
+    /// 组装发送权限判定所需的服务集合。
+    fn send_authorization_deps(&self) -> crate::service::send_authorization::SendAuthorizationDeps {
+        crate::service::send_authorization::SendAuthorizationDeps {
+            channel_service: self.channel_service.clone(),
+            friend_service: self.friend_service.clone(),
+            blacklist_service: self.blacklist_service.clone(),
+            privacy_service: self.privacy_service.clone(),
         }
     }
 

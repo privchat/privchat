@@ -44,6 +44,10 @@ pub enum ForwardRefusal {
     TargetNotWritable,
     /// 客户端声称的 source_channel_id 与源消息真实所在会话不符。
     SourceChannelMismatch,
+    /// 源会话开启了内容保护（禁止转发）。对齐 Telegram CHAT_FORWARDS_RESTRICTED。
+    ForwardsRestricted,
+    /// 源消息在「读出来」与「写下去」之间被改过（内容或引用）。
+    SourceChanged,
     /// 源消息的媒体引用不完整（存量破损数据）。转发会把坏账复制成新消息。
     SourceMediaIncomplete(crate::service::legacy_media_refs::LegacyAudit),
     /// 引用表与 metadata 互相矛盾。复制过去会产出一条「客户端按 metadata 渲染、
@@ -64,6 +68,8 @@ impl ForwardRefusal {
             ForwardRefusal::TypeNotAllowed(_) => "FORWARD_TYPE_NOT_ALLOWED",
             ForwardRefusal::TargetNotWritable => "FORWARD_TARGET_NOT_WRITABLE",
             ForwardRefusal::SourceChannelMismatch => "FORWARD_SOURCE_CHANNEL_MISMATCH",
+            ForwardRefusal::ForwardsRestricted => "FORWARDS_RESTRICTED",
+            ForwardRefusal::SourceChanged => "FORWARD_SOURCE_CHANGED",
             ForwardRefusal::SourceMediaIncomplete(_) => "FORWARD_SOURCE_MEDIA_INCOMPLETE",
             ForwardRefusal::SourceMediaInconsistent { .. } => "FORWARD_SOURCE_MEDIA_INCONSISTENT",
         }
@@ -233,6 +239,26 @@ mod tests {
         assert!(
             refs_for_copy(Vec::new(), ContentMessageType::Video as i32, &thumb_only).is_err(),
             "缺主体文件的媒体不能被转发成新消息",
+        );
+    }
+
+    /// 每个拒绝理由都有稳定标识：客户端按它决定文案与是否可重试。
+    #[test]
+    fn every_refusal_has_a_stable_code() {
+        let codes = [
+            ForwardRefusal::SourceNotFound.code(),
+            ForwardRefusal::SourceGone.code(),
+            ForwardRefusal::SourceNotReadable.code(),
+            ForwardRefusal::TargetNotWritable.code(),
+            ForwardRefusal::SourceChannelMismatch.code(),
+            ForwardRefusal::ForwardsRestricted.code(),
+            ForwardRefusal::SourceChanged.code(),
+        ];
+        let unique: std::collections::BTreeSet<_> = codes.iter().collect();
+        assert_eq!(unique.len(), codes.len(), "拒绝码不能重复：{codes:?}");
+        assert!(
+            codes.contains(&"FORWARDS_RESTRICTED"),
+            "§6.3 内容保护必须有自己的码，对齐 Telegram CHAT_FORWARDS_RESTRICTED",
         );
     }
 

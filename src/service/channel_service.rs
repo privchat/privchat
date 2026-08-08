@@ -3595,6 +3595,21 @@ impl ChannelService {
     /// 获取频道成员列表
     /// 判断 user 是否是 channel 成员（附件访问授权用，ATTACHMENT_ENCRYPTION_SPEC §授权）。
     /// 1.0 复用 get_channel_members 遍历；TODO: 改 SQL `EXISTS` 查询避免拉全量。
+    /// 这些会话里，`user_id` 是否**至少属于一个**。
+    ///
+    /// 存在性判定，命中即返回——附件授权只关心「有没有一条有效引用是我能看的」，
+    /// 不需要知道是哪一条。逐个 `is_channel_member` 在热门文件被转发到大量会话后
+    /// 是 N+1；这里集中在服务层做，两边仍然共用同一份成员规则
+    /// （自己在授权路径写一份成员 SQL 会变成第二份实现）。
+    pub async fn is_member_of_any(&self, channel_ids: &[u64], user_id: u64) -> Result<bool> {
+        for channel_id in channel_ids {
+            if self.is_channel_member(*channel_id, user_id).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn is_channel_member(&self, channel_id: u64, user_id: u64) -> Result<bool> {
         let members = self.get_channel_members(&channel_id).await?;
         Ok(members.iter().any(|m| m.user_id == user_id))
@@ -3950,8 +3965,8 @@ impl ChannelService {
         &self,
         group_id: u64,
     ) -> Result<Option<crate::model::channel::GroupPolicy>> {
-        let row = sqlx::query_as::<_, (bool, i16, bool, bool, bool)>(
-            "SELECT allow_search, join_policy, allow_member_invite, allow_member_add_friend, all_muted \
+        let row = sqlx::query_as::<_, (bool, i16, bool, bool, bool, bool)>(
+            "SELECT allow_search, join_policy, allow_member_invite, allow_member_add_friend, all_muted, forbid_forward \
              FROM privchat_groups WHERE group_id = $1",
         )
         .bind(group_id as i64)
@@ -3966,6 +3981,7 @@ impl ChannelService {
                 allow_member_invite,
                 allow_member_add_friend,
                 all_muted,
+                forbid_forward,
             )| {
                 crate::model::channel::GroupPolicy {
                     allow_search,
@@ -3973,6 +3989,7 @@ impl ChannelService {
                     allow_member_invite,
                     allow_member_add_friend,
                     all_muted,
+                    forbid_forward,
                 }
             },
         ))
