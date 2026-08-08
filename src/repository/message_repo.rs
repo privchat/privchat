@@ -904,6 +904,60 @@ impl PgMessageRepository {
 
     /// 按 message_id 取 channel_id（附件访问授权用：file→message→channel）。
     /// 返回 None 表示消息不存在（授权方应据此拒绝）。
+    /// 引用了该文件的消息所在会话，以及那条消息是否仍然有效
+    /// （MEDIA_REFERENCE_AND_FORWARD_SPEC §4.1）。
+    ///
+    /// 授权从「单点绑定」改成**存在性查询**之后，这是唯一的候选来源：
+    /// 一个文件可以被多条消息引用，只要其中**任意一条**有效且请求者在它的会话里，
+    /// 就该放行——转发副本正是靠这一条能下载。
+    ///
+    /// 同时返回失效的引用（`live=false`），因为「有引用但全都撤回了」与
+    /// 「压根没有引用（pending）」是两种不同的判据：前者拒绝，后者看 uploader。
+    pub async fn file_reference_channels(
+        &self,
+        file_id: u64,
+    ) -> Result<Vec<(u64, bool)>, DatabaseError> {
+        let rows: Vec<(i64, bool)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT m.channel_id,
+                   (m.deleted = false AND m.revoked = false) AS live
+            FROM privchat_message_file_refs r
+            JOIN privchat_messages m
+              ON m.message_id = r.message_id
+             AND m.created_at = r.message_created_at
+            WHERE r.file_id = $1
+            "#,
+        )
+        .bind(file_id as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("查询文件引用会话失败: {}", e)))?;
+        Ok(rows.into_iter().map(|(c, live)| (c as u64, live)).collect())
+    }
+
+    /// 按 message_id 取会话，并带上「消息是否仍然有效」。
+    ///
+    /// 🔴 与 [`Self::get_channel_id`] 的区别就是这个 live 位。附件授权**必须**用这个：
+    /// 裸查 channel_id 不看 `deleted` / `revoked`，而删除是软删（行还在），
+    /// 于是撤回过的消息，附件照样能下载（spec §4.2）。
+    pub async fn live_channel_of_message(
+        &self,
+        message_id: u64,
+    ) -> Result<Option<(u64, bool)>, DatabaseError> {
+        let row: Option<(i64, bool)> = sqlx::query_as(
+            r#"
+            SELECT channel_id, (deleted = false AND revoked = false) AS live
+            FROM privchat_messages
+            WHERE message_id = $1
+            "#,
+        )
+        .bind(message_id as i64)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("查询消息存活状态失败: {}", e)))?;
+        Ok(row.map(|(c, live)| (c as u64, live)))
+    }
+
     pub async fn get_channel_id(&self, message_id: u64) -> Result<Option<u64>, DatabaseError> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT channel_id FROM privchat_messages WHERE message_id = $1")
@@ -2522,6 +2576,12 @@ mod atomic_dispatch_tests {
         };
         // 附件绑定守卫要求文件属于发送者且尚未被占用——先造出这两个文件行，
         // 否则提交会以 ATTACHMENT_BINDING_REJECTED 失败，测不到引用写入。
+        // 先删再插：`ON CONFLICT DO NOTHING` 会保留上一次跑残留的 business_id，
+        // 绑定守卫看到「已绑到别的消息」就整条拒绝——fixture 必须是确定的。
+        let _ = sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = ANY($1)")
+            .bind(vec![100i64, 200i64])
+            .execute(repo.pool())
+            .await;
         for file_id in [100i64, 200i64] {
             sqlx::query(
                 r#"
@@ -2584,6 +2644,158 @@ mod atomic_dispatch_tests {
 
         let _ = sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = ANY($1)")
             .bind(vec![100i64, 200i64])
+            .execute(repo.pool())
+            .await;
+        cleanup(&repo).await;
+    }
+
+    /// 【spec §4.2 的真库回归】撤回一条消息后，它的引用不再算「有效」。
+    ///
+    /// 这条洞的形状是：删除是软删（`deleted = true`，行还在），旧实现裸查
+    /// `SELECT channel_id FROM privchat_messages WHERE message_id = $1`
+    /// 照样拿得到会话，于是撤回过的图片仍然能换到 CEK 下载。
+    /// 存活位必须由 SQL 算出来——纯函数测试拦不住写错的 WHERE。
+    #[tokio::test]
+    async fn a_revoked_message_stops_counting_as_a_live_reference() {
+        use privchat_protocol::{MediaRef, MediaRole};
+
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
+        let Some(repo) = open_repo().await else {
+            eprintln!("skip live reference test: DATABASE_URL not configured");
+            return;
+        };
+        cleanup(&repo).await;
+        ensure_user(&repo, OWNER_ID).await;
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_groups
+                (group_id, name, owner_id, member_count, created_at, updated_at, qr_key)
+            VALUES ($1, 'live-ref-group', $2, 1, $3, $3, $4)
+            "#,
+        )
+        .bind(GROUP_ID)
+        .bind(OWNER_ID)
+        .bind(Utc::now().timestamp_millis())
+        .bind(format!("q{GROUP_ID}"))
+        .execute(repo.pool())
+        .await
+        .expect("insert group");
+        sqlx::query(
+            "INSERT INTO privchat_channels (channel_id, channel_type, group_id) VALUES ($1, 1, $1)",
+        )
+        .bind(GROUP_ID)
+        .execute(repo.pool())
+        .await
+        .expect("insert channel");
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_group_members
+                (group_id, user_id, role, joined_at, updated_at)
+            VALUES ($1, $2, 2, $3, $3)
+            "#,
+        )
+        .bind(GROUP_ID)
+        .bind(OWNER_ID)
+        .bind(Utc::now().timestamp_millis())
+        .execute(repo.pool())
+        .await
+        .expect("insert group member");
+        let _ = sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = $1")
+            .bind(4242i64)
+            .execute(repo.pool())
+            .await;
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_file_uploads
+                (file_id, original_filename, file_size, file_type, mime_type,
+                 file_path, uploader_id, business_type)
+            VALUES ($1, 'x.jpg', 1, 'image', 'image/jpeg', '/x.jpg', $2, 'message')
+            "#,
+        )
+        .bind(4242i64)
+        .bind(OWNER_ID)
+        .execute(repo.pool())
+        .await
+        .expect("seed file row");
+
+        let now = Utc::now();
+        let legacy = privchat_protocol::LocalMessagePayloadEnvelope {
+            content: String::new(),
+            ..Default::default()
+        };
+        let message = Message {
+            message_id: MESSAGE_ID,
+            channel_id: GROUP_ID as u64,
+            sender_id: OWNER_ID as u64,
+            pts: None,
+            local_message_id: Some(MESSAGE_ID),
+            content: String::new(),
+            message_type: privchat_protocol::ContentMessageType::Image,
+            metadata: serde_json::json!({ "file_id": 4242u64 }),
+            reply_to_message_id: None,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+            deleted_at: None,
+            revoked: false,
+            revoked_at: None,
+            revoked_by: None,
+        };
+        repo.create_message_and_commit_atomic(AtomicMessageCommitRequest {
+            message,
+            dedup_key: Some("test:p2:group-snapshot".to_string()),
+            client_registry_claim: None,
+            attachment_refs: vec![MediaRef {
+                file_id: 4242,
+                role: MediaRole::Original,
+                ordinal: 0,
+            }],
+            channel_type: 2,
+            event: CanonicalTimelineEvent::NewMessage(privchat_protocol::NewMessageEvent {
+                message_type: privchat_protocol::ContentMessageType::Image,
+                payload: privchat_protocol::MessagePayloadEnvelope::from_legacy(
+                    &legacy,
+                    privchat_protocol::ContentMessageType::Image,
+                ),
+            }),
+            sender_username: None,
+        })
+        .await
+        .expect("commit media message");
+
+        assert_eq!(
+            repo.file_reference_channels(4242).await.expect("refs"),
+            vec![(GROUP_ID as u64, true)],
+            "刚发出的消息是有效引用",
+        );
+        assert_eq!(
+            repo.live_channel_of_message(MESSAGE_ID)
+                .await
+                .expect("live channel"),
+            Some((GROUP_ID as u64, true)),
+        );
+
+        sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = $1")
+            .bind(MESSAGE_ID as i64)
+            .execute(repo.pool())
+            .await
+            .expect("revoke message");
+
+        assert_eq!(
+            repo.file_reference_channels(4242).await.expect("refs"),
+            vec![(GROUP_ID as u64, false)],
+            "撤回后引用仍在（审计），但不再算有效",
+        );
+        assert_eq!(
+            repo.live_channel_of_message(MESSAGE_ID)
+                .await
+                .expect("live channel"),
+            Some((GROUP_ID as u64, false)),
+            "business_id 兜底路径也必须带上存活位，否则洞只是换个入口",
+        );
+
+        let _ = sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = $1")
+            .bind(4242i64)
             .execute(repo.pool())
             .await;
         cleanup(&repo).await;

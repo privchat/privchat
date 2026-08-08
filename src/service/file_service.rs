@@ -55,24 +55,44 @@ pub struct FileUrlResponse {
     pub cek: Option<String>,
 }
 
-/// 附件访问授权纯决策（无 IO，便于单测；ATTACHMENT_ENCRYPTION_SPEC §授权）。
+/// 一个文件的引用现状：由调用方把 IO 查好再传进来（纯决策，便于单测）。
 ///
-/// 由调用方先把 IO 解析好再传入：
-/// - `bound_message_id`：file 绑定的 message_id；`None` = 未绑定（pending）。
-/// - `member_of_message_channel`：当 bound 时，当前用户是否是该 message 所在 channel 成员；
-///   `Some(true)`=是成员；`Some(false)`=非成员；`None`=消息/channel 无法解析（broken binding）。
+/// 三个字段各自回答一个独立问题，**不能互相推导**：
+/// - `has_any_reference`：这个文件有没有被任何消息引用过（含已撤回/已删除的）。
+///   `false` = pending（上传了还没发出去）。
+/// - `requester_is_member_of_a_live_reference`：请求者是不是**某条仍然有效**的引用
+///   消息所在会话的成员。这是放行的正条件。
+/// - `uploader_id` / `requester_id`：pending 阶段唯一的判据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileAccessFacts {
+    pub requester_id: u64,
+    pub uploader_id: u64,
+    pub has_any_reference: bool,
+    pub requester_is_member_of_a_live_reference: bool,
+}
+
+/// 附件访问授权纯决策（无 IO；MEDIA_REFERENCE_AND_FORWARD_SPEC §4.1）。
 ///
-/// 规则：pending → 仅 uploader；bound → 必须是成员（broken/非成员一律拒绝，不 fallback 放行）。
-/// 注意：bound 文件即使是 uploader，若非成员也拒绝（不能靠 uploader 身份绕过）。
-pub fn authorize_file_access(
-    user_id: u64,
-    uploader_id: u64,
-    bound_message_id: Option<u64>,
-    member_of_message_channel: Option<bool>,
-) -> bool {
-    match bound_message_id {
-        None => uploader_id == user_id,
-        Some(_) => member_of_message_channel == Some(true),
+/// ```text
+/// 放行 ⟺ 存在一条引用该文件的消息 M，且
+///          M.deleted = false AND M.revoked = false
+///          AND requester 是 M.channel_id 的成员
+///      或  文件尚未被任何消息引用（pending）AND requester == uploader
+/// ```
+///
+/// 🔴 授权主体是 **requester**，不是 sender。写成 sender 会变成
+/// 「A 发的消息，B 下载时按 A 的权限放行」。
+///
+/// 🔴 uploader 身份**不能**绕过成员校验：文件一旦被消息引用，就只看会话成员关系。
+/// 否则上传者可以下载自己被转发到陌生群里的那份，反过来也给了「先上传再蹭权限」的口子。
+///
+/// 🔴 「有引用但全都失效」≠「没有引用」。前者拒绝（撤回后不该再能下载），
+/// 后者回落 uploader（还没发出去，只有自己能看）。
+pub fn authorize_file_access(facts: FileAccessFacts) -> bool {
+    if facts.has_any_reference {
+        facts.requester_is_member_of_a_live_reference
+    } else {
+        facts.requester_id == facts.uploader_id
     }
 }
 
@@ -540,45 +560,69 @@ impl StreamingUpload {
 
 #[cfg(test)]
 mod authz_tests {
-    use super::authorize_file_access;
+    use super::{authorize_file_access, FileAccessFacts};
 
-    // pending（未绑定 message）：仅 uploader 可访问
+    fn facts(
+        requester_id: u64,
+        uploader_id: u64,
+        has_any_reference: bool,
+        member_of_live: bool,
+    ) -> FileAccessFacts {
+        FileAccessFacts {
+            requester_id,
+            uploader_id,
+            has_any_reference,
+            requester_is_member_of_a_live_reference: member_of_live,
+        }
+    }
+
+    // pending（还没被任何消息引用）：仅 uploader 可访问
     #[test]
     fn pending_uploader_allowed() {
-        assert!(authorize_file_access(1, 1, None, None));
+        assert!(authorize_file_access(facts(1, 1, false, false)));
     }
 
     #[test]
     fn pending_non_uploader_denied() {
-        assert!(!authorize_file_access(2, 1, None, None));
+        assert!(!authorize_file_access(facts(2, 1, false, false)));
     }
 
-    // bound（已绑定 message）：成员可访问
+    // 被有效消息引用：会话成员可访问
     #[test]
-    fn bound_member_allowed() {
-        assert!(authorize_file_access(2, 1, Some(99), Some(true)));
+    fn referenced_member_allowed() {
+        assert!(authorize_file_access(facts(2, 1, true, true)));
     }
 
     #[test]
-    fn bound_non_member_denied() {
-        assert!(!authorize_file_access(2, 1, Some(99), Some(false)));
+    fn referenced_non_member_denied() {
+        assert!(!authorize_file_access(facts(2, 1, true, false)));
     }
 
-    // broken binding（消息/channel 解析不出）：拒绝，不 fallback 放行
+    // uploader 身份不能绕过成员校验
     #[test]
-    fn bound_broken_binding_denied() {
-        assert!(!authorize_file_access(2, 1, Some(99), None));
+    fn referenced_uploader_but_non_member_denied() {
+        assert!(!authorize_file_access(facts(1, 1, true, false)));
     }
 
-    // bound 文件即使是 uploader，非成员也不能靠 uploader 身份绕过
     #[test]
-    fn bound_uploader_but_non_member_denied() {
-        assert!(!authorize_file_access(1, 1, Some(99), Some(false)));
+    fn referenced_uploader_and_member_allowed() {
+        assert!(authorize_file_access(facts(1, 1, true, true)));
     }
 
-    // bound 文件 uploader 且是成员 → 允许
+    /// 【spec §4.2 的回归】引用全部失效（撤回/删除）→ 拒绝。
+    ///
+    /// 这条正是「撤回后附件仍可下载」那个洞：撤回是软删，行还在，
+    /// 旧实现裸查 channel_id 拿到会话、成员校验通过，于是照常放行。
     #[test]
-    fn bound_uploader_and_member_allowed() {
-        assert!(authorize_file_access(1, 1, Some(99), Some(true)));
+    fn every_reference_revoked_denies_even_the_uploader() {
+        assert!(!authorize_file_access(facts(1, 1, true, false)));
+        assert!(!authorize_file_access(facts(2, 1, true, false)));
+    }
+
+    /// 【转发的核心用例】上传者与请求者毫无关系，只要请求者在某条有效引用
+    /// 消息的会话里就该放行——转发副本的接收方正是这个形态。
+    #[test]
+    fn a_forwarded_copy_is_readable_by_someone_unrelated_to_the_uploader() {
+        assert!(authorize_file_access(facts(777, 1, true, true)));
     }
 }

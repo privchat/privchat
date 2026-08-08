@@ -40,12 +40,17 @@ pub async fn get_file_url(
         user_id
     );
 
-    // 附件访问授权（ATTACHMENT_ENCRYPTION_SPEC §授权）：本接口返回 CEK，必须校验访问权，
-    // 否则任意登录用户拿 file_id 即可解密。方案 A + pending uploader-only fallback：
-    //  - business_id 已绑定 message → file→message→channel 成员校验
-    //  - business_id 未绑定（pending）→ 仅 uploader
-    //  - 任何异常（消息不存在/查询失败）→ 拒绝，不 fallback 放行
-    // 注意：cek 绝不进日志。
+    // 附件访问授权（MEDIA_REFERENCE_AND_FORWARD_SPEC §4.1）：本接口返回 CEK，
+    // 必须校验访问权，否则任意登录用户拿 file_id 即可解密。注意：cek 绝不进日志。
+    //
+    // 判据是**存在性**，不是单点绑定：只要存在一条引用该文件、且未删除未撤回的消息，
+    // 请求者又是那条消息所在会话的成员，就放行。转发副本靠的就是这一条。
+    //
+    // 候选消息有两条发现路径，**判据只有一套**：
+    //   1. 引用表（权威）
+    //   2. 老的 business_id 单点绑定（过渡期，存量回填前的兜底）
+    // 🔴 第 2 条只是「怎么找到候选消息」的另一种方式，**不是**回落到旧的
+    // authorize_file_access 语义——否则 §4.2 那个「撤回后附件仍可下载」的洞会原样留着。
     let file_meta = services
         .file_service
         .get_file_metadata(request.file_id)
@@ -53,42 +58,73 @@ pub async fn get_file_url(
         .map_err(|e| RpcError::internal(format!("查询文件失败: {}", e)))?
         .ok_or_else(|| RpcError::validation("文件不存在".to_string()))?;
 
-    let bound_message_id = file_meta
-        .business_id
-        .as_deref()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|id| *id > 0);
+    let mut candidates = services
+        .message_repository
+        .file_reference_channels(request.file_id)
+        .await
+        .map_err(|e| RpcError::internal(format!("查询文件引用失败: {}", e)))?;
 
-    // 解析 bound 消息的成员关系（IO），再交给纯函数 authorize_file_access 决策（便于单测）。
-    let member_of_message_channel = match bound_message_id {
-        Some(message_id) => match services.message_repository.get_channel_id(message_id).await {
-            Ok(Some(channel_id)) => Some(
-                services
-                    .channel_service
-                    .is_channel_member(channel_id, user_id)
-                    .await
-                    .unwrap_or(false),
-            ),
-            // 消息不存在 / channel 缺失 / 查询失败 → broken binding
-            _ => None,
-        },
-        None => None,
-    };
+    let used_legacy_fallback = candidates.is_empty();
+    if used_legacy_fallback {
+        // 引用表里没有 —— 可能是回填尚未覆盖的存量消息。按 business_id 找候选，
+        // 找到之后走同一套判据（含存活过滤）。
+        if let Some(message_id) = file_meta
+            .business_id
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|id| *id > 0)
+        {
+            if let Ok(Some(entry)) = services
+                .message_repository
+                .live_channel_of_message(message_id)
+                .await
+            {
+                candidates.push(entry);
+            }
+        }
+    }
+
+    let has_any_reference = !candidates.is_empty();
+    let mut requester_is_member_of_a_live_reference = false;
+    for (channel_id, live) in &candidates {
+        if !*live {
+            continue;
+        }
+        if services
+            .channel_service
+            .is_channel_member(*channel_id, user_id)
+            .await
+            .unwrap_or(false)
+        {
+            requester_is_member_of_a_live_reference = true;
+            break;
+        }
+    }
 
     let authorized = crate::service::file_service::authorize_file_access(
-        user_id,
-        file_meta.uploader_id,
-        bound_message_id,
-        member_of_message_channel,
+        crate::service::file_service::FileAccessFacts {
+            requester_id: user_id,
+            uploader_id: file_meta.uploader_id,
+            has_any_reference,
+            requester_is_member_of_a_live_reference,
+        },
     );
+
+    if authorized && has_any_reference {
+        // fallback 命中率是「回填够不够」的唯一读数。归零之前不能删掉第 2 条路径，
+        // 归零之后才谈得上移除 business_id 兼容（spec §10 第 9 步）。
+        crate::infra::metrics::record_file_access_authorized(used_legacy_fallback);
+    }
 
     if !authorized {
         tracing::warn!(
-            "🚫 拒绝访问附件: file_id={}, user_id={}, bound_message={:?}",
+            "🚫 拒绝访问附件: file_id={}, user_id={}, references={}, live_member={}",
             request.file_id,
             user_id,
-            bound_message_id
+            candidates.len(),
+            requester_is_member_of_a_live_reference
         );
+        crate::infra::metrics::record_file_access_denied();
         return Err(RpcError::forbidden("无权访问该附件".to_string()));
     }
 
