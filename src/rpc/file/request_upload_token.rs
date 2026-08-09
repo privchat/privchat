@@ -110,6 +110,13 @@ pub async fn request_upload_token(
                 mime_type: Some(mime_type.clone()),
                 transform_version: request.transform_version,
             },
+            // 命中 → 这张 token 只能拿去 claim；未命中 → 只能拿去传字节。
+            // 两个入口各自拒绝不属于自己的用途，堵住「同一张 token 两边各用一次」。
+            if already_exists {
+                crate::service::upload_token_service::UploadTokenPurpose::ClaimExisting
+            } else {
+                crate::service::upload_token_service::UploadTokenPurpose::Upload
+            },
         )
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
