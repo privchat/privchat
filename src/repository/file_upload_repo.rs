@@ -64,11 +64,31 @@ impl FileUploadRepository {
     /// 复制的是 `file_path` / 存储源 / 加密版本 / CEK —— 物理文件一份，两行指向它。
     /// 🔴 新行的 `uploader_id` 是请求者自己，`business_id` 留空：他要把这个文件绑到
     /// **他自己的**那条消息上。绝不返回别人的 `file_id`。
+    /// 这个幂等键之前是不是已经成功取用过。
+    ///
+    /// 命中就直接把当时那个 `file_id` 还回去——响应丢了、客户端重试，拿到的仍是
+    /// 同一份，而不是又多一行。
+    pub async fn find_claimed(&self, uploader_id: u64, claim_key_hash: &str) -> Result<Option<u64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT file_id FROM privchat_file_uploads \
+             WHERE uploader_id = $1 AND claim_key_hash = $2",
+        )
+        .bind(uploader_id as i64)
+        .bind(claim_key_hash)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询秒传幂等记录失败: {}", e)))?;
+        Ok(row.map(|(id,)| id as u64))
+    }
+
     pub async fn copy_for_user(
         &self,
         source: &FileMetadata,
         uploader_id: u64,
         business_type: &str,
+        // 幂等键（token 的摘要）。与那一行**同事务**写入，所以「插进去了」
+        // 与「记下取用过」是同一件事，不存在中间态。
+        claim_key_hash: Option<&str>,
     ) -> Result<u64> {
         let file_id = self.next_file_id().await?;
         let mut tx = self
@@ -106,8 +126,11 @@ impl FileUploadRepository {
             INSERT INTO privchat_file_uploads (
                 file_id, original_filename, file_size, file_type, mime_type,
                 file_path, storage_source_id, uploader_id, uploaded_at,
-                width, height, file_hash, business_type, encryption_version, cek
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now_millis(), $9, $10, $11, $12, $13, $14)
+                width, height, file_hash, business_type, encryption_version, cek,
+                claim_key_hash
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now_millis(), $9, $10, $11, $12, $13, $14, $15)
+            ON CONFLICT (uploader_id, claim_key_hash) WHERE claim_key_hash IS NOT NULL
+            DO NOTHING
             "#,
         )
         .bind(file_id as i64)
@@ -124,9 +147,27 @@ impl FileUploadRepository {
         .bind(business_type)
         .bind(source.encryption_version)
         .bind(&source.cek)
+        .bind(claim_key_hash)
         .execute(&mut *tx)
         .await
         .map_err(|e| ServerError::Database(format!("创建秒传记录失败: {}", e)))?;
+
+        // 唯一索引把并发的第二个 claim 挡成 0 行：读回先到那个的 file_id 返回，
+        // 而不是报错。两个人拿同一个 token 重试，应该拿到同一份，不是一个成功一个失败。
+        let file_id = if let Some(key) = claim_key_hash {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT file_id FROM privchat_file_uploads \
+                 WHERE uploader_id = $1 AND claim_key_hash = $2",
+            )
+            .bind(uploader_id as i64)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("回读秒传记录失败: {}", e)))?;
+            row.map(|(id,)| id as u64).unwrap_or(file_id)
+        } else {
+            file_id
+        };
 
         tx.commit()
             .await
