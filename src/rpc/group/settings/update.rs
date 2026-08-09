@@ -200,13 +200,16 @@ pub async fn handle(
         tracing::debug!("✅ 更新群公告成功");
     }
 
-    // 4.3. 更新全员禁言
+    // 4.3. 全员禁言：**只刷缓存**。
+    //
+    // 🔴 上面的 5.0 已经把它连同其它策略项一次写进了 privchat_groups。
+    // 这里再调 `set_channel_all_muted` 会发第二条 UPDATE，把同一次操作变成两次写、
+    // 两次 sync_version 推进——相关用户白白多走一轮增量同步。
     if let Some(muted) = all_muted {
         services
             .channel_service
-            .set_channel_all_muted(&group_id, muted)
-            .await
-            .map_err(|e| RpcError::internal(format!("更新全员禁言失败: {}", e)))?;
+            .sync_all_muted_cache(&group_id, muted)
+            .await;
         update_count += 1;
         tracing::debug!("✅ 更新全员禁言成功: {}", muted);
     }
