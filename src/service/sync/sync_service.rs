@@ -232,6 +232,12 @@ pub struct SyncService {
     delivery_service: Arc<CommittedTimelineDeliveryService>,
 }
 
+/// `attachment_binding` 的结果。
+pub struct AttachmentBinding {
+    pub refs: Vec<privchat_protocol::MediaRef>,
+    pub origin: crate::repository::message_repo::AttachmentOrigin,
+}
+
 impl SyncService {
     /// 创建同步服务
     pub fn new(
@@ -342,6 +348,30 @@ impl SyncService {
         }
     }
 
+    /// 这条消息的附件引用**从哪来**，以及提交时按哪种归属规则处理。
+    ///
+    /// 抽成函数是为了能对它写用例：这两个值一旦选错，图片转发要么被绑定守卫拒掉
+    /// （选了 FreshUpload），要么让客户端报的 file_id 混进来（用了 req 里的引用）。
+    /// 两种错都不会在编译期暴露。
+    fn attachment_binding(
+        forward: &Option<crate::rpc::sync::ForwardCommit>,
+        fresh_refs: Vec<privchat_protocol::MediaRef>,
+    ) -> AttachmentBinding {
+        match forward {
+            // 转发：引用集合来自**源消息**，不是客户端 metadata 解析出来的；
+            // 归属走复用分支，跳过「上传者必须是发送者」的守卫——安全性由
+            // 「客户端从不提交 file_id」+ 源消息可读校验保证。
+            Some(f) => AttachmentBinding {
+                refs: f.attachment_refs.clone(),
+                origin: crate::repository::message_repo::AttachmentOrigin::CopiedFromExistingMessage,
+            },
+            None => AttachmentBinding {
+                refs: fresh_refs,
+                origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
+            },
+        }
+    }
+
     fn attachment_refs(
         metadata: Option<&MessageMetadata>,
     ) -> Vec<privchat_protocol::MediaRef> {
@@ -436,6 +466,11 @@ impl SyncService {
         req: ClientSubmitRequest,
         sender_id: u64,  // 从 JWT token 中提取
         device_id: &str, // 从认证会话提取（CODEX-8：幂等命名空间的 device 维度，服务端权威）
+        // 转发：服务端算好的引用与源消息快照。`None` = 普通发送。
+        //
+        // 🔴 引用由服务端给，不从 `req` 里读——客户端一旦能报 `file_id`，
+        // 就能引用别人的附件。这是整条链上唯一防越权的地方。
+        forward: Option<crate::rpc::sync::ForwardCommit>,
     ) -> Result<ClientSubmitResponse> {
         debug!(
             "收到客户端提交: local_message_id={}, channel_id={}, channel_type={}",
@@ -500,6 +535,7 @@ impl SyncService {
                     "sync/submit legacy projection failed: {error}"
                 ))
             })?;
+        let attachment_binding = Self::attachment_binding(&forward, attachment_refs);
         let tx_result = self
             .message_repository
             .create_message_and_commit_atomic(AtomicMessageCommitRequest {
@@ -509,9 +545,10 @@ impl SyncService {
                     device_id: device_id.to_string(),
                     decision: "accepted".to_string(),
                 }),
-                attachment_refs,
-                attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
-                forward_precondition: None,
+                attachment_refs: attachment_binding.refs,
+                attachment_origin: attachment_binding.origin,
+                // 事务内复查源消息在改写之后有没有被撤回/改动。
+                forward_precondition: forward.as_ref().map(|f| f.precondition.clone()),
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
                 sender_username: None,
@@ -821,6 +858,47 @@ impl SyncService {
 
 #[cfg(test)]
 mod tests {
+
+    /// 转发必须**换掉**引用来源与归属规则。
+    ///
+    /// 🔴 这两个值选错都不会编译报错，也不会被提交层的真库测试抓到（那条直接调提交层，
+    /// 不经过这里）。选 FreshUpload → 图片转发被绑定守卫拒；用客户端的引用 →
+    /// 客户端报的 file_id 混进来，等于可以引用别人的附件。
+    #[test]
+    fn forwarding_replaces_both_the_refs_and_the_ownership_rule() {
+        use crate::repository::message_repo::{AttachmentOrigin, ForwardPrecondition};
+        use privchat_protocol::{MediaRef, MediaRole};
+
+        let client_ref = MediaRef { file_id: 111, role: MediaRole::Original, ordinal: 0 };
+        let source_ref = MediaRef { file_id: 222, role: MediaRole::Original, ordinal: 0 };
+
+        let fresh = super::SyncService::attachment_binding(&None, vec![client_ref.clone()]);
+        assert_eq!(fresh.origin, AttachmentOrigin::FreshUpload);
+        assert_eq!(fresh.refs, vec![client_ref.clone()], "普通发送用客户端解析出的引用");
+
+        let forwarded = super::SyncService::attachment_binding(
+            &Some(crate::rpc::sync::ForwardCommit {
+                attachment_refs: vec![source_ref.clone()],
+                precondition: ForwardPrecondition {
+                    source_message_id: 9,
+                    expected_content: String::new(),
+                    expected_metadata: serde_json::json!({}),
+                    expected_refs: Vec::new(),
+                },
+            }),
+            vec![client_ref],
+        );
+        assert_eq!(
+            forwarded.origin,
+            AttachmentOrigin::CopiedFromExistingMessage,
+            "转发复用已有文件，不能按新上传判归属",
+        );
+        assert_eq!(
+            forwarded.refs,
+            vec![source_ref],
+            "引用必须来自源消息——客户端报的那个一个都不能留",
+        );
+    }
     use super::{merge_unread_increment, UnreadIncrement};
     use std::collections::HashMap;
 
