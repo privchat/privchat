@@ -267,8 +267,16 @@ impl FileService {
         mime_type: &str,
         filename: &str,
         token_max_size: i64,
+        // token 里签下的语义类型。🔴 优先于 multipart MIME：
+        // 加密上传的 body 是不透明字节，客户端普遍标成 application/octet-stream，
+        // 按它推导会把加密后的图片存成普通文件，之后按 image 预检自然对不上。
+        // multipart 只负责承载字节，「这是什么」由签名 token 说了算。
+        token_file_type: Option<FileType>,
     ) -> Result<StreamingUpload> {
-        let file_type = self.detect_file_type(mime_type)?;
+        let file_type = match token_file_type {
+            Some(ft) => ft,
+            None => self.detect_file_type(mime_type)?,
+        };
         let type_limit = Self::max_size_for_type(&file_type) as u64;
         let limit = type_limit.min(token_max_size.max(0) as u64);
 
@@ -348,9 +356,14 @@ impl FileService {
         // 声明「我这份字节叫什么」，之后别人算出同一个名字就会拿到他的东西。
         let stored_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
 
-        // 声明的大小必须与实际收到的字节数一致。判重已经只看摘要，但入库的
-        // `file_size` 得是真的——它会被客户端拿去显示、拿去做进度。
-        if let Some(declared_size) = declared_size {
+        // 声明的大小必须与实际收到的字节数一致——但**只对新客户端生效**。
+        //
+        // 🔴 老客户端报的是**明文**大小，之后才加密，密文固定多 28 字节
+        // （12 nonce + 16 tag）。无条件比对会让新服务端一上线就把所有老客户端的
+        // 正常上传全部拒掉——那不是「秒传暂时不可用」，是附件直接发不出去。
+        //
+        // 判据：带了 `sha256` 才是按新口径（最终 blob）报的，才核对大小。
+        if let (Some(_), Some(declared_size)) = (declared_content_sha256.as_deref(), declared_size) {
             if declared_size != upload.written as i64 {
                 if let Ok(op) = self.operator_for_source(upload.source_id).await {
                     let _ = op.delete(&upload.file_path).await;
@@ -925,20 +938,44 @@ pub async fn converge_upload(
     .await
     .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {e}")))?;
 
-    Ok(match existing {
-        Some((path, src, enc, existing_cek)) => ResolvedPlacement {
-            duplicate: path != input.my_path,
-            file_path: path,
-            storage_source_id: src,
-            encryption_version: enc,
-            cek: existing_cek,
-        },
-        None => ResolvedPlacement {
-            file_path: input.my_path.clone(),
-            storage_source_id: input.my_source_id,
-            encryption_version: input.encryption_version,
-            cek: input.my_cek.clone(),
-            duplicate: false,
-        },
+    if let Some((path, src, enc, existing_cek)) = existing {
+        // 🔴 选中了别人那份物理文件之后，还要取**同一把 `file_path` 锁**再确认它没被删。
+        //
+        // 只有内容锁挡不住这条：上传选中旧路径 → 删除把最后一行连同物理对象删掉 →
+        // 上传插入一条指向已删除对象的记录。增加引用与减少引用必须共用一把锁。
+        //
+        // 锁序固定为「内容锁 → 路径锁」，而删除/取用只拿路径锁，因此不会成环。
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&path)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("获取物理文件锁失败: {e}")))?;
+
+        let still_there: Option<(i64,)> = sqlx::query_as(
+            "SELECT file_id FROM privchat_file_uploads WHERE file_path = $1 LIMIT 1",
+        )
+        .bind(&path)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("复查物理文件失败: {e}")))?;
+
+        if still_there.is_some() {
+            return Ok(ResolvedPlacement {
+                duplicate: path != input.my_path,
+                file_path: path,
+                storage_source_id: src,
+                encryption_version: enc,
+                cek: existing_cek,
+            });
+        }
+        // 等锁期间它被删了：退回用自己刚上传的那份，物理文件不丢。
+    }
+
+    Ok(ResolvedPlacement {
+        file_path: input.my_path.clone(),
+        storage_source_id: input.my_source_id,
+        encryption_version: input.encryption_version,
+        cek: input.my_cek.clone(),
+        duplicate: false,
     })
 }
