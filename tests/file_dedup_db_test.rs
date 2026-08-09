@@ -461,3 +461,76 @@ async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
 
     cleanup(&pool).await;
 }
+
+/// 🔴 claim 的**生产入口**：token 已被消费之后重放，必须返回同一个 file_id。
+///
+/// 之前这条只测到仓储层。仓储层看不见「幂等查询排在 token 校验之前」这个顺序——
+/// 有人把它挪到后面，仓储测试照样绿，而实际行为是：成功过的 token 已被消费，
+/// 再去校验只会得到「无效」，客户端永远拿不回那条记录。
+///
+/// 这里调的是 `claim_existing_file` 本身，它只依赖文件服务和 token 服务两样东西，
+/// 不需要整个 RpcServiceContext。
+#[tokio::test]
+async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
+    use privchat::service::file_claim_service::claim_existing_file;
+    use privchat::service::upload_token_service::{
+        UploadIdentity, UploadTokenPurpose, UploadTokenService,
+    };
+    use privchat::service::FileService;
+
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+
+    let repo = FileUploadRepository::new(pool.clone());
+    let original = seed_original(&repo).await;
+
+    let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
+    let token_service = Arc::new(UploadTokenService::new());
+    let token = token_service
+        .generate_token(
+            OTHER as u64,
+            FileType::Image,
+            10 * 1024 * 1024,
+            "message".to_string(),
+            Some("photo.png".to_string()),
+            UploadIdentity {
+                sha256: Some(SHA.to_string()),
+                declared_size: Some(1024),
+                mime_type: Some("image/png".to_string()),
+                transform_version: 0,
+            },
+            // 预检命中签发的就是这种用途。
+            UploadTokenPurpose::ClaimExisting,
+        )
+        .await
+        .expect("token");
+
+    let first = claim_existing_file(&file_service, &token_service, OTHER as u64, &token.token, SHA)
+        .await
+        .expect("first claim");
+    assert_ne!(first.file_id, original.file_id, "拿到的是自己的新 file_id");
+
+    // token 此刻已被消费——这正是重放路径的前提。
+    assert!(
+        token_service.validate_token(&token.token).await.is_err(),
+        "第一次成功之后 token 应当已经作废",
+    );
+
+    // 「响应丢了」：客户端拿同一个 token 再来一次。
+    let replay = claim_existing_file(&file_service, &token_service, OTHER as u64, &token.token, SHA)
+        .await
+        .expect("replayed claim must succeed even though the token is spent");
+    assert_eq!(first.file_id, replay.file_id, "重放必须返回同一个 file_id");
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM privchat_file_uploads WHERE uploader_id = $1",
+    )
+    .bind(OTHER)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("count");
+    assert_eq!(rows, 1, "重放不能多出一行");
+
+    cleanup(&pool).await;
+}

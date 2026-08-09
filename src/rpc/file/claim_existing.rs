@@ -52,102 +52,24 @@ pub async fn claim_existing(
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("sha256 is required".to_string()))?;
 
-    // 🔴 幂等第一步：这个 token 之前成功取用过吗？
-    //
-    // 命中就把当时那个 file_id 原样还回去。数据库提交了但响应丢了的情况，
-    // 客户端重试拿到的是同一份，而不是又多一行——而且这一步在 token 校验之前，
-    // 因为成功过的 token 已经被消费掉了，再去校验只会得到「无效」。
-    let claim_key_hash = {
-        use sha2::Digest as _;
-        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-        hasher.update(token_str.as_bytes());
-        hex::encode(hasher.finalize())
-    };
-    if let Some(existing) = services
-        .file_service
-        .find_claimed(user_id, &claim_key_hash)
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?
-    {
-        if let Some(meta) = services
-            .file_service
-            .get_file_metadata(existing)
-            .await
-            .map_err(|e| RpcError::internal(e.to_string()))?
-        {
-            return upload_result(&services, &meta);
-        }
-    }
-
-    // token 必须有效、属于当前用户、且未被用过（一次性）。
-    let token = services
-        .upload_token_service
-        .validate_token(token_str)
-        .await
-        .map_err(|_| RpcError::validation("上传 token 无效或已过期".to_string()))?;
-
-    if token.purpose != crate::service::upload_token_service::UploadTokenPurpose::ClaimExisting {
-        return Err(RpcError::validation(
-            "该 token 用于实体上传，不能用于秒传取用".to_string(),
-        ));
-    }
-
-    if token.user_id != user_id {
-        return Err(RpcError::forbidden("上传 token 不属于当前用户".to_string()));
-    }
-
-    // 🔴 逐项复核 token 里签下的身份，不信这次请求带来的参数。
-    // 否则客户端可以 prepare 一个小文件、claim 另一份内容。
-    let bound = token
-        .sha256
-        .as_deref()
-        .ok_or_else(|| RpcError::validation("该 token 未绑定内容摘要".to_string()))?;
-    if !bound.eq_ignore_ascii_case(sha256.trim()) {
-        return Err(RpcError::validation(
-            "sha256 与 token 绑定的内容不一致".to_string(),
-        ));
-    }
-
-    // 摘要必须是 64 位十六进制。脏摘要不会立刻报错，只会让秒传永远命不中，
-    // 表现成「怎么每次都重传」，很难往回查——所以在入口就拒掉。
-    let normalized = bound.trim().to_ascii_lowercase();
-    if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(RpcError::validation(
-            "sha256 必须是 64 位十六进制（SHA-256）".to_string(),
-        ));
-    }
-
-    // 判重只看摘要：字节相同就是同一份东西。
-    let source = services
-        .file_service
-        .find_by_content(&normalized)
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?
-        .ok_or_else(|| RpcError::not_found("服务端没有这份内容，请正常上传".to_string()))?;
-
-    // 照着已有那行给**当前用户**插一条新记录：物理文件一份，两行指向它。
-    // 他拿到的是自己的 file_id，绑到自己的消息上，与别人那条消息毫无关系。
-    let file_id = services
-        .file_service
-        .copy_for_user(&source, user_id, &token.business_type, Some(&claim_key_hash))
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
-
-    // 🔴 消费 token 放在**数据库提交之后**。放前面的话，后续任何失败都会把 token
-    // 烧掉，客户端连重试的机会都没有；而幂等已经由 claim_key_hash 保证，
-    // 这里消费失败也不会多出一行。
-    if let Err(e) = services.upload_token_service.mark_token_used(token_str).await {
-        tracing::warn!("标记上传 token 已使用失败（幂等由 claim_key_hash 保证）: {e}");
-    }
+    let meta = crate::service::file_claim_service::claim_existing_file(
+        &services.file_service,
+        &services.upload_token_service,
+        user_id,
+        token_str,
+        sha256,
+    )
+    .await
+    .map_err(RpcError::from)?;
 
     tracing::info!(
         "⚡ 秒传取用: user={} 复用 path={} → file_id={}",
         user_id,
-        source.file_path,
-        file_id
+        meta.file_path,
+        meta.file_id
     );
 
-    upload_result(&services, &source_after_claim(&source, file_id))
+    upload_result(&services, &meta)
 }
 
 /// 秒传取用的结果，形状与 `/files/upload` 的 `UploadResponse` **逐字段一致**。
@@ -174,12 +96,3 @@ fn upload_result(
     }))
 }
 
-/// 取用产生的那一行：内容字段沿用源行，`file_id` 换成自己的。
-fn source_after_claim(
-    source: &crate::model::file_upload::FileMetadata,
-    file_id: u64,
-) -> crate::model::file_upload::FileMetadata {
-    let mut meta = source.clone();
-    meta.file_id = file_id;
-    meta
-}
