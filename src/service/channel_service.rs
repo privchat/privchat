@@ -1404,6 +1404,113 @@ impl ChannelService {
         Ok(())
     }
 
+    /// 转让群主：**一个事务里**把旧群主降为普通成员、把新群主升为 Owner，
+    /// 并同步 `privchat_groups.owner_id`。
+    ///
+    /// 🔴 三件事必须一起成立，否则群会停在没有群主、或者有两个群主的状态：
+    ///   - `privchat_group_members` 里旧 Owner 降级
+    ///   - 同表里新成员升为 Owner
+    ///   - `privchat_groups.owner_id` 跟着走（它是第二处真源，很多查询直接读它）
+    ///
+    /// `expected_current_owner` 是**调用方声称的操作者**。这里在事务内按 DB 复核
+    /// 他确实是当前群主——权限判定不能建立在内存缓存或请求体自报的身份上。
+    pub async fn transfer_group_owner(
+        &self,
+        group_id: u64,
+        expected_current_owner: u64,
+        new_owner_id: u64,
+    ) -> Result<()> {
+        if expected_current_owner == new_owner_id {
+            return Err(ServerError::Validation("不能把群主转让给自己".to_string()));
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启转让群主事务失败: {}", e)))?;
+
+        // 锁住这两行再判定，避免两个并发转让都读到「我是群主」。
+        let current_owner: Option<i64> = sqlx::query_scalar(
+            "SELECT owner_id FROM privchat_groups WHERE group_id = $1 FOR UPDATE",
+        )
+        .bind(group_id as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询群主失败: {}", e)))?;
+
+        let Some(current_owner) = current_owner else {
+            tx.rollback().await.ok();
+            return Err(ServerError::NotFound(format!("群组 {} 不存在", group_id)));
+        };
+
+        if current_owner as u64 != expected_current_owner {
+            tx.rollback().await.ok();
+            return Err(ServerError::PermissionDenied(
+                "只有群主可以转让群主权限".to_string(),
+            ));
+        }
+
+        let new_owner_active: Option<i16> = sqlx::query_scalar(
+            "SELECT role FROM privchat_group_members \
+             WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL FOR UPDATE",
+        )
+        .bind(group_id as i64)
+        .bind(new_owner_id as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询新群主成员身份失败: {}", e)))?;
+
+        if new_owner_active.is_none() {
+            tx.rollback().await.ok();
+            return Err(ServerError::Validation("新群主不是群组成员".to_string()));
+        }
+
+        for (uid, role) in [
+            (expected_current_owner, MemberRole::Member),
+            (new_owner_id, MemberRole::Owner),
+        ] {
+            sqlx::query(
+                "UPDATE privchat_group_members SET role = $3, updated_at = $4 \
+                 WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL",
+            )
+            .bind(group_id as i64)
+            .bind(uid as i64)
+            .bind(role.to_i16())
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("更新群成员角色失败: {}", e)))?;
+        }
+
+        sqlx::query("UPDATE privchat_groups SET owner_id = $2, updated_at = $3 WHERE group_id = $1")
+            .bind(group_id as i64)
+            .bind(new_owner_id as i64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("更新群 owner_id 失败: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交转让群主事务失败: {}", e)))?;
+
+        // 内存缓存跟随（缓存里没有这个群时无事发生，下次 load 从 DB 读到的就是新值）。
+        let _ = self
+            .set_member_role(&group_id, &expected_current_owner, MemberRole::Member)
+            .await;
+        let _ = self
+            .set_member_role(&group_id, &new_owner_id, MemberRole::Owner)
+            .await;
+
+        info!(
+            "✅ 群主已转让: group_id={}, {} -> {}",
+            group_id, expected_current_owner, new_owner_id
+        );
+        Ok(())
+    }
+
     /// 生成私聊会话的索引键（已排序，确保一致性）
     fn make_direct_key(user1_id: u64, user2_id: u64) -> (u64, u64) {
         if user1_id < user2_id {
@@ -3827,7 +3934,17 @@ impl ChannelService {
         // 此前只写内存导致 mute-all 跨重启失效。channel_id == group_id（005 id 统一）。
         self.update_group_policy(*channel_id, None, None, None, None, Some(muted), None, None)
             .await?;
-        // 再刷内存缓存
+        self.sync_all_muted_cache(channel_id, muted).await;
+        Ok(())
+    }
+
+    /// 只刷内存缓存里的全员禁言标记，**不写库**。
+    ///
+    /// 给「策略已经在别处一次性落库」的调用方用（如 `group/settings/update`）。
+    /// 那里如果再调 `set_channel_all_muted`，就会对 `privchat_groups` 发第二条
+    /// UPDATE——多一次写不只是浪费：`privchat_users`/群实体上挂着 sync_version
+    /// trigger，等于把相关用户又推进一轮增量同步。
+    pub async fn sync_all_muted_cache(&self, channel_id: &u64, muted: bool) {
         let mut channels = self.channels.write().await;
         if let Some(channel) = channels.get_mut(channel_id) {
             if channel.settings.is_none() {
@@ -3838,7 +3955,6 @@ impl ChannelService {
             }
             channel.updated_at = chrono::Utc::now();
         }
-        Ok(())
     }
 
     /// 设置频道加群审批

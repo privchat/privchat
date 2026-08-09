@@ -33,14 +33,23 @@ pub async fn handle(
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
     let group_id = request.group_id;
-    let operator_id = request.operator_id;
     let user_id = request.user_id;
     let role_str = request.role;
 
+    // 🔴 这个 handler 原来**一处权限校验都没有**：`operator_id` 从请求体读出来后
+    // 再也没被用过，任何登录用户都能把任意人（包括自己）设成任意群的管理员。
+    // 操作者只认连接上下文；请求体里的 operator_id 只能用来核对。
+    let operator_id = crate::rpc::get_current_user_id(&ctx)?;
+    if request.operator_id != 0 && request.operator_id != operator_id {
+        return Err(RpcError::forbidden(
+            "operator_id 与当前登录用户不一致".to_string(),
+        ));
+    }
+
     // 验证角色值
-    let role = match role_str.as_str() {
-        "admin" => 1,
-        "member" => 0,
+    let target_role = match role_str.as_str() {
+        "admin" => crate::model::channel::MemberRole::Admin,
+        "member" => crate::model::channel::MemberRole::Member,
         _ => {
             return Err(RpcError::validation(format!(
                 "Invalid role: {}, expected 'admin' or 'member'",
@@ -49,17 +58,29 @@ pub async fn handle(
         }
     };
 
-    // 验证角色值
-    let target_role = match role {
-        1 => crate::model::channel::MemberRole::Admin,
-        0 => crate::model::channel::MemberRole::Member,
-        _ => return Err(RpcError::validation("Invalid role value".to_string())),
-    };
+    // 只有群主可以任免管理员。管理员不能自我复制，也不能互相罢免。
+    let channel = services
+        .channel_service
+        .get_channel(&group_id)
+        .await
+        .map_err(|e| RpcError::not_found(format!("群组不存在: {}", e)))?;
+    let operator = channel
+        .members
+        .get(&operator_id)
+        .ok_or_else(|| RpcError::forbidden("您不是群组成员".to_string()))?;
+    if !matches!(operator.role, crate::model::channel::MemberRole::Owner) {
+        return Err(RpcError::forbidden(
+            "只有群主可以任免管理员".to_string(),
+        ));
+    }
 
     // 调用 Channel 服务设置角色
     match services
         .channel_service
-        .set_member_role(&group_id, &user_id, target_role)
+        // 🔴 走落库版本：原来用的是只改内存缓存的 `set_member_role`，
+        // 角色重启即回退，而鉴权在别处读的是 DB 真源——两边说的不是一件事。
+        // 这个版本还会拒绝把成员改成 Owner / 改动现任 Owner（那要走转让流程）。
+        .set_member_role_admin(group_id, user_id, target_role)
         .await
     {
         Ok(()) => {
