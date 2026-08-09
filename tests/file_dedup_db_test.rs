@@ -208,37 +208,37 @@ async fn concurrent_first_uploads_converge_on_one_physical_file() {
     cleanup(&pool).await;
 }
 
-/// 收尾判定的最小复刻：内容锁 → 查同内容 → 有就指向它、没有就用自己的。
+/// 走**生产那个函数**（`converge_upload`）判定这次上传落到哪个物理文件上。
 ///
-/// 与 `commit_streaming_upload` 里那段是同一套 SQL；这里单独跑是为了能确定性地
-/// 制造并发，而不必真的推两条 HTTP 上传。
+/// 🔴 此前这里抄了一份生产 SQL。抄件只能证明抄件自洽：改了生产的判据，
+/// 先红的是测试，而测试证明不了产品。现在两边调的是同一个函数。
 async fn converge(pool: &sqlx::PgPool, uploader: i64, my_path: &str) -> String {
+    use privchat::service::file_service::{converge_upload, UploadPlacement};
+
     let repo = FileUploadRepository::new(Arc::new(pool.clone()));
     let file_id = repo.next_file_id().await.expect("file id");
     let mut tx = pool.begin().await.expect("tx");
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-        .bind(SHA)
-        .execute(&mut *tx)
-        .await
-        .expect("content lock");
 
-
-    let existing: Option<(String,)> = sqlx::query_as(
-        "SELECT file_path FROM privchat_file_uploads \
-         WHERE file_hash = $1 AND file_type = $2 AND file_size = $3 ORDER BY file_id LIMIT 1",
+    let placement = converge_upload(
+        &mut tx,
+        &UploadPlacement {
+            stored_sha256: SHA.to_string(),
+            file_type: FileType::Image.as_str().to_string(),
+            byte_size: 1024,
+            encryption_version: 0,
+            my_path: my_path.to_string(),
+            my_source_id: 0,
+            my_cek: None,
+        },
     )
-    .bind(SHA)
-    .bind(FileType::Image.as_str())
-    .bind(1024i64)
-    .fetch_optional(&mut *tx)
     .await
-    .expect("probe");
+    .expect("converge");
 
-    let path = existing.map(|(p,)| p).unwrap_or_else(|| my_path.to_string());
-    // 🔴 把「查完还没写」的窗口撑开。没有这一下，两个事务会被时序自然串开，
+    // 🔴 把「判完还没写」的窗口撑开。没有这一下，两个事务会被时序自然串开，
     // 于是把内容锁删掉测试照样绿——我第一版就是这样，白测一轮。
     // 有锁时后到者根本进不到这里（它还堵在锁上），所以这段停顿不会造成死等。
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
     sqlx::query(
         "INSERT INTO privchat_file_uploads \
          (file_id, original_filename, file_size, file_type, mime_type, file_path, \
@@ -247,14 +247,14 @@ async fn converge(pool: &sqlx::PgPool, uploader: i64, my_path: &str) -> String {
     )
     .bind(file_id as i64)
     .bind(FileType::Image.as_str())
-    .bind(&path)
+    .bind(&placement.file_path)
     .bind(uploader)
     .bind(SHA)
     .execute(&mut *tx)
     .await
     .expect("insert");
     tx.commit().await.expect("commit");
-    path
+    placement.file_path
 }
 
 /// 身份是 内容摘要 + 类型 + 大小：任一项不同都不算同一份内容。

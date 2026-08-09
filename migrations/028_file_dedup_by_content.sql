@@ -12,12 +12,18 @@
 --
 -- 不引入第二张 blob 表：那会造出两处「物理文件真源」，读取路径一旦分叉就是漂移。
 --
--- 🔴 `file_hash` 从此存**客户端声明的最终明文内容** SHA-256（压缩/转码之后、
--- 加密之前）。此前存的是服务端对收到字节求的摘要——加密上传时那是**密文**摘要，
--- 随机 nonce 决定它每次都不同，用它做秒传身份命中率恒为 0。
+-- 🔴 `file_hash` 存的是**服务端对实际收到并落盘的那串字节**算出的 SHA-256。
+--
+-- 去重的单位就是「最终上传的字节」，服务端不理解加密：
+--   · 明文文件与加密文件不会互相命中；
+--   · 同一明文用不同随机 CEK/nonce 加密两次，是**两个**物理文件——这是预期行为。
+--
+-- 客户端要拿到秒传，就必须保留并重传当初参与哈希的那个 blob；预检之后重新加密，
+-- 字节就变了，本来也不该命中。客户端在 prepare 报的值只用于预检，权威值是服务端算的。
 --
 -- 存量行的 file_hash 是 `hash:<u64>`（DefaultHasher，跨 Rust 版本都不稳定），
 -- 与 64 位十六进制不可能相等，因此老文件只是命不中，不会误命中。
 
+-- 匹配条件带上 encryption_version：明文与密文即便长度凑巧相同也绝不能互相复用。
 CREATE INDEX IF NOT EXISTS idx_privchat_file_uploads_content
-    ON privchat_file_uploads (file_hash, file_type, file_size);
+    ON privchat_file_uploads (file_hash, file_type, file_size, encryption_version);
