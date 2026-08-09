@@ -33,6 +33,60 @@ impl FileUploadRepository {
         Self { pool }
     }
 
+    /// 底层连接池。秒传那一层要按内容摘要查 blob，走的是同一个库。
+    pub fn pool(&self) -> &PgPool {
+        self.pool.as_ref()
+    }
+
+    /// 把逻辑句柄挂到物理对象上。
+    pub async fn set_blob_id(&self, file_id: u64, blob_id: i64) -> Result<()> {
+        sqlx::query("UPDATE privchat_file_uploads SET blob_id = $2 WHERE file_id = $1")
+            .bind(file_id as i64)
+            .bind(blob_id)
+            .execute(self.pool.as_ref())
+            .await
+            .map_err(|e| ServerError::Database(format!("关联物理对象失败: {}", e)))?;
+        Ok(())
+    }
+
+    /// 秒传命中：为**当前用户**建一个指向同一个物理对象的新句柄。
+    ///
+    /// 🔴 返回的必须是他自己的新 `file_id`。把别人的 id 发回去，等于把别人的
+    /// 文件记录交给他——后续发消息时的归属校验也会因此被绕过。
+    pub async fn create_handle_for_blob(
+        &self,
+        blob: &crate::service::media_blob_service::MediaBlob,
+        uploader_id: u64,
+        filename: &str,
+        file_type: &str,
+        business_type: &str,
+    ) -> Result<u64> {
+        let file_id = self.next_file_id().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_file_uploads (
+                file_id, original_filename, file_size, file_type, mime_type,
+                file_path, storage_source_id, uploader_id, uploaded_at,
+                file_hash, business_type, encryption_version, cek, blob_id
+            )
+            SELECT $1, $2, b.file_size, $3, b.mime_type, b.storage_path,
+                   b.storage_source_id, $4, now_millis(), b.content_sha256, $5,
+                   b.encryption_version, b.cek, b.blob_id
+            FROM privchat_media_blobs b WHERE b.blob_id = $6
+            "#,
+        )
+        .bind(file_id as i64)
+        .bind(filename)
+        .bind(file_type)
+        .bind(uploader_id as i64)
+        .bind(business_type)
+        .bind(blob.blob_id)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("创建秒传句柄失败: {}", e)))?;
+        Ok(file_id)
+    }
+
     /// 取下一个自增 file_id（BIGSERIAL 序列），用于先得到 id 再落盘、再 insert
     pub async fn next_file_id(&self) -> Result<u64> {
         let row: (i64,) = sqlx::query_as("SELECT nextval('privchat_file_uploads_id_seq')::BIGINT")

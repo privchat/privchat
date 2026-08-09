@@ -18,6 +18,7 @@
 // 业务服务层模块
 pub mod admin_service;
 pub mod attachment_authorization;
+pub mod media_blob_service;
 pub mod auth_service;
 pub mod channel_service; // ChannelService 在这里
 pub mod committed_timeline_delivery_service;

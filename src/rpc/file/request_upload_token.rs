@@ -71,6 +71,69 @@ pub async fn request_upload_token(
         ));
     }
 
+    // 秒传：客户端报了最终内容的摘要，而服务端已经有这份字节 → 不必再传一遍。
+    //
+    // 「转发」在本产品里就走这条路：转发的人本来就下载过那张图，他重新发一条
+    // 同样的消息，附件在这里命中，于是既没有转发协议，也没有第二条上传路径。
+    if let Some(sha256) = request.sha256.as_deref() {
+        let identity = crate::service::media_blob_service::BlobIdentity::parse(
+            sha256,
+            request.transform_version,
+        )
+        .map_err(|e| RpcError::validation(e.to_string()))?;
+
+        let pool = services.channel_service.pool();
+        if let Some(blob) = crate::service::media_blob_service::find_blob(pool, &identity)
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?
+        {
+            // 🔴 命中不等于放行。只凭摘要就发句柄 = 「知道 hash 就等于拥有文件」，
+            // 判据是他**已经有权读到这份内容**（自己传过，或能读到引用它的消息）。
+            let may_reuse = crate::service::media_blob_service::may_reuse(
+                pool,
+                &services.message_repository,
+                &services.channel_service,
+                blob.blob_id,
+                user_id,
+            )
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+
+            if may_reuse {
+                // 建的是**当前用户自己的**新句柄。后续发消息时的归属校验
+                // （uploader_id = sender_id）因此自然通过，不需要任何专用分支。
+                let file_id = services
+                    .file_service
+                    .create_handle_for_blob(
+                        &blob,
+                        user_id,
+                        filename.as_deref().unwrap_or("file.bin"),
+                        file_type.as_str(),
+                        &business_type,
+                    )
+                    .await
+                    .map_err(|e| RpcError::internal(e.to_string()))?;
+
+                tracing::info!(
+                    "⚡ 秒传命中: user={} blob={} → file_id={}",
+                    user_id,
+                    blob.blob_id,
+                    file_id
+                );
+                let response = FileRequestUploadTokenResponse {
+                    token: String::new(),
+                    upload_url: String::new(),
+                    already_exists: true,
+                    file_id: file_id.to_string(),
+                    expires_at: None,
+                    max_size: None,
+                };
+                return serde_json::to_value(response)
+                    .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)));
+            }
+        }
+    }
+
     // 生成上传 token（将 u64 转换为 String）
     let token = services
         .upload_token_service
@@ -92,6 +155,7 @@ pub async fn request_upload_token(
     let response = FileRequestUploadTokenResponse {
         token: token.token.clone(),
         upload_url,
+        already_exists: false,
         // request_upload_token 阶段尚未落盘具体文件，保留兼容空值
         file_id: String::new(),
         expires_at: Some(token.expires_at.timestamp()),
