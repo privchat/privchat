@@ -319,6 +319,9 @@ impl FileService {
         cek: Option<String>,
         // 产出这份字节的客户端处理版本；0 = 原始未处理。
         transform_version: i32,
+        // 客户端在 prepare 声明并签进 token 的**明文最终内容**摘要。
+        // `None` = 老客户端没报，这次上传不参与秒传。
+        declared_content_sha256: Option<String>,
     ) -> Result<FileMetadata> {
         let mut writer = upload
             .writer
@@ -329,8 +332,13 @@ impl FileService {
             .await
             .map_err(|e| ServerError::Internal(format!("存储写入收尾失败: {}", e)))?;
 
-        // 内容摘要定稿。秒传按它认身份，所以这里必须是**最终字节**的 SHA-256。
-        let content_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
+        // 🔴 两个摘要，别混：
+        //   stored_sha256   服务端对**实际落盘字节**求的摘要。加密上传时这是**密文**的
+        //                   摘要，随机 nonce 决定它每次都不同——**不能**当秒传身份。
+        //   content_sha256  客户端在 prepare 声明的**明文最终内容**摘要，签在 token 里。
+        //                   秒传按它认身份。
+        let stored_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
+        let content_sha256 = declared_content_sha256.clone();
 
         let metadata = FileMetadata {
             file_id: upload.file_id,
@@ -346,7 +354,8 @@ impl FileService {
             uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
             width: None,
             height: None,
-            file_hash: Some(content_sha256.clone()),
+            // 文件行上记的是落盘字节摘要（完整性用）。内容身份在 blob 上。
+            file_hash: Some(stored_sha256.clone()),
             business_type: Some(business_type),
             business_id,
             encryption_version,
@@ -358,13 +367,22 @@ impl FileService {
         //
         // 🔴 这一步失败不能让整次上传失败——字节已经落盘、句柄已经建好，用户的
         // 文件是好的。丢的只是「下次能不能省一次上传」，那是优化不是正确性。
-        let identity = crate::service::media_blob_service::BlobIdentity {
-            content_sha256: content_sha256.clone(),
-            transform_version,
+        // 客户端没声明明文摘要（老客户端）→ 不登记 blob。宁可不秒传，
+        // 也不能拿密文摘要冒充内容身份：那会让「同一份文件」永远对不上，
+        // 更糟的是不同文件的密文摘要之间毫无意义地占着唯一键。
+        let Some(content_sha256) = content_sha256 else {
+            return Ok(metadata);
+        };
+        let Ok(identity) = crate::service::media_blob_service::BlobIdentity::parse(&content_sha256)
+        else {
+            tracing::warn!("客户端声明的内容摘要不合法，跳过 blob 登记");
+            return Ok(metadata);
         };
         match crate::service::media_blob_service::register_blob(
             self.file_upload_repo.pool(),
             &identity,
+            &stored_sha256,
+            transform_version,
             &metadata.file_path,
             metadata.storage_source_id as i32,
             metadata.file_size as i64,

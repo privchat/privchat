@@ -30,6 +30,15 @@ use uuid::Uuid;
 use crate::error::{Result, ServerError};
 use crate::service::file_service::FileType;
 
+/// prepare 阶段声明的文件身份，签进 token 后在完成时逐项复核。
+#[derive(Debug, Clone, Default)]
+pub struct UploadIdentity {
+    pub sha256: Option<String>,
+    pub declared_size: Option<i64>,
+    pub mime_type: Option<String>,
+    pub transform_version: i32,
+}
+
 /// 上传 Token 信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadToken {
@@ -45,6 +54,22 @@ pub struct UploadToken {
     pub business_type: String,
     /// 原始文件名（可选）
     pub filename: Option<String>,
+    /// 客户端在 prepare 阶段声明的最终内容摘要（SHA-256 十六进制）。
+    ///
+    /// 🔴 文件身份必须**绑在 token 里**，完成时逐项复核。只信请求参数的话，
+    /// 客户端可以在 prepare 与 upload 之间换掉摘要、大小或处理版本——
+    /// 那样秒传判定用的是一组参数，落库用的是另一组。
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// 声明的精确大小（字节）。`max_size` 是上限，这是「就该是这么大」。
+    #[serde(default)]
+    pub declared_size: Option<i64>,
+    /// 声明的 MIME。
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    /// 产出这份字节的客户端处理版本。
+    #[serde(default)]
+    pub transform_version: i32,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 过期时间（默认 5 分钟）
@@ -61,6 +86,7 @@ impl UploadToken {
         max_size: i64,
         business_type: String,
         filename: Option<String>,
+        identity: UploadIdentity,
     ) -> Self {
         let now = Utc::now();
         let token = Uuid::new_v4().to_string();
@@ -72,6 +98,10 @@ impl UploadToken {
             max_size,
             business_type,
             filename,
+            sha256: identity.sha256,
+            declared_size: identity.declared_size,
+            mime_type: identity.mime_type,
+            transform_version: identity.transform_version,
             created_at: now,
             expires_at: now + Duration::minutes(5), // 5 分钟过期
             used: false,
@@ -131,8 +161,16 @@ impl UploadTokenService {
         max_size: i64,
         business_type: String,
         filename: Option<String>,
+        identity: UploadIdentity,
     ) -> Result<UploadToken> {
-        let token = UploadToken::new(user_id, file_type, max_size, business_type, filename);
+        let token = UploadToken::new(
+            user_id,
+            file_type,
+            max_size,
+            business_type,
+            filename,
+            identity,
+        );
 
         if let Some(redis) = &self.redis {
             let ttl = (token.expires_at - Utc::now()).num_seconds().max(1) as usize;
@@ -297,6 +335,7 @@ mod tests {
                 10485760, // 10MB
                 "message".to_string(),
                 Some("test.jpg".to_string()),
+                UploadIdentity::default(),
             )
             .await
             .unwrap();
@@ -314,7 +353,7 @@ mod tests {
         let service = UploadTokenService::new();
 
         let token = service
-            .generate_token(1001, FileType::Image, 10485760, "message".to_string(), None)
+            .generate_token(1001, FileType::Image, 10485760, "message".to_string(), None, UploadIdentity::default())
             .await
             .unwrap();
 

@@ -71,73 +71,44 @@ pub async fn request_upload_token(
         ));
     }
 
-    // 秒传：客户端报了最终内容的摘要，而服务端已经有这份字节 → 不必再传一遍。
+    // 秒传探测：**只回答「这份内容在不在」**，不产生任何副作用。
     //
-    // 「转发」在本产品里就走这条路：转发的人本来就下载过那张图，他重新发一条
-    // 同样的消息，附件在这里命中，于是既没有转发协议，也没有第二条上传路径。
+    // 🔴 prepare 绝不建句柄。反复探测会攒出一堆没有任何消息使用的孤儿记录；
+    // 而且「探测」和「取得所有权」是两件事，混在一个接口里，任何一次重试
+    // 都会多给调用方一份文件。命中之后由客户端另外调 `file/claim_existing`
+    // 带 token + sha256 去换**他自己的** file_id。
+    let mut already_exists = false;
     if let Some(sha256) = request.sha256.as_deref() {
-        let identity = crate::service::media_blob_service::BlobIdentity::parse(
-            sha256,
-            request.transform_version,
+        let identity = crate::service::media_blob_service::BlobIdentity::parse(sha256)
+            .map_err(|e| RpcError::validation(e.to_string()))?;
+
+        already_exists = crate::service::media_blob_service::find_blob(
+            services.channel_service.pool(),
+            &identity,
         )
-        .map_err(|e| RpcError::validation(e.to_string()))?;
-
-        let pool = services.channel_service.pool();
-        if let Some(blob) = crate::service::media_blob_service::find_blob(pool, &identity)
-            .await
-            .map_err(|e| RpcError::internal(e.to_string()))?
-        {
-            // 🔴 命中不等于放行。只凭摘要就发句柄 = 「知道 hash 就等于拥有文件」，
-            // 判据是他**已经有权读到这份内容**（自己传过，或能读到引用它的消息）。
-            let may_reuse = crate::service::media_blob_service::may_reuse(
-                pool,
-                &services.message_repository,
-                &services.channel_service,
-                blob.blob_id,
-                user_id,
-            )
-            .await
-            .map_err(|e| RpcError::internal(e.to_string()))?;
-
-            if may_reuse {
-                // 建的是**当前用户自己的**新句柄。后续发消息时的归属校验
-                // （uploader_id = sender_id）因此自然通过，不需要任何专用分支。
-                let file_id = services
-                    .file_service
-                    .create_handle_for_blob(
-                        &blob,
-                        user_id,
-                        filename.as_deref().unwrap_or("file.bin"),
-                        file_type.as_str(),
-                        &business_type,
-                    )
-                    .await
-                    .map_err(|e| RpcError::internal(e.to_string()))?;
-
-                tracing::info!(
-                    "⚡ 秒传命中: user={} blob={} → file_id={}",
-                    user_id,
-                    blob.blob_id,
-                    file_id
-                );
-                let response = FileRequestUploadTokenResponse {
-                    token: String::new(),
-                    upload_url: String::new(),
-                    already_exists: true,
-                    file_id: file_id.to_string(),
-                    expires_at: None,
-                    max_size: None,
-                };
-                return serde_json::to_value(response)
-                    .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)));
-            }
-        }
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?
+        .is_some();
     }
 
     // 生成上传 token（将 u64 转换为 String）
     let token = services
         .upload_token_service
-        .generate_token(user_id, file_type, max_size, business_type, filename)
+        .generate_token(
+            user_id,
+            file_type,
+            max_size,
+            business_type,
+            filename,
+            // 文件身份签进 token，完成时逐项复核——否则客户端可以在 prepare 与
+            // upload/claim 之间把摘要或大小换掉。
+            crate::service::upload_token_service::UploadIdentity {
+                sha256: request.sha256.clone(),
+                declared_size: Some(file_size),
+                mime_type: Some(mime_type.clone()),
+                transform_version: request.transform_version,
+            },
+        )
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
 
@@ -155,7 +126,9 @@ pub async fn request_upload_token(
     let response = FileRequestUploadTokenResponse {
         token: token.token.clone(),
         upload_url,
-        already_exists: false,
+        // 命中只是**告知**：字节已经在服务端，不必再传。要拿到自己的 file_id
+        // 还得带这个 token 调 `file/claim_existing`。
+        already_exists,
         // request_upload_token 阶段尚未落盘具体文件，保留兼容空值
         file_id: String::new(),
         expires_at: Some(token.expires_at.timestamp()),

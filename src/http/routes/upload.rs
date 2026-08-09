@@ -341,9 +341,11 @@ async fn upload_file(
             business_id,
             encryption_version,
             cek,
-            // 处理版本由客户端在表单里声明；缺省 0 = 未处理。它参与秒传身份，
-            // 所以必须原样带到 blob 上，不能在这里就地假设成 0。
+            // 处理版本只是元数据，不参与秒传身份（身份只看内容摘要）。
             transform_version,
+            // 🔴 内容摘要取自 **token**，不取表单。表单里的值是这一次请求带来的，
+            // 客户端可以在 prepare 之后换掉；token 里那份是 prepare 当时签下的。
+            token_info.sha256.clone(),
         )
         .await?;
 
