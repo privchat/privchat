@@ -98,7 +98,7 @@ async fn a_second_sender_gets_their_own_row_over_the_same_file() {
 
     // 探测：按 内容摘要 + 类型 + 大小 找。
     let found = repo
-        .find_by_content(SHA, FileType::Image.as_str(), 1024)
+        .find_by_content(SHA)
         .await
         .expect("probe")
         .expect("命中已有内容");
@@ -223,8 +223,6 @@ async fn converge(pool: &sqlx::PgPool, uploader: i64, my_path: &str) -> String {
         &mut tx,
         &UploadPlacement {
             stored_sha256: SHA.to_string(),
-            file_type: FileType::Image.as_str().to_string(),
-            byte_size: 1024,
             encryption_version: 0,
             my_path: my_path.to_string(),
             my_source_id: 0,
@@ -257,30 +255,37 @@ async fn converge(pool: &sqlx::PgPool, uploader: i64, my_path: &str) -> String {
     placement.file_path
 }
 
-/// 身份是 内容摘要 + 类型 + 大小：任一项不同都不算同一份内容。
+/// 秒传取用与删除必须共用同一把 file_path 锁。
+///
+/// 🔴 不共用会出现：claim 读到源行 → delete 删掉最后一行并删物理文件 →
+/// claim 插入新行，结果是一条**指向已被删除文件**的记录。
+/// 这里验的是拿到锁之后的复查：源行已经没了就拒绝，而不是插一条死记录。
 #[tokio::test]
-async fn size_and_type_are_part_of_the_identity() {
+async fn claiming_a_file_that_was_just_deleted_is_refused() {
     let _guard = fixture_lock().lock().await;
     let Some(pool) = pool().await else { return };
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
 
-    seed_original(&repo).await;
+    let original = seed_original(&repo).await;
+    // 模拟「claim 已经读到了源行」：拿着这份快照，但库里那行随后被删掉。
+    let snapshot = original.clone();
+    repo.delete(original.file_id).await.expect("delete source");
 
+    let refused = repo.copy_for_user(&snapshot, OTHER as u64, "message").await;
     assert!(
-        repo.find_by_content(SHA, FileType::Image.as_str(), 2048)
-            .await
-            .expect("probe")
-            .is_none(),
-        "大小不同不能命中",
+        refused.is_err(),
+        "源文件已被删除时必须拒绝，不能留下指向不存在文件的记录",
     );
-    assert!(
-        repo.find_by_content(SHA, FileType::File.as_str(), 1024)
-            .await
-            .expect("probe")
-            .is_none(),
-        "类型不同不能命中",
-    );
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM privchat_file_uploads WHERE file_path = $1",
+    )
+    .bind(SHARED_PATH)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("count");
+    assert_eq!(rows, 0, "不该凭空多出一行");
 
     cleanup(&pool).await;
 }
@@ -306,7 +311,7 @@ async fn legacy_hashes_never_match() {
         .expect("legacy hash");
 
     assert!(
-        repo.find_by_content(SHA, FileType::Image.as_str(), 1024)
+        repo.find_by_content(SHA)
             .await
             .expect("probe")
             .is_none(),

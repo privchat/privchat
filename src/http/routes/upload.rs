@@ -346,6 +346,7 @@ async fn upload_file(
             // 🔴 内容摘要取自 **token**，不取表单。表单里的值是这一次请求带来的，
             // 客户端可以在 prepare 之后换掉；token 里那份是 prepare 当时签下的。
             token_info.sha256.clone(),
+            token_info.declared_size,
         )
         .await?;
 

@@ -24,6 +24,8 @@
 -- 存量行的 file_hash 是 `hash:<u64>`（DefaultHasher，跨 Rust 版本都不稳定），
 -- 与 64 位十六进制不可能相等，因此老文件只是命不中，不会误命中。
 
--- 匹配条件带上 encryption_version：明文与密文即便长度凑巧相同也绝不能互相复用。
+-- 判重就看 hash：SHA-256 相同即字节相同，于是大小必然相同，
+-- 「明文/密文会不会互相复用」也不成立——字节都一样了，本来就是同一份东西。
+-- 多加 type/size/encryption_version 只是给同一个判据套三层同义反复。
 CREATE INDEX IF NOT EXISTS idx_privchat_file_uploads_content
-    ON privchat_file_uploads (file_hash, file_type, file_size, encryption_version);
+    ON privchat_file_uploads (file_hash);

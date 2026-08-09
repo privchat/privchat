@@ -40,22 +40,15 @@ impl FileUploadRepository {
 
     /// 秒传探测：这份内容在不在。**不写任何东西。**
     ///
-    /// 身份 = **落盘字节**摘要 + 类型 + 字节数（+ 加密版本，见 `converge_upload`）。
-    /// 摘要是服务端对实际收到那串字节算的；客户端 prepare 报的同名值只用于预检。
-    pub async fn find_by_content(
-        &self,
-        sha256: &str,
-        file_type: &str,
-        file_size: i64,
-    ) -> Result<Option<FileMetadata>> {
+    /// 判重只看**落盘字节**的 SHA-256：摘要相同即字节相同，大小自然相同，
+    /// 也不存在「明文和密文互相复用」——字节都一样了，就是同一份东西。
+    /// 摘要由服务端对实际收到那串字节计算；客户端 prepare 报的同名值只用于预检。
+    pub async fn find_by_content(&self, sha256: &str) -> Result<Option<FileMetadata>> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT file_id FROM privchat_file_uploads \
-             WHERE file_hash = $1 AND file_type = $2 AND file_size = $3 \
-             ORDER BY file_id LIMIT 1",
+             WHERE file_hash = $1 ORDER BY file_id LIMIT 1",
         )
         .bind(sha256)
-        .bind(file_type)
-        .bind(file_size)
         .fetch_optional(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {}", e)))?;
@@ -78,6 +71,36 @@ impl FileUploadRepository {
         business_type: &str,
     ) -> Result<u64> {
         let file_id = self.next_file_id().await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启秒传取用事务失败: {}", e)))?;
+
+        // 🔴 与删除**共用同一把 file_path 锁**。否则会出现：
+        //   claim 读到源行 → delete 删掉最后一行并删物理文件 → claim 插入新行
+        // 结果是一条指向已被删除文件的记录。加引用和减引用必须排成序。
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&source.file_path)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("获取物理文件锁失败: {}", e)))?;
+
+        // 拿到锁之后复查源行还在不在：等锁期间它可能已经被删掉了。
+        let still_there: Option<(i64,)> = sqlx::query_as(
+            "SELECT file_id FROM privchat_file_uploads WHERE file_path = $1 LIMIT 1",
+        )
+        .bind(&source.file_path)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("复查源文件失败: {}", e)))?;
+        if still_there.is_none() {
+            tx.rollback().await.ok();
+            return Err(ServerError::NotFound(
+                "该文件已被删除，请正常上传".to_string(),
+            ));
+        }
+
         sqlx::query(
             r#"
             INSERT INTO privchat_file_uploads (
@@ -101,9 +124,13 @@ impl FileUploadRepository {
         .bind(business_type)
         .bind(source.encryption_version)
         .bind(&source.cek)
-        .execute(self.pool.as_ref())
+        .execute(&mut *tx)
         .await
         .map_err(|e| ServerError::Database(format!("创建秒传记录失败: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交秒传取用事务失败: {}", e)))?;
         Ok(file_id)
     }
 
