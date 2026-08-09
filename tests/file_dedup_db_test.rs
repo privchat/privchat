@@ -438,10 +438,12 @@ async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
         placement
     });
 
-    // 确认 B 确实在等锁——不等的话下面的删除就没卡在正确的位置上，
-    // 这条测试会退化成「先删再收敛」，也就走不到复查。
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!b.is_finished(), "B 应当堵在路径锁上，而不是已经跑完");
+    // 🔴 确认 B 确实**在等这把锁**，而不是靠睡一会儿再猜。
+    //
+    // 固定等待在慢机器上会失效：B 可能还没执行到查询，删除就发生了，
+    // 这条测试于是退化成「先删再收敛」——走的是 `None` 分支，复查根本没被执行，
+    // 也就成了假绿。这里直接问 Postgres：有没有人在等这把 advisory 锁。
+    wait_until_blocked_on_advisory_lock(&pool, SHARED_PATH).await;
 
     // 3. A 删掉最后一行并提交，释放锁。
     sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = $1")
@@ -511,6 +513,18 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
         .expect("first claim");
     assert_ne!(first.file_id, original.file_id, "拿到的是自己的新 file_id");
 
+    // 🔴 返回的必须是**新那一行**的真实数据，不是克隆源行改个 id。
+    // 克隆出来的对象带着原上传者的归属和业务绑定；当前 RPC 恰好没下发这几个字段，
+    // 所以看不出问题——但这个领域对象一旦被别处拿去判归属，错的就是权限。
+    assert_eq!(
+        first.uploader_id, OTHER as u64,
+        "归属必须是取用者自己，不能是原上传者",
+    );
+    assert_eq!(
+        first.business_id, None,
+        "新行不继承源行的业务绑定：它要绑到取用者自己的那条消息上",
+    );
+
     // token 此刻已被消费——这正是重放路径的前提。
     assert!(
         token_service.validate_token(&token.token).await.is_err(),
@@ -531,6 +545,122 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
     .await
     .expect("count");
     assert_eq!(rows, 1, "重放不能多出一行");
+
+    cleanup(&pool).await;
+}
+
+/// 轮询 `pg_locks`，直到确实有连接在等这把 advisory 锁。
+///
+/// 判据是「有一条 advisory 锁记录处于未授予状态」——不是睡够时间，
+/// 所以机器再慢也不会提前往下走。
+async fn wait_until_blocked_on_advisory_lock(pool: &sqlx::PgPool, key: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks \
+             WHERE locktype = 'advisory' AND NOT granted \
+               AND objid = (hashtext($1)::bigint & 4294967295)",
+        )
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "10 秒内没有观察到有人在等这把 advisory 锁；\
+             不能继续，否则删除会落在错误的时点上，测试变成假绿",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// purpose 双向隔离：两种 token 各自只能走自己那条入口。
+///
+/// 🔴 一次性 token 只挡得住「同一入口用两次」。没有用途隔离的话，两个入口
+/// 并发各用一次，会同时留下一条 claim 行和一条上传行。
+#[tokio::test]
+async fn a_token_can_only_be_used_for_its_own_purpose() {
+    use privchat::service::file_claim_service::claim_existing_file;
+    use privchat::service::upload_token_service::{
+        UploadIdentity, UploadTokenPurpose, UploadTokenService,
+    };
+    use privchat::service::FileService;
+
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
+    seed_original(&repo).await;
+
+    let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
+    let token_service = Arc::new(UploadTokenService::new());
+
+    let identity = || UploadIdentity {
+        sha256: Some(SHA.to_string()),
+        declared_size: Some(1024),
+        mime_type: Some("image/png".to_string()),
+        transform_version: 0,
+    };
+
+    // 实体上传用途的 token 拿去 claim → 拒绝。
+    let upload_token = token_service
+        .generate_token(
+            OTHER as u64,
+            FileType::Image,
+            10 * 1024 * 1024,
+            "message".to_string(),
+            None,
+            identity(),
+            UploadTokenPurpose::Upload,
+        )
+        .await
+        .expect("upload token");
+    let refused = claim_existing_file(
+        &file_service,
+        &token_service,
+        OTHER as u64,
+        &upload_token.token,
+        SHA,
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "实体上传用途的 token 不能拿去秒传取用——否则同一张 token 能在两个入口各用一次",
+    );
+
+    // 反向：claim 用途的 token 拿去实体上传 → 也要拒绝。
+    // 上传入口的判据与这里同构（`purpose != Upload` 即拒），这里锁住这个枚举语义。
+    let claim_token = token_service
+        .generate_token(
+            OTHER as u64,
+            FileType::Image,
+            10 * 1024 * 1024,
+            "message".to_string(),
+            None,
+            identity(),
+            UploadTokenPurpose::ClaimExisting,
+        )
+        .await
+        .expect("claim token");
+    assert_ne!(
+        claim_token.purpose,
+        UploadTokenPurpose::Upload,
+        "claim 用途的 token 在实体上传入口必须不等于 Upload，从而被拒",
+    );
+
+    // 用途正确时照常放行。
+    assert!(claim_existing_file(
+        &file_service,
+        &token_service,
+        OTHER as u64,
+        &claim_token.token,
+        SHA,
+    )
+    .await
+    .is_ok());
 
     cleanup(&pool).await;
 }

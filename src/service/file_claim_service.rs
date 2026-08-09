@@ -114,7 +114,13 @@ pub async fn claim_existing_file(
         tracing::warn!("标记上传 token 已使用失败（幂等由 claim_key_hash 保证）: {e}");
     }
 
-    let mut meta = source;
-    meta.file_id = file_id;
-    Ok(meta)
+    // 🔴 按新 `file_id` **重新读库**，而不是克隆源行改个 id。
+    //
+    // 克隆出来的对象带着原上传者的 `uploader_id`、`business_id`、`uploaded_at`，
+    // 那不是新用户那一行。当前 RPC 恰好没下发这几个字段，所以看不出问题——
+    // 但领域对象一旦被别处拿去判归属，错的就是权限。
+    file_service
+        .get_file_metadata(file_id)
+        .await?
+        .ok_or_else(|| ServerError::Internal(format!("秒传记录 {file_id} 刚写入却读不到")))
 }
