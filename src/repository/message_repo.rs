@@ -140,14 +140,6 @@ pub struct ForwardSource {
     pub created_at: i64,
 }
 
-/// 转发来源快照（spec §3.3）。
-#[derive(Debug, Clone)]
-pub struct ForwardOrigin {
-    pub root_message_id: Option<u64>,
-    pub root_author_id: u64,
-    pub root_channel_id: Option<u64>,
-    pub display_snapshot: Option<serde_json::Value>,
-}
 
 #[derive(Debug, Clone)]
 pub struct AtomicMessageCommitRequest {
@@ -163,8 +155,6 @@ pub struct AtomicMessageCommitRequest {
     pub attachment_refs: Vec<privchat_protocol::MediaRef>,
     /// 这些引用是新上传的文件，还是从既有消息复制来的。
     pub attachment_origin: AttachmentOrigin,
-    /// 转发来源（仅转发路径填；spec §3.3）。与消息同事务写入。
-    pub forward_origin: Option<ForwardOrigin>,
     /// 转发前置条件（spec §6.4）：源消息必须仍然有效，且**内容与副本一致**。
     ///
     /// 🔴 只复查 `deleted/revoked` 不够。构造副本时在事务外读过源消息，那次读
@@ -807,34 +797,6 @@ impl PgMessageRepository {
             })?;
         }
 
-        // 转发来源（spec §3.3）。与消息同事务：来源记录晚于消息落库，
-        // 中间那一瞬间副本会显示成「原创」。
-        if let Some(origin) = &request.forward_origin {
-            sqlx::query(
-                r#"
-                INSERT INTO privchat_message_forward_origin
-                    (message_id, root_message_id, root_author_id, root_channel_id,
-                     display_snapshot, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (message_id) DO NOTHING
-                "#,
-            )
-            .bind(message.message_id as i64)
-            .bind(origin.root_message_id.map(|id| id as i64))
-            .bind(origin.root_author_id as i64)
-            .bind(origin.root_channel_id.map(|id| id as i64))
-            .bind(origin.display_snapshot.clone())
-            .bind(created_at)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                DatabaseError::Database(format!(
-                    "Failed to record forward origin for message_id={}: {}",
-                    message.message_id, e
-                ))
-            })?;
-        }
-
         // 维护 message head（V019）。与建消息同事务：head 落后于消息会让客户端以为
         // 自己已经追平最新，从而不去补那几条差值——那是静默丢消息。
         //
@@ -1131,35 +1093,6 @@ impl PgMessageRepository {
                 ordinal,
             })
             .collect())
-    }
-
-    /// 转发来源快照：这条消息本身是不是转发来的。
-    /// 转发一条转发消息时，`root_*` 沿用它的 root，不是上一手（对齐微信/Telegram）。
-    pub async fn forward_origin_of(
-        &self,
-        message_id: u64,
-    ) -> Result<Option<ForwardOrigin>, DatabaseError> {
-        let row: Option<(Option<i64>, i64, Option<i64>, Option<serde_json::Value>)> =
-            sqlx::query_as(
-                r#"
-                SELECT root_message_id, root_author_id, root_channel_id, display_snapshot
-                FROM privchat_message_forward_origin
-                WHERE message_id = $1
-                "#,
-            )
-            .bind(message_id as i64)
-            .fetch_optional(self.pool())
-            .await
-            .map_err(|e| DatabaseError::Database(format!("查询转发来源失败: {}", e)))?;
-
-        Ok(row.map(
-            |(root_message_id, root_author_id, root_channel_id, display_snapshot)| ForwardOrigin {
-                root_message_id: root_message_id.map(|id| id as u64),
-                root_author_id: root_author_id as u64,
-                root_channel_id: root_channel_id.map(|id| id as u64),
-                display_snapshot,
-            },
-        ))
     }
 
     /// 引用了该文件的消息所在会话，以及那条消息是否仍然有效
@@ -2861,7 +2794,6 @@ mod atomic_dispatch_tests {
             dedup_key: Some("test:p2:group-snapshot".to_string()),
             client_registry_claim: None,
             attachment_origin: AttachmentOrigin::FreshUpload,
-            forward_origin: None,
             forward_precondition: None,
             attachment_refs: vec![
                 MediaRef {
@@ -3006,7 +2938,6 @@ mod atomic_dispatch_tests {
             dedup_key: Some("test:p2:group-snapshot".to_string()),
             client_registry_claim: None,
             attachment_origin: AttachmentOrigin::FreshUpload,
-            forward_origin: None,
             forward_precondition: None,
             attachment_refs: vec![MediaRef {
                 file_id: 4242,
@@ -3168,7 +3099,6 @@ mod atomic_dispatch_tests {
                 client_registry_claim: None,
                 attachment_refs: Vec::new(),
                 attachment_origin: AttachmentOrigin::FreshUpload,
-                forward_origin: None,
                 forward_precondition: None,
                 channel_type: 2,
                 event: CanonicalTimelineEvent::NewMessage(privchat_protocol::NewMessageEvent {

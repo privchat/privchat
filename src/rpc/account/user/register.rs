@@ -228,7 +228,6 @@ pub async fn handle(
                             dedup_key: None,
                             attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
                             attachment_refs_override: None,
-                            forward_origin: None,
             forward_precondition: None,
                         })
                         .await

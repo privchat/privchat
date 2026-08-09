@@ -511,7 +511,6 @@ impl SyncService {
                 }),
                 attachment_refs,
                 attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
-                forward_origin: None,
                 forward_precondition: None,
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
