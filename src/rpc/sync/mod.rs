@@ -190,126 +190,6 @@ async fn handle_get_difference_rpc(
 }
 
 /// RPC 处理函数：客户端提交命令
-/// 单条转发：把 `sync/submit` 的请求**就地改写**成「按源消息的内容再发一条」。
-///
-/// 转发不是另一套发送。它唯一特别的地方是：正文与媒体引用由**服务端**从源消息取，
-/// 客户端只报 `source_message_id`。客户端一旦能报 `file_id`，就能引用别人的附件——
-/// 这是整条链上唯一防越权的地方。
-///
-/// 改写完成后，后面的幂等、发送权限、落库、投递、回执、difference、多设备同步
-/// 全部走普通提交的那一条路，不需要任何转发专用分支。
-async fn rewrite_submit_as_forward(
-    request: &mut privchat_protocol::rpc::sync::ClientSubmitRequest,
-    services: &RpcServiceContext,
-    forwarder_id: u64,
-) -> RpcResult<ForwardCommit> {
-    use crate::service::forward_service::{is_forwardable, refs_for_copy};
-    use privchat_protocol::ContentMessageType;
-
-    let source_message_id = request
-        .payload
-        .get("source_message_id")
-        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-        .ok_or_else(|| RpcError::validation("source_message_id is required".to_string()))?;
-
-    let source = services
-        .message_repository
-        .get_message_for_forward(source_message_id)
-        .await
-        .map_err(|e| RpcError::internal(format!("读取源消息失败: {e}")))?
-        .ok_or_else(|| RpcError::not_found("源消息不存在".to_string()))?;
-
-    // 撤回/删除的消息不能再被转发出去——否则撤回等于没撤。
-    if source.deleted || source.revoked {
-        return Err(RpcError::forbidden("源消息已不可用".to_string()));
-    }
-
-    let source_type = u32::try_from(source.message_type)
-        .ok()
-        .and_then(ContentMessageType::from_u32)
-        .ok_or_else(|| RpcError::validation("源消息类型无法识别".to_string()))?;
-    if !is_forwardable(source_type) {
-        return Err(RpcError::forbidden("该类型消息不支持转发".to_string()));
-    }
-
-    // 读源消息的资格：转发人必须在源会话里。没有这一条，任何人报一个 id
-    // 就能把别人会话里的内容搬出来。
-    if !services
-        .channel_service
-        .is_channel_member(source.channel_id, forwarder_id)
-        .await
-        .map_err(|e| RpcError::internal(format!("查询源会话成员失败: {e}")))?
-    {
-        return Err(RpcError::forbidden("无权读取源消息".to_string()));
-    }
-
-    // 内容保护：源群禁止转发时，在创建副本**之前**拒绝。
-    // 已完成的转发不追溯——副本是目标会话里的独立消息。
-    if let Some(group_id) = services
-        .channel_service
-        .get_channel_opt(source.channel_id)
-        .await
-        .and_then(|channel| channel.group_id)
-    {
-        let forbids = services
-            .channel_service
-            .get_group_policy(group_id)
-            .await
-            .map_err(|e| RpcError::internal(format!("查询群策略失败: {e}")))?
-            .map(|policy| policy.forbid_forward)
-            .unwrap_or(false);
-        if forbids {
-            return Err(RpcError::forbidden("该群消息不允许转发".to_string()));
-        }
-    }
-
-    let refs_from_table = services
-        .message_repository
-        .message_media_refs(source_message_id)
-        .await
-        .map_err(|e| RpcError::internal(format!("读取源消息媒体引用失败: {e}")))?;
-    let expected_refs: Vec<(u64, i16, i32)> = refs_from_table
-        .iter()
-        .map(|r| (r.file_id, r.role as i16, r.ordinal))
-        .collect();
-    let attachment_refs = refs_for_copy(
-        refs_from_table,
-        source.message_type as i32,
-        &source.metadata,
-    )
-        // 引用集合与 metadata 对不上时拒绝，并保留 typed code：客户端据此区分
-    // 「源消息缺缩略图」和「源消息被改过」，两者的处理不一样。
-    .map_err(|refusal| RpcError::validation(refusal.code().to_string()))?;
-
-    // 副本保留**源消息自己的类型**：转发来的图片仍然是图片，图片浏览、搜索、
-    // 缩略图、文件分类全部照常工作，不必为「转发过来的图片」再写一遍。
-    request.command_type = source_type.as_str().to_string();
-    request.payload = source.metadata.clone();
-    if let Some(obj) = request.payload.as_object_mut() {
-        obj.insert("content".to_string(), serde_json::Value::String(source.content.clone()));
-        // 回复与 @ 是原会话里的关系，跟到新会话就是指向不存在的东西。
-        obj.remove("reply_to_message_id");
-        obj.remove("mentioned_user_ids");
-        obj.remove("source_message_id");
-    }
-
-    Ok(ForwardCommit {
-        attachment_refs,
-        precondition: crate::repository::message_repo::ForwardPrecondition {
-            source_message_id,
-            expected_content: source.content,
-            expected_metadata: source.metadata,
-            expected_refs,
-        },
-    })
-}
-
-/// 服务端为一次转发算出来的东西：副本要挂的引用，以及提交事务里复查源消息用的快照。
-pub struct ForwardCommit {
-    pub attachment_refs: Vec<privchat_protocol::MediaRef>,
-    pub precondition: crate::repository::message_repo::ForwardPrecondition,
-}
-
 /// 当前登录用户。转发改写要在权限判定之前拿到它，所以单独抽出来。
 fn sender_id_early(ctx: &crate::rpc::RpcContext) -> RpcResult<u64> {
     crate::rpc::get_current_user_id(ctx)
@@ -322,7 +202,7 @@ async fn handle_submit_rpc(
 ) -> RpcResult<Value> {
     use privchat_protocol::rpc::sync::ClientSubmitRequest;
 
-    let mut request: ClientSubmitRequest = serde_json::from_value(body)
+    let request: ClientSubmitRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数错误: {}", e)))?;
 
     // 转发在这里就地改写成一条普通提交：把源消息的类型/正文/metadata/引用取出来放进
@@ -330,18 +210,14 @@ async fn handle_submit_rpc(
     //
     // 顺序要紧：改写在**发送权限之前**。目标会话能不能发，判的是改写后的这条消息。
     // `forward` 是**合并转发容器**（聊天记录打包）的内容类型，服务端注入用；
-    // 普通客户端不能拿它凭空造一个容器。单条转发用下面的 `forward_message`。
+    // 普通客户端不能拿它凭空造一个容器。
+    //
+    // 单条转发**不是**一种命令：它就是当前用户重新发一条同样的消息，
+    // 附件靠秒传复用已有对象，走的是普通 image/video/file 的发送路径。
     if request.command_type.eq_ignore_ascii_case("forward") {
-        return Err(RpcError::validation(
-            "forward 为保留类型；单条转发请用 command_type=forward_message".to_string(),
-        ));
+        return Err(RpcError::validation("forward 为保留类型".to_string()));
     }
 
-    let forward = if request.command_type.eq_ignore_ascii_case("forward_message") {
-        Some(rewrite_submit_as_forward(&mut request, &services, sender_id_early(&ctx)?).await?)
-    } else {
-        None
-    };
 
     let request_for_projection = request.clone();
 
@@ -384,7 +260,7 @@ async fn handle_submit_rpc(
     let device_id = resolve_session_device_id(ctx.device_id.clone())?;
     let response = services
         .sync_service
-        .handle_client_submit(request, sender_id, &device_id, forward)
+        .handle_client_submit(request, sender_id, &device_id)
         .await
         .map_err(|e| {
             error!("SyncService.handle_client_submit 失败: {}", e);
