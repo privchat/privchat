@@ -332,13 +332,7 @@ impl FileService {
             .await
             .map_err(|e| ServerError::Internal(format!("存储写入收尾失败: {}", e)))?;
 
-        // 🔴 两个摘要，别混：
-        //   stored_sha256   服务端对**实际落盘字节**求的摘要。加密上传时这是**密文**的
-        //                   摘要，随机 nonce 决定它每次都不同——**不能**当秒传身份。
-        //   content_sha256  客户端在 prepare 声明的**明文最终内容**摘要，签在 token 里。
-        //                   秒传按它认身份。
         let stored_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
-        let content_sha256 = declared_content_sha256.clone();
 
         let metadata = FileMetadata {
             file_id: upload.file_id,
@@ -354,8 +348,17 @@ impl FileService {
             uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
             width: None,
             height: None,
-            // 文件行上记的是落盘字节摘要（完整性用）。内容身份在 blob 上。
-            file_hash: Some(stored_sha256.clone()),
+            // 🔴 这里记的是**客户端声明的最终明文内容**摘要，秒传按它认身份。
+            //
+            // 不能记服务端对收到字节求的那个摘要：加密上传时那是密文摘要，
+            // 随机 nonce 决定它每次都不同，同一份文件永远对不上。
+            // 客户端没声明（老客户端）就退回落盘摘要——它不会等于任何 64 位
+            // 十六进制内容摘要，因此只是命不中，不会误命中。
+            file_hash: Some(
+                declared_content_sha256
+                    .clone()
+                    .unwrap_or_else(|| stored_sha256.clone()),
+            ),
             business_type: Some(business_type),
             business_id,
             encryption_version,
@@ -363,61 +366,30 @@ impl FileService {
         };
         self.file_upload_repo.insert(&metadata).await?;
 
-        // 登记物理对象并把句柄挂上去：下一次有人发同样的内容，就能命中秒传。
-        //
-        // 🔴 这一步失败不能让整次上传失败——字节已经落盘、句柄已经建好，用户的
-        // 文件是好的。丢的只是「下次能不能省一次上传」，那是优化不是正确性。
-        // 客户端没声明明文摘要（老客户端）→ 不登记 blob。宁可不秒传，
-        // 也不能拿密文摘要冒充内容身份：那会让「同一份文件」永远对不上，
-        // 更糟的是不同文件的密文摘要之间毫无意义地占着唯一键。
-        let Some(content_sha256) = content_sha256 else {
-            return Ok(metadata);
-        };
-        let Ok(identity) = crate::service::media_blob_service::BlobIdentity::parse(&content_sha256)
-        else {
-            tracing::warn!("客户端声明的内容摘要不合法，跳过 blob 登记");
-            return Ok(metadata);
-        };
-        match crate::service::media_blob_service::register_blob(
-            self.file_upload_repo.pool(),
-            &identity,
-            &stored_sha256,
-            transform_version,
-            &metadata.file_path,
-            metadata.storage_source_id as i32,
-            metadata.file_size as i64,
-            &metadata.mime_type,
-            metadata.encryption_version,
-            metadata.cek.as_deref(),
-        )
-        .await
-        {
-            Ok(blob) => {
-                if let Err(e) = self
-                    .file_upload_repo
-                    .set_blob_id(metadata.file_id, blob.blob_id)
-                    .await
-                {
-                    tracing::warn!("关联物理对象失败 file_id={}: {}", metadata.file_id, e);
-                }
-            }
-            Err(e) => tracing::warn!("登记物理对象失败 sha256={}: {}", content_sha256, e),
-        }
-
         Ok(metadata)
     }
 
-    /// 秒传命中：为当前用户建一个指向同一个物理对象的新句柄。
-    pub async fn create_handle_for_blob(
+    /// 秒传探测：这份内容在不在（不写任何东西）。
+    pub async fn find_by_content(
         &self,
-        blob: &crate::service::media_blob_service::MediaBlob,
-        uploader_id: u64,
-        filename: &str,
+        sha256: &str,
         file_type: &str,
+        file_size: i64,
+    ) -> Result<Option<crate::model::file_upload::FileMetadata>> {
+        self.file_upload_repo
+            .find_by_content(sha256, file_type, file_size)
+            .await
+    }
+
+    /// 秒传取用：照着已有那行给当前用户插一条新记录，物理文件不动。
+    pub async fn copy_for_user(
+        &self,
+        source: &crate::model::file_upload::FileMetadata,
+        uploader_id: u64,
         business_type: &str,
     ) -> Result<u64> {
         self.file_upload_repo
-            .create_handle_for_blob(blob, uploader_id, filename, file_type, business_type)
+            .copy_for_user(source, uploader_id, business_type)
             .await
     }
 
@@ -467,11 +439,73 @@ impl FileService {
     /// 在那套状态机落地之前这里直接拒绝。**不做 ownership / 引用计数查询**——
     /// 查了也不影响结果，只是让人误以为这里还有一套判断在生效。
     /// 现状：本方法无 RPC 调用方，这是拆引信，不是砍功能。
-    pub async fn delete_file(&self, file_id: u64, _user_id: u64) -> Result<()> {
-        tracing::warn!("🚫 拒绝直接删除文件 file_id={file_id}：引用计数 GC 未落地前不提供物理删除");
-        Err(ServerError::Forbidden(
-            "直接删除文件已停用，等待引用计数 GC".to_string(),
-        ))
+    pub async fn delete_file(&self, file_id: u64, user_id: u64) -> Result<()> {
+        let Some(meta) = self.file_upload_repo.get_by_file_id(file_id).await? else {
+            return Ok(());
+        };
+        if meta.uploader_id != user_id {
+            return Err(ServerError::Forbidden("只能删除自己的文件".to_string()));
+        }
+
+        // 🔴 先看还有没有别人指着同一个物理文件，再删自己这行——顺序反过来的话，
+        // 两个人同时删各自的行会双双读到「还有别人」，物理文件永远没人删。
+        // 反过来说，先删行再判断也不行：两边都判成「没人了」，然后都去删同一个对象。
+        //
+        // 这里用一次 SELECT ... FOR UPDATE 把同 path 的行锁住，让删除与秒传取用
+        // （它会插入新的一行指向同一个 path）排成序。
+        let mut tx = self
+            .file_upload_repo
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启删除事务失败: {e}")))?;
+
+        let others: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM privchat_file_uploads \
+             WHERE file_path = $1 AND file_id <> $2 FOR UPDATE",
+        )
+        .bind(&meta.file_path)
+        .bind(file_id as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("统计共享物理文件的记录失败: {e}")))?;
+
+        sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = $1")
+            .bind(file_id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("删除上传记录失败: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交删除事务失败: {e}")))?;
+
+        if others.0 > 0 {
+            tracing::info!(
+                "🗑️ 只删记录 file_id={file_id}：还有 {} 行指向同一个物理文件",
+                others.0
+            );
+            return Ok(());
+        }
+
+        // 最后一行没了才删物理文件。删失败只记日志：数据库已经提交，
+        // 再回滚出一行"指向不存在文件"的记录更糟；留下的孤儿对象由 GC 收。
+        let op = self
+            .operators
+            .read()
+            .await
+            .get(&meta.storage_source_id)
+            .cloned()
+            .ok_or_else(|| {
+                ServerError::Internal(format!(
+                    "未找到存储源 id={} 的 Operator",
+                    meta.storage_source_id
+                ))
+            })?;
+        if let Err(e) = op.delete(&meta.file_path).await {
+            tracing::warn!("删除物理文件失败（留待 GC）path={}: {}", meta.file_path, e);
+        }
+        Ok(())
     }
 
     fn detect_file_type(&self, mime_type: &str) -> Result<FileType> {

@@ -33,32 +33,49 @@ impl FileUploadRepository {
         Self { pool }
     }
 
-    /// 底层连接池。秒传那一层要按内容摘要查 blob，走的是同一个库。
+    /// 底层连接池。删除时要在事务里锁住共享同一物理文件的行。
     pub fn pool(&self) -> &PgPool {
         self.pool.as_ref()
     }
 
-    /// 把逻辑句柄挂到物理对象上。
-    pub async fn set_blob_id(&self, file_id: u64, blob_id: i64) -> Result<()> {
-        sqlx::query("UPDATE privchat_file_uploads SET blob_id = $2 WHERE file_id = $1")
-            .bind(file_id as i64)
-            .bind(blob_id)
-            .execute(self.pool.as_ref())
-            .await
-            .map_err(|e| ServerError::Database(format!("关联物理对象失败: {}", e)))?;
-        Ok(())
+    /// 秒传探测：这份内容在不在。**不写任何东西。**
+    ///
+    /// 身份 = 内容摘要 + 类型 + 大小。摘要是客户端声明的**最终明文内容** SHA-256
+    /// （压缩/转码之后、加密之前）；服务端收到的是密文，随机 nonce 决定密文摘要
+    /// 每次都不同，拿它做身份命中率恒为 0。
+    pub async fn find_by_content(
+        &self,
+        sha256: &str,
+        file_type: &str,
+        file_size: i64,
+    ) -> Result<Option<FileMetadata>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT file_id FROM privchat_file_uploads \
+             WHERE file_hash = $1 AND file_type = $2 AND file_size = $3 \
+             ORDER BY file_id LIMIT 1",
+        )
+        .bind(sha256)
+        .bind(file_type)
+        .bind(file_size)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {}", e)))?;
+
+        match row {
+            Some((file_id,)) => self.get_by_file_id(file_id as u64).await,
+            None => Ok(None),
+        }
     }
 
-    /// 秒传命中：为**当前用户**建一个指向同一个物理对象的新句柄。
+    /// 秒传取用：照着已有那行，给**当前用户**插一条新记录。
     ///
-    /// 🔴 返回的必须是他自己的新 `file_id`。把别人的 id 发回去，等于把别人的
-    /// 文件记录交给他——后续发消息时的归属校验也会因此被绕过。
-    pub async fn create_handle_for_blob(
+    /// 复制的是 `file_path` / 存储源 / 加密版本 / CEK —— 物理文件一份，两行指向它。
+    /// 🔴 新行的 `uploader_id` 是请求者自己，`business_id` 留空：他要把这个文件绑到
+    /// **他自己的**那条消息上。绝不返回别人的 `file_id`。
+    pub async fn copy_for_user(
         &self,
-        blob: &crate::service::media_blob_service::MediaBlob,
+        source: &FileMetadata,
         uploader_id: u64,
-        filename: &str,
-        file_type: &str,
         business_type: &str,
     ) -> Result<u64> {
         let file_id = self.next_file_id().await?;
@@ -67,27 +84,46 @@ impl FileUploadRepository {
             INSERT INTO privchat_file_uploads (
                 file_id, original_filename, file_size, file_type, mime_type,
                 file_path, storage_source_id, uploader_id, uploaded_at,
-                file_hash, business_type, encryption_version, cek, blob_id
-            )
-            SELECT $1, $2, b.file_size, $3, b.mime_type, b.storage_path,
-                   b.storage_source_id, $4, now_millis(), b.content_sha256, $5,
-                   b.encryption_version, b.cek, b.blob_id
-            FROM privchat_media_blobs b WHERE b.blob_id = $6
+                width, height, file_hash, business_type, encryption_version, cek
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now_millis(), $9, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(file_id as i64)
-        .bind(filename)
-        .bind(file_type)
+        .bind(&source.original_filename)
+        .bind(source.file_size as i64)
+        .bind(source.file_type.as_str())
+        .bind(&source.mime_type)
+        .bind(&source.file_path)
+        .bind(source.storage_source_id as i32)
         .bind(uploader_id as i64)
+        .bind(source.width.map(|v| v as i32))
+        .bind(source.height.map(|v| v as i32))
+        .bind(&source.file_hash)
         .bind(business_type)
-        .bind(blob.blob_id)
+        .bind(source.encryption_version)
+        .bind(&source.cek)
         .execute(self.pool.as_ref())
         .await
-        .map_err(|e| ServerError::Database(format!("创建秒传句柄失败: {}", e)))?;
+        .map_err(|e| ServerError::Database(format!("创建秒传记录失败: {}", e)))?;
         Ok(file_id)
     }
 
-    /// 取下一个自增 file_id（BIGSERIAL 序列），用于先得到 id 再落盘、再 insert
+    /// 除了这一行，还有没有别人指着同一个物理文件。
+    ///
+    /// 删除时用：还有人指着就只删数据库行，物理文件留着。
+    pub async fn other_rows_share_path(&self, file_id: u64, file_path: &str) -> Result<bool> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM privchat_file_uploads WHERE file_path = $1 AND file_id <> $2",
+        )
+        .bind(file_path)
+        .bind(file_id as i64)
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("统计共享同一物理文件的记录失败: {}", e)))?;
+        Ok(count > 0)
+    }
+
+    /// 取下一个自增 file_id    /// 取下一个自增 file_id（BIGSERIAL 序列），用于先得到 id 再落盘、再 insert
     pub async fn next_file_id(&self) -> Result<u64> {
         let row: (i64,) = sqlx::query_as("SELECT nextval('privchat_file_uploads_id_seq')::BIGINT")
             .fetch_one(self.pool.as_ref())

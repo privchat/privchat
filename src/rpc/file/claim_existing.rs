@@ -75,42 +75,32 @@ pub async fn claim_existing(
         ));
     }
 
-    let identity = crate::service::media_blob_service::BlobIdentity::parse(bound)
-        .map_err(|e| RpcError::validation(e.to_string()))?;
+    // 摘要必须是 64 位十六进制。脏摘要不会立刻报错，只会让秒传永远命不中，
+    // 表现成「怎么每次都重传」，很难往回查——所以在入口就拒掉。
+    let normalized = bound.trim().to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(RpcError::validation(
+            "sha256 必须是 64 位十六进制（SHA-256）".to_string(),
+        ));
+    }
 
-    let pool = services.channel_service.pool();
-    let blob = crate::service::media_blob_service::find_blob(pool, &identity)
+    let declared_size = token
+        .declared_size
+        .ok_or_else(|| RpcError::validation("该 token 未绑定文件大小".to_string()))?;
+
+    // 身份 = 内容摘要 + 类型 + 大小，全部取自 token。
+    let source = services
+        .file_service
+        .find_by_content(&normalized, token.file_type.as_str(), declared_size)
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?
         .ok_or_else(|| RpcError::not_found("服务端没有这份内容，请正常上传".to_string()))?;
 
-    // 命中 ≠ 放行。只凭摘要就发句柄，等于「知道 hash 就等于拥有这个文件」。
-    // 判据是他**已经有权读到这份内容**（自己传过，或能读到引用它的消息），
-    // 用的是 `file/get_url` 的同一个决策函数。
-    let may_reuse = crate::service::media_blob_service::may_reuse(
-        pool,
-        &services.message_repository,
-        &services.channel_service,
-        blob.blob_id,
-        user_id,
-    )
-    .await
-    .map_err(|e| RpcError::internal(e.to_string()))?;
-    if !may_reuse {
-        return Err(RpcError::forbidden(
-            "无权复用该文件，请正常上传".to_string(),
-        ));
-    }
-
+    // 照着已有那行给**当前用户**插一条新记录：物理文件一份，两行指向它。
+    // 他拿到的是自己的 file_id，绑到自己的消息上，与别人那条消息毫无关系。
     let file_id = services
         .file_service
-        .create_handle_for_blob(
-            &blob,
-            user_id,
-            token.filename.as_deref().unwrap_or("file.bin"),
-            token.file_type.as_str(),
-            &token.business_type,
-        )
+        .copy_for_user(&source, user_id, &token.business_type)
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
 
@@ -122,18 +112,18 @@ pub async fn claim_existing(
         .map_err(|e| RpcError::internal(e.to_string()))?;
 
     tracing::info!(
-        "⚡ 秒传取用: user={} blob={} → file_id={}",
+        "⚡ 秒传取用: user={} 复用 path={} → file_id={}",
         user_id,
-        blob.blob_id,
+        source.file_path,
         file_id
     );
 
     // 形状与正常上传的结果一致：客户端两条路径拿到的是同一种东西。
     Ok(json!({
         "file_id": file_id.to_string(),
-        "file_size": blob.file_size,
-        "mime_type": blob.mime_type,
-        "sha256": identity.content_sha256,
-        "encryption_version": blob.encryption_version,
+        "file_size": source.file_size,
+        "mime_type": source.mime_type,
+        "sha256": normalized,
+        "encryption_version": source.encryption_version,
     }))
 }

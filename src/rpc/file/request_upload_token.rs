@@ -79,16 +79,18 @@ pub async fn request_upload_token(
     // 带 token + sha256 去换**他自己的** file_id。
     let mut already_exists = false;
     if let Some(sha256) = request.sha256.as_deref() {
-        let identity = crate::service::media_blob_service::BlobIdentity::parse(sha256)
-            .map_err(|e| RpcError::validation(e.to_string()))?;
-
-        already_exists = crate::service::media_blob_service::find_blob(
-            services.channel_service.pool(),
-            &identity,
-        )
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?
-        .is_some();
+        let normalized = sha256.trim().to_ascii_lowercase();
+        if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(RpcError::validation(
+                "sha256 必须是 64 位十六进制（SHA-256）".to_string(),
+            ));
+        }
+        already_exists = services
+            .file_service
+            .find_by_content(&normalized, file_type.as_str(), file_size)
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?
+            .is_some();
     }
 
     // 生成上传 token（将 u64 转换为 String）
