@@ -118,12 +118,21 @@ pub async fn claim_existing(
         file_id
     );
 
-    // 形状与正常上传的结果一致：客户端两条路径拿到的是同一种东西。
+    // 🔴 形状必须与 `/files/upload` 的 `UploadResponse` **逐字段一致**。
+    // 客户端两条路径拿到的应该是同一种东西——差一个字段，调用方就得写两套解析，
+    // 而那两套迟早会分叉。
     Ok(json!({
-        "file_id": file_id.to_string(),
+        "file_id": file_id,
+        "file_url": services
+            .file_service
+            .build_access_url(&source.file_path, source.storage_source_id),
+        "thumbnail_url": serde_json::Value::Null,
         "file_size": source.file_size,
+        "original_size": source.original_size,
+        "width": source.width,
+        "height": source.height,
         "mime_type": source.mime_type,
-        "sha256": normalized,
-        "encryption_version": source.encryption_version,
+        "uploaded_at": chrono::Utc::now().timestamp_millis(),
+        "storage_source_id": source.storage_source_id,
     }))
 }
