@@ -356,14 +356,9 @@ impl FileService {
         // 声明「我这份字节叫什么」，之后别人算出同一个名字就会拿到他的东西。
         let stored_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
 
-        // 声明的大小必须与实际收到的字节数一致——但**只对新客户端生效**。
-        //
-        // 🔴 老客户端报的是**明文**大小，之后才加密，密文固定多 28 字节
-        // （12 nonce + 16 tag）。无条件比对会让新服务端一上线就把所有老客户端的
-        // 正常上传全部拒掉——那不是「秒传暂时不可用」，是附件直接发不出去。
-        //
-        // 判据：带了 `sha256` 才是按新口径（最终 blob）报的，才核对大小。
-        if let (Some(_), Some(declared_size)) = (declared_content_sha256.as_deref(), declared_size) {
+        if let Some(declared_size) =
+            size_check_target(declared_content_sha256.as_deref(), declared_size)
+        {
             if declared_size != upload.written as i64 {
                 if let Ok(op) = self.operator_for_source(upload.source_id).await {
                     let _ = op.delete(&upload.file_path).await;
@@ -986,4 +981,19 @@ pub async fn converge_upload(
         cek: input.my_cek.clone(),
         duplicate: false,
     })
+}
+
+/// 这次上传要不要核对声明的字节数，要的话核对哪个值。
+///
+/// 🔴 只有**同时**带了摘要和大小才核对。老客户端报的是**明文**大小，之后才加密，
+/// 密文固定多 28 字节（12 nonce + 16 tag）——无条件比对会让新服务端一上线就把
+/// 所有老客户端的正常上传全部拒掉。那不是「秒传暂时不可用」，是附件直接发不出去。
+///
+/// 抽成函数是为了让测试调**这一个**，而不是在测试里抄一份同样的条件：
+/// 抄件只能证明抄件自洽，生产改回无条件核对时它照样绿。
+pub fn size_check_target(declared_digest: Option<&str>, declared_size: Option<i64>) -> Option<i64> {
+    match (declared_digest, declared_size) {
+        (Some(_), Some(size)) => Some(size),
+        _ => None,
+    }
 }

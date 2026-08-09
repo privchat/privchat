@@ -311,6 +311,17 @@ async fn upload_file(
         .validate_token(upload_token)
         .await?;
 
+    // 🔴 预检命中时签发的是 claim 用途的 token，不能拿来传字节。
+    // 一次性只挡得住「同一入口用两次」，挡不住「两个入口各用一次」——
+    // 那会同时留下一条 claim 行和一条上传行。
+    if token_info.purpose
+        != crate::service::upload_token_service::UploadTokenPurpose::Upload
+    {
+        return Err(ServerError::Validation(
+            "该 token 用于秒传取用，不能用于实体上传".to_string(),
+        ));
+    }
+
     // 标记 token 已使用（Redis 路径 GETDEL 原子消费，跨实例一次性）
     state
         .upload_token_service

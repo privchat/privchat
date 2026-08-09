@@ -86,6 +86,12 @@ pub async fn claim_existing(
         .await
         .map_err(|_| RpcError::validation("上传 token 无效或已过期".to_string()))?;
 
+    if token.purpose != crate::service::upload_token_service::UploadTokenPurpose::ClaimExisting {
+        return Err(RpcError::validation(
+            "该 token 用于实体上传，不能用于秒传取用".to_string(),
+        ));
+    }
+
     if token.user_id != user_id {
         return Err(RpcError::forbidden("上传 token 不属于当前用户".to_string()));
     }

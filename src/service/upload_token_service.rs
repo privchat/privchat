@@ -30,6 +30,26 @@ use uuid::Uuid;
 use crate::error::{Result, ServerError};
 use crate::service::file_service::FileType;
 
+/// 这张 token 是干什么用的。
+///
+/// 🔴 一次性 token 只保证「同一入口不能用两次」，挡不住**两个入口各用一次**：
+/// claim 与实体上传都是先校验后消费，并发时可以双双通过，最后留下一条 claim 行
+/// 和一条上传行。用途签进 token，两个入口各自拒绝不属于自己的那种。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UploadTokenPurpose {
+    /// 预检未命中：这张 token 只能拿去传字节。
+    Upload,
+    /// 预检命中：这张 token 只能拿去换自己的 file_id，不能再传字节。
+    ClaimExisting,
+}
+
+impl Default for UploadTokenPurpose {
+    /// 老 token（Redis 里没有这个字段）按实体上传处理，兼容滚动升级。
+    fn default() -> Self {
+        Self::Upload
+    }
+}
+
 /// prepare 阶段声明的文件身份，签进 token 后在完成时逐项复核。
 #[derive(Debug, Clone, Default)]
 pub struct UploadIdentity {
@@ -70,6 +90,9 @@ pub struct UploadToken {
     /// 产出这份字节的客户端处理版本。
     #[serde(default)]
     pub transform_version: i32,
+    /// 这张 token 的用途，见 [`UploadTokenPurpose`]。
+    #[serde(default)]
+    pub purpose: UploadTokenPurpose,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 过期时间（默认 5 分钟）
@@ -87,6 +110,7 @@ impl UploadToken {
         business_type: String,
         filename: Option<String>,
         identity: UploadIdentity,
+        purpose: UploadTokenPurpose,
     ) -> Self {
         let now = Utc::now();
         let token = Uuid::new_v4().to_string();
@@ -102,6 +126,7 @@ impl UploadToken {
             declared_size: identity.declared_size,
             mime_type: identity.mime_type,
             transform_version: identity.transform_version,
+            purpose,
             created_at: now,
             expires_at: now + Duration::minutes(5), // 5 分钟过期
             used: false,
@@ -162,6 +187,7 @@ impl UploadTokenService {
         business_type: String,
         filename: Option<String>,
         identity: UploadIdentity,
+        purpose: UploadTokenPurpose,
     ) -> Result<UploadToken> {
         let token = UploadToken::new(
             user_id,
@@ -170,6 +196,7 @@ impl UploadTokenService {
             business_type,
             filename,
             identity,
+            purpose,
         );
 
         if let Some(redis) = &self.redis {
@@ -336,6 +363,7 @@ mod tests {
                 "message".to_string(),
                 Some("test.jpg".to_string()),
                 UploadIdentity::default(),
+                UploadTokenPurpose::Upload,
             )
             .await
             .unwrap();
@@ -353,7 +381,7 @@ mod tests {
         let service = UploadTokenService::new();
 
         let token = service
-            .generate_token(1001, FileType::Image, 10485760, "message".to_string(), None, UploadIdentity::default())
+            .generate_token(1001, FileType::Image, 10485760, "message".to_string(), None, UploadIdentity::default(), UploadTokenPurpose::Upload)
             .await
             .unwrap();
 

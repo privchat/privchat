@@ -371,86 +371,93 @@ async fn replaying_a_claim_returns_the_same_file_id() {
 /// 老客户端：报**明文**大小，实际上传的密文多 28 字节，必须仍然成功。
 ///
 /// 🔴 我一度把大小核对写成无条件的，那会让新服务端一上线就把所有老客户端的
-/// 正常上传全部拒掉。判据是「带了 sha256 才按新口径核对」，这条锁住它。
+/// 正常上传全部拒掉。这里调的是**生产那个函数**——上一版在测试里抄了一份同样的
+/// 条件，生产改回无条件核对它照样绿。
 #[test]
 fn a_client_that_declares_no_digest_is_not_size_checked() {
-    // 与 `commit_streaming_upload` 里那个条件同构：两个都有才核对。
-    fn should_check(declared_digest: Option<&str>, declared_size: Option<i64>) -> bool {
-        matches!((declared_digest, declared_size), (Some(_), Some(_)))
-    }
+    use privchat::service::file_service::size_check_target;
 
-    // 老客户端：报了明文大小，但没有摘要 → 不核对。
-    assert!(
-        !should_check(None, Some(1024)),
+    // 老客户端：报了明文大小，没有摘要 → 不核对。
+    assert_eq!(
+        size_check_target(None, Some(1024)),
+        None,
         "老客户端报的是明文大小，密文固定多 28 字节；核对它等于禁止所有老客户端上传",
     );
     // 新客户端：两个都按最终 blob 报 → 核对。
-    assert!(should_check(Some("d0"), Some(1052)));
+    assert_eq!(size_check_target(Some("d0"), Some(1052)), Some(1052));
+    // 只有摘要没有大小：没什么可比的。
+    assert_eq!(size_check_target(Some("d0"), None), None);
 }
 
-/// 收敛：有同内容就指向它，没有就用自己那份。
+/// 🔴 收敛选中了某个路径，而那个路径的最后一行在它拿到路径锁**之前**被删掉：
+/// 必须退回用自己刚上传的那份，而不是留下一条指向已删除物理文件的记录。
 ///
-/// ⚠️ **这条不覆盖并发复查那一臂。** `converge_upload` 在拿到路径锁之后会复查
-/// 「这个路径还有没有行」，防的是「按 hash 查到了 → 等锁期间删除把最后一行连同
-/// 物理对象删掉 → 插入一条指向已删除文件的记录」。
+/// 这一臂之前没有覆盖——删掉行再调用的话，按 hash 的查询直接落到 `None` 分支，
+/// 走不到复查。这里用两条连接把顺序钉死，不需要给生产函数开测试注入点：
 ///
-/// 但那需要让删除**恰好**发生在 hash 查询与路径锁之间，而这两步都在
-/// `converge_upload` 内部，没法从外面插入屏障。删掉最后一行再调用的话，
-/// hash 查询直接落到 `None` 分支，走不到复查——我第一版就是这么写的，
-/// 把复查改成恒真它照样绿。
-///
-/// 所以这里只断言两个分支的结果，复查那一臂**目前没有自动化覆盖**，如实记在这里。
+///   1. A 先持有目标 `file_path` 的 advisory 锁；
+///   2. B 调生产 `converge_upload`：内容锁拿得到、按 hash 查得到旧行，
+///      然后**堵在**路径锁上；
+///   3. A 删掉最后一行并提交（锁随之释放）；
+///   4. B 拿到锁，复查发现路径上已经没有行，退回自己的路径。
 #[tokio::test]
-async fn convergence_picks_the_existing_path_or_falls_back_to_its_own() {
+async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
     use privchat::service::file_service::{converge_upload, UploadPlacement};
 
     let _guard = fixture_lock().lock().await;
     let Some(pool) = pool().await else { return };
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
-
-    // 先有一行占着 SHARED_PATH，收敛会选中它。
     let original = seed_original(&repo).await;
-    let mut tx = pool.begin().await.expect("tx");
-    let hit = converge_upload(
-        &mut tx,
-        &UploadPlacement {
-            stored_sha256: SHA.to_string(),
-            encryption_version: 0,
-            my_path: "/tmp/privchat-dedup-test/mine.bin".to_string(),
-            my_source_id: 0,
-            my_cek: None,
-        },
-    )
-    .await
-    .expect("converge");
-    assert_eq!(hit.file_path, SHARED_PATH, "有同内容时应当选中已有路径");
-    assert!(hit.duplicate, "自己那份是多余的，可以删");
-    tx.rollback().await.ok();
 
-    // 现在把那一行删掉（物理文件随之被删），再收敛一次。
-    repo.delete(original.file_id).await.expect("delete last row");
+    // 1. A 抢先占住路径锁。
+    let mut tx_a = pool.begin().await.expect("tx a");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(SHARED_PATH)
+        .execute(&mut *tx_a)
+        .await
+        .expect("a holds path lock");
 
-    let mut tx = pool.begin().await.expect("tx");
-    let after = converge_upload(
-        &mut tx,
-        &UploadPlacement {
-            stored_sha256: SHA.to_string(),
-            encryption_version: 0,
-            my_path: "/tmp/privchat-dedup-test/mine.bin".to_string(),
-            my_source_id: 0,
-            my_cek: None,
-        },
-    )
-    .await
-    .expect("converge after delete");
-    tx.rollback().await.ok();
+    // 2. B 去收敛：会查到旧行，然后堵在路径锁上。
+    let pool_b = pool.clone();
+    let b = tokio::spawn(async move {
+        let mut tx = pool_b.begin().await.expect("tx b");
+        let placement = converge_upload(
+            &mut tx,
+            &UploadPlacement {
+                stored_sha256: SHA.to_string(),
+                encryption_version: 0,
+                my_path: "/tmp/privchat-dedup-test/mine.bin".to_string(),
+                my_source_id: 0,
+                my_cek: None,
+            },
+        )
+        .await
+        .expect("converge");
+        tx.rollback().await.ok();
+        placement
+    });
 
+    // 确认 B 确实在等锁——不等的话下面的删除就没卡在正确的位置上，
+    // 这条测试会退化成「先删再收敛」，也就走不到复查。
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!b.is_finished(), "B 应当堵在路径锁上，而不是已经跑完");
+
+    // 3. A 删掉最后一行并提交，释放锁。
+    sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = $1")
+        .bind(original.file_id as i64)
+        .execute(&mut *tx_a)
+        .await
+        .expect("delete last row");
+    tx_a.commit().await.expect("commit a");
+
+    // 4. B 拿到锁后复查失败，退回自己那份。
+    let placement = b.await.expect("join b");
     assert_eq!(
-        after.file_path, "/tmp/privchat-dedup-test/mine.bin",
-        "路径上已经没有任何记录时，必须退回用自己刚上传的那份，而不是指向被删掉的文件",
+        placement.file_path, "/tmp/privchat-dedup-test/mine.bin",
+        "等锁期间路径上的最后一行被删了，必须退回自己刚上传的那份",
     );
-    assert!(!after.duplicate, "自己那份现在是唯一的一份，不能删");
+    assert!(!placement.duplicate, "自己那份现在是唯一的一份，不能删");
 
     cleanup(&pool).await;
 }
