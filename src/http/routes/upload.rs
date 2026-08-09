@@ -83,7 +83,7 @@ pub fn create_route() -> Router<FileServerState> {
 /// 流式接收 multipart：file 字段按 chunk 直写存储（大小硬顶即时校验），
 /// 其余字段照常收集；收完后做加密结构校验。任何失败都会清理已写入的半文件。
 ///
-/// 返回 (upload, filename, mime_type, business_id, encryption_version, cek)。
+/// 返回 (upload, filename, mime_type, business_id, encryption_version, cek, transform_version)。
 async fn receive_streaming(
     state: &FileServerState,
     token_info: &crate::service::upload_token_service::UploadToken,
@@ -96,6 +96,7 @@ async fn receive_streaming(
         Option<String>,
         i32,
         Option<String>,
+        i32,
     ),
     ServerError,
 > {
@@ -106,6 +107,8 @@ async fn receive_streaming(
     // 附件加密 v1：encryption_version 0/1；version=1 时 cek=base64url(32B)，nonce 在 blob 头。
     let mut encryption_version: i32 = 0;
     let mut cek: Option<String> = None;
+    // 客户端处理版本：参与秒传身份。压缩算法一变就是另一份字节，不能命中旧对象。
+    let mut transform_version: i32 = 0;
 
     // 失败路径统一清理半文件后返回错误。
     macro_rules! fail {
@@ -185,6 +188,11 @@ async fn receive_streaming(
             "encryption_version" => {
                 if let Ok(s) = field.text().await {
                     encryption_version = s.trim().parse::<i32>().unwrap_or(0);
+                }
+            }
+            "transform_version" => {
+                if let Ok(s) = field.text().await {
+                    transform_version = s.trim().parse::<i32>().unwrap_or(0);
                 }
             }
             "cek" => {
@@ -268,6 +276,7 @@ async fn receive_streaming(
         business_id,
         encryption_version,
         cek,
+        transform_version,
     ))
 }
 
@@ -304,7 +313,7 @@ async fn upload_file(
     tracing::info!("✅ Token 验证通过，用户: {}", token_info.user_id);
 
     // P0-10：流式接收——数据边收边写存储，任何失败清理半文件，不再全量进内存。
-    let (upload, filename, mime_type, business_id, encryption_version, cek) =
+    let (upload, filename, mime_type, business_id, encryption_version, cek, transform_version) =
         receive_streaming(&state, &token_info, &mut multipart).await?;
 
     let uploader_id = token_info.user_id;
@@ -332,6 +341,9 @@ async fn upload_file(
             business_id,
             encryption_version,
             cek,
+            // 处理版本由客户端在表单里声明；缺省 0 = 未处理。它参与秒传身份，
+            // 所以必须原样带到 blob 上，不能在这里就地假设成 0。
+            transform_version,
         )
         .await?;
 

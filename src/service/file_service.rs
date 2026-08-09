@@ -317,6 +317,8 @@ impl FileService {
         business_id: Option<String>,
         encryption_version: i32,
         cek: Option<String>,
+        // 产出这份字节的客户端处理版本；0 = 原始未处理。
+        transform_version: i32,
     ) -> Result<FileMetadata> {
         let mut writer = upload
             .writer
@@ -326,6 +328,9 @@ impl FileService {
             .close()
             .await
             .map_err(|e| ServerError::Internal(format!("存储写入收尾失败: {}", e)))?;
+
+        // 内容摘要定稿。秒传按它认身份，所以这里必须是**最终字节**的 SHA-256。
+        let content_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
 
         let metadata = FileMetadata {
             file_id: upload.file_id,
@@ -341,14 +346,61 @@ impl FileService {
             uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
             width: None,
             height: None,
-            file_hash: Some(hex::encode(sha2::Digest::finalize(upload.hasher))),
+            file_hash: Some(content_sha256.clone()),
             business_type: Some(business_type),
             business_id,
             encryption_version,
             cek,
         };
         self.file_upload_repo.insert(&metadata).await?;
+
+        // 登记物理对象并把句柄挂上去：下一次有人发同样的内容，就能命中秒传。
+        //
+        // 🔴 这一步失败不能让整次上传失败——字节已经落盘、句柄已经建好，用户的
+        // 文件是好的。丢的只是「下次能不能省一次上传」，那是优化不是正确性。
+        let identity = crate::service::media_blob_service::BlobIdentity {
+            content_sha256: content_sha256.clone(),
+            transform_version,
+        };
+        match crate::service::media_blob_service::register_blob(
+            self.file_upload_repo.pool(),
+            &identity,
+            &metadata.file_path,
+            metadata.storage_source_id as i32,
+            metadata.file_size as i64,
+            &metadata.mime_type,
+            metadata.encryption_version,
+            metadata.cek.as_deref(),
+        )
+        .await
+        {
+            Ok(blob) => {
+                if let Err(e) = self
+                    .file_upload_repo
+                    .set_blob_id(metadata.file_id, blob.blob_id)
+                    .await
+                {
+                    tracing::warn!("关联物理对象失败 file_id={}: {}", metadata.file_id, e);
+                }
+            }
+            Err(e) => tracing::warn!("登记物理对象失败 sha256={}: {}", content_sha256, e),
+        }
+
         Ok(metadata)
+    }
+
+    /// 秒传命中：为当前用户建一个指向同一个物理对象的新句柄。
+    pub async fn create_handle_for_blob(
+        &self,
+        blob: &crate::service::media_blob_service::MediaBlob,
+        uploader_id: u64,
+        filename: &str,
+        file_type: &str,
+        business_type: &str,
+    ) -> Result<u64> {
+        self.file_upload_repo
+            .create_handle_for_blob(blob, uploader_id, filename, file_type, business_type)
+            .await
     }
 
     pub async fn get_file_metadata(&self, file_id: u64) -> Result<Option<FileMetadata>> {
