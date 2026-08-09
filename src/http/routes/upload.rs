@@ -142,9 +142,16 @@ async fn receive_streaming(
                     .file_name()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "file.bin".to_string());
-                let mime = field
-                    .content_type()
-                    .map(|s| s.to_string())
+                // 🔴 MIME 以 **token** 为准，multipart 只作老协议兜底。
+                //
+                // 加密上传的 body 是不透明字节，客户端普遍标 application/octet-stream；
+                // 按它入库会把 image/jpeg、video/mp4 丢成 octet-stream，
+                // 下载响应的 Content-Type 也跟着错。
+                let mime = token_info
+                    .mime_type
+                    .clone()
+                    .filter(|m| !m.trim().is_empty())
+                    .or_else(|| field.content_type().map(|s| s.to_string()))
                     .unwrap_or_else(|| "application/octet-stream".to_string());
                 let mut sink = match state
                     .file_service

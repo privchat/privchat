@@ -515,9 +515,17 @@ impl FileService {
         source: &crate::model::file_upload::FileMetadata,
         uploader_id: u64,
         business_type: &str,
+        claim_key_hash: Option<&str>,
     ) -> Result<u64> {
         self.file_upload_repo
-            .copy_for_user(source, uploader_id, business_type)
+            .copy_for_user(source, uploader_id, business_type, claim_key_hash)
+            .await
+    }
+
+    /// 这个幂等键之前是不是已经成功取用过。
+    pub async fn find_claimed(&self, uploader_id: u64, claim_key_hash: &str) -> Result<Option<u64>> {
+        self.file_upload_repo
+            .find_claimed(uploader_id, claim_key_hash)
             .await
     }
 

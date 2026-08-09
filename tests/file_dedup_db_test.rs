@@ -106,7 +106,7 @@ async fn a_second_sender_gets_their_own_row_over_the_same_file() {
 
     // 取用：给 OTHER 复制一行。
     let mine = repo
-        .copy_for_user(&found, OTHER as u64, "message")
+        .copy_for_user(&found, OTHER as u64, "message", None)
         .await
         .expect("copy");
 
@@ -146,7 +146,7 @@ async fn deleting_one_row_keeps_the_file_while_others_point_at_it() {
 
     let original = seed_original(&repo).await;
     let mine = repo
-        .copy_for_user(&original, OTHER as u64, "message")
+        .copy_for_user(&original, OTHER as u64, "message", None)
         .await
         .expect("copy");
 
@@ -272,7 +272,7 @@ async fn claiming_a_file_that_was_just_deleted_is_refused() {
     let snapshot = original.clone();
     repo.delete(original.file_id).await.expect("delete source");
 
-    let refused = repo.copy_for_user(&snapshot, OTHER as u64, "message").await;
+    let refused = repo.copy_for_user(&snapshot, OTHER as u64, "message", None).await;
     assert!(
         refused.is_err(),
         "源文件已被删除时必须拒绝，不能留下指向不存在文件的记录",
@@ -319,4 +319,71 @@ async fn legacy_hashes_never_match() {
     );
 
     cleanup(&pool).await;
+}
+
+/// 🔴 claim 响应丢失后重试，必须拿回**同一个** file_id。
+///
+/// 这是幂等真正的判据。只做到「并发只有一个成功」是不够的：数据库提交了、响应在
+/// 网络上丢了，客户端重试如果又插一行，用户就多了一份没人用的记录，
+/// 而他手上那条消息引用的还是拿不到的那个 id。
+#[tokio::test]
+async fn replaying_a_claim_returns_the_same_file_id() {
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
+
+    let original = seed_original(&repo).await;
+    let key = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
+
+    let first = repo
+        .copy_for_user(&original, OTHER as u64, "message", Some(key))
+        .await
+        .expect("first claim");
+    // 「响应丢了」= 客户端没收到结果，拿同一个 token 又来一次。
+    let replay = repo
+        .copy_for_user(&original, OTHER as u64, "message", Some(key))
+        .await
+        .expect("replayed claim");
+
+    assert_eq!(first, replay, "同一个幂等键必须还回同一个 file_id");
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM privchat_file_uploads \
+         WHERE uploader_id = $1 AND claim_key_hash = $2",
+    )
+    .bind(OTHER)
+    .bind(key)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("count");
+    assert_eq!(rows, 1, "重试不能多出一行");
+
+    // 查询接口也要认得它——claim 入口靠它在校验 token 之前就短路返回。
+    assert_eq!(
+        repo.find_claimed(OTHER as u64, key).await.expect("lookup"),
+        Some(first),
+    );
+
+    cleanup(&pool).await;
+}
+
+/// 老客户端：报**明文**大小，实际上传的密文多 28 字节，必须仍然成功。
+///
+/// 🔴 我一度把大小核对写成无条件的，那会让新服务端一上线就把所有老客户端的
+/// 正常上传全部拒掉。判据是「带了 sha256 才按新口径核对」，这条锁住它。
+#[test]
+fn a_client_that_declares_no_digest_is_not_size_checked() {
+    // 与 `commit_streaming_upload` 里那个条件同构：两个都有才核对。
+    fn should_check(declared_digest: Option<&str>, declared_size: Option<i64>) -> bool {
+        matches!((declared_digest, declared_size), (Some(_), Some(_)))
+    }
+
+    // 老客户端：报了明文大小，但没有摘要 → 不核对。
+    assert!(
+        !should_check(None, Some(1024)),
+        "老客户端报的是明文大小，密文固定多 28 字节；核对它等于禁止所有老客户端上传",
+    );
+    // 新客户端：两个都按最终 blob 报 → 核对。
+    assert!(should_check(Some("d0"), Some(1052)));
 }

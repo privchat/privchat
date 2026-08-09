@@ -52,6 +52,33 @@ pub async fn claim_existing(
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("sha256 is required".to_string()))?;
 
+    // 🔴 幂等第一步：这个 token 之前成功取用过吗？
+    //
+    // 命中就把当时那个 file_id 原样还回去。数据库提交了但响应丢了的情况，
+    // 客户端重试拿到的是同一份，而不是又多一行——而且这一步在 token 校验之前，
+    // 因为成功过的 token 已经被消费掉了，再去校验只会得到「无效」。
+    let claim_key_hash = {
+        use sha2::Digest as _;
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        hasher.update(token_str.as_bytes());
+        hex::encode(hasher.finalize())
+    };
+    if let Some(existing) = services
+        .file_service
+        .find_claimed(user_id, &claim_key_hash)
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?
+    {
+        if let Some(meta) = services
+            .file_service
+            .get_file_metadata(existing)
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?
+        {
+            return upload_result(&services, &meta);
+        }
+    }
+
     // token 必须有效、属于当前用户、且未被用过（一次性）。
     let token = services
         .upload_token_service
@@ -84,16 +111,6 @@ pub async fn claim_existing(
         ));
     }
 
-    // 🔴 token 一次性：**先消费再插入**。
-    //
-    // 原来的顺序是「插入用户文件行 → 标记 token 已使用」，两个并发 claim 会各插一行。
-    // 消费失败（已被别人用掉）就直接返回，不再往下走。
-    services
-        .upload_token_service
-        .mark_token_used(token_str)
-        .await
-        .map_err(|_| RpcError::validation("上传 token 已被使用".to_string()))?;
-
     // 判重只看摘要：字节相同就是同一份东西。
     let source = services
         .file_service
@@ -106,9 +123,16 @@ pub async fn claim_existing(
     // 他拿到的是自己的 file_id，绑到自己的消息上，与别人那条消息毫无关系。
     let file_id = services
         .file_service
-        .copy_for_user(&source, user_id, &token.business_type)
+        .copy_for_user(&source, user_id, &token.business_type, Some(&claim_key_hash))
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
+
+    // 🔴 消费 token 放在**数据库提交之后**。放前面的话，后续任何失败都会把 token
+    // 烧掉，客户端连重试的机会都没有；而幂等已经由 claim_key_hash 保证，
+    // 这里消费失败也不会多出一行。
+    if let Err(e) = services.upload_token_service.mark_token_used(token_str).await {
+        tracing::warn!("标记上传 token 已使用失败（幂等由 claim_key_hash 保证）: {e}");
+    }
 
     tracing::info!(
         "⚡ 秒传取用: user={} 复用 path={} → file_id={}",
@@ -117,21 +141,39 @@ pub async fn claim_existing(
         file_id
     );
 
-    // 🔴 形状必须与 `/files/upload` 的 `UploadResponse` **逐字段一致**。
-    // 客户端两条路径拿到的应该是同一种东西——差一个字段，调用方就得写两套解析，
-    // 而那两套迟早会分叉。
+    upload_result(&services, &source_after_claim(&source, file_id))
+}
+
+/// 秒传取用的结果，形状与 `/files/upload` 的 `UploadResponse` **逐字段一致**。
+///
+/// 客户端两条路径拿到的应该是同一种东西——差一个字段，调用方就得写两套解析，
+/// 而那两套迟早会分叉。
+fn upload_result(
+    services: &RpcServiceContext,
+    meta: &crate::model::file_upload::FileMetadata,
+) -> RpcResult<Value> {
     Ok(json!({
-        "file_id": file_id,
+        "file_id": meta.file_id,
         "file_url": services
             .file_service
-            .build_access_url(&source.file_path, source.storage_source_id),
+            .build_access_url(&meta.file_path, meta.storage_source_id),
         "thumbnail_url": serde_json::Value::Null,
-        "file_size": source.file_size,
-        "original_size": source.original_size,
-        "width": source.width,
-        "height": source.height,
-        "mime_type": source.mime_type,
+        "file_size": meta.file_size,
+        "original_size": meta.original_size,
+        "width": meta.width,
+        "height": meta.height,
+        "mime_type": meta.mime_type,
         "uploaded_at": chrono::Utc::now().timestamp_millis(),
-        "storage_source_id": source.storage_source_id,
+        "storage_source_id": meta.storage_source_id,
     }))
+}
+
+/// 取用产生的那一行：内容字段沿用源行，`file_id` 换成自己的。
+fn source_after_claim(
+    source: &crate::model::file_upload::FileMetadata,
+    file_id: u64,
+) -> crate::model::file_upload::FileMetadata {
+    let mut meta = source.clone();
+    meta.file_id = file_id;
+    meta
 }
