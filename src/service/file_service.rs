@@ -332,7 +332,69 @@ impl FileService {
             .await
             .map_err(|e| ServerError::Internal(format!("存储写入收尾失败: {}", e)))?;
 
+        // 🔴 权威摘要由**服务端**计算，对象是**落盘的那份字节**。
+        //
+        // 客户端在 prepare 报的那个值只是预检用的，不能直接写库——那等于让调用方
+        // 自己声明「我这份内容叫什么」，之后别人算出同一个名字就会拿到他的东西。
+        // 这里重新算一遍，并与 token 里签下的值比对，对不上就整次拒绝。
+        //
+        // 加密上传时落盘的是密文，所以这是**密文摘要**。要让它能命中秒传，
+        // 同一份内容必须产出同一份密文（CEK/nonce 由内容派生）——这是客户端
+        // 那一侧的约定；服务端这边只认「我存了什么，我就按什么算」。
         let stored_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
+
+        if let Some(declared) = declared_content_sha256.as_deref() {
+            if !declared.eq_ignore_ascii_case(&stored_sha256) {
+                // 声明与实际不符：删掉刚写进去的对象，别留一份没人认领的字节。
+                if let Ok(op) = self.operator_for_source(upload.source_id).await {
+                    let _ = op.delete(&upload.file_path).await;
+                }
+                return Err(ServerError::Validation(
+                    "上传内容与 prepare 阶段声明的摘要不一致".to_string(),
+                ));
+            }
+        }
+
+        // 并发首传收敛：两个人同时传同一份内容，两边预检都没命中，于是各写了一份
+        // 物理文件。这里在锁内再查一次——已经有人先落了就删掉自己这份，
+        // 指向已有的那个 path。不做这一步，「物理文件只存一份」在并发下就是空话。
+        let mut tx = self
+            .file_upload_repo
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启上传收敛事务失败: {e}")))?;
+        // 同一份内容的所有首传串行到这一把锁上。锁的粒度是内容，不是全表。
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&stored_sha256)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("获取内容锁失败: {e}")))?;
+
+        let existing: Option<(String, i32, i32, Option<String>)> = sqlx::query_as(
+            "SELECT file_path, storage_source_id, encryption_version, cek \
+             FROM privchat_file_uploads \
+             WHERE file_hash = $1 AND file_type = $2 AND file_size = $3 \
+             ORDER BY file_id LIMIT 1",
+        )
+        .bind(&stored_sha256)
+        .bind(upload.file_type.as_str())
+        .bind(upload.written as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {e}")))?;
+
+        let (file_path, source_id, enc_version, stored_cek, duplicate) = match existing {
+            // 已经有人先落了同样的内容：用他那份物理文件，删掉我刚写的。
+            Some((path, src, enc, existing_cek)) => (path, src, enc, existing_cek, true),
+            None => (
+                upload.file_path.clone(),
+                upload.source_id as i32,
+                encryption_version,
+                cek,
+                false,
+            ),
+        };
 
         let metadata = FileMetadata {
             file_id: upload.file_id,
@@ -341,32 +403,85 @@ impl FileService {
             original_size: None,
             file_type: upload.file_type.clone(),
             mime_type,
-            file_path: upload.file_path.clone(),
-            storage_source_id: upload.source_id,
+            file_path: file_path.clone(),
+            storage_source_id: source_id as u32,
             uploader_id,
             uploader_ip,
             uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
             width: None,
             height: None,
-            // 🔴 这里记的是**客户端声明的最终明文内容**摘要，秒传按它认身份。
-            //
-            // 不能记服务端对收到字节求的那个摘要：加密上传时那是密文摘要，
-            // 随机 nonce 决定它每次都不同，同一份文件永远对不上。
-            // 客户端没声明（老客户端）就退回落盘摘要——它不会等于任何 64 位
-            // 十六进制内容摘要，因此只是命不中，不会误命中。
-            file_hash: Some(
-                declared_content_sha256
-                    .clone()
-                    .unwrap_or_else(|| stored_sha256.clone()),
-            ),
+            file_hash: Some(stored_sha256.clone()),
             business_type: Some(business_type),
             business_id,
-            encryption_version,
-            cek,
+            encryption_version: enc_version,
+            cek: stored_cek,
         };
-        self.file_upload_repo.insert(&metadata).await?;
+        self.insert_within(&mut tx, &metadata).await?;
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交上传收敛事务失败: {e}")))?;
+
+        if duplicate && upload.file_path != file_path {
+            // 事务已提交，记录指向的是别人那份物理文件；我这份多余的对象可以删了。
+            // 删失败只记日志：留一个没人指向的孤儿对象，交给 GC。
+            if let Ok(op) = self.operator_for_source(upload.source_id).await {
+                if let Err(e) = op.delete(&upload.file_path).await {
+                    tracing::warn!("删除重复上传的物理文件失败 path={}: {}", upload.file_path, e);
+                }
+            }
+            tracing::info!("⚡ 并发首传收敛: file_id={} 指向已有 path={}", upload.file_id, file_path);
+        }
 
         Ok(metadata)
+    }
+
+    /// 按存储源取 Operator。
+    async fn operator_for_source(&self, source_id: u32) -> Result<Operator> {
+        self.operators
+            .read()
+            .await
+            .get(&source_id)
+            .cloned()
+            .ok_or_else(|| ServerError::Internal(format!("未找到存储源 id={source_id} 的 Operator")))
+    }
+
+    /// 在给定事务里插入上传记录。收敛判定与插入必须同事务，否则锁白加。
+    async fn insert_within(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        meta: &FileMetadata,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_file_uploads (
+                file_id, original_filename, file_size, file_type, mime_type,
+                file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at,
+                width, height, file_hash, business_type, business_id,
+                encryption_version, cek
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            "#,
+        )
+        .bind(meta.file_id as i64)
+        .bind(&meta.original_filename)
+        .bind(meta.file_size as i64)
+        .bind(meta.file_type.as_str())
+        .bind(&meta.mime_type)
+        .bind(&meta.file_path)
+        .bind(meta.storage_source_id as i32)
+        .bind(meta.uploader_id as i64)
+        .bind(&meta.uploader_ip)
+        .bind(meta.uploaded_at as i64)
+        .bind(meta.width.map(|v| v as i32))
+        .bind(meta.height.map(|v| v as i32))
+        .bind(&meta.file_hash)
+        .bind(&meta.business_type)
+        .bind(&meta.business_id)
+        .bind(meta.encryption_version)
+        .bind(&meta.cek)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("插入上传记录失败: {e}")))?;
+        Ok(())
     }
 
     /// 秒传探测：这份内容在不在（不写任何东西）。
@@ -490,18 +605,7 @@ impl FileService {
 
         // 最后一行没了才删物理文件。删失败只记日志：数据库已经提交，
         // 再回滚出一行"指向不存在文件"的记录更糟；留下的孤儿对象由 GC 收。
-        let op = self
-            .operators
-            .read()
-            .await
-            .get(&meta.storage_source_id)
-            .cloned()
-            .ok_or_else(|| {
-                ServerError::Internal(format!(
-                    "未找到存储源 id={} 的 Operator",
-                    meta.storage_source_id
-                ))
-            })?;
+        let op = self.operator_for_source(meta.storage_source_id).await?;
         if let Err(e) = op.delete(&meta.file_path).await {
             tracing::warn!("删除物理文件失败（留待 GC）path={}: {}", meta.file_path, e);
         }
