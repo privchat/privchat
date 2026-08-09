@@ -15,7 +15,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod forward;
 pub mod history;
 pub mod pin;
 pub mod reaction;
@@ -43,18 +42,18 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    // 单条转发路由（MEDIA_REFERENCE_AND_FORWARD_SPEC §6 / §15.1）：**不注册**。
+    // 单条转发**不再是独立路由**（MEDIA_REFERENCE_AND_FORWARD_SPEC §6）。
     //
-    // 🔴 我曾以「五条前提已满足」为由注册了它，但其中三条只做到表面：
-    //   - 「单事务」只在事务内锁了源消息，成员/禁言/拉黑/forbid_forward 仍在事务外
-    //   - 「来源投影」只进了 legacy JSON，canonical FlatBuffers 解码处写死 None，
-    //     而实时投递优先走 canonical —— 查 commit_log 只证明库里有字段
-    //   - 「批量成员判定」是个包了一层的循环，复杂度没变
-    // 外加：幂等在可变校验之后、缺请求指纹；黑名单排在好友判定之后（好友仍可拉黑）；
-    // 转发把 typed 错误码压成了 PermissionDenied。
+    // 转发就是「按源消息的内容再发一条」，走的应该是现成的发送链路：
+    // `sync/submit` 已经是 RPC，已经带幂等命名空间、发送权限、投递、回执、
+    // difference 与多设备同步。再开一条 `message/forward` 等于把这些全部重写一遍——
+    // 之前列出的那一长串启用前提（真单事务、带指纹的幂等、canonical 投影、
+    // 单 SQL 成员判定、typed 错误码），逐条都是「把发送链路已有的东西再造一次」。
     //
-    // 重新注册的前提见 spec §15.1，逐条都要有对应的行为测试，而不是手测一两条。
-
+    // 收口形态：`sync/submit` 的一个 command，payload 只带
+    // `source_channel_id + source_message_id`；服务端校验源可读、目标可发，
+    // 复制正文与媒体引用，重新生成 id/pts/时间/发送者。
+    // 🔴 客户端永远不自己报 `file_id`——那等于可以引用别人的附件。
     // 注册群消息置顶 / 取消置顶路由（P1）
     GLOBAL_RPC_ROUTER
         .register(routes::message::PIN, {
@@ -78,6 +77,6 @@ pub async fn register_routes(services: RpcServiceContext) {
         .await;
 
     tracing::debug!(
-        "📋 Message 系统路由注册完成 (history, status, reaction, revoke, pin, pin/list；forward 未注册)"
+        "📋 Message 系统路由注册完成 (history, status, reaction, revoke, pin, pin/list)"
     );
 }
