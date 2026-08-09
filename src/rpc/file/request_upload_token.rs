@@ -87,7 +87,7 @@ pub async fn request_upload_token(
         }
         already_exists = services
             .file_service
-            .find_by_content(&normalized, file_type.as_str(), file_size)
+            .find_by_content(&normalized)
             .await
             .map_err(|e| RpcError::internal(e.to_string()))?
             .is_some();

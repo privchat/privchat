@@ -114,6 +114,8 @@ pub async fn get_file_url(
         original_filename: file_meta.original_filename,
         encryption_version: url.encryption_version,
         cek: url.cek,
+        // 转发同一份附件时，客户端拿它直接走 prepare + claim。
+        sha256: file_meta.file_hash.clone(),
     };
 
     Ok(serde_json::to_value(response)

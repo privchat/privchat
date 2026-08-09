@@ -84,14 +84,20 @@ pub async fn claim_existing(
         ));
     }
 
-    let declared_size = token
-        .declared_size
-        .ok_or_else(|| RpcError::validation("该 token 未绑定文件大小".to_string()))?;
+    // 🔴 token 一次性：**先消费再插入**。
+    //
+    // 原来的顺序是「插入用户文件行 → 标记 token 已使用」，两个并发 claim 会各插一行。
+    // 消费失败（已被别人用掉）就直接返回，不再往下走。
+    services
+        .upload_token_service
+        .mark_token_used(token_str)
+        .await
+        .map_err(|_| RpcError::validation("上传 token 已被使用".to_string()))?;
 
-    // 身份 = 内容摘要 + 类型 + 大小，全部取自 token。
+    // 判重只看摘要：字节相同就是同一份东西。
     let source = services
         .file_service
-        .find_by_content(&normalized, token.file_type.as_str(), declared_size)
+        .find_by_content(&normalized)
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?
         .ok_or_else(|| RpcError::not_found("服务端没有这份内容，请正常上传".to_string()))?;
@@ -101,13 +107,6 @@ pub async fn claim_existing(
     let file_id = services
         .file_service
         .copy_for_user(&source, user_id, &token.business_type)
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
-
-    // token 一次性：换过一次就作废，重试拿不到第二份句柄。
-    services
-        .upload_token_service
-        .mark_token_used(token_str)
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
 

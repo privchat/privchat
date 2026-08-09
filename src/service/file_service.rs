@@ -319,9 +319,11 @@ impl FileService {
         cek: Option<String>,
         // 产出这份字节的客户端处理版本；0 = 原始未处理。
         transform_version: i32,
-        // 客户端在 prepare 声明并签进 token 的**明文最终内容**摘要。
+        // 客户端在 prepare 声明并签进 token 的**最终上传 blob** 摘要。
         // `None` = 老客户端没报，这次上传不参与秒传。
         declared_content_sha256: Option<String>,
+        // token 里签下的精确字节数；`None` = 老客户端没报。
+        declared_size: Option<i64>,
     ) -> Result<FileMetadata> {
         let mut writer = upload
             .writer
@@ -346,6 +348,20 @@ impl FileService {
         // 声明「我这份字节叫什么」，之后别人算出同一个名字就会拿到他的东西。
         let stored_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
 
+        // 声明的大小必须与实际收到的字节数一致。判重已经只看摘要，但入库的
+        // `file_size` 得是真的——它会被客户端拿去显示、拿去做进度。
+        if let Some(declared_size) = declared_size {
+            if declared_size != upload.written as i64 {
+                if let Ok(op) = self.operator_for_source(upload.source_id).await {
+                    let _ = op.delete(&upload.file_path).await;
+                }
+                return Err(ServerError::Validation(format!(
+                    "上传字节数与 prepare 阶段声明的不一致：声明 {declared_size}，实际 {}",
+                    upload.written
+                )));
+            }
+        }
+
         if let Some(declared) = declared_content_sha256.as_deref() {
             if !declared.eq_ignore_ascii_case(&stored_sha256) {
                 // 声明与实际不符：删掉刚写进去的对象，别留一份没人认领的字节。
@@ -369,8 +385,6 @@ impl FileService {
             &mut tx,
             &UploadPlacement {
                 stored_sha256: stored_sha256.clone(),
-                file_type: upload.file_type.as_str().to_string(),
-                byte_size: upload.written as i64,
                 encryption_version,
                 my_path: upload.file_path.clone(),
                 my_source_id: upload.source_id as i32,
@@ -478,12 +492,8 @@ impl FileService {
     pub async fn find_by_content(
         &self,
         sha256: &str,
-        file_type: &str,
-        file_size: i64,
     ) -> Result<Option<crate::model::file_upload::FileMetadata>> {
-        self.file_upload_repo
-            .find_by_content(sha256, file_type, file_size)
-            .await
+        self.file_upload_repo.find_by_content(sha256).await
     }
 
     /// 秒传取用：照着已有那行给当前用户插一条新记录，物理文件不动。
@@ -862,9 +872,6 @@ mod authz_tests {
 pub struct UploadPlacement {
     /// 服务端对**实际收到并落盘的字节**算出的 SHA-256。
     pub stored_sha256: String,
-    pub file_type: String,
-    /// 落盘字节数（加密上传时即密文长度）。
-    pub byte_size: i64,
     pub encryption_version: i32,
     pub my_path: String,
     pub my_source_id: i32,
@@ -906,18 +913,14 @@ pub async fn converge_upload(
         .await
         .map_err(|e| ServerError::Database(format!("获取内容锁失败: {e}")))?;
 
-    // 加密版本进入匹配条件：明文与密文即便长度凑巧相同也绝不能互相复用。
+    // 判重只看 hash：摘要相同即字节相同，大小自然相同，也不存在
+    // 「明文和密文互相复用」——字节都一样了，就是同一份东西。
     let existing: Option<(String, i32, i32, Option<String>)> = sqlx::query_as(
         "SELECT file_path, storage_source_id, encryption_version, cek \
          FROM privchat_file_uploads \
-         WHERE file_hash = $1 AND file_type = $2 AND file_size = $3 \
-           AND encryption_version = $4 \
-         ORDER BY file_id LIMIT 1",
+         WHERE file_hash = $1 ORDER BY file_id LIMIT 1",
     )
     .bind(&input.stored_sha256)
-    .bind(&input.file_type)
-    .bind(input.byte_size)
-    .bind(input.encryption_version)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {e}")))?;
