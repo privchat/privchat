@@ -207,59 +207,32 @@ async fn handle_submit_rpc(
     // 获取当前用户ID
     let sender_id = crate::rpc::get_current_user_id(&ctx)?;
 
-    // P1-16 安全补齐：sync/submit 是消息主路径之一，此前没有任何成员/禁言校验，
-    // 被禁言用户（乃至非成员）可以从这条路径绕过 wire SendMessageHandler 的全部
-    // 检查。语义与 wire 路径对齐：非成员拒绝；个人禁言拒绝（到期放行）；
-    // 群全员禁言以 DB(privchat_groups.all_muted) 为真源，群主/管理员豁免。
+    // 发送权限：与 wire 发送路径**共用同一个** `authorize_send_to_channel`。
+    //
+    // 🔴 这里原本是手抄的一份子集（成员 + 个人禁言 + 全员禁言），缺了角色权限、
+    // 群 `allow_member_post`、**拉黑**、好友与隐私。也就是说被拉黑的人从 wire
+    // 发不出去，换 `sync/submit` 就发得出去——两条主路径对同一个问题给不同答案时，
+    // 攻击者只会走松的那条。策略只能有一份。
     {
         let channel = services
             .channel_service
             .get_channel_opt(channel_id)
             .await
             .ok_or_else(|| RpcError::validation(format!("频道不存在: {}", channel_id)))?;
-        // 成员权威判定：Direct 认 direct_user1/2（脏数据 participants 缺行不误拒），
-        // 群/房间认 members（CHANNEL_SPEC / Channel::is_member）。
-        if !channel.is_member(sender_id) {
-            return Err(RpcError::forbidden(format!(
-                "用户 {} 不是频道 {} 成员",
-                sender_id, channel_id
-            )));
-        }
-        let now = chrono::Utc::now();
-        // 禁言/全员禁言仅群会话有语义（Direct 无禁言，成员身份已由 is_member 通过）。
-        // 群成员 participants 完整，members.get 通常命中；None（异常）时不判禁言、保守
-        // 放行——用 if let 包裹，避免误退整个 handler。
-        if channel.channel_type == crate::model::channel::ChannelType::Group {
-            if let Some(member) = channel.members.get(&sender_id) {
-                if crate::model::channel::mute_is_active(member.is_muted, member.mute_until, now) {
-                    return Err(RpcError::forbidden(
-                        crate::model::channel::mute_reject_message(member.mute_until, now),
-                    ));
-                }
-                let is_privileged = matches!(
-                    member.role,
-                    crate::model::channel::MemberRole::Owner
-                        | crate::model::channel::MemberRole::Admin
-                );
-                if !is_privileged {
-                    // 群主/管理员不受全员禁言限制
-                    let all_muted = if let Some(gid) = channel.group_id {
-                        services
-                            .channel_service
-                            .get_group_policy(gid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|p| p.all_muted)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
-                    if all_muted {
-                        return Err(RpcError::forbidden("群组全员禁言中".to_string()));
-                    }
-                }
-            }
+
+        let deps = crate::service::send_authorization::SendAuthorizationDeps {
+            channel_service: services.channel_service.clone(),
+            friend_service: services.friend_service.clone(),
+            blacklist_service: services.blacklist_service.clone(),
+            privacy_service: services.privacy_service.clone(),
+        };
+        if let Err(refusal) =
+            crate::service::send_authorization::authorize_send_to_channel(&deps, &channel, sender_id)
+                .await
+        {
+            // 保留 typed 错误码：客户端据此区分「被禁言」「被拉黑」「稍后重试」，
+            // 压成一个 forbidden 会让这些提示全变成同一句话。
+            return Err(RpcError::from_code(refusal.error_code(), refusal.message()));
         }
     }
 
