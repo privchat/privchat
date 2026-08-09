@@ -332,15 +332,18 @@ impl FileService {
             .await
             .map_err(|e| ServerError::Internal(format!("存储写入收尾失败: {}", e)))?;
 
-        // 🔴 权威摘要由**服务端**计算，对象是**落盘的那份字节**。
+        // 🔴 权威摘要由**服务端**计算，对象是**实际收到并落盘的那串字节**。
         //
-        // 客户端在 prepare 报的那个值只是预检用的，不能直接写库——那等于让调用方
-        // 自己声明「我这份内容叫什么」，之后别人算出同一个名字就会拿到他的东西。
-        // 这里重新算一遍，并与 token 里签下的值比对，对不上就整次拒绝。
+        // 服务端不理解加密，也不需要理解：去重的单位就是「最终上传的字节」。
+        // 字节完全相同才复用，因此——
+        //   · 明文文件与加密文件不会互相命中；
+        //   · 同一明文用不同随机 CEK/nonce 加密两次，是**两个**物理文件，这是预期行为。
         //
-        // 加密上传时落盘的是密文，所以这是**密文摘要**。要让它能命中秒传，
-        // 同一份内容必须产出同一份密文（CEK/nonce 由内容派生）——这是客户端
-        // 那一侧的约定；服务端这边只认「我存了什么，我就按什么算」。
+        // 客户端要拿到秒传，就必须**保留并重传当初参与哈希的那个 blob**：
+        // 预检之后重新加密一次，字节就变了，本来也不该命中。
+        //
+        // 客户端在 prepare 报的值只用于预检，不能直接写库——那等于让调用方自己
+        // 声明「我这份字节叫什么」，之后别人算出同一个名字就会拿到他的东西。
         let stored_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
 
         if let Some(declared) = declared_content_sha256.as_deref() {
@@ -355,46 +358,33 @@ impl FileService {
             }
         }
 
-        // 并发首传收敛：两个人同时传同一份内容，两边预检都没命中，于是各写了一份
-        // 物理文件。这里在锁内再查一次——已经有人先落了就删掉自己这份，
-        // 指向已有的那个 path。不做这一步，「物理文件只存一份」在并发下就是空话。
+        // 并发首传收敛（见 `converge_upload`）。
         let mut tx = self
             .file_upload_repo
             .pool()
             .begin()
             .await
             .map_err(|e| ServerError::Database(format!("开启上传收敛事务失败: {e}")))?;
-        // 同一份内容的所有首传串行到这一把锁上。锁的粒度是内容，不是全表。
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(&stored_sha256)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ServerError::Database(format!("获取内容锁失败: {e}")))?;
-
-        let existing: Option<(String, i32, i32, Option<String>)> = sqlx::query_as(
-            "SELECT file_path, storage_source_id, encryption_version, cek \
-             FROM privchat_file_uploads \
-             WHERE file_hash = $1 AND file_type = $2 AND file_size = $3 \
-             ORDER BY file_id LIMIT 1",
-        )
-        .bind(&stored_sha256)
-        .bind(upload.file_type.as_str())
-        .bind(upload.written as i64)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {e}")))?;
-
-        let (file_path, source_id, enc_version, stored_cek, duplicate) = match existing {
-            // 已经有人先落了同样的内容：用他那份物理文件，删掉我刚写的。
-            Some((path, src, enc, existing_cek)) => (path, src, enc, existing_cek, true),
-            None => (
-                upload.file_path.clone(),
-                upload.source_id as i32,
+        let placement = converge_upload(
+            &mut tx,
+            &UploadPlacement {
+                stored_sha256: stored_sha256.clone(),
+                file_type: upload.file_type.as_str().to_string(),
+                byte_size: upload.written as i64,
                 encryption_version,
-                cek,
-                false,
-            ),
-        };
+                my_path: upload.file_path.clone(),
+                my_source_id: upload.source_id as i32,
+                my_cek: cek,
+            },
+        )
+        .await?;
+        let (file_path, source_id, enc_version, stored_cek, duplicate) = (
+            placement.file_path.clone(),
+            placement.storage_source_id,
+            placement.encryption_version,
+            placement.cek.clone(),
+            placement.duplicate,
+        );
 
         let metadata = FileMetadata {
             file_id: upload.file_id,
@@ -575,9 +565,21 @@ impl FileService {
             .await
             .map_err(|e| ServerError::Database(format!("开启删除事务失败: {e}")))?;
 
+        // 🔴 `COUNT(*) ... FOR UPDATE` **不构成任何锁**：聚合结果没有行可锁，
+        // Postgres 直接把它当普通查询。上一版写成那样，等于两个并发删除都读到
+        // 「还有别人」（各自看见对方的行），物理文件永远没人删；或者都读到
+        // 「没人了」，双双去删同一个对象。
+        //
+        // 用按 file_path 的 advisory 锁把同一个物理文件上的删除与秒传取用串起来。
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&meta.file_path)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("获取物理文件锁失败: {e}")))?;
+
         let others: (i64,) = sqlx::query_as(
             "SELECT count(*) FROM privchat_file_uploads \
-             WHERE file_path = $1 AND file_id <> $2 FOR UPDATE",
+             WHERE file_path = $1 AND file_id <> $2",
         )
         .bind(&meta.file_path)
         .bind(file_id as i64)
@@ -853,4 +855,87 @@ mod authz_tests {
             "d01f1b584be7a9e4acbaac536abfa9f00d9d33fb62a5ce76c54a25ee096908bd",
         );
     }
+}
+
+/// 一次上传要落到哪个物理文件上的输入。
+#[derive(Debug, Clone)]
+pub struct UploadPlacement {
+    /// 服务端对**实际收到并落盘的字节**算出的 SHA-256。
+    pub stored_sha256: String,
+    pub file_type: String,
+    /// 落盘字节数（加密上传时即密文长度）。
+    pub byte_size: i64,
+    pub encryption_version: i32,
+    pub my_path: String,
+    pub my_source_id: i32,
+    pub my_cek: Option<String>,
+}
+
+/// 收敛结果：这条记录最终指向哪个物理文件。
+#[derive(Debug, Clone)]
+pub struct ResolvedPlacement {
+    pub file_path: String,
+    pub storage_source_id: i32,
+    pub encryption_version: i32,
+    pub cek: Option<String>,
+    /// true = 命中了别人先落的那份，自己刚写的对象可以删。
+    pub duplicate: bool,
+}
+
+/// 并发首传收敛：同一串字节只保留一份物理文件。
+///
+/// 两个人同时上传同样的字节，两边预检都没命中，于是各写了一份对象。这里在
+/// **内容锁**里再查一次：已经有人先落了就指向他那份，自己那份可以删。
+/// 少了这一步，「物理文件只存一份」恰好在并发时不成立——而并发正是它最该成立的时候。
+///
+/// 🔴 去重的单位是**最终上传的字节**，服务端不理解加密：明文与密文不会互相命中，
+/// 同一明文用不同随机 CEK/nonce 加密两次也是两个物理文件——这是预期行为。
+/// 客户端要拿到秒传，就得保留并重传当初参与哈希的那个 blob。
+///
+/// 生产与测试**调用的是同一个函数**。此前测试把这段 SQL 抄了一份，
+/// 那样只能证明抄件自洽：改了生产的判据，先红的是测试，而测试证明不了产品。
+pub async fn converge_upload(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    input: &UploadPlacement,
+) -> Result<ResolvedPlacement> {
+    // 同一串字节的所有首传串行到这一把锁上。粒度是内容，不是全表。
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&input.stored_sha256)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("获取内容锁失败: {e}")))?;
+
+    // 加密版本进入匹配条件：明文与密文即便长度凑巧相同也绝不能互相复用。
+    let existing: Option<(String, i32, i32, Option<String>)> = sqlx::query_as(
+        "SELECT file_path, storage_source_id, encryption_version, cek \
+         FROM privchat_file_uploads \
+         WHERE file_hash = $1 AND file_type = $2 AND file_size = $3 \
+           AND encryption_version = $4 \
+         ORDER BY file_id LIMIT 1",
+    )
+    .bind(&input.stored_sha256)
+    .bind(&input.file_type)
+    .bind(input.byte_size)
+    .bind(input.encryption_version)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {e}")))?;
+
+    Ok(match existing {
+        Some((path, src, enc, existing_cek)) => ResolvedPlacement {
+            duplicate: path != input.my_path,
+            file_path: path,
+            storage_source_id: src,
+            encryption_version: enc,
+            cek: existing_cek,
+        },
+        None => ResolvedPlacement {
+            file_path: input.my_path.clone(),
+            storage_source_id: input.my_source_id,
+            encryption_version: input.encryption_version,
+            cek: input.my_cek.clone(),
+            duplicate: false,
+        },
+    })
 }
