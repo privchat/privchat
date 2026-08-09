@@ -44,14 +44,16 @@ pub struct MediaBlob {
     pub cek: Option<String>,
 }
 
-/// 秒传判定的身份：**内容摘要 + 处理版本**。
+/// 秒传判定的身份：**内容摘要**，仅此而已。
 ///
-/// 🔴 处理版本必须参与。客户端换了压缩算法，产出的字节就是另一份内容；
-/// 不区分的话，新版本会命中旧对象，用户看到的是旧编码的画质。
+/// 这里的「内容」是**压缩/转码之后、加密之前的明文最终字节**。加密用随机 nonce，
+/// 同一份文件每次密文都不同，所以密文摘要不能当身份——那是上一版命中率恒为 0 的原因。
+///
+/// `transform_version` 只是元数据，**不参与身份**：字节不同摘要自然不同，
+/// 字节相同就该复用。因为压缩器版本号不同而把同样的字节存两份，是白占存储。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobIdentity {
     pub content_sha256: String,
-    pub transform_version: i32,
 }
 
 impl BlobIdentity {
@@ -59,7 +61,7 @@ impl BlobIdentity {
     ///
     /// 校验放在入口，是因为脏摘要不会立刻报错——它只会让秒传永远不命中，
     /// 表现成「怎么每次都重传」，很难往回查。
-    pub fn parse(sha256: &str, transform_version: i32) -> Result<Self> {
+    pub fn parse(sha256: &str) -> Result<Self> {
         let normalized = sha256.trim().to_ascii_lowercase();
         if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(ServerError::Validation(
@@ -68,7 +70,6 @@ impl BlobIdentity {
         }
         Ok(Self {
             content_sha256: normalized,
-            transform_version,
         })
     }
 }
@@ -81,6 +82,9 @@ impl BlobIdentity {
 pub async fn register_blob(
     pool: &PgPool,
     identity: &BlobIdentity,
+    // 服务端对**实际落盘字节**求的摘要（完整性用，不参与身份）。
+    stored_sha256: &str,
+    transform_version: i32,
     storage_path: &str,
     storage_source_id: i32,
     file_size: i64,
@@ -91,17 +95,18 @@ pub async fn register_blob(
     let row: (i64, String, i32, i64, String, i32, Option<String>) = sqlx::query_as(
         r#"
         INSERT INTO privchat_media_blobs
-            (content_sha256, transform_version, storage_path, storage_source_id,
-             file_size, mime_type, encryption_version, cek)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (content_sha256, transform_version) DO UPDATE
+            (content_sha256, stored_sha256, transform_version, storage_path,
+             storage_source_id, file_size, mime_type, encryption_version, cek)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (content_sha256) DO UPDATE
             SET content_sha256 = EXCLUDED.content_sha256
         RETURNING blob_id, storage_path, storage_source_id, file_size, mime_type,
                   encryption_version, cek
         "#,
     )
     .bind(&identity.content_sha256)
-    .bind(identity.transform_version)
+    .bind(stored_sha256)
+    .bind(transform_version)
     .bind(storage_path)
     .bind(storage_source_id)
     .bind(file_size)
@@ -130,11 +135,10 @@ pub async fn find_blob(pool: &PgPool, identity: &BlobIdentity) -> Result<Option<
         SELECT blob_id, storage_path, storage_source_id, file_size, mime_type,
                encryption_version, cek
         FROM privchat_media_blobs
-        WHERE content_sha256 = $1 AND transform_version = $2
+        WHERE content_sha256 = $1
         "#,
     )
     .bind(&identity.content_sha256)
-    .bind(identity.transform_version)
     .fetch_optional(pool)
     .await
     .map_err(|e| ServerError::Database(format!("查询物理对象失败: {e}")))?;
@@ -217,26 +221,23 @@ mod tests {
     fn a_digest_must_be_sixty_four_hex_characters() {
         assert!(BlobIdentity::parse(
             "d01f1b584be7a9e4acbaac536abfa9f00d9d33fb62a5ce76c54a25ee096908bd",
-            0
         )
         .is_ok());
 
         // 旧实现写的是 `hash:<u64>`；放进来只会让秒传永远不命中，必须当场拒绝。
-        assert!(BlobIdentity::parse("hash:12345678901234567890", 0).is_err());
-        assert!(BlobIdentity::parse("abc", 0).is_err());
-        assert!(BlobIdentity::parse(&"z".repeat(64), 0).is_err());
+        assert!(BlobIdentity::parse("hash:12345678901234567890").is_err());
+        assert!(BlobIdentity::parse("abc").is_err());
+        assert!(BlobIdentity::parse(&"z".repeat(64)).is_err());
     }
 
     #[test]
     fn digests_are_compared_case_insensitively() {
         let upper = BlobIdentity::parse(
             "D01F1B584BE7A9E4ACBAAC536ABFA9F00D9D33FB62A5CE76C54A25EE096908BD",
-            0,
         )
         .expect("uppercase hex is still hex");
         let lower = BlobIdentity::parse(
             "d01f1b584be7a9e4acbaac536abfa9f00d9d33fb62a5ce76c54a25ee096908bd",
-            0,
         )
         .expect("lowercase");
         assert_eq!(
@@ -245,19 +246,21 @@ mod tests {
         );
     }
 
-    /// 处理版本参与身份判定。
+    /// 处理版本**不**参与身份。
+    ///
+    /// 我上一版把它放进唯一键，理由是「换了压缩算法不能命中旧对象」——那条推理错了：
+    /// 换算法产出的字节不同，摘要自然就不同，本来就命不中；而字节相同就该复用。
+    /// 放进键里只会让同样的字节因为版本号不同被存两份。
     #[test]
-    fn a_different_transform_version_is_a_different_object() {
-        let v0 = BlobIdentity::parse(
+    fn the_transform_version_is_not_part_of_the_identity() {
+        let a = BlobIdentity::parse(
             "d01f1b584be7a9e4acbaac536abfa9f00d9d33fb62a5ce76c54a25ee096908bd",
-            0,
         )
         .unwrap();
-        let v1 = BlobIdentity::parse(
+        let b = BlobIdentity::parse(
             "d01f1b584be7a9e4acbaac536abfa9f00d9d33fb62a5ce76c54a25ee096908bd",
-            1,
         )
         .unwrap();
-        assert_ne!(v0, v1, "换了压缩算法就是另一份字节，不能命中旧对象");
+        assert_eq!(a, b, "同样的字节就是同一个对象，与谁产出的无关");
     }
 }

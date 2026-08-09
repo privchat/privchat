@@ -18,11 +18,13 @@
 //! 文件相关 RPC 接口
 
 pub mod get_url;
+pub mod claim_existing;
 pub mod request_upload_token;
 pub mod upload_callback;
 pub mod validate_token;
 
 pub use get_url::get_file_url;
+pub use claim_existing::claim_existing;
 pub use request_upload_token::request_upload_token;
 pub use upload_callback::upload_callback;
 pub use validate_token::validate_upload_token;
@@ -38,6 +40,15 @@ pub async fn register_routes(services: RpcServiceContext) {
         .register("file/request_upload_token", move |params, ctx| {
             let services = services1.clone();
             Box::pin(async move { request_upload_token(services, params, ctx).await })
+        })
+        .await;
+
+    // 秒传命中后取得所有权：与探测分开的独立入口（见 claim_existing 模块说明）。
+    let services_claim = services.clone();
+    GLOBAL_RPC_ROUTER
+        .register("file/claim_existing", move |params, ctx| {
+            let services = services_claim.clone();
+            Box::pin(async move { claim_existing(services, params, ctx).await })
         })
         .await;
 

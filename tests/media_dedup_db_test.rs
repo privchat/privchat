@@ -59,10 +59,14 @@ async fn cleanup(pool: &sqlx::PgPool) {
 }
 
 async fn register(pool: &sqlx::PgPool, sha: &str, version: i32) -> i64 {
-    let identity = BlobIdentity::parse(sha, version).expect("identity");
+    let identity = BlobIdentity::parse(sha).expect("identity");
     register_blob(
         pool,
         &identity,
+        // 落盘字节摘要：加密上传时是密文摘要，每次都不同——所以这里故意用一个
+        // 随版本变化的值，证明它**不参与**身份判定。
+        &format!("{:064x}", version + 1),
+        version,
         "/tmp/blob.bin",
         0,
         1024,
@@ -97,18 +101,21 @@ async fn the_same_content_is_stored_once() {
     cleanup(&pool).await;
 }
 
-/// 🔴 处理版本参与身份：换了压缩算法就是另一份字节。
+/// 🔴 处理版本**不**参与身份，落盘字节摘要也不参与——身份只看内容摘要。
+///
+/// 上一版把处理版本放进唯一键是错的：换算法产出的字节不同，摘要自然不同，
+/// 本来就命不中；字节相同就该复用。放进键里只会让同样的字节存两份。
 #[tokio::test]
-async fn a_different_transform_version_gets_its_own_object() {
+async fn only_the_content_digest_decides_identity() {
     let _guard = fixture_lock().lock().await;
     let Some(pool) = pool().await else { return };
     cleanup(&pool).await;
 
     let v0 = register(&pool, SHA_A, 0).await;
     let v1 = register(&pool, SHA_A, 1).await;
-    assert_ne!(
+    assert_eq!(
         v0, v1,
-        "同摘要不同处理版本必须是两个对象——混在一起会让新版本取回旧编码的画质",
+        "同样的内容摘要就是同一个对象——处理版本与落盘字节摘要都不参与身份",
     );
 
     cleanup(&pool).await;
@@ -153,7 +160,7 @@ async fn a_hit_yields_the_requesters_own_handle() {
     cleanup(&pool).await;
 
     let blob_id = register(&pool, SHA_A, 0).await;
-    let blob = find_blob(&pool, &BlobIdentity::parse(SHA_A, 0).unwrap())
+    let blob = find_blob(&pool, &BlobIdentity::parse(SHA_A).unwrap())
         .await
         .expect("find")
         .expect("blob exists");
@@ -207,6 +214,6 @@ async fn a_hit_yields_the_requesters_own_handle() {
 async fn a_malformed_digest_is_refused_up_front() {
     // 旧实现写的是 `hash:<u64>`（DefaultHasher，跨 Rust 版本都不稳定）。
     // 放进来不会报错，只会让秒传永远不命中——表现成「怎么每次都重传」，很难查。
-    assert!(BlobIdentity::parse("hash:12345678901234567890", 0).is_err());
-    assert!(BlobIdentity::parse("", 0).is_err());
+    assert!(BlobIdentity::parse("hash:12345678901234567890").is_err());
+    assert!(BlobIdentity::parse("").is_err());
 }
