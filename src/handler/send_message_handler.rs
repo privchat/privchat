@@ -1145,7 +1145,6 @@ impl MessageHandler for SendMessageHandler {
             reply_to_message_id: reply_to_id,
             mentioned_user_ids: mentioned_user_ids.clone(),
             message_source: None,
-            forward_origin: None,
         });
         canonical_payload.content = content.clone();
         let canonical_event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
@@ -1164,7 +1163,6 @@ impl MessageHandler for SendMessageHandler {
                 client_registry_claim: None,
                 attachment_refs,
                 attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
-                forward_origin: None,
                 forward_precondition: None,
                 channel_type: channel_type_code as i16,
                 event: canonical_event,

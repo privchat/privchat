@@ -97,8 +97,6 @@ pub struct ServerSendMessageRequest {
     /// 服务端给定的媒体引用。`None` = 从 metadata 解析（普通发送）。
     /// 转发路径显式传源消息的引用，不靠对复制后的 metadata 再解析一次。
     pub attachment_refs_override: Option<Vec<privchat_protocol::MediaRef>>,
-    /// 转发来源快照（spec §3.3）。
-    pub forward_origin: Option<crate::repository::message_repo::ForwardOrigin>,
     /// 转发前置条件：提交事务里锁源消息并复查存活 + 内容 + 引用（spec §6.4）。
     pub forward_precondition: Option<crate::repository::message_repo::ForwardPrecondition>,
 }
@@ -201,18 +199,6 @@ impl MessageService {
                 message_source: None,
                 // 转发副本自带来源：接收方未必读得到源会话，让客户端回头去查
                 // 源消息是行不通的（可能在别的会话、可能已被删除、可能无权读）。
-                forward_origin: req.forward_origin.as_ref().map(|origin| {
-                    privchat_protocol::ForwardOriginSnapshot {
-                        root_message_id: origin.root_message_id,
-                        root_author_id: origin.root_author_id,
-                        root_author_name: origin
-                            .display_snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.get("root_author_name"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string),
-                    }
-                }),
             },
         });
         let (_, commit_content) = canonical_event
@@ -244,7 +230,6 @@ impl MessageService {
                 client_registry_claim: None,
                 attachment_refs,
                 attachment_origin: req.attachment_origin,
-                forward_origin: req.forward_origin.clone(),
                 forward_precondition: req.forward_precondition.clone(),
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
@@ -395,7 +380,6 @@ impl MessageService {
             dedup_key: None,
             attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
-            forward_origin: None,
             forward_precondition: None,
         };
 

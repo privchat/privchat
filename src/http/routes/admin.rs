@@ -2017,7 +2017,6 @@ async fn send_system_message(
             dedup_key: None, // 系统灰条通知不需要卡片幂等
             attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
-            forward_origin: None,
             forward_precondition: None,
         })
         .await
@@ -2087,7 +2086,6 @@ async fn send_system_message_to_user(
             dedup_key: None,
             attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
-            forward_origin: None,
             forward_precondition: None,
         })
         .await
@@ -2330,7 +2328,6 @@ async fn send_message(
             dedup_key: request.dedup_key.clone(),
             attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
-            forward_origin: None,
             forward_precondition: None,
         })
         .await

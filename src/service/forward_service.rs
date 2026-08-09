@@ -27,7 +27,7 @@ use privchat_protocol::message::ContentMessageType;
 use privchat_protocol::MediaRef;
 use std::collections::BTreeSet;
 
-use crate::repository::message_repo::{AttachmentOrigin, ForwardOrigin};
+use crate::repository::message_repo::AttachmentOrigin;
 
 /// 转发被拒的原因。每一条都对应 spec 里一条明确规则，不用笼统的「失败」。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,25 +95,6 @@ pub fn is_forwardable(message_type: ContentMessageType) -> bool {
             | ContentMessageType::Location
             | ContentMessageType::Link
     )
-}
-
-/// 目标消息的来源快照（§6.2）：转发一条转发消息时，root 沿用源消息的 root，
-/// **不是上一手**——展示「转发自最初作者」，与微信/Telegram 一致。
-pub fn root_origin_for_copy(
-    source_message_id: u64,
-    source_channel_id: u64,
-    source_author_id: u64,
-    source_origin: Option<ForwardOrigin>,
-) -> ForwardOrigin {
-    match source_origin {
-        Some(existing) => existing,
-        None => ForwardOrigin {
-            root_message_id: Some(source_message_id),
-            root_author_id: source_author_id,
-            root_channel_id: Some(source_channel_id),
-            display_snapshot: None,
-        },
-    }
 }
 
 /// 复制到目标消息的媒体引用。
@@ -262,28 +243,7 @@ mod tests {
         );
     }
 
-    /// 转发一条转发消息：root 沿用源消息的 root，不是上一手。
-    #[test]
-    fn forwarding_a_forward_keeps_the_original_author() {
-        let source_origin = ForwardOrigin {
-            root_message_id: Some(11),
-            root_author_id: 111,
-            root_channel_id: Some(1111),
-            display_snapshot: None,
-        };
-        let copied = root_origin_for_copy(22, 2222, 222, Some(source_origin));
-        assert_eq!(copied.root_message_id, Some(11));
-        assert_eq!(copied.root_author_id, 111, "展示的是最初作者，不是上一手转发人");
-    }
 
-    /// 转发一条原创消息：源消息自己就是 root。
-    #[test]
-    fn forwarding_an_original_makes_it_the_root() {
-        let copied = root_origin_for_copy(22, 2222, 222, None);
-        assert_eq!(copied.root_message_id, Some(22));
-        assert_eq!(copied.root_author_id, 222);
-        assert_eq!(copied.root_channel_id, Some(2222));
-    }
 
     /// 引用表与 metadata 必须一致；一致时采用，冲突时拒绝。
     ///
