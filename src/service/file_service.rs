@@ -298,7 +298,7 @@ impl FileService {
             file_type,
             op,
             writer: Some(writer),
-            hasher: std::collections::hash_map::DefaultHasher::new(),
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
             written: 0,
             limit,
         })
@@ -318,8 +318,6 @@ impl FileService {
         encryption_version: i32,
         cek: Option<String>,
     ) -> Result<FileMetadata> {
-        use std::hash::Hasher as _;
-
         let mut writer = upload
             .writer
             .take()
@@ -343,7 +341,7 @@ impl FileService {
             uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
             width: None,
             height: None,
-            file_hash: Some(format!("hash:{}", upload.hasher.finish())),
+            file_hash: Some(hex::encode(sha2::Digest::finalize(upload.hasher))),
             business_type: Some(business_type),
             business_id,
             encryption_version,
@@ -506,7 +504,12 @@ pub struct StreamingUpload {
     file_type: FileType,
     op: Operator,
     writer: Option<opendal::Writer>,
-    hasher: std::collections::hash_map::DefaultHasher,
+    /// 🔴 内容摘要必须是 **SHA-256**，不能用 `DefaultHasher`。
+    ///
+    /// `DefaultHasher` 是 SipHash：标准库明确写着**不保证跨 Rust 版本稳定**，
+    /// 只有 64 位，也不是密码学摘要。拿它当文件内容标识，秒传会在某次工具链升级后
+    /// 集体失配（同一个文件算出不同值 → 全量重传），碰撞也不是理论问题。
+    hasher: sha2::Sha256,
     written: u64,
     limit: u64,
 }
@@ -520,8 +523,6 @@ impl StreamingUpload {
     /// 写入一个 chunk：先做累计大小硬顶校验（超限即时失败，不再继续收 body），
     /// 同步推进增量 hash。
     pub async fn write_chunk(&mut self, chunk: bytes::Bytes) -> Result<()> {
-        use std::hash::Hasher as _;
-
         self.written = self.written.saturating_add(chunk.len() as u64);
         if self.written > self.limit {
             return Err(ServerError::Validation(format!(
@@ -529,7 +530,7 @@ impl StreamingUpload {
                 self.written, self.limit
             )));
         }
-        self.hasher.write(&chunk);
+        sha2::Digest::update(&mut self.hasher, &chunk);
         let writer = self
             .writer
             .as_mut()
@@ -617,5 +618,31 @@ mod authz_tests {
     #[test]
     fn a_forwarded_copy_is_readable_by_someone_unrelated_to_the_uploader() {
         assert!(authorize_file_access(facts(777, 1, true, true)));
+    }
+
+    /// 上传摘要必须是 **SHA-256 的十六进制**，秒传要靠它判「同一份内容」。
+    ///
+    /// 🔴 这里曾经用 `DefaultHasher`，写出来的是 `hash:<u64>`。那是 SipHash：
+    /// 标准库明确说**不保证跨 Rust 版本稳定**，只有 64 位，也不是密码学摘要。
+    /// 换个工具链重编，同一个文件算出来的值就变了——秒传会从「命中」变成全量重传，
+    /// 而且这种失效不会报错，只会悄悄变慢。
+    #[test]
+    fn the_upload_digest_is_a_sha256_hex_string() {
+        use sha2::Digest as _;
+
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        hasher.update(b"privchat");
+        let digest = hex::encode(hasher.finalize());
+
+        assert_eq!(digest.len(), 64, "SHA-256 十六进制是 64 个字符");
+        assert!(
+            digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "必须是纯十六进制，不能带 `hash:` 之类前缀——那种值没法跨端比对",
+        );
+        // 已知向量：换实现或换编码方式都会在这里断掉。
+        assert_eq!(
+            digest,
+            "d01f1b584be7a9e4acbaac536abfa9f00d9d33fb62a5ce76c54a25ee096908bd",
+        );
     }
 }
