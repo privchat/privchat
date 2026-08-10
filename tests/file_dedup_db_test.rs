@@ -824,71 +824,166 @@ async fn wait_until_blocked_on_row_lock(pool: &sqlx::PgPool) {
     }
 }
 
-/// 撤回与 claim 必须串行：claim 拿到共享锁之后，撤回要等它提交。
+/// 撤回 / 退群必须等在**生产代码**持有的共享锁上。
 ///
-/// 🔴 这是「在事务里查一次」与「锁住依据」的分界。不加 `FOR SHARE` 的话，撤回
-/// 完全可以在授权 SELECT 之后、INSERT 之前提交——查得再晚也拦不住。
+/// 🔴 上一版这条测试是假的：它自己写了一条 `FOR SHARE`，然后证明 PostgreSQL
+/// 的锁语义有效——跟 `copy_for_user` 有没有持锁毫无关系。把生产里的 `FOR SHARE`
+/// 删掉，那种测试照样绿。
 ///
-/// 三种会话类型各跑一遍：私聊的授权主体是频道行，群聊在 group_members，
-/// 其它在 participants，锁的对象不同，得各自验。
+/// 这一版让**真实的** `copy_for_user` 跑起来，用一个 BEFORE INSERT trigger 把它
+/// 卡在 INSERT 前：那一刻它的授权锁已经全部持住。然后并发去改它依赖的那一行，
+/// 观察是否真的等在锁上。
+async fn arm_insert_barrier(pool: &sqlx::PgPool, key: i64) {
+    // 多条语句要走 `execute_batch` 式的 raw execute，prepared statement 塞不下。
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION dedup_claim_barrier() RETURNS trigger AS $$
+         BEGIN
+           PERFORM pg_advisory_xact_lock({key});
+           RETURN NEW;
+         END; $$ LANGUAGE plpgsql;
+         DROP TRIGGER IF EXISTS dedup_claim_barrier ON privchat_file_uploads;
+         CREATE TRIGGER dedup_claim_barrier BEFORE INSERT ON privchat_file_uploads
+           FOR EACH ROW EXECUTE FUNCTION dedup_claim_barrier();"
+    ))
+    .execute(pool)
+    .await
+    .expect("arm insert barrier");
+}
+
+async fn disarm_insert_barrier(pool: &sqlx::PgPool) {
+    sqlx::query("DROP TRIGGER IF EXISTS dedup_claim_barrier ON privchat_file_uploads")
+        .execute(pool)
+        .await
+        .expect("disarm insert barrier");
+}
+
+/// 轮询 `pg_locks`，直到指定连接确实在等锁。
+///
+/// 限定到目标 PID：不限定的话，别的测试留下的等待也会让判据通过，又是假绿。
+async fn wait_until_pid_blocked(pool: &sqlx::PgPool, pid: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // 🔴 必须限定到**目标关系**。只看「这条连接有未授予的锁」是不够的：
+        // 任何一次短暂的关系锁等待都会让判据通过，于是删掉生产里的成员锁，
+        // 测试照样绿——上一版就是这样假绿的。
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks l
+              WHERE NOT l.granted AND l.pid = $1
+                -- 行锁等待在 pg_locks 里体现为等持锁**事务**（transactionid），
+                -- 不是在那张表上的 relation 锁——按 relation 过滤永远等不到。
+                AND l.locktype = 'transactionid'",
+        )
+        .bind(pid)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "10 秒内没有观察到 pid={pid} 在等行锁；不能继续，否则并发断言变成假绿",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 私聊：并发撤回必须等在生产 claim 持有的**消息行**共享锁上。
 #[tokio::test]
-async fn a_revoke_waits_for_an_in_flight_claim() {
+async fn a_revoke_waits_for_the_production_claim() {
     let _guard = fixture_lock().lock().await;
     let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
+    let original = seed_original(&repo).await;
+    let msg = seed_reference_for(&pool, 0, original.file_id).await;
 
-    // 只有 0/1 两种：`privchat_channels_check` 要求 type=0 带两个 direct 用户、
-    // type=1 带 group_id，别的建不出来。「其它类型 → participants」那一支是给
-    // 尚未冻结成员模型的 room 类会话留的，当前 schema 下不可达，所以测不了——
-    // 不是漏测，是它还不存在。
-    for channel_type in [0_i16, 1] {
-        cleanup(&pool).await;
-        let repo = FileUploadRepository::new(pool.clone());
-        let original = seed_original(&repo).await;
-        let msg = seed_reference_for(&pool, channel_type, original.file_id).await;
-
-        // A：开一个事务，走到「授权依据已锁住」为止，先不提交。
-        let mut claim_tx = pool.begin().await.expect("claim tx");
-        sqlx::query(
-            "SELECT 1 FROM privchat_messages m WHERE m.message_id = $1 \
-               AND m.deleted = false AND m.revoked = false FOR SHARE",
-        )
-        .bind(msg)
-        .fetch_optional(&mut *claim_tx)
+    const BARRIER: i64 = 973_001;
+    arm_insert_barrier(&pool, BARRIER).await;
+    // 测试端先占住 barrier，生产 claim 会停在 INSERT 前。
+    let mut holder = pool.begin().await.expect("holder tx");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(BARRIER)
+        .execute(&mut *holder)
         .await
-        .expect("lock message like the claim does");
+        .expect("hold barrier");
 
-        // B：并发撤回同一条消息——必须等在 A 的共享锁上。
-        let revoke_pool = pool.clone();
-        let revoker = tokio::spawn(async move {
-            sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = $1")
-                .bind(msg)
-                .execute(revoke_pool.as_ref())
-                .await
-                .expect("revoke");
-        });
+    let claim_pool = pool.clone();
+    let source = original.clone();
+    let claim = tokio::spawn(async move {
+        FileUploadRepository::new(claim_pool)
+            .copy_for_user(&source, OTHER as u64, "message", None)
+            .await
+    });
 
-        wait_until_blocked_on_row_lock(&pool).await;
-        assert!(
-            !revoker.is_finished(),
-            "channel_type={channel_type}：撤回没有被 claim 的共享锁挡住"
-        );
+    // 等真实 claim 卡在 barrier 上——此刻它的授权锁已经持住了。
+    let claim_pid: i32 = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let pid: Option<(i32,)> = sqlx::query_as(
+                "SELECT pid FROM pg_locks
+                  WHERE locktype = 'advisory' AND NOT granted
+                    AND objid = ($1::bigint & 4294967295) LIMIT 1",
+            )
+            .bind(BARRIER)
+            .fetch_optional(pool.as_ref())
+            .await
+            .expect("find claim pid");
+            if let Some((pid,)) = pid {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "10 秒内真实 claim 没有停在 barrier 上"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
 
-        // A 提交 → B 才能往下走。
-        claim_tx.commit().await.expect("commit claim tx");
-        revoker.await.expect("revoke completes");
+    // 并发撤回：必须等在生产 claim 的消息行共享锁上。
+    //
+    // 🔴 判据是「那条连接确实有一把未授予的锁」，不是「睡 200ms 之后任务还没结束」。
+    // 后者在任务没被调度时也成立，是假绿——上一版就栽在这儿。
+    let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
+    let revoke_pool = pool.clone();
+    let revoker = tokio::spawn(async move {
+        let mut conn = revoke_pool.acquire().await.expect("revoke conn");
+        let pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("pid");
+        pid_tx.send(pid.0).expect("report pid");
+        sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = $1")
+            .bind(msg)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+    });
+    let revoke_pid = pid_rx.await.expect("revoke pid");
+    wait_until_pid_blocked(&pool, revoke_pid).await;
 
-        // 撤回已经提交，此刻再 claim 必须被拒。
-        let refused = repo
-            .copy_for_user(&original, OTHER as u64, "message", None)
-            .await;
-        assert!(
-            refused.is_err(),
-            "channel_type={channel_type}：撤回提交之后不能再开出新的 file_id"
-        );
-    }
+    // 放行 barrier → claim 提交 → 撤回才能往下走。
+    holder.commit().await.expect("release barrier");
+    let claimed = claim.await.expect("claim task").expect("claim succeeds");
+    assert!(claimed > 0);
+    revoker
+        .await
+        .expect("revoke task")
+        .expect("revoke completes after claim");
 
+    disarm_insert_barrier(&pool).await;
+    let _ = claim_pid;
     cleanup(&pool).await;
 }
+
+/// ⚠️ 群成员锁**没有并发测试**。
+///
+/// 试过让退群并发跑起来观察等待，但 `pg_locks` 只告诉你「在等哪个事务」，
+/// 不告诉你在等哪一行——所以判据要么宽到删掉生产的成员锁也照样绿（假覆盖），
+/// 要么窄到用 relation 过滤，而行锁等待根本不体现为 relation 锁，永远等不到。
+///
+/// 生产代码里那次 `privchat_group_members ... FOR SHARE` 因此只经过代码审查，
+/// 没有测试守住。不把它算作已覆盖。
 
 /// 轮询 `pg_locks`，直到确实有连接在等这把 advisory 锁。
 ///
