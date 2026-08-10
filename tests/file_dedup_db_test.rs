@@ -95,6 +95,7 @@ async fn a_second_sender_gets_their_own_row_over_the_same_file() {
     let repo = FileUploadRepository::new(pool.clone());
 
     let original = seed_original(&repo).await;
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
     // 探测：按 内容摘要 + 类型 + 大小 找。
     let found = repo
@@ -145,6 +146,7 @@ async fn deleting_one_row_keeps_the_file_while_others_point_at_it() {
     let repo = FileUploadRepository::new(pool.clone());
 
     let original = seed_original(&repo).await;
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
     let mine = repo
         .copy_for_user(&original, OTHER as u64, "message", None)
         .await
@@ -268,6 +270,7 @@ async fn claiming_a_file_that_was_just_deleted_is_refused() {
     let repo = FileUploadRepository::new(pool.clone());
 
     let original = seed_original(&repo).await;
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
     // 模拟「claim 已经读到了源行」：拿着这份快照，但库里那行随后被删掉。
     let snapshot = original.clone();
     repo.delete(original.file_id).await.expect("delete source");
@@ -334,6 +337,7 @@ async fn replaying_a_claim_returns_the_same_file_id() {
     let repo = FileUploadRepository::new(pool.clone());
 
     let original = seed_original(&repo).await;
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
     let key = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
 
     let first = repo
@@ -409,6 +413,7 @@ async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
     let original = seed_original(&repo).await;
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
     // 1. A 抢先占住路径锁。
     let mut tx_a = pool.begin().await.expect("tx a");
@@ -509,9 +514,19 @@ async fn authorize_claimer(pool: &sqlx::PgPool, file_id: u64, uploader: i64, cla
         .await
         .expect("ensure participant");
     }
+    // 🔴 先删后建，别指望 ON CONFLICT。
+    //
+    // `privchat_messages` 的主键含 `created_at`，而它默认取 now()——所以每跑一次
+    // 就多一行同 message_id 的消息，ON CONFLICT 永远不命中。撤回过的那些旧行
+    // 一直留着，引用 join 照样命中它们，于是一堆与撤回无关的用例集体被闸门拒掉。
+    sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
+        .bind(MSG)
+        .execute(pool)
+        .await
+        .expect("reset message");
     sqlx::query(
         "INSERT INTO privchat_messages (message_id, channel_id, sender_id, pts, message_type, content)
-         VALUES ($1, $2, $3, 1, 1, '[image]') ON CONFLICT DO NOTHING",
+         VALUES ($1, $2, $3, 1, 1, '[image]')",
     )
     .bind(MSG)
     .bind(CH)
@@ -579,6 +594,7 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
 
     let repo = FileUploadRepository::new(pool.clone());
     let original = seed_original(&repo).await;
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
     let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
     let token_service = Arc::new(UploadTokenService::new());
@@ -747,6 +763,63 @@ async fn a_digest_alone_does_not_authorize_a_claim() {
     cleanup(&pool).await;
 }
 
+/// 授权检查通过之后、写入之前撤回消息 → 不能再开出新的 file_id。
+///
+/// 🔴 claim 是一次**新的授权动作**。「撤回收不回已经下载的东西」不等于「撤回之后
+/// 还能继续开新的 file_id」——后者是在失权之后继续授予。
+///
+/// 这条不靠时序：测试自己按顺序走完「判定 → 撤回 → 写入」，正是那个窗口里
+/// 会发生的事，所以确定性复现。
+#[tokio::test]
+async fn revoking_between_the_check_and_the_write_stops_the_claim() {
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
+    let original = seed_original(&repo).await;
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
+
+    // 1) 判定：此刻是有权的（规范判据）。
+    let (messages, channels) = authorization_deps(&pool);
+    let decision = privchat::service::attachment_authorization::resolve_attachment_access(
+        &messages,
+        &channels,
+        &original,
+        OTHER as u64,
+    )
+    .await
+    .expect("authorization available");
+    assert!(decision.authorized, "前提：撤回之前是有权的");
+
+    // 2) 撤回：判定与写入之间发生的事。
+    sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = 970002")
+        .execute(pool.as_ref())
+        .await
+        .expect("revoke");
+
+    // 3) 写入：必须被事务内那道闸拦下。
+    let refused = repo
+        .copy_for_user(&original, OTHER as u64, "message", Some("race-key"))
+        .await;
+    assert!(
+        refused.is_err(),
+        "🔴 撤回之后不能再开出新的 file_id——那是在失权之后继续授予"
+    );
+
+    // 而且整事务回滚，不留半条记录。
+    let rows: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM privchat_file_uploads WHERE uploader_id = $1 AND file_path = $2",
+    )
+    .bind(OTHER)
+    .bind(&original.file_path)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("count");
+    assert_eq!(rows.0, 0, "被拒的 claim 不该留下任何行");
+
+    cleanup(&pool).await;
+}
+
 /// purpose 双向隔离：两种 token 各自只能走自己那条入口。
 ///
 /// 🔴 一次性 token 只挡得住「同一入口用两次」。没有用途隔离的话，两个入口
@@ -764,6 +837,7 @@ async fn a_token_can_only_be_used_for_its_own_purpose() {
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
     let original = seed_original(&repo).await;
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
     let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
     let token_service = Arc::new(UploadTokenService::new());
