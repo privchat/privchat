@@ -106,6 +106,58 @@ impl FileUploadRepository {
             .await
             .map_err(|e| ServerError::Database(format!("获取物理文件锁失败: {}", e)))?;
 
+        // 🔴 在**事务内、对数据库**再确认一次调用者此刻仍有权读这份内容。
+        //
+        // 两个理由，各自都足够：
+        //
+        // 1. claim 是一次**新的授权动作**。「撤回收不回已经下载的东西」不等于
+        //    「撤回之后还能继续开新的 file_id」——后者是在失权之后继续授予。
+        // 2. 规范判据 `resolve_attachment_access` 的成员部分走 ChannelService，
+        //    而它命中内存缓存就直接返回（`get_channel_members`）。那份缓存陈旧多久，
+        //    窗口就有多长，不是微秒级。这里直查库，绕开缓存。
+        //
+        // 这道闸**只能拒、不能放行**：规范判据仍是 `authorize_file_access`，
+        // 这里只负责确认它依据的事实没有在期间变过。两者的状态对应关系由
+        // `the_guard_agrees_with_the_canonical_rule` 钉住。
+        let still_allowed: Option<(i32,)> = sqlx::query_as(
+            r#"
+            SELECT 1
+            FROM privchat_message_file_refs r
+            JOIN privchat_messages m
+              ON m.message_id = r.message_id
+             AND m.created_at = r.message_created_at
+            JOIN privchat_channel_participants p
+              ON p.channel_id = m.channel_id
+            WHERE r.file_id = $1
+              AND m.deleted = false
+              AND m.revoked = false
+              AND p.user_id = $2
+              AND p.left_at IS NULL
+            UNION ALL
+            -- 还没被任何消息引用过的文件（pending）：只有上传者本人能取用。
+            -- 这一支是给「自己重发自己刚传的东西」留的，不是给别人的。
+            SELECT 1
+            WHERE NOT EXISTS (
+                    SELECT 1 FROM privchat_message_file_refs WHERE file_id = $1
+                  )
+              AND $2 = $3
+            LIMIT 1
+            "#,
+        )
+        .bind(source.file_id as i64)
+        .bind(uploader_id as i64)
+        .bind(source.uploader_id as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;
+        if still_allowed.is_none() {
+            // 授权在这期间没了（撤回、删除、退群）。整事务回滚，不留下新的 file_id。
+            tx.rollback().await.ok();
+            return Err(ServerError::NotFound(
+                "服务端没有这份内容，请正常上传".to_string(),
+            ));
+        }
+
         // 拿到锁之后复查源行还在不在：等锁期间它可能已经被删掉了。
         let still_there: Option<(i64,)> = sqlx::query_as(
             "SELECT file_id FROM privchat_file_uploads WHERE file_path = $1 LIMIT 1",
