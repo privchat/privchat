@@ -840,10 +840,12 @@ struct InsertBarrier {
 impl InsertBarrier {
     /// 装一个 BEFORE INSERT trigger，让写 `privchat_file_uploads` 的事务停在
     /// 指定的 advisory 锁上——那一刻它的授权锁已经全部持住。
-    async fn arm(pool: &std::sync::Arc<sqlx::PgPool>, key: i64) -> Self {
-        // 先清残留：上一次跑如果在断言处 panic，trigger 会留在库里挡住所有
-        // 后续 INSERT。
+    async fn arm(pool: &std::sync::Arc<sqlx::PgPool>, key: i64, claim_key: &str) -> Self {
+        // 先清残留：上一次跑如果在断言处 panic，Drop 也可能没跑成。
         Self::drop_all(pool).await;
+        // 🔴 只对**本测试那一次 claim** 生效（按 claim_key_hash 匹配）。
+        // 全局 trigger 万一残留，会把后续每一次文件 INSERT 都挂住，一条测试失败
+        // 拖垮整个套件；限定之后，残留最多影响这一个不会再出现的键。
         sqlx::raw_sql(&format!(
             "CREATE OR REPLACE FUNCTION dedup_claim_barrier() RETURNS trigger AS $$
              BEGIN
@@ -851,7 +853,8 @@ impl InsertBarrier {
                RETURN NEW;
              END; $$ LANGUAGE plpgsql;
              CREATE TRIGGER dedup_claim_barrier BEFORE INSERT ON privchat_file_uploads
-               FOR EACH ROW EXECUTE FUNCTION dedup_claim_barrier();"
+               FOR EACH ROW WHEN (NEW.claim_key_hash = '{claim_key}')
+               EXECUTE FUNCTION dedup_claim_barrier();"
         ))
         .execute(pool.as_ref())
         .await
@@ -967,7 +970,8 @@ async fn a_revoke_is_blocked_by_the_production_claim() {
     let msg = seed_reference_for(&pool, 0, original.file_id).await;
 
     const BARRIER: i64 = 973_001;
-    let _barrier = InsertBarrier::arm(&pool, BARRIER).await;
+    const CLAIM_KEY: &str = "barrier-claim-key";
+    let _barrier = InsertBarrier::arm(&pool, BARRIER, CLAIM_KEY).await;
     let mut holder = pool.begin().await.expect("holder tx");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(BARRIER)
@@ -979,7 +983,7 @@ async fn a_revoke_is_blocked_by_the_production_claim() {
     let source = original.clone();
     let claim = tokio::spawn(async move {
         FileUploadRepository::new(claim_pool)
-            .copy_for_user(&source, OTHER as u64, "message", None)
+            .copy_for_user(&source, OTHER as u64, "message", Some(CLAIM_KEY))
             .await
     });
     let claim_pid = wait_for_claim_at_barrier(&pool, BARRIER).await;
@@ -1025,7 +1029,8 @@ async fn leaving_a_group_is_blocked_by_the_production_claim() {
             .expect("group id");
 
     const BARRIER: i64 = 973_002;
-    let _barrier = InsertBarrier::arm(&pool, BARRIER).await;
+    const CLAIM_KEY: &str = "barrier-claim-key-group";
+    let _barrier = InsertBarrier::arm(&pool, BARRIER, CLAIM_KEY).await;
     let mut holder = pool.begin().await.expect("holder tx");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(BARRIER)
@@ -1037,7 +1042,7 @@ async fn leaving_a_group_is_blocked_by_the_production_claim() {
     let source = original.clone();
     let claim = tokio::spawn(async move {
         FileUploadRepository::new(claim_pool)
-            .copy_for_user(&source, OTHER as u64, "message", None)
+            .copy_for_user(&source, OTHER as u64, "message", Some(CLAIM_KEY))
             .await
     });
     let claim_pid = wait_for_claim_at_barrier(&pool, BARRIER).await;
