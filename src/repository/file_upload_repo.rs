@@ -119,18 +119,31 @@ impl FileUploadRepository {
         // 这道闸**只能拒、不能放行**：规范判据仍是 `authorize_file_access`，
         // 这里只负责确认它依据的事实没有在期间变过。两者的状态对应关系由
         // `the_guard_agrees_with_the_canonical_rule` 钉住。
-        // 🔴 成员判定必须按会话类型分流，这三支与投递收件人那份权威表达式同形
-        //（`message_repo.rs` 的 `privchat_message_dispatch_recipient` 插入）：
+        // 🔴 授权复查必须**锁住**它依据的那几行，否则「在事务里查一次」只是查得晚
+        // 一点：READ COMMITTED 下，撤回或退群完全可以在这条 SELECT 之后、INSERT
+        // 之前提交。
         //
-        //   Direct(0) → 频道行上的 direct_user1/2_id（**没有 participants 行**）
-        //   Group(1)  → privchat_group_members
-        //   其它      → privchat_channel_participants
+        // 锁序固定为 advisory(file_path) → message → channel → 成员行，全流程只有
+        // 这一处按这个顺序取锁，不会与自己成环。撤回、移出成员、退群都是对这些行的
+        // UPDATE/DELETE，会自然等在共享锁上；最终语义是二者必有一个先提交：
+        //   claim 先提交 → 取用成功，随后撤回；
+        //   撤回先提交 → claim 等到锁后重新判定，拒绝。
         //
-        // 只查 participants 的话，私聊和群聊会被**误拒**——那不是「更安全」，
-        // 是把合法用户挡在外面。
-        let still_allowed: Option<(i32,)> = sqlx::query_as(
+        // 等待封顶，免得一次异常的长事务把 claim 卡死。
+        sqlx::query("SET LOCAL lock_timeout = '3s'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("设置锁等待上限失败: {}", e)))?;
+
+        // 第一步：挑一条**此刻确实授权**的有效引用，并锁住消息行与频道行。
+        //
+        // 锁频道行同时覆盖了私聊：私聊的权威成员就写在这一行的
+        // `direct_user1/2_id` 上，没有 participants 行（成员判据与投递收件人那份
+        // 表达式同形，见 `message_repo` 的 dispatch_recipient 插入）。
+        // 排序只为让并发的多个 claim 以相同顺序取锁。
+        let candidate: Option<(i64, i16)> = sqlx::query_as(
             r#"
-            SELECT 1
+            SELECT m.channel_id, c.channel_type
             FROM privchat_message_file_refs r
             JOIN privchat_messages m
               ON m.message_id = r.message_id
@@ -158,24 +171,62 @@ impl FileUploadRepository {
                              AND p.left_at IS NULL
                          ))
                   )
-            UNION ALL
-            -- 还没被任何消息引用过的文件（pending）：只有上传者本人能取用。
-            -- 这一支是给「自己重发自己刚传的东西」留的，不是给别人的。
-            SELECT 1
-            WHERE NOT EXISTS (
-                    SELECT 1 FROM privchat_message_file_refs WHERE file_id = $1
-                  )
-              AND $2 = $3
+            ORDER BY m.message_id
+            FOR SHARE OF m, c
             LIMIT 1
             "#,
         )
         .bind(source.file_id as i64)
         .bind(uploader_id as i64)
-        .bind(source.uploader_id as i64)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;
-        if still_allowed.is_none() {
+        .map_err(|e| ServerError::Database(format!("锁定取用授权依据失败: {}", e)))?;
+
+        let authorized = match candidate {
+            // 私聊：授权主体就是刚锁住的那条频道行，不必再锁别的。
+            Some((_, 0)) => true,
+            // 群聊 / 其它：成员在另一张表上，还要锁住那一行再确认一次。
+            // 锁得到就说明这一刻它仍然有效；并发的退群会等在这把锁上。
+            Some((channel_id, channel_type)) => {
+                let sql = if channel_type == 1 {
+                    "SELECT 1 FROM privchat_group_members
+                      WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
+                      FOR SHARE"
+                } else {
+                    "SELECT 1 FROM privchat_channel_participants
+                      WHERE channel_id = $1 AND user_id = $2 AND left_at IS NULL
+                      FOR SHARE"
+                };
+                sqlx::query_as::<_, (i32,)>(sql)
+                    .bind(channel_id)
+                    .bind(uploader_id as i64)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| ServerError::Database(format!("锁定成员关系失败: {}", e)))?
+                    .is_some()
+            }
+            // 一条有效引用都没有：只有「文件从未被任何消息引用过」且取用者就是
+            // 上传者时才放行——那是「自己重发自己刚传的东西」，不是给别人的口子。
+            None => {
+                let pending_self: Option<(i32,)> = sqlx::query_as(
+                    r#"
+                    SELECT 1
+                    WHERE NOT EXISTS (
+                            SELECT 1 FROM privchat_message_file_refs WHERE file_id = $1
+                          )
+                      AND $2 = $3
+                    "#,
+                )
+                .bind(source.file_id as i64)
+                .bind(uploader_id as i64)
+                .bind(source.uploader_id as i64)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;
+                pending_self.is_some()
+            }
+        };
+        if !authorized {
             // 授权在这期间没了（撤回、删除、退群）。整事务回滚，不留下新的 file_id。
             tx.rollback().await.ok();
             return Err(ServerError::NotFound(
