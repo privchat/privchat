@@ -116,6 +116,9 @@ pub async fn get_file_url(
         cek: url.cek,
         // 转发同一份附件时，客户端拿它直接走 prepare + claim。
         sha256: file_meta.file_hash.clone(),
+        // 真实类型由服务端下发，客户端不该按 mime 猜——猜出来的表还会在每个
+        // 端各存一份。
+        file_type: file_meta.file_type.as_str().to_string(),
     };
 
     Ok(serde_json::to_value(response)
