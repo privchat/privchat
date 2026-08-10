@@ -43,9 +43,13 @@ pub fn claim_key_hash(token: &str) -> String {
 ///
 /// 重复调用返回同一条：数据库提交了但响应丢了，客户端拿同一个 token 重试，
 /// 拿到的是同一个 `file_id`，而不是又多一行。
+#[allow(clippy::too_many_arguments)]
 pub async fn claim_existing_file(
     file_service: &Arc<FileService>,
     token_service: &Arc<UploadTokenService>,
+    // 判定「这个人现在还能不能读这份文件」用的是 get_url 那一套，不另立判据。
+    message_repository: &crate::repository::message_repo::PgMessageRepository,
+    channel_service: &crate::service::channel_service::ChannelService,
     user_id: u64,
     token_str: &str,
     request_sha256: &str,
@@ -102,6 +106,42 @@ pub async fn claim_existing_file(
         .find_by_content(&normalized)
         .await?
         .ok_or_else(|| ServerError::NotFound("服务端没有这份内容，请正常上传".to_string()))?;
+
+    // 🔴 摘要不是授权。`stored_sha256` 只是一个猜不出来的标识——拿到它的人可以
+    // 一直留着，权限却会变（退群、被移出、消息被删）。只认摘要就等于让哈希的寿命
+    // 超过访问权限的寿命，谁手上有旧哈希谁就能把文件领走。
+    //
+    // 判据与 `file/get_url` 完全同一套，避免两处判断慢慢分叉。
+    let decision = crate::service::attachment_authorization::resolve_attachment_access(
+        message_repository,
+        channel_service,
+        &source,
+        user_id,
+    )
+    .await
+    .map_err(|error| {
+        // 判定不可用是服务异常，不能降级成「无权」——更不能降级成「放行」。
+        tracing::error!(
+            "秒传授权判定不可用 source_file_id={} user_id={}: {}",
+            source.file_id,
+            user_id,
+            error
+        );
+        ServerError::Internal("ATTACHMENT_AUTHORIZATION_UNAVAILABLE".to_string())
+    })?;
+    if !decision.authorized {
+        tracing::warn!(
+            "🚫 拒绝秒传取用: source_file_id={} user_id={} source={:?}",
+            source.file_id,
+            user_id,
+            decision.source
+        );
+        // 🔴 与「服务端没有这份内容」返回同一句话。分开说的话，这个接口就成了
+        // 文件存在性探测器：拿一堆摘要来问，能区分「没有」和「有但你无权」。
+        return Err(ServerError::NotFound(
+            "服务端没有这份内容，请正常上传".to_string(),
+        ));
+    }
 
     let file_id = file_service
         .copy_for_user(&source, user_id, &token.business_type, Some(&key))
