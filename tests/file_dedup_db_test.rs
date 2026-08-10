@@ -666,6 +666,9 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
     cleanup(&pool).await;
 }
 
+
+
+
 /// 按会话类型建一条引用这份文件、且 OTHER 有权读的消息，返回 message_id。
 ///
 /// 三种类型的授权主体不同（频道行 / group_members / participants），并发用例要
@@ -1063,6 +1066,16 @@ async fn leaving_a_group_is_blocked_by_the_production_claim() {
 
     cleanup(&pool).await;
 }
+
+// ⚠️ 「第一候选在等锁期间失效 → 换下一条」这条**没有门禁**。
+//
+// 试写过：文件同时挂群引用和私聊引用，退群事务先改成员行（AFTER trigger 连带
+// 锁住群频道行）不提交，再起 claim，等它卡住后提交退群，断言 claim 靠私聊那条
+// 成功。写出来是绿的——但把私聊引用整个去掉它**仍然绿**，说明 claim 根本没走到
+// 换候选那一步，等待循环也没等到它真的阻塞。判据错在哪还没查清。
+//
+// 所以这条只靠 PostgreSQL 的 EvalPlanQual 语义 + 代码审查，没有测试守住。
+// 与其留一条测不到自己声称之事的用例，不如把缺口写在这里。
 
 /// 锁等待超时必须是**可重试**的，不是终局失败。
 ///
