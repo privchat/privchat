@@ -81,6 +81,19 @@ impl FileUploadRepository {
         Ok(row.map(|(id,)| id as u64))
     }
 
+    /// 锁等待超时（PostgreSQL `55P03`）是**瞬时**竞争，不是这次取用不合法。
+    ///
+    /// 包成 Database 的话它会一路落成 internal，客户端把一次锁竞争当成永久失败，
+    /// 附件就再也发不出去了。映射成 ServiceUnavailable，让上层照常重试。
+    fn map_lock_error(context: &str, e: sqlx::Error) -> ServerError {
+        if let Some(db) = e.as_database_error() {
+            if db.code().as_deref() == Some("55P03") {
+                return ServerError::ServiceUnavailable(format!("{context}: 锁等待超时，请重试"));
+            }
+        }
+        ServerError::Database(format!("{context}: {e}"))
+    }
+
     pub async fn copy_for_user(
         &self,
         source: &FileMetadata,
@@ -100,11 +113,18 @@ impl FileUploadRepository {
         // 🔴 与删除**共用同一把 file_path 锁**。否则会出现：
         //   claim 读到源行 → delete 删掉最后一行并删物理文件 → claim 插入新行
         // 结果是一条指向已被删除文件的记录。加引用和减引用必须排成序。
+        // 🔴 等待上限必须在**第一把锁之前**设。放在后面的话，最先取的这把
+        // file_path advisory 锁仍然可以无限等——「封顶 3 秒」就是句空话。
+        sqlx::query("SET LOCAL lock_timeout = '3s'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("设置锁等待上限失败: {}", e)))?;
+
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
             .bind(&source.file_path)
             .execute(&mut *tx)
             .await
-            .map_err(|e| ServerError::Database(format!("获取物理文件锁失败: {}", e)))?;
+            .map_err(|e| Self::map_lock_error("获取物理文件锁失败", e))?;
 
         // 🔴 在**事务内、对数据库**再确认一次调用者此刻仍有权读这份内容。
         //
@@ -130,11 +150,6 @@ impl FileUploadRepository {
         //   撤回先提交 → claim 等到锁后重新判定，拒绝。
         //
         // 等待封顶，免得一次异常的长事务把 claim 卡死。
-        sqlx::query("SET LOCAL lock_timeout = '3s'")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ServerError::Database(format!("设置锁等待上限失败: {}", e)))?;
-
         // 第一步：挑一条**此刻确实授权**的有效引用，并锁住消息行与频道行。
         //
         // 锁频道行同时覆盖了私聊：私聊的权威成员就写在这一行的
@@ -180,7 +195,7 @@ impl FileUploadRepository {
         .bind(uploader_id as i64)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| ServerError::Database(format!("锁定取用授权依据失败: {}", e)))?;
+        .map_err(|e| Self::map_lock_error("锁定取用授权依据失败", e))?;
 
         let authorized = match candidate {
             // 私聊：授权主体就是刚锁住的那条频道行，不必再锁别的。
@@ -202,7 +217,7 @@ impl FileUploadRepository {
                     .bind(uploader_id as i64)
                     .fetch_optional(&mut *tx)
                     .await
-                    .map_err(|e| ServerError::Database(format!("锁定成员关系失败: {}", e)))?
+                    .map_err(|e| Self::map_lock_error("锁定成员关系失败", e))?
                     .is_some()
             }
             // 一条有效引用都没有：只有「文件从未被任何消息引用过」且取用者就是
