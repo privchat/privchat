@@ -156,7 +156,7 @@ impl FileUploadRepository {
         // `direct_user1/2_id` 上，没有 participants 行（成员判据与投递收件人那份
         // 表达式同形，见 `message_repo` 的 dispatch_recipient 插入）。
         // 排序只为让并发的多个 claim 以相同顺序取锁。
-        let candidate: Option<(i64, i16)> = sqlx::query_as(
+        let candidates: Vec<(i64, i16)> = sqlx::query_as(
             r#"
             SELECT m.channel_id, c.channel_type
             FROM privchat_message_file_refs r
@@ -188,41 +188,62 @@ impl FileUploadRepository {
                   )
             ORDER BY m.message_id
             FOR SHARE OF m, c
-            LIMIT 1
             "#,
         )
         .bind(source.file_id as i64)
         .bind(uploader_id as i64)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| Self::map_lock_error("锁定取用授权依据失败", e))?;
 
-        let authorized = match candidate {
+        // 🔴 逐个试，不是只看第一条。同一份内容可能被多条消息引用；第一条的群
+        // 成员关系恰好在这期间失效，不代表另一条私聊引用也失效了——就此拒绝
+        // 是并发下的误拒。
+        let mut authorized = false;
+        for (channel_id, channel_type) in &candidates {
             // 私聊：授权主体就是刚锁住的那条频道行，不必再锁别的。
-            Some((_, 0)) => true,
-            // 群聊 / 其它：成员在另一张表上，还要锁住那一行再确认一次。
-            // 锁得到就说明这一刻它仍然有效；并发的退群会等在这把锁上。
-            Some((channel_id, channel_type)) => {
-                let sql = if channel_type == 1 {
-                    "SELECT 1 FROM privchat_group_members
-                      WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
-                      FOR SHARE"
-                } else {
-                    "SELECT 1 FROM privchat_channel_participants
-                      WHERE channel_id = $1 AND user_id = $2 AND left_at IS NULL
-                      FOR SHARE"
-                };
-                sqlx::query_as::<_, (i32,)>(sql)
-                    .bind(channel_id)
-                    .bind(uploader_id as i64)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| Self::map_lock_error("锁定成员关系失败", e))?
-                    .is_some()
+            if *channel_type == 0 {
+                authorized = true;
+                break;
             }
-            // 一条有效引用都没有：只有「文件从未被任何消息引用过」且取用者就是
-            // 上传者时才放行——那是「自己重发自己刚传的东西」，不是给别人的口子。
-            None => {
+            // 群聊 / 其它：成员在另一张表上，还要锁住那一行再确认一次。
+            //
+            // ⚠️ 在当前 schema 下这把锁是**冗余**的：`trg_privchat_group_membership_version`
+            // 会让任何 `left_at` 变更连带 `UPDATE privchat_channels.membership_version`，
+            // 而那一行上面已经 `FOR SHARE` 锁住了，所以退群本来就被挡住。
+            //
+            // 保留它是因为串行化不该依赖某个 trigger 恰好存在——那个 trigger 是为
+            // 同步版本号加的，不是为授权加的，随时可能被改掉或换实现。这里锁的是
+            // 判据本身。
+            //
+            // 后果是它**没有独立的并发测试**：删掉它，退群仍被频道行锁挡住，
+            // `leaving_a_group_is_blocked_by_the_production_claim` 照样绿。那条用例
+            // 真正守住的是频道行锁这条链路，不是这一句。
+            let sql = if *channel_type == 1 {
+                "SELECT 1 FROM privchat_group_members
+                  WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL
+                  FOR SHARE"
+            } else {
+                "SELECT 1 FROM privchat_channel_participants
+                  WHERE channel_id = $1 AND user_id = $2 AND left_at IS NULL
+                  FOR SHARE"
+            };
+            if sqlx::query_as::<_, (i32,)>(sql)
+                .bind(channel_id)
+                .bind(uploader_id as i64)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Self::map_lock_error("锁定成员关系失败", e))?
+                .is_some()
+            {
+                authorized = true;
+                break;
+            }
+        }
+
+        // 一条有效引用都没有：只有「文件从未被任何消息引用过」且取用者就是
+        // 上传者时才放行——那是「自己重发自己刚传的东西」，不是给别人的口子。
+        if !authorized && candidates.is_empty() {
                 let pending_self: Option<(i32,)> = sqlx::query_as(
                     r#"
                     SELECT 1
@@ -236,11 +257,10 @@ impl FileUploadRepository {
                 .bind(uploader_id as i64)
                 .bind(source.uploader_id as i64)
                 .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;
-                pending_self.is_some()
-            }
-        };
+            .await
+            .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;
+            authorized = pending_self.is_some();
+        }
         if !authorized {
             // 授权在这期间没了（撤回、删除、退群）。整事务回滚，不留下新的 file_id。
             tx.rollback().await.ok();
