@@ -55,6 +55,8 @@ pub async fn claim_existing(
     let meta = crate::service::file_claim_service::claim_existing_file(
         &services.file_service,
         &services.upload_token_service,
+        &services.message_repository,
+        &services.channel_service,
         user_id,
         token_str,
         sha256,

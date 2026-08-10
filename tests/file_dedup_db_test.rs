@@ -467,6 +467,99 @@ async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
 /// 🔴 claim 的**生产入口**：token 已被消费之后重放，必须返回同一个 file_id。
 ///
 /// 之前这条只测到仓储层。仓储层看不见「幂等查询排在 token 校验之前」这个顺序——
+/// 让 `claimer` 对源文件**确实有读取权限**：把文件挂到一条双方都在的会话消息上。
+///
+/// 不建这个前提的话，claim 会被授权闸门拒掉——那正是它该做的事，但这两条用例
+/// 要验的是 token 用途和重放幂等，不是授权本身（授权在 `attachment_authz_db_test`）。
+async fn authorize_claimer(pool: &sqlx::PgPool, file_id: u64, uploader: i64, claimer: i64) {
+    const CH: i64 = 970_001;
+    const MSG: i64 = 970_002;
+    let qr = |n: i64| format!("dedup-qr-{n}");
+    for (uid, name) in [(uploader, "dedup_uploader"), (claimer, "dedup_claimer")] {
+        sqlx::query(
+            "INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+             VALUES ($1, $2, $2, $3) ON CONFLICT (user_id) DO NOTHING",
+        )
+        .bind(uid)
+        .bind(name)
+        .bind(qr(uid))
+        .execute(pool)
+        .await
+        .expect("ensure user");
+    }
+    sqlx::query(
+        "INSERT INTO privchat_channels (channel_id, channel_type, direct_user1_id, direct_user2_id)
+         VALUES ($1, 0, $2, $3) ON CONFLICT (channel_id) DO NOTHING",
+    )
+    .bind(CH)
+    .bind(uploader)
+    .bind(claimer)
+    .execute(pool)
+    .await
+    .expect("ensure channel");
+    for uid in [uploader, claimer] {
+        sqlx::query(
+            "INSERT INTO privchat_channel_participants (channel_id, user_id, role, joined_at, left_at)
+             VALUES ($1, $2, 2, now_millis(), NULL)
+             ON CONFLICT (channel_id, user_id) DO UPDATE SET left_at = NULL",
+        )
+        .bind(CH)
+        .bind(uid)
+        .execute(pool)
+        .await
+        .expect("ensure participant");
+    }
+    sqlx::query(
+        "INSERT INTO privchat_messages (message_id, channel_id, sender_id, pts, message_type, content)
+         VALUES ($1, $2, $3, 1, 1, '[image]') ON CONFLICT DO NOTHING",
+    )
+    .bind(MSG)
+    .bind(CH)
+    .bind(uploader)
+    .execute(pool)
+    .await
+    .expect("ensure message");
+    // 🔴 先删。引用表主键不含 file_id，上一轮跑剩的行会让 ON CONFLICT DO NOTHING
+    // 静默吞掉这次插入——于是文件看起来「从未被引用」，授权回落到只有上传者可读，
+    // 表现为一条与授权无关的用例莫名其妙失败。
+    sqlx::query("DELETE FROM privchat_message_file_refs WHERE message_id = $1")
+        .bind(MSG)
+        .execute(pool)
+        .await
+        .expect("reset file refs");
+    sqlx::query(
+        "INSERT INTO privchat_message_file_refs
+             (message_id, message_created_at, file_id, role, ordinal, created_at)
+         SELECT $1, m.created_at, $2, 0, 0, m.created_at
+         FROM privchat_messages m WHERE m.message_id = $1
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(MSG)
+    .bind(file_id as i64)
+    .execute(pool)
+    .await
+    .expect("insert file ref");
+}
+
+/// 秒传取用的授权判据与 `file/get_url` 同一套，所以测试也得把那两样依赖备齐。
+fn authorization_deps(
+    pool: &sqlx::PgPool,
+) -> (
+    privchat::repository::message_repo::PgMessageRepository,
+    privchat::service::channel_service::ChannelService,
+) {
+    (
+        privchat::repository::message_repo::PgMessageRepository::new(std::sync::Arc::new(
+            pool.clone(),
+        )),
+        privchat::service::channel_service::ChannelService::new_with_repository(std::sync::Arc::new(
+            privchat::repository::channel_repo::PgChannelRepository::new(std::sync::Arc::new(
+                pool.clone(),
+            )),
+        )),
+    )
+}
+
 /// 有人把它挪到后面，仓储测试照样绿，而实际行为是：成功过的 token 已被消费，
 /// 再去校验只会得到「无效」，客户端永远拿不回那条记录。
 ///
@@ -508,7 +601,9 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
         .await
         .expect("token");
 
-    let first = claim_existing_file(&file_service, &token_service, OTHER as u64, &token.token, SHA)
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
+    let (messages, channels) = authorization_deps(&pool);
+    let first = claim_existing_file(&file_service, &token_service, &messages, &channels, OTHER as u64, &token.token, SHA)
         .await
         .expect("first claim");
     assert_ne!(first.file_id, original.file_id, "拿到的是自己的新 file_id");
@@ -532,7 +627,7 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
     );
 
     // 「响应丢了」：客户端拿同一个 token 再来一次。
-    let replay = claim_existing_file(&file_service, &token_service, OTHER as u64, &token.token, SHA)
+    let replay = claim_existing_file(&file_service, &token_service, &messages, &channels, OTHER as u64, &token.token, SHA)
         .await
         .expect("replayed claim must succeed even though the token is spent");
     assert_eq!(first.file_id, replay.file_id, "重放必须返回同一个 file_id");
@@ -577,6 +672,81 @@ async fn wait_until_blocked_on_advisory_lock(pool: &sqlx::PgPool, key: &str) {
     }
 }
 
+/// 摘要不是授权：拿得到 `stored_sha256` 不等于现在还能读这份文件。
+///
+/// 🔴 摘要会比访问权限活得久——读者退群、消息被删之后，那串哈希还在他手里。
+/// 只认摘要就等于让任何拿到过哈希的人随时把文件领走。
+///
+/// 拒绝时必须与「服务端没有这份内容」返回同一句话，否则这个接口就成了文件
+/// 存在性探测器：拿一堆摘要来问，能区分「没有」和「有但你无权」。
+#[tokio::test]
+async fn a_digest_alone_does_not_authorize_a_claim() {
+    use privchat::service::file_claim_service::claim_existing_file;
+    use privchat::service::upload_token_service::{
+        UploadIdentity, UploadTokenPurpose, UploadTokenService,
+    };
+    use privchat::service::FileService;
+
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
+    let original = seed_original(&repo).await;
+
+    // 关键：**不**建立任何引用/成员关系。OTHER 只是知道那串摘要而已。
+    let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
+    let token_service = Arc::new(UploadTokenService::new());
+    let token = token_service
+        .generate_token(
+            OTHER as u64,
+            FileType::Image,
+            10 * 1024 * 1024,
+            "message".to_string(),
+            None,
+            UploadIdentity {
+                sha256: Some(SHA.to_string()),
+                declared_size: Some(1024),
+                mime_type: Some("image/png".to_string()),
+                transform_version: 0,
+            },
+            UploadTokenPurpose::ClaimExisting,
+        )
+        .await
+        .expect("token");
+
+    let (messages, channels) = authorization_deps(&pool);
+    let refused = claim_existing_file(
+        &file_service,
+        &token_service,
+        &messages,
+        &channels,
+        OTHER as u64,
+        &token.token,
+        SHA,
+    )
+    .await;
+
+    match refused {
+        Err(e) => {
+            let text = e.to_string();
+            assert!(
+                text.contains("没有这份内容"),
+                "拒绝语必须与「内容不存在」一致，实际: {text}"
+            );
+        }
+        Ok(meta) => panic!("🔴 无权者仅凭摘要就领到了 file_id={}", meta.file_id),
+    }
+
+    // 而且不能留下任何痕迹：被拒的 claim 不该写库。
+    let claimed = repo
+        .find_claimed(OTHER as u64, &privchat::service::file_claim_service::claim_key_hash(&token.token))
+        .await
+        .expect("query claimed");
+    assert!(claimed.is_none(), "被拒的 claim 不该留下记录");
+
+    cleanup(&pool).await;
+}
+
 /// purpose 双向隔离：两种 token 各自只能走自己那条入口。
 ///
 /// 🔴 一次性 token 只挡得住「同一入口用两次」。没有用途隔离的话，两个入口
@@ -593,7 +763,7 @@ async fn a_token_can_only_be_used_for_its_own_purpose() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
-    seed_original(&repo).await;
+    let original = seed_original(&repo).await;
 
     let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
     let token_service = Arc::new(UploadTokenService::new());
@@ -618,9 +788,13 @@ async fn a_token_can_only_be_used_for_its_own_purpose() {
         )
         .await
         .expect("upload token");
+    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
+    let (messages, channels) = authorization_deps(&pool);
     let refused = claim_existing_file(
         &file_service,
         &token_service,
+        &messages,
+        &channels,
         OTHER as u64,
         &upload_token.token,
         SHA,
@@ -655,6 +829,8 @@ async fn a_token_can_only_be_used_for_its_own_purpose() {
     assert!(claim_existing_file(
         &file_service,
         &token_service,
+        &messages,
+        &channels,
         OTHER as u64,
         &claim_token.token,
         SHA,
