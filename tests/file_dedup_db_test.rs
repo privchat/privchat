@@ -666,6 +666,230 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
     cleanup(&pool).await;
 }
 
+/// 按会话类型建一条引用这份文件、且 OTHER 有权读的消息，返回 message_id。
+///
+/// 三种类型的授权主体不同（频道行 / group_members / participants），并发用例要
+/// 逐一覆盖，所以这里按类型分建而不是只建一种。
+async fn seed_reference_for(pool: &sqlx::PgPool, channel_type: i16, file_id: u64) -> i64 {
+    let channel: i64 = 972_000 + channel_type as i64;
+    let msg: i64 = 972_100 + channel_type as i64;
+
+    // 私聊频道对 (user1, user2) 有唯一索引，同一对用户只能有一条。别的 fixture
+    // 可能已经建过，所以先找再建。
+    let mut channel = channel;
+    match channel_type {
+        0 => {
+            let existing: Option<(i64,)> = sqlx::query_as(
+                "SELECT channel_id FROM privchat_channels
+                  WHERE channel_type = 0
+                    AND LEAST(direct_user1_id, direct_user2_id) = LEAST($1, $2)
+                    AND GREATEST(direct_user1_id, direct_user2_id) = GREATEST($1, $2)
+                  LIMIT 1",
+            )
+            .bind(OWNER)
+            .bind(OTHER)
+            .fetch_optional(pool)
+            .await
+            .expect("look up direct channel");
+            match existing {
+                Some((id,)) => channel = id,
+                None => {
+                    sqlx::query(
+                        "INSERT INTO privchat_channels
+                             (channel_id, channel_type, direct_user1_id, direct_user2_id)
+                         VALUES ($1, 0, $2, $3)",
+                    )
+                    .bind(channel)
+                    .bind(OWNER)
+                    .bind(OTHER)
+                    .execute(pool)
+                    .await
+                    .expect("direct channel");
+                }
+            }
+        }
+        1 => {
+            sqlx::query(
+                "INSERT INTO privchat_groups (group_id, name, owner_id, qr_key)
+                 VALUES ($1, 'dedup-lock-group', $2, 'dlq972001')
+                 ON CONFLICT (group_id) DO NOTHING",
+            )
+            .bind(channel)
+            .bind(OWNER)
+            .execute(pool)
+            .await
+            .expect("group");
+            sqlx::query(
+                "INSERT INTO privchat_channels (channel_id, channel_type, group_id)
+                 VALUES ($1, 1, $1) ON CONFLICT (channel_id) DO NOTHING",
+            )
+            .bind(channel)
+            .execute(pool)
+            .await
+            .expect("group channel");
+            sqlx::query(
+                "INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, left_at)
+                 VALUES ($1, $2, 2, now_millis(), NULL)
+                 ON CONFLICT (group_id, user_id) DO UPDATE SET left_at = NULL",
+            )
+            .bind(channel)
+            .bind(OTHER)
+            .execute(pool)
+            .await
+            .expect("group member");
+        }
+        _ => {
+            sqlx::query(
+                "INSERT INTO privchat_channels (channel_id, channel_type)
+                 VALUES ($1, $2) ON CONFLICT (channel_id) DO NOTHING",
+            )
+            .bind(channel)
+            .bind(channel_type)
+            .execute(pool)
+            .await
+            .expect("channel");
+            sqlx::query(
+                "INSERT INTO privchat_channel_participants
+                     (channel_id, user_id, role, joined_at, left_at)
+                 VALUES ($1, $2, 2, now_millis(), NULL)
+                 ON CONFLICT (channel_id, user_id) DO UPDATE SET left_at = NULL",
+            )
+            .bind(channel)
+            .bind(OTHER)
+            .execute(pool)
+            .await
+            .expect("participant");
+        }
+    }
+
+    // 先删后建：消息主键含 created_at 且默认 now()，ON CONFLICT 永远不命中，
+    // 撤回过的旧行会一直留着并被引用 join 命中。
+    sqlx::query("DELETE FROM privchat_message_file_refs WHERE message_id = $1")
+        .bind(msg)
+        .execute(pool)
+        .await
+        .expect("reset refs");
+    sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
+        .bind(msg)
+        .execute(pool)
+        .await
+        .expect("reset message");
+    sqlx::query(
+        "INSERT INTO privchat_messages (message_id, channel_id, sender_id, pts, message_type, content)
+         VALUES ($1, $2, $3, 1, 1, '[image]')",
+    )
+    .bind(msg)
+    .bind(channel)
+    .bind(OWNER)
+    .execute(pool)
+    .await
+    .expect("message");
+    sqlx::query(
+        "INSERT INTO privchat_message_file_refs
+             (message_id, message_created_at, file_id, role, ordinal, created_at)
+         SELECT $1, m.created_at, $2, 0, 0, m.created_at
+         FROM privchat_messages m WHERE m.message_id = $1",
+    )
+    .bind(msg)
+    .bind(file_id as i64)
+    .execute(pool)
+    .await
+    .expect("file ref");
+
+    msg
+}
+
+/// 轮询 `pg_locks`，直到确实有连接在等**行**锁（tuple / transactionid）。
+///
+/// 判据同样是「有一条未授予的锁记录」而不是睡够时间：撤回被 claim 的共享锁挡住
+/// 时，等待就体现在这里。
+async fn wait_until_blocked_on_row_lock(pool: &sqlx::PgPool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks \
+             WHERE NOT granted AND locktype IN ('tuple', 'transactionid')",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "10 秒内没有观察到有人在等行锁；不能继续，否则并发断言变成假绿",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 撤回与 claim 必须串行：claim 拿到共享锁之后，撤回要等它提交。
+///
+/// 🔴 这是「在事务里查一次」与「锁住依据」的分界。不加 `FOR SHARE` 的话，撤回
+/// 完全可以在授权 SELECT 之后、INSERT 之前提交——查得再晚也拦不住。
+///
+/// 三种会话类型各跑一遍：私聊的授权主体是频道行，群聊在 group_members，
+/// 其它在 participants，锁的对象不同，得各自验。
+#[tokio::test]
+async fn a_revoke_waits_for_an_in_flight_claim() {
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+
+    // 只有 0/1 两种：`privchat_channels_check` 要求 type=0 带两个 direct 用户、
+    // type=1 带 group_id，别的建不出来。「其它类型 → participants」那一支是给
+    // 尚未冻结成员模型的 room 类会话留的，当前 schema 下不可达，所以测不了——
+    // 不是漏测，是它还不存在。
+    for channel_type in [0_i16, 1] {
+        cleanup(&pool).await;
+        let repo = FileUploadRepository::new(pool.clone());
+        let original = seed_original(&repo).await;
+        let msg = seed_reference_for(&pool, channel_type, original.file_id).await;
+
+        // A：开一个事务，走到「授权依据已锁住」为止，先不提交。
+        let mut claim_tx = pool.begin().await.expect("claim tx");
+        sqlx::query(
+            "SELECT 1 FROM privchat_messages m WHERE m.message_id = $1 \
+               AND m.deleted = false AND m.revoked = false FOR SHARE",
+        )
+        .bind(msg)
+        .fetch_optional(&mut *claim_tx)
+        .await
+        .expect("lock message like the claim does");
+
+        // B：并发撤回同一条消息——必须等在 A 的共享锁上。
+        let revoke_pool = pool.clone();
+        let revoker = tokio::spawn(async move {
+            sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = $1")
+                .bind(msg)
+                .execute(revoke_pool.as_ref())
+                .await
+                .expect("revoke");
+        });
+
+        wait_until_blocked_on_row_lock(&pool).await;
+        assert!(
+            !revoker.is_finished(),
+            "channel_type={channel_type}：撤回没有被 claim 的共享锁挡住"
+        );
+
+        // A 提交 → B 才能往下走。
+        claim_tx.commit().await.expect("commit claim tx");
+        revoker.await.expect("revoke completes");
+
+        // 撤回已经提交，此刻再 claim 必须被拒。
+        let refused = repo
+            .copy_for_user(&original, OTHER as u64, "message", None)
+            .await;
+        assert!(
+            refused.is_err(),
+            "channel_type={channel_type}：撤回提交之后不能再开出新的 file_id"
+        );
+    }
+
+    cleanup(&pool).await;
+}
+
 /// 轮询 `pg_locks`，直到确实有连接在等这把 advisory 锁。
 ///
 /// 判据是「有一条 advisory 锁记录处于未授予状态」——不是睡够时间，
