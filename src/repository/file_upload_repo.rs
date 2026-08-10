@@ -119,6 +119,15 @@ impl FileUploadRepository {
         // 这道闸**只能拒、不能放行**：规范判据仍是 `authorize_file_access`，
         // 这里只负责确认它依据的事实没有在期间变过。两者的状态对应关系由
         // `the_guard_agrees_with_the_canonical_rule` 钉住。
+        // 🔴 成员判定必须按会话类型分流，这三支与投递收件人那份权威表达式同形
+        //（`message_repo.rs` 的 `privchat_message_dispatch_recipient` 插入）：
+        //
+        //   Direct(0) → 频道行上的 direct_user1/2_id（**没有 participants 行**）
+        //   Group(1)  → privchat_group_members
+        //   其它      → privchat_channel_participants
+        //
+        // 只查 participants 的话，私聊和群聊会被**误拒**——那不是「更安全」，
+        // 是把合法用户挡在外面。
         let still_allowed: Option<(i32,)> = sqlx::query_as(
             r#"
             SELECT 1
@@ -126,13 +135,29 @@ impl FileUploadRepository {
             JOIN privchat_messages m
               ON m.message_id = r.message_id
              AND m.created_at = r.message_created_at
-            JOIN privchat_channel_participants p
-              ON p.channel_id = m.channel_id
+            JOIN privchat_channels c
+              ON c.channel_id = m.channel_id
             WHERE r.file_id = $1
               AND m.deleted = false
               AND m.revoked = false
-              AND p.user_id = $2
-              AND p.left_at IS NULL
+              AND (
+                    (c.channel_type = 0
+                     AND $2 IN (c.direct_user1_id, c.direct_user2_id))
+                 OR (c.channel_type = 1
+                     AND EXISTS (
+                           SELECT 1 FROM privchat_group_members g
+                           WHERE g.group_id = c.channel_id
+                             AND g.user_id = $2
+                             AND g.left_at IS NULL
+                         ))
+                 OR (c.channel_type NOT IN (0, 1)
+                     AND EXISTS (
+                           SELECT 1 FROM privchat_channel_participants p
+                           WHERE p.channel_id = c.channel_id
+                             AND p.user_id = $2
+                             AND p.left_at IS NULL
+                         ))
+                  )
             UNION ALL
             -- 还没被任何消息引用过的文件（pending）：只有上传者本人能取用。
             -- 这一支是给「自己重发自己刚传的东西」留的，不是给别人的。

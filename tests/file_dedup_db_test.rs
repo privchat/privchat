@@ -17,6 +17,10 @@ use privchat::repository::FileUploadRepository;
 
 const OWNER: i64 = 9_980_001;
 const OTHER: i64 = 9_980_002;
+/// 私聊/群聊授权用例专用：私聊频道对 (user1, user2) 有唯一索引，
+/// 复用 OWNER/OTHER 那一对建不出第二条 DM。
+const DIRECT_PEER: i64 = 9_980_011;
+const DIRECT_HOST: i64 = 9_980_012;
 const SHA: &str = "d01f1b584be7a9e4acbaac536abfa9f00d9d33fb62a5ce76c54a25ee096908bd";
 const SHARED_PATH: &str = "/tmp/privchat-dedup-test/photo.png";
 
@@ -37,8 +41,10 @@ async fn pool() -> Option<Arc<sqlx::PgPool>> {
 }
 
 async fn cleanup(pool: &sqlx::PgPool) {
+    // 🔴 这里漏掉哪个 uploader，它的残留行就会以 `file_path` 相同的方式，破坏
+    // 别的用例「源文件已被删」这类前提——失败点离病因很远，非常难查。
     sqlx::query("DELETE FROM privchat_file_uploads WHERE uploader_id = ANY($1)")
-        .bind(&vec![OWNER, OTHER])
+        .bind(&vec![OWNER, OTHER, DIRECT_PEER, DIRECT_HOST])
         .execute(pool)
         .await
         .expect("clean uploads");
@@ -761,6 +767,128 @@ async fn a_digest_alone_does_not_authorize_a_claim() {
     assert!(claimed.is_none(), "被拒的 claim 不该留下记录");
 
     cleanup(&pool).await;
+}
+
+/// 私聊没有 participants 行、群聊成员在 group_members —— 都必须放行。
+///
+/// 🔴 只查 `privchat_channel_participants` 会把这两种**合法**取用挡在外面。
+/// 权威来源按会话类型分流（与投递收件人那份表达式同形）：
+///   Direct(0) → 频道行的 direct_user1/2_id；Group(1) → group_members；其它 → participants。
+///
+/// 之前的测试自己补了 participants 行，正好把这个 bug 盖住了——所以这里刻意
+/// **不**建 participants。
+#[tokio::test]
+async fn direct_and_group_members_are_authorized_without_participant_rows() {
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
+
+    const DM: i64 = 971_001;
+    const GROUP: i64 = 971_002;
+    const DM_MSG: i64 = 971_003;
+    const GROUP_MSG: i64 = 971_004;
+
+    for (uid, name) in [
+        (DIRECT_PEER, "dd_peer"),
+        (DIRECT_HOST, "dd_owner"),
+    ] {
+        sqlx::query(
+            "INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+             VALUES ($1, $2, $2, $3) ON CONFLICT (user_id) DO NOTHING",
+        )
+        .bind(uid)
+        .bind(name)
+        .bind(format!("dg{uid}"))
+        .execute(pool.as_ref())
+        .await
+        .expect("ensure user");
+    }
+
+    // ---- 私聊：成员写在频道行上，**没有 participants 行** ----
+    sqlx::query(
+        "INSERT INTO privchat_channels (channel_id, channel_type, direct_user1_id, direct_user2_id)
+         VALUES ($1, 0, $2, $3) ON CONFLICT (channel_id) DO NOTHING",
+    )
+    .bind(DM)
+    .bind(DIRECT_HOST)
+    .bind(DIRECT_PEER)
+    .execute(pool.as_ref())
+    .await
+    .expect("direct channel");
+
+    // ---- 群聊：成员在 group_members，同样没有 participants 行 ----
+    sqlx::query(
+        "INSERT INTO privchat_groups (group_id, name, owner_id, qr_key)
+         VALUES ($1, 'dedup-guard-group', $2, 'dgq971002') ON CONFLICT (group_id) DO NOTHING",
+    )
+    .bind(GROUP)
+    .bind(DIRECT_HOST)
+    .execute(pool.as_ref())
+    .await
+    .expect("group");
+    sqlx::query(
+        "INSERT INTO privchat_channels (channel_id, channel_type, group_id)
+         VALUES ($1, 1, $1) ON CONFLICT (channel_id) DO NOTHING",
+    )
+    .bind(GROUP)
+    .execute(pool.as_ref())
+    .await
+    .expect("group channel");
+    sqlx::query(
+        "INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, left_at)
+         VALUES ($1, $2, 2, now_millis(), NULL)
+         ON CONFLICT (group_id, user_id) DO UPDATE SET left_at = NULL",
+    )
+    .bind(GROUP)
+    .bind(DIRECT_PEER)
+    .execute(pool.as_ref())
+    .await
+    .expect("group member");
+
+    for (msg, channel) in [(DM_MSG, DM), (GROUP_MSG, GROUP)] {
+        let original = seed_original(&repo).await;
+        sqlx::query("DELETE FROM privchat_message_file_refs WHERE message_id = $1")
+            .bind(msg)
+            .execute(pool.as_ref())
+            .await
+            .expect("reset refs");
+        sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
+            .bind(msg)
+            .execute(pool.as_ref())
+            .await
+            .expect("reset message");
+        sqlx::query(
+            "INSERT INTO privchat_messages (message_id, channel_id, sender_id, pts, message_type, content)
+             VALUES ($1, $2, $3, 1, 1, '[image]')",
+        )
+        .bind(msg)
+        .bind(channel)
+        .bind(DIRECT_HOST)
+        .execute(pool.as_ref())
+        .await
+        .expect("message");
+        sqlx::query(
+            "INSERT INTO privchat_message_file_refs
+                 (message_id, message_created_at, file_id, role, ordinal, created_at)
+             SELECT $1, m.created_at, $2, 0, 0, m.created_at
+             FROM privchat_messages m WHERE m.message_id = $1",
+        )
+        .bind(msg)
+        .bind(original.file_id as i64)
+        .execute(pool.as_ref())
+        .await
+        .expect("file ref");
+
+        let claimed = repo
+            .copy_for_user(&original, DIRECT_PEER as u64, "message", None)
+            .await;
+        assert!(
+            claimed.is_ok(),
+            "channel_id={channel} 的合法成员被误拒了：{claimed:?}"
+        );
+        cleanup(&pool).await;
+    }
 }
 
 /// 授权检查通过之后、写入之前撤回消息 → 不能再开出新的 file_id。
