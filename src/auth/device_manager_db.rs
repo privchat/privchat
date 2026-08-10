@@ -398,7 +398,19 @@ impl DeviceManagerDb {
         Ok(count)
     }
 
-    /// 重新激活设备（被踢后重新登录）
+    /// 显式恢复一台设备（后台「解除封禁」用）。
+    ///
+    /// **与 [`register_or_update_device`] 的分工**：重新登录导致的恢复在那边的 upsert
+    /// 里就地完成，不走这里——登录是热路径，为一次状态归零多跑一条 UPDATE 不值得，
+    /// 而且分两步做就有中间态。
+    ///
+    /// 这个接口留给「不重新登录也要放行」的场景：解除风控冻结(Frozen)、
+    /// 通过二次验证(PendingVerify)。它**不判**当前状态，调用方自己决定该不该放行。
+    ///
+    /// 注意：目前后台还没有对应入口，所以暂时没有调用方。曾经 [`can_reactivate`]
+    /// 和本函数都无人调用，导致「设计上有恢复能力、实现上一次也没执行过」——
+    /// 被踢或被撤销的设备就此永久报废。要再加恢复入口时，从这里接。
+    #[allow(dead_code)]
     pub async fn reactivate_device(&self, user_id: u64, device_id: &str) -> Result<()> {
         let device_uuid = Uuid::parse_str(device_id)
             .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
@@ -473,7 +485,37 @@ impl DeviceManagerDb {
                 --
                 -- 这里 +1 让「重新登录」自己把上一次会话收掉，登出通知丢了也能自愈。
                 -- 只在 conflict 分支执行：新建设备走 VALUES 的 1，不受影响。
-                session_version = privchat_devices.session_version + 1
+                session_version = privchat_devices.session_version + 1,
+                -- 重新登录 = Kicked / Revoked 的解除条件，在这里恢复。
+                --
+                -- 漏了这一句的后果不是「少恢复一次」，而是**设备永久报废**：device_id 来自
+                -- 设备指纹，同一台机器每次登录都是同一个 id，走的都是这个 conflict 分支。
+                -- 状态一旦置为非 0 就再没有任何地方会改回去，用户此后每次都是
+                -- 「HTTP 登录成功、IM 连接被拒」，只能靠换设备。线上真出过：
+                -- 一台设备 session_version 涨到 17（登录十几次）而 state 始终是 3。
+                --
+                -- 只恢复 Kicked(1) / Revoked(3)，因为**重新登录本身就是它们的解除条件**
+                -- （Revoked 的定义就是「密码修改等场景，必须重新登录」）。
+                -- Frozen(2) / PendingVerify(4) 的解除条件是风控放行与二次验证，
+                -- 让重新登录顺手解掉，等于谁被风控冻结都只要退出重进就能绕过。
+                session_state = CASE
+                    WHEN privchat_devices.session_state IN (1, 3) THEN 0
+                    ELSE privchat_devices.session_state
+                END,
+                -- 连同踢出痕迹一起清掉。只改 state 会留下「状态正常，但踢出原因还写着
+                -- admin manual」的记录，后台看着像还被封着，排查时又要多绕一圈。
+                kicked_at = CASE
+                    WHEN privchat_devices.session_state IN (1, 3) THEN NULL
+                    ELSE privchat_devices.kicked_at
+                END,
+                kicked_by_device_id = CASE
+                    WHEN privchat_devices.session_state IN (1, 3) THEN NULL
+                    ELSE privchat_devices.kicked_by_device_id
+                END,
+                kicked_reason = CASE
+                    WHEN privchat_devices.session_state IN (1, 3) THEN NULL
+                    ELSE privchat_devices.kicked_reason
+                END
             RETURNING (xmax = 0) AS created, session_version
             "#,
             device_uuid,
