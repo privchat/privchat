@@ -60,7 +60,14 @@ impl SessionState {
         matches!(self, SessionState::Active)
     }
 
-    /// 判断是否可以重新激活（重新登录）
+    /// 能否**不重新登录**就恢复（走风控放行 / 二次验证这类流程）。
+    ///
+    /// 别把它读成「重新登录能不能恢复」——那是另一回事，由
+    /// `register_or_update_device` 的 upsert 决定，规则也不同：
+    /// 重新登录会恢复 Kicked / Revoked（重登本就是它们的解除条件），
+    /// 但**不会**恢复 Frozen / PendingVerify，否则退出重进就能绕过风控。
+    /// 两个维度正好互补，混用会得出相反的结论。
+    #[allow(dead_code)]
     pub fn can_reactivate(&self) -> bool {
         matches!(
             self,
