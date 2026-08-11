@@ -43,7 +43,7 @@ impl FileUploadRepository {
     /// 一串字节可能已经被好几个用户各自记过一笔——物理文件一份，记录多条。
     /// 判「这个人能不能取用」时必须逐条看：他有权读的可能不是最老那条。
     pub async fn find_all_by_content(&self, sha256: &str) -> Result<Vec<FileMetadata>> {
-        let rows: Vec<(i64,)> = sqlx::query_as(
+        let ids: Vec<(i64,)> = sqlx::query_as(
             "SELECT file_id FROM privchat_file_uploads \
              WHERE file_hash = $1 ORDER BY file_id LIMIT 16",
         )
@@ -51,8 +51,10 @@ impl FileUploadRepository {
         .fetch_all(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("按内容查所有记录失败: {}", e)))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (file_id,) in rows {
+        // 逐条取完整 metadata：`get_by_file_id` 是 file 表读取的唯一入口，
+        // 列的映射只维护一份。上限 16 条，N+1 的量是有界的。
+        let mut out = Vec::with_capacity(ids.len());
+        for (file_id,) in ids {
             if let Some(meta) = self.get_by_file_id(file_id as u64).await? {
                 out.push(meta);
             }
@@ -125,6 +127,18 @@ impl FileUploadRepository {
         // 与「记下取用过」是同一件事，不存在中间态。
         claim_key_hash: Option<&str>,
     ) -> Result<u64> {
+        // 🔴 秒传取用的身份就是这串摘要，缺了或不合法就不该往下走。
+        // 用空串顶上会让下面按 hash 的匹配落到「所有没有摘要的记录」上，
+        // pending 判定也跟着错——那是拿授权去赌一个空值。
+        let content_hash = match source.file_hash.as_deref() {
+            Some(h) if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) => h.to_string(),
+            _ => {
+                return Err(ServerError::NotFound(
+                    "服务端没有这份内容，请正常上传".to_string(),
+                ))
+            }
+        };
+
         let file_id = self.next_file_id().await?;
         let mut tx = self
             .pool
@@ -229,7 +243,7 @@ impl FileUploadRepository {
         )
         .bind(source.file_id as i64)
         .bind(uploader_id as i64)
-        .bind(source.file_hash.as_deref().unwrap_or_default())
+        .bind(&content_hash)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| Self::map_lock_error("锁定取用授权依据失败", e))?;
@@ -306,7 +320,7 @@ impl FileUploadRepository {
                 .bind(source.file_id as i64)
                 .bind(uploader_id as i64)
                 .bind(source.uploader_id as i64)
-                .bind(source.file_hash.as_deref().unwrap_or_default())
+                .bind(&content_hash)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;
