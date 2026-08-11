@@ -116,8 +116,14 @@ pub async fn resolve_attachment_access(
         .filter(|(_, live)| *live)
         .map(|(channel_id, _)| *channel_id)
         .collect();
-    let requester_is_member_of_a_live_reference = channel_service
-        .is_member_of_any(&live_channels, requester_id)
+    // 🔴 直查库，不走 ChannelService。它的成员读取命中内存缓存就返回，
+    // 缓存陈旧多久，已经退群的人就还能读多久附件。授权不能建立在缓存上。
+    //
+    // `channel_service` 仍在签名里：调用方拿它做别的事，而且这里换判据是一次
+    // 收敛，不想顺手改所有调用点的形状。
+    let _ = channel_service;
+    let requester_is_member_of_a_live_reference = message_repository
+        .is_member_of_any_channel(&live_channels, requester_id)
         .await
         .map_err(|error| AttachmentAccessError::Unavailable(error.to_string()))?;
 

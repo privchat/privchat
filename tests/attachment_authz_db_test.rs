@@ -409,6 +409,94 @@ async fn attachment_file_and_thumbnail_bind_to_message() {
     cleanup(&pool, &file_repo).await;
 }
 
+/// 授权判定读库，不读 ChannelService 的内存缓存。
+///
+/// 🔴 `get_channel_members` 命中缓存就直接返回。授权走它的话，缓存陈旧多久，
+/// 已经退群的人就还能读多久附件——不是微秒级窗口，是缓存的生命周期。
+///
+/// 这里先把成员关系读进 ChannelService 的缓存（模拟「进程里已经缓存过」），
+/// 然后只改数据库让他退群，缓存不动。判定必须按库里的事实拒绝。
+#[tokio::test]
+async fn authorization_reads_membership_from_the_database_not_the_cache() {
+    let _fixture_guard = fixture_lock().lock().await;
+    let Some(pool) = open_test_pool().await else {
+        eprintln!("skip: DATABASE_URL not configured");
+        return;
+    };
+    let file_repo = FileUploadRepository::new(pool.clone());
+    let msg_repo = PgMessageRepository::new(pool.clone());
+    let channel_repo = Arc::new(PgChannelRepository::new(pool.clone()));
+    let channel_service = ChannelService::new_with_repository(channel_repo);
+
+    cleanup(&pool, &file_repo).await;
+    seed_common(&pool).await;
+    file_repo
+        .insert(&file_meta(FILE_V1_BOUND, UPLOADER_UID, 1, Some("cek"), None))
+        .await
+        .expect("insert file");
+    sqlx::query(
+        r#"
+        INSERT INTO privchat_message_file_refs
+            (message_id, message_created_at, file_id, role, ordinal, created_at)
+        SELECT $1, m.created_at, $2, 0, 0, m.created_at
+        FROM privchat_messages m WHERE m.message_id = $1
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(MESSAGE_ID)
+    .bind(FILE_V1_BOUND as i64)
+    .execute(pool.as_ref())
+    .await
+    .expect("insert ref");
+
+    let meta = file_repo
+        .get_by_file_id(FILE_V1_BOUND)
+        .await
+        .expect("read file")
+        .expect("file exists");
+
+    // 前提：现在是有权的，并且让 ChannelService 把成员关系读进缓存。
+    let before = resolve_attachment_access(&msg_repo, &channel_service, &meta, MEMBER_UID as u64)
+        .await
+        .expect("authorization available");
+    assert!(before.authorized, "前提：退群之前有权读");
+    let _ = channel_service
+        .get_channel_members(&(CHANNEL_ID as u64))
+        .await
+        .expect("warm the cache");
+
+    // 只改数据库让他离开，**不碰缓存**。
+    sqlx::query(
+        "UPDATE privchat_channel_participants SET left_at = now_millis() \
+          WHERE channel_id = $1 AND user_id = $2",
+    )
+    .bind(CHANNEL_ID)
+    .bind(MEMBER_UID)
+    .execute(pool.as_ref())
+    .await
+    .expect("leave");
+    sqlx::query(
+        "UPDATE privchat_channels SET direct_user1_id = $2, direct_user2_id = $3 \
+          WHERE channel_id = $1 AND channel_type = 0",
+    )
+    .bind(CHANNEL_ID)
+    .bind(UPLOADER_UID)
+    .bind(STRANGER_UID)
+    .execute(pool.as_ref())
+    .await
+    .expect("rewrite direct pair");
+
+    let after = resolve_attachment_access(&msg_repo, &channel_service, &meta, MEMBER_UID as u64)
+        .await
+        .expect("authorization available");
+    assert!(
+        !after.authorized,
+        "🔴 库里已经不是成员了还放行——判定读的是缓存，不是事实"
+    );
+
+    cleanup(&pool, &file_repo).await;
+}
+
 /// 引用表语义的两条新契约（MEDIA_REFERENCE_AND_FORWARD_SPEC §4.1 / §4.3）。
 ///
 /// 1. 撤回一条消息 → 它的引用不再授权（旧实现的洞：软删 + 裸查 channel_id）。
