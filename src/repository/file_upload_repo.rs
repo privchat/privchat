@@ -143,8 +143,10 @@ impl FileUploadRepository {
         // 一点：READ COMMITTED 下，撤回或退群完全可以在这条 SELECT 之后、INSERT
         // 之前提交。
         //
-        // 锁序固定为 advisory(file_path) → message → channel → 成员行，全流程只有
-        // 这一处按这个顺序取锁，不会与自己成环。撤回、移出成员、退群都是对这些行的
+        // 锁序固定为 advisory(file_path) → message → channel，到此为止。
+        // **绝不再往下锁成员行**：退群的顺序是 member(写) → AFTER trigger → channel(写)，
+        // 再去锁 member 就成了环。成员状态改用「拿到频道锁之后新起一条语句重读」，
+        // 见下方。撤回、移出成员、退群都是对这些行的
         // UPDATE/DELETE，会自然等在共享锁上；最终语义是二者必有一个先提交：
         //   claim 先提交 → 取用成功，随后撤回；
         //   撤回先提交 → claim 等到锁后重新判定，拒绝。
@@ -156,7 +158,7 @@ impl FileUploadRepository {
         // `direct_user1/2_id` 上，没有 participants 行（成员判据与投递收件人那份
         // 表达式同形，见 `message_repo` 的 dispatch_recipient 插入）。
         // 排序只为让并发的多个 claim 以相同顺序取锁。
-        let candidate: Option<(i64, i16)> = sqlx::query_as(
+        let candidates: Vec<(i64, i16)> = sqlx::query_as(
             r#"
             SELECT m.channel_id, c.channel_type
             FROM privchat_message_file_refs r
@@ -188,12 +190,16 @@ impl FileUploadRepository {
                   )
             ORDER BY m.message_id
             FOR SHARE OF m, c
-            LIMIT 1
+            -- 🔴 有上限的遍历，两头都要顾：
+            --   只取 1 条 → 第一条在等锁期间失效就直接拒，哪怕还有别的有效引用；
+            --   全取     → 一次 claim 锁住热门文件的所有引用消息，挡下大量无关撤回。
+            -- 取到上限之外的候选一律不看：那种情况退化成「照常上传」，不是错误。
+            LIMIT 16
             "#,
         )
         .bind(source.file_id as i64)
         .bind(uploader_id as i64)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| Self::map_lock_error("锁定取用授权依据失败", e))?;
 
@@ -211,11 +217,48 @@ impl FileUploadRepository {
         //
         // 也因此只取一条：一次 claim 不该把这份文件的所有引用消息全锁住，
         // 热门文件会因此挡下大量无关的撤回。
-        let authorized = match candidate {
-            Some(_) => true,
-            // 一条有效引用都没有：只有「文件从未被任何消息引用过」且取用者就是
-            // 上传者时才放行——那是「自己重发自己刚传的东西」，不是给别人的口子。
-            None => {
+        let mut authorized = false;
+        for (channel_id, channel_type) in &candidates {
+            // 私聊：成员就写在刚锁住的频道行上，EvalPlanQual 会按最新版本重求，
+            // 不需要再读一次。
+            if *channel_type == 0 {
+                authorized = true;
+                break;
+            }
+            // 🔴 群聊 / 其它：成员在另一张表上，必须用**一条新语句**重读一次。
+            //
+            // 上面那条查询的 `FOR SHARE OF m, c` 只让 PostgreSQL 对 m/c 两行做
+            // EvalPlanQual；成员判定在 `EXISTS` 子查询里，走的是语句开始时的快照。
+            // 等锁期间提交的退群，它看不见——于是「已经退群了还能取用」。
+            //
+            // 用新语句而不是给成员行加 `FOR SHARE`：READ COMMITTED 下每条语句
+            // 取新快照，够看到那次提交；而加锁会变成 channel→member，与退群的
+            // member→channel（AFTER trigger 写 membership_version）成环。
+            // 串行化由频道行负责——migration 016 就是这么设计的。
+            let sql = if *channel_type == 1 {
+                "SELECT 1 FROM privchat_group_members
+                  WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL"
+            } else {
+                "SELECT 1 FROM privchat_channel_participants
+                  WHERE channel_id = $1 AND user_id = $2 AND left_at IS NULL"
+            };
+            if sqlx::query_as::<_, (i32,)>(sql)
+                .bind(channel_id)
+                .bind(uploader_id as i64)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| ServerError::Database(format!("重读成员关系失败: {e}")))?
+                .is_some()
+            {
+                authorized = true;
+                break;
+            }
+        }
+
+        // 一条有效引用都没有：只有「文件从未被任何消息引用过」且取用者就是
+        // 上传者时才放行——那是「自己重发自己刚传的东西」，不是给别人的口子。
+        if !authorized && candidates.is_empty() {
+            {
                 let pending_self: Option<(i32,)> = sqlx::query_as(
                     r#"
                     SELECT 1
@@ -231,9 +274,9 @@ impl FileUploadRepository {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;
-                pending_self.is_some()
+                authorized = pending_self.is_some();
             }
-        };
+        }
         if !authorized {
             // 授权在这期间没了（撤回、删除、退群）。整事务回滚，不留下新的 file_id。
             tx.rollback().await.ok();

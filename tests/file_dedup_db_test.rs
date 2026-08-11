@@ -1067,15 +1067,200 @@ async fn leaving_a_group_is_blocked_by_the_production_claim() {
     cleanup(&pool).await;
 }
 
-// ⚠️ 「第一候选在等锁期间失效 → 换下一条」这条**没有门禁**。
-//
-// 试写过：文件同时挂群引用和私聊引用，退群事务先改成员行（AFTER trigger 连带
-// 锁住群频道行）不提交，再起 claim，等它卡住后提交退群，断言 claim 靠私聊那条
-// 成功。写出来是绿的——但把私聊引用整个去掉它**仍然绿**，说明 claim 根本没走到
-// 换候选那一步，等待循环也没等到它真的阻塞。判据错在哪还没查清。
-//
-// 所以这条只靠 PostgreSQL 的 EvalPlanQual 语义 + 代码审查，没有测试守住。
-// 与其留一条测不到自己声称之事的用例，不如把缺口写在这里。
+/// 建一条群引用（OTHER 是群成员），返回 group/channel id。
+async fn seed_group_reference(pool: &sqlx::PgPool, msg: i64, file_id: u64) -> i64 {
+    const GROUP: i64 = 974_100;
+    sqlx::query(
+        "INSERT INTO privchat_groups (group_id, name, owner_id, qr_key)
+         VALUES ($1, 'dedup-fallthrough', $2, 'dfq974100')
+         ON CONFLICT (group_id) DO NOTHING",
+    )
+    .bind(GROUP)
+    .bind(OWNER)
+    .execute(pool)
+    .await
+    .expect("group");
+    sqlx::query(
+        "INSERT INTO privchat_channels (channel_id, channel_type, group_id)
+         VALUES ($1, 1, $1) ON CONFLICT (channel_id) DO NOTHING",
+    )
+    .bind(GROUP)
+    .execute(pool)
+    .await
+    .expect("group channel");
+    sqlx::query(
+        "INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, left_at)
+         VALUES ($1, $2, 2, now_millis(), NULL)
+         ON CONFLICT (group_id, user_id) DO UPDATE SET left_at = NULL",
+    )
+    .bind(GROUP)
+    .bind(OTHER)
+    .execute(pool)
+    .await
+    .expect("group member");
+    seed_message_ref(pool, msg, GROUP, file_id).await;
+    GROUP
+}
+
+/// 建一条私聊引用（OWNER ↔ OTHER），复用已有的那条 DM。
+async fn seed_direct_reference(pool: &sqlx::PgPool, msg: i64, file_id: u64) {
+    let existing: Option<(i64,)> = sqlx::query_as(
+        "SELECT channel_id FROM privchat_channels
+          WHERE channel_type = 0
+            AND LEAST(direct_user1_id, direct_user2_id) = LEAST($1, $2)
+            AND GREATEST(direct_user1_id, direct_user2_id) = GREATEST($1, $2)
+          LIMIT 1",
+    )
+    .bind(OWNER)
+    .bind(OTHER)
+    .fetch_optional(pool)
+    .await
+    .expect("look up direct channel");
+    let channel = match existing {
+        Some((id,)) => id,
+        None => {
+            const DM: i64 = 974_101;
+            sqlx::query(
+                "INSERT INTO privchat_channels
+                     (channel_id, channel_type, direct_user1_id, direct_user2_id)
+                 VALUES ($1, 0, $2, $3)",
+            )
+            .bind(DM)
+            .bind(OWNER)
+            .bind(OTHER)
+            .execute(pool)
+            .await
+            .expect("direct channel");
+            DM
+        }
+    };
+    seed_message_ref(pool, msg, channel, file_id).await;
+}
+
+/// 先删后建一条消息并挂上文件引用（消息主键含 created_at，ON CONFLICT 不管用）。
+async fn seed_message_ref(pool: &sqlx::PgPool, msg: i64, channel: i64, file_id: u64) {
+    sqlx::query("DELETE FROM privchat_message_file_refs WHERE message_id = $1")
+        .bind(msg)
+        .execute(pool)
+        .await
+        .expect("reset refs");
+    sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
+        .bind(msg)
+        .execute(pool)
+        .await
+        .expect("reset message");
+    sqlx::query(
+        "INSERT INTO privchat_messages (message_id, channel_id, sender_id, pts, message_type, content)
+         VALUES ($1, $2, $3, 1, 1, '[image]')",
+    )
+    .bind(msg)
+    .bind(channel)
+    .bind(OWNER)
+    .execute(pool)
+    .await
+    .expect("message");
+    sqlx::query(
+        "INSERT INTO privchat_message_file_refs
+             (message_id, message_created_at, file_id, role, ordinal, created_at)
+         SELECT $1, m.created_at, $2, 0, 0, m.created_at
+         FROM privchat_messages m WHERE m.message_id = $1",
+    )
+    .bind(msg)
+    .bind(file_id as i64)
+    .execute(pool)
+    .await
+    .expect("file ref");
+}
+
+/// 第一候选在等锁期间失效 → 换下一条；没有下一条才拒绝。
+///
+/// 🔴 守住「`LIMIT 1` 也够用」的全部依据：拿到锁之后 PostgreSQL 按最新版本重新
+/// 求值，第一条不再满足就继续找。不成立的话单条候选就是并发下的误拒。
+///
+/// 不用 INSERT barrier——退群事务自己控制何时提交就够确定。关键是先断言
+/// **确实有人被退群那个事务挡住**：只看「claim 还没结束」在它根本没阻塞时也成立，
+/// 那样测的就不是这件事（上一版正是栽在这儿）。
+async fn run_fall_through_case(pool: &std::sync::Arc<sqlx::PgPool>, with_direct: bool) -> bool {
+    cleanup(pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
+    let original = seed_original(&repo).await;
+
+    // 群引用的 message_id 必须**更小**：生产按 message_id 排序，否则私聊那条
+    // 先被选中，压根走不到 fall-through。
+    const GROUP_MSG: i64 = 974_001;
+    const DIRECT_MSG: i64 = 974_002;
+    let group = seed_group_reference(pool, GROUP_MSG, original.file_id).await;
+    if with_direct {
+        seed_direct_reference(pool, DIRECT_MSG, original.file_id).await;
+    }
+
+    let mut leave = pool.begin().await.expect("leave tx");
+    let leave_pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut *leave)
+        .await
+        .expect("leave pid");
+    let touched = sqlx::query(
+        "UPDATE privchat_group_members SET left_at = now_millis()
+          WHERE group_id = $1 AND user_id = $2",
+    )
+    .bind(group)
+    .bind(OTHER)
+    .execute(&mut *leave)
+    .await
+    .expect("leave the group")
+    .rows_affected();
+    assert_eq!(touched, 1, "前提：退群要真的改到那一行，否则 trigger 不触发");
+
+    let claim_pool = pool.clone();
+    let source = original.clone();
+    let claim = tokio::spawn(async move {
+        FileUploadRepository::new(claim_pool)
+            .copy_for_user(&source, OTHER as u64, "message", None)
+            .await
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let blocked: Vec<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(leave_pid.0)
+        .fetch_all(pool.as_ref())
+        .await
+        .expect("pg_blocking_pids");
+        if !blocked.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "10 秒内没有连接被退群事务(pid={})挡住；claim 没有等在群频道行上，\
+             这条用例测不到 fall-through",
+            leave_pid.0
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    leave.commit().await.expect("commit the leave");
+    let claimed = claim.await.expect("claim task");
+    cleanup(pool).await;
+    claimed.is_ok()
+}
+
+/// 两个方向一起断言：有兜底引用必须成功，没有必须拒绝。缺一边都可能是假绿。
+#[tokio::test]
+async fn a_stale_first_candidate_falls_through_to_the_next_one() {
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+
+    assert!(
+        run_fall_through_case(&pool, true).await,
+        "🔴 群引用失效但私聊引用仍有效时必须成功——就此拒绝是并发下的误拒"
+    );
+    assert!(
+        !run_fall_through_case(&pool, false).await,
+        "🔴 唯一的引用失效之后必须拒绝；仍然成功说明授权没有重新求值"
+    );
+}
 
 /// 锁等待超时必须是**可重试**的，不是终局失败。
 ///
