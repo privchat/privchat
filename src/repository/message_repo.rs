@@ -97,50 +97,6 @@ pub struct PgMessageRepository {
     pool: Arc<PgPool>,
 }
 
-/// 附件引用的来源。决定要不要跑「把文件绑到这条消息」的归属守卫。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachmentOrigin {
-    /// 普通发送：文件是发送者刚上传的，必须过归属守卫
-    /// （只能绑自己的、未被占用的文件）。
-    FreshUpload,
-    /// 转发：引用是服务端从源消息复制的，文件早就绑在源消息上了。
-    ///
-    /// 🔴 这条路径**必须跳过**归属守卫。守卫要求 `uploader_id = sender_id`，
-    /// 而转发人和上传者本来就是两个人——不跳过的话，转发他人图片必然
-    /// `ATTACHMENT_BINDING_REJECTED`。这正是转发在生产上 100% 失败的原因。
-    ///
-    /// 安全性不靠守卫，靠「客户端从不提交 file_id」：引用是服务端读源消息得到的，
-    /// 而读源消息之前已经校验过转发人有权读它。
-    CopiedFromExistingMessage,
-}
-
-/// 提交事务内要复查的转发前置条件。
-#[derive(Debug, Clone)]
-pub struct ForwardPrecondition {
-    pub source_message_id: u64,
-    /// 事务外读到的源正文——事务内必须仍然一致。
-    pub expected_content: String,
-    /// 事务外读到的源 metadata。
-    pub expected_metadata: serde_json::Value,
-    /// 事务外读到的源引用集合（file_id, role, ordinal），已排序去重。
-    pub expected_refs: Vec<(u64, i16, i32)>,
-}
-
-/// 转发时读到的源消息投影。
-#[derive(Debug, Clone)]
-pub struct ForwardSource {
-    pub message_id: u64,
-    pub channel_id: u64,
-    pub sender_id: u64,
-    pub message_type: i16,
-    pub content: String,
-    pub metadata: serde_json::Value,
-    pub deleted: bool,
-    pub revoked: bool,
-    pub created_at: i64,
-}
-
-
 #[derive(Debug, Clone)]
 pub struct AtomicMessageCommitRequest {
     pub message: Message,
@@ -153,16 +109,6 @@ pub struct AtomicMessageCommitRequest {
     /// **只有一个来源**：`service::legacy_media_refs`（裸 JSON 或 typed 两个入口）。
     /// 事务里按两个维度消费——绑定守卫按去重后的 file_id，引用表按 (role, ordinal)。
     pub attachment_refs: Vec<privchat_protocol::MediaRef>,
-    /// 这些引用是新上传的文件，还是从既有消息复制来的。
-    pub attachment_origin: AttachmentOrigin,
-    /// 转发前置条件（spec §6.4）：源消息必须仍然有效，且**内容与副本一致**。
-    ///
-    /// 🔴 只复查 `deleted/revoked` 不够。构造副本时在事务外读过源消息，那次读
-    /// 之后源消息可能被撤回、被编辑、引用被改。这里在同一个事务里 `FOR UPDATE`
-    /// 锁住源消息，把内容与引用重新读一遍并与副本比对——对不上就整条回滚。
-    /// 撤回、编辑与转发因此被行锁排成序：谁先提交谁生效，不存在
-    /// 「读到的是旧内容、写下去的是新消息」这种中间态。
-    pub forward_precondition: Option<ForwardPrecondition>,
     pub channel_type: i16,
     pub event: CanonicalTimelineEvent,
     pub sender_username: Option<String>,
@@ -571,66 +517,6 @@ impl PgMessageRepository {
             }
         }
 
-        // 转发前置条件（spec §6.4）：在**本事务内**锁住源消息，复查存活 + 内容 + 引用。
-        //
-        // 🔴 顺序必须在**幂等判定之后**。反过来的后果：第一次转发已经提交、
-        // 但响应在网络上丢了，随后源消息被撤回；客户端用同一个 request id 重试时，
-        // 会先撞上「源消息已撤回」而报错——明明那条转发早就成功了。
-        // 幂等结果代表「这件事已经发生过」，它优先于任何前置条件。
-        if let Some(precondition) = &request.forward_precondition {
-            let source: Option<(bool, bool, String, serde_json::Value)> = sqlx::query_as(
-                "SELECT deleted, revoked, content, metadata FROM privchat_messages \
-                 WHERE message_id = $1 FOR UPDATE",
-            )
-            .bind(precondition.source_message_id as i64)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| DatabaseError::Database(format!("锁定转发源消息失败: {}", e)))?;
-
-            let source_message_id = precondition.source_message_id;
-            match source {
-                None => {
-                    return Err(DatabaseError::Validation(format!(
-                        "FORWARD_SOURCE_NOT_FOUND source message {source_message_id} does not exist"
-                    )));
-                }
-                Some((deleted, revoked, _, _)) if deleted || revoked => {
-                    return Err(DatabaseError::Validation(format!(
-                        "FORWARD_SOURCE_GONE source message {source_message_id} was deleted or revoked"
-                    )));
-                }
-                Some((_, _, content, metadata)) => {
-                    // 内容在我们读完之后被改过 → 副本会与源不符，整条拒绝重来。
-                    if content != precondition.expected_content
-                        || metadata != precondition.expected_metadata
-                    {
-                        return Err(DatabaseError::Validation(format!(
-                            "FORWARD_SOURCE_CHANGED source message {source_message_id} changed while forwarding"
-                        )));
-                    }
-                }
-            }
-
-            // 引用同样要复查：源消息的媒体引用被改过时，副本会指向一组已经不存在的文件。
-            let current_refs: Vec<(i64, i16, i32)> = sqlx::query_as(
-                "SELECT file_id, role, ordinal FROM privchat_message_file_refs \
-                 WHERE message_id = $1 ORDER BY role, ordinal",
-            )
-            .bind(source_message_id as i64)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| DatabaseError::Database(format!("复查源消息引用失败: {}", e)))?;
-            let current: Vec<(u64, i16, i32)> = current_refs
-                .into_iter()
-                .map(|(file_id, role, ordinal)| (file_id as u64, role, ordinal))
-                .collect();
-            if current != precondition.expected_refs {
-                return Err(DatabaseError::Validation(format!(
-                    "FORWARD_SOURCE_CHANGED source message {source_message_id} media references changed while forwarding"
-                )));
-            }
-        }
-
         let now = chrono::Utc::now().timestamp_millis();
         let pts_row = sqlx::query(
             r#"
@@ -705,13 +591,9 @@ impl PgMessageRepository {
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
 
-        let bind_file_ids = match request.attachment_origin {
-            AttachmentOrigin::FreshUpload => {
-                crate::service::legacy_media_refs::unique_file_ids_of(&request.attachment_refs)
-            }
-            // 转发：文件已经绑在源消息上，这里只加引用，不改归属。
-            AttachmentOrigin::CopiedFromExistingMessage => Vec::new(),
-        };
+        let bind_file_ids = crate::service::legacy_media_refs::unique_file_ids_of(
+            &request.attachment_refs,
+        );
         for file_id in bind_file_ids {
             // P1-19 归属守卫：file_id 来自客户端可控的 metadata，必须校验
             // ① 上传者就是发送者（不能引用他人的 file）
@@ -1024,45 +906,6 @@ impl PgMessageRepository {
 
     /// 按 message_id 取 channel_id（附件访问授权用：file→message→channel）。
     /// 返回 None 表示消息不存在（授权方应据此拒绝）。
-    /// 读一条消息用于构造转发副本（不加锁）。
-    ///
-    /// 存活性与内容一致性在**提交事务里**用 `forward_precondition` 复查
-    /// （spec §6.4），这里读到的只是构造副本用的快照。
-    pub async fn get_message_for_forward(
-        &self,
-        message_id: u64,
-    ) -> Result<Option<ForwardSource>, DatabaseError> {
-        let row: Option<(i64, i64, i16, String, serde_json::Value, bool, bool, i64)> =
-            sqlx::query_as(
-                r#"
-                SELECT channel_id, sender_id, message_type, content, metadata,
-                       deleted, revoked, created_at
-                FROM privchat_messages
-                WHERE message_id = $1
-                "#,
-            )
-            .bind(message_id as i64)
-            .fetch_optional(self.pool())
-            .await
-            .map_err(|e| DatabaseError::Database(format!("读取源消息失败: {}", e)))?;
-
-        Ok(row.map(
-            |(channel_id, sender_id, message_type, content, metadata, deleted, revoked, created_at)| {
-                ForwardSource {
-                    message_id,
-                    channel_id: channel_id as u64,
-                    sender_id: sender_id as u64,
-                    message_type,
-                    content,
-                    metadata,
-                    deleted,
-                    revoked,
-                    created_at,
-                }
-            },
-        ))
-    }
-
     /// 一条消息的媒体引用（权威来源：引用表）。
     pub async fn message_media_refs(
         &self,
@@ -1104,6 +947,60 @@ impl PgMessageRepository {
     ///
     /// 同时返回失效的引用（`live=false`），因为「有引用但全都撤回了」与
     /// 「压根没有引用（pending）」是两种不同的判据：前者拒绝，后者看 uploader。
+    /// 这些会话里，有没有一个**此刻**还把这个人算作成员。
+    ///
+    /// 🔴 授权判定必须直查库。`ChannelService::get_channel_members` 命中内存缓存
+    /// 就直接返回（`channel_service.rs` 的 `get_channel_opt`），那份缓存陈旧多久，
+    /// 退群的人就还能读多久附件——不是微秒级窗口，是缓存的生命周期。
+    ///
+    /// 判据按会话类型分流，与投递收件人那份表达式同形（见本文件
+    /// `privchat_message_dispatch_recipient` 的插入）：
+    ///   Direct(0) → 频道行上的 direct_user1/2_id（没有 participants 行）
+    ///   Group(1)  → privchat_group_members
+    ///   其它      → privchat_channel_participants
+    pub async fn is_member_of_any_channel(
+        &self,
+        channel_ids: &[u64],
+        user_id: u64,
+    ) -> Result<bool, DatabaseError> {
+        if channel_ids.is_empty() {
+            return Ok(false);
+        }
+        let ids: Vec<i64> = channel_ids.iter().map(|id| *id as i64).collect();
+        let row: Option<(i32,)> = sqlx::query_as(
+            r#"
+            SELECT 1
+            FROM privchat_channels c
+            WHERE c.channel_id = ANY($1)
+              AND (
+                    (c.channel_type = 0
+                     AND $2 IN (c.direct_user1_id, c.direct_user2_id))
+                 OR (c.channel_type = 1
+                     AND EXISTS (
+                           SELECT 1 FROM privchat_group_members g
+                           WHERE g.group_id = c.channel_id
+                             AND g.user_id = $2
+                             AND g.left_at IS NULL
+                         ))
+                 OR (c.channel_type NOT IN (0, 1)
+                     AND EXISTS (
+                           SELECT 1 FROM privchat_channel_participants p
+                           WHERE p.channel_id = c.channel_id
+                             AND p.user_id = $2
+                             AND p.left_at IS NULL
+                         ))
+                  )
+            LIMIT 1
+            "#,
+        )
+        .bind(&ids)
+        .bind(user_id as i64)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("查询会话成员失败: {e}")))?;
+        Ok(row.is_some())
+    }
+
     pub async fn file_reference_channels(
         &self,
         file_id: u64,
@@ -2793,8 +2690,6 @@ mod atomic_dispatch_tests {
             message,
             dedup_key: Some("test:p2:group-snapshot".to_string()),
             client_registry_claim: None,
-            attachment_origin: AttachmentOrigin::FreshUpload,
-            forward_precondition: None,
             attachment_refs: vec![
                 MediaRef {
                     file_id: 100,
@@ -2937,8 +2832,6 @@ mod atomic_dispatch_tests {
             message,
             dedup_key: Some("test:p2:group-snapshot".to_string()),
             client_registry_claim: None,
-            attachment_origin: AttachmentOrigin::FreshUpload,
-            forward_precondition: None,
             attachment_refs: vec![MediaRef {
                 file_id: 4242,
                 role: MediaRole::Original,
@@ -3098,8 +2991,6 @@ mod atomic_dispatch_tests {
                 dedup_key: Some("test:p2:group-snapshot".to_string()),
                 client_registry_claim: None,
                 attachment_refs: Vec::new(),
-                attachment_origin: AttachmentOrigin::FreshUpload,
-                forward_precondition: None,
                 channel_type: 2,
                 event: CanonicalTimelineEvent::NewMessage(privchat_protocol::NewMessageEvent {
                     message_type: privchat_protocol::ContentMessageType::Text,
