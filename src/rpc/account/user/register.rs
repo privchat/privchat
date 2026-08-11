@@ -226,9 +226,7 @@ pub async fn handle(
                             channel_type: 1,
                             recipient_user_ids: vec![user_id, crate::config::SYSTEM_USER_ID],
                             dedup_key: None,
-                            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
                             attachment_refs_override: None,
-            forward_precondition: None,
                         })
                         .await
                     {

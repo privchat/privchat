@@ -510,8 +510,6 @@ impl SyncService {
                     decision: "accepted".to_string(),
                 }),
                 attachment_refs,
-                attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
-                forward_precondition: None,
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
                 sender_username: None,

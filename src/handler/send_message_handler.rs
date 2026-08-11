@@ -1162,8 +1162,6 @@ impl MessageHandler for SendMessageHandler {
                 dedup_key: client_dedup_key.clone(),
                 client_registry_claim: None,
                 attachment_refs,
-                attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
-                forward_precondition: None,
                 channel_type: channel_type_code as i16,
                 event: canonical_event,
                 sender_username: None,
@@ -1772,9 +1770,11 @@ impl SendMessageHandler {
             privchat_protocol::ContentMessageType::Sticker => {
                 self.validate_sticker_metadata(&metadata).await
             }
-            privchat_protocol::ContentMessageType::Forward => {
-                self.validate_forward_metadata(&metadata).await
-            }
+            privchat_protocol::ContentMessageType::Forward => Err(
+                crate::error::ServerError::Validation(
+                    "forward 消息类型已废弃，请使用普通消息类型".to_string(),
+                ),
+            ),
             privchat_protocol::ContentMessageType::Link => {
                 self.validate_link_metadata(&metadata).await
             }
@@ -1976,27 +1976,6 @@ impl SendMessageHandler {
         if url.trim().is_empty() {
             return Err(crate::error::ServerError::Validation(
                 "link 消息的 metadata.url 不能为空".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// 验证转发消息 metadata
-    async fn validate_forward_metadata(&self, metadata: &Value) -> crate::Result<()> {
-        // 验证 messages 数组（扁平结构）
-        let messages = metadata
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                crate::error::ServerError::Validation(
-                    "forward 消息缺少 metadata.messages 数组".to_string(),
-                )
-            })?;
-
-        if messages.is_empty() {
-            return Err(crate::error::ServerError::Validation(
-                "forward 消息的 messages 数组不能为空".to_string(),
             ));
         }
 

@@ -1989,7 +1989,7 @@ async fn send_system_message(
 ) -> ApiResult<dto::SendSystemMessageResponse> {
     verify_service_key(&headers, &state).await?;
 
-    let message_type = parse_content_message_type(request.message_type.as_deref());
+    let message_type = parse_content_message_type(request.message_type.as_deref())?;
 
     let metadata = request
         .metadata
@@ -2015,9 +2015,7 @@ async fn send_system_message(
             channel_type,
             recipient_user_ids: recipients,
             dedup_key: None, // 系统灰条通知不需要卡片幂等
-            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
-            forward_precondition: None,
         })
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
@@ -2068,7 +2066,7 @@ async fn send_system_message_to_user(
         .ensure_direct_channel_for_admin(sender_id, request.user_id)
         .await?;
 
-    let message_type = parse_content_message_type(request.message_type.as_deref());
+    let message_type = parse_content_message_type(request.message_type.as_deref())?;
     let metadata = request
         .metadata
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
@@ -2084,9 +2082,7 @@ async fn send_system_message_to_user(
             channel_type: 1, // 1 = Direct
             recipient_user_ids: vec![sender_id, request.user_id],
             dedup_key: None,
-            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
-            forward_precondition: None,
         })
         .await
         .map_err(|e| ServerError::Internal(format!("发送系统消息失败: {}", e)))?;
@@ -2297,7 +2293,7 @@ async fn send_message(
 ) -> ApiResult<dto::SendMessageResponse> {
     verify_service_key(&headers, &state).await?;
 
-    let message_type = parse_content_message_type(request.message_type.as_deref());
+    let message_type = parse_content_message_type(request.message_type.as_deref())?;
 
     let content_len = request.content.chars().count();
     info!(
@@ -2326,9 +2322,7 @@ async fn send_message(
             channel_type,
             recipient_user_ids: recipients,
             dedup_key: request.dedup_key.clone(),
-            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
-            forward_precondition: None,
         })
         .await
         .map_err(|e| {
@@ -2910,25 +2904,27 @@ async fn ensure_system_sender(state: &AdminServerState, sender_id: u64) -> Resul
 }
 
 /// 解析消息类型字符串为 ContentMessageType
-fn parse_content_message_type(s: Option<&str>) -> privchat_protocol::ContentMessageType {
+fn parse_content_message_type(s: Option<&str>) -> Result<privchat_protocol::ContentMessageType> {
     use privchat_protocol::ContentMessageType;
     match s {
-        Some("image") => ContentMessageType::Image,
+        Some("image") => Ok(ContentMessageType::Image),
         // 普通音频文件作为 File 消息发送，不再有独立 Audio 消息类型
-        Some("file") | Some("audio") => ContentMessageType::File,
-        Some("voice") => ContentMessageType::Voice,
-        Some("video") => ContentMessageType::Video,
-        Some("system") => ContentMessageType::System,
-        Some("location") => ContentMessageType::Location,
-        Some("contact_card") => ContentMessageType::ContactCard,
-        Some("sticker") => ContentMessageType::Sticker,
-        Some("forward") => ContentMessageType::Forward,
-        Some("link") => ContentMessageType::Link,
+        Some("file") | Some("audio") => Ok(ContentMessageType::File),
+        Some("voice") => Ok(ContentMessageType::Voice),
+        Some("video") => Ok(ContentMessageType::Video),
+        Some("system") => Ok(ContentMessageType::System),
+        Some("location") => Ok(ContentMessageType::Location),
+        Some("contact_card") => Ok(ContentMessageType::ContactCard),
+        Some("sticker") => Ok(ContentMessageType::Sticker),
+        Some("forward") => Err(ServerError::Validation(
+            "forward 消息类型已废弃，请使用普通消息类型".to_string(),
+        )),
+        Some("link") => Ok(ContentMessageType::Link),
         // RP-12：资金消息卡片由 platform 服务端注入（server-authoritative）。
         // 协议枚举早已支持 RedPacket=11 / MoneyTransfer=12，此前该 match 漏映射会兜底成 Text。
-        Some("red_packet") => ContentMessageType::RedPacket,
-        Some("money_transfer") => ContentMessageType::MoneyTransfer,
-        _ => ContentMessageType::Text,
+        Some("red_packet") => Ok(ContentMessageType::RedPacket),
+        Some("money_transfer") => Ok(ContentMessageType::MoneyTransfer),
+        _ => Ok(ContentMessageType::Text),
     }
 }
 
