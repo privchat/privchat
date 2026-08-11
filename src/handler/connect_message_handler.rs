@@ -648,9 +648,7 @@ impl ConnectMessageHandler {
                 channel_type: 1, // DM (system ↔ user)
                 recipient_user_ids: vec![user_id],
                 dedup_key: None,
-                attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
                 attachment_refs_override: None,
-            forward_precondition: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("send login notice failed: {}", e))?;

@@ -91,14 +91,8 @@ pub struct ServerSendMessageRequest {
     /// RP-12 幂等键（资金消息卡片注入用，如 `red_packet:{id}` / `money_transfer:{id}`）。
     /// 普通消息为 None。重复注入返回既有 message_id，不重复落库/推送。
     pub dedup_key: Option<String>,
-    /// 媒体引用的来源。默认 `FreshUpload`；转发路径传
-    /// `CopiedFromExistingMessage`，跳过「文件必须属于发送者」的归属守卫。
-    pub attachment_origin: crate::repository::message_repo::AttachmentOrigin,
-    /// 服务端给定的媒体引用。`None` = 从 metadata 解析（普通发送）。
-    /// 转发路径显式传源消息的引用，不靠对复制后的 metadata 再解析一次。
+    /// 服务端给定的媒体引用；`None` 时从 metadata 解析。
     pub attachment_refs_override: Option<Vec<privchat_protocol::MediaRef>>,
-    /// 转发前置条件：提交事务里锁源消息并复查存活 + 内容 + 引用（spec §6.4）。
-    pub forward_precondition: Option<crate::repository::message_repo::ForwardPrecondition>,
 }
 
 /// 服务端发消息的结果
@@ -229,8 +223,6 @@ impl MessageService {
                 dedup_key: req.dedup_key.clone(),
                 client_registry_claim: None,
                 attachment_refs,
-                attachment_origin: req.attachment_origin,
-                forward_precondition: req.forward_precondition.clone(),
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
                 sender_username: None,
@@ -378,9 +370,7 @@ impl MessageService {
             channel_type: 2, // Group
             recipient_user_ids,
             dedup_key: None,
-            attachment_origin: crate::repository::message_repo::AttachmentOrigin::FreshUpload,
             attachment_refs_override: None,
-            forward_precondition: None,
         };
 
         self.send_message(req)
