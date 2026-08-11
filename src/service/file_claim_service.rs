@@ -102,46 +102,39 @@ pub async fn claim_existing_file(
     }
 
     // 判重只看摘要：字节相同就是同一份东西。
-    let source = file_service
-        .find_by_content(&normalized)
-        .await?
-        .ok_or_else(|| ServerError::NotFound("服务端没有这份内容，请正常上传".to_string()))?;
-
-    // 🔴 摘要不是授权。`stored_sha256` 只是一个猜不出来的标识——拿到它的人可以
-    // 一直留着，权限却会变（退群、被移出、消息被删）。只认摘要就等于让哈希的寿命
-    // 超过访问权限的寿命，谁手上有旧哈希谁就能把文件领走。
     //
-    // 判据与 `file/get_url` 完全同一套，避免两处判断慢慢分叉。
-    let decision = crate::service::attachment_authorization::resolve_attachment_access(
-        message_repository,
-        channel_service,
-        &source,
-        user_id,
-    )
-    .await
-    .map_err(|error| {
-        // 判定不可用是服务异常，不能降级成「无权」——更不能降级成「放行」。
-        tracing::error!(
-            "秒传授权判定不可用 source_file_id={} user_id={}: {}",
-            source.file_id,
+    // 🔴 同一串字节可能已经有好几条记录（alice 发在群 A、bob 发在群 B……）。
+    // 物理文件一份，记录多条，而**授权是按记录算的**：调用者有权读的未必是最老
+    // 那条。所以逐条试，取第一条他现在读得到的，不能先钉死一条再判。
+    let candidates = file_service.find_all_by_content(&normalized).await?;
+    let mut source = None;
+    for candidate in candidates {
+        let decision = crate::service::attachment_authorization::resolve_attachment_access(
+            message_repository,
+            channel_service,
+            &candidate,
             user_id,
-            error
-        );
-        ServerError::Internal("ATTACHMENT_AUTHORIZATION_UNAVAILABLE".to_string())
-    })?;
-    if !decision.authorized {
-        tracing::warn!(
-            "🚫 拒绝秒传取用: source_file_id={} user_id={} source={:?}",
-            source.file_id,
-            user_id,
-            decision.source
-        );
-        // 🔴 与「服务端没有这份内容」返回同一句话。分开说的话，这个接口就成了
-        // 文件存在性探测器：拿一堆摘要来问，能区分「没有」和「有但你无权」。
-        return Err(ServerError::NotFound(
-            "服务端没有这份内容，请正常上传".to_string(),
-        ));
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                "秒传授权判定不可用 source_file_id={} user_id={}: {}",
+                candidate.file_id,
+                user_id,
+                error
+            );
+            ServerError::Internal("ATTACHMENT_AUTHORIZATION_UNAVAILABLE".to_string())
+        })?;
+        if decision.authorized {
+            source = Some(candidate);
+            break;
+        }
     }
+    // 🔴 与「服务端没有这份内容」返回同一句话。分开说的话，这个接口就成了
+    // 文件存在性探测器：拿一堆摘要来问，能区分「没有」和「有但你无权」。
+    let source = source.ok_or_else(|| {
+        ServerError::NotFound("服务端没有这份内容，请正常上传".to_string())
+    })?;
 
     let file_id = file_service
         .copy_for_user(&source, user_id, &token.business_type, Some(&key))

@@ -504,6 +504,14 @@ impl FileService {
         self.file_upload_repo.find_by_content(sha256).await
     }
 
+    /// 同一份内容的所有逻辑记录（有上限）。授权按记录算，调用者能读的未必是最老那条。
+    pub async fn find_all_by_content(
+        &self,
+        sha256: &str,
+    ) -> Result<Vec<crate::model::file_upload::FileMetadata>> {
+        self.file_upload_repo.find_all_by_content(sha256).await
+    }
+
     /// 秒传取用：照着已有那行给当前用户插一条新记录，物理文件不动。
     pub async fn copy_for_user(
         &self,
@@ -852,7 +860,7 @@ mod authz_tests {
     /// 【转发的核心用例】上传者与请求者毫无关系，只要请求者在某条有效引用
     /// 消息的会话里就该放行——转发副本的接收方正是这个形态。
     #[test]
-    fn a_forwarded_copy_is_readable_by_someone_unrelated_to_the_uploader() {
+    fn a_shared_file_reference_is_readable_by_another_message_owner() {
         assert!(authorize_file_access(facts(777, 1, true, true)));
     }
 
