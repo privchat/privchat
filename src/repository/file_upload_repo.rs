@@ -38,6 +38,28 @@ impl FileUploadRepository {
         self.pool.as_ref()
     }
 
+    /// 同一份内容的所有逻辑记录（有上限）。
+    ///
+    /// 一串字节可能已经被好几个用户各自记过一笔——物理文件一份，记录多条。
+    /// 判「这个人能不能取用」时必须逐条看：他有权读的可能不是最老那条。
+    pub async fn find_all_by_content(&self, sha256: &str) -> Result<Vec<FileMetadata>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT file_id FROM privchat_file_uploads \
+             WHERE file_hash = $1 ORDER BY file_id LIMIT 16",
+        )
+        .bind(sha256)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("按内容查所有记录失败: {}", e)))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (file_id,) in rows {
+            if let Some(meta) = self.get_by_file_id(file_id as u64).await? {
+                out.push(meta);
+            }
+        }
+        Ok(out)
+    }
+
     /// 秒传探测：这份内容在不在。**不写任何东西。**
     ///
     /// 判重只看**落盘字节**的 SHA-256：摘要相同即字节相同，大小自然相同，
@@ -167,7 +189,15 @@ impl FileUploadRepository {
              AND m.created_at = r.message_created_at
             JOIN privchat_channels c
               ON c.channel_id = m.channel_id
-            WHERE r.file_id = $1
+            -- 🔴 跨**同一份内容的所有逻辑记录**找，不是只看传进来那条。
+            --
+            -- 同一串字节可能已经有好几条记录：alice 发在群 A（file_id=1），
+            -- bob 发在群 B（file_id=2）。charlie 只在群 B，他能读的是 2。
+            -- 先按 `ORDER BY file_id` 钉死最老那条再判授权，charlie 就会被拒——
+            -- 而他明明有权拿到这份内容。物理文件是同一个，授权是按记录算的。
+            WHERE r.file_id IN (
+                    SELECT file_id FROM privchat_file_uploads WHERE file_hash = $3
+                  )
               AND m.deleted = false
               AND m.revoked = false
               AND (
@@ -190,7 +220,7 @@ impl FileUploadRepository {
                   )
             ORDER BY m.message_id
             FOR SHARE OF m, c
-            -- 🔴 有上限的遍历，两头都要顾：
+            -- 🔴 有上限的遍历（**不是只取一条**），两头都要顾：
             --   只取 1 条 → 第一条在等锁期间失效就直接拒，哪怕还有别的有效引用；
             --   全取     → 一次 claim 锁住热门文件的所有引用消息，挡下大量无关撤回。
             -- 取到上限之外的候选一律不看：那种情况退化成「照常上传」，不是错误。
@@ -199,6 +229,7 @@ impl FileUploadRepository {
         )
         .bind(source.file_id as i64)
         .bind(uploader_id as i64)
+        .bind(source.file_hash.as_deref().unwrap_or_default())
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| Self::map_lock_error("锁定取用授权依据失败", e))?;
@@ -263,7 +294,11 @@ impl FileUploadRepository {
                     r#"
                     SELECT 1
                     WHERE NOT EXISTS (
-                            SELECT 1 FROM privchat_message_file_refs WHERE file_id = $1
+                            SELECT 1 FROM privchat_message_file_refs
+                             WHERE file_id IN (
+                                     SELECT file_id FROM privchat_file_uploads
+                                      WHERE file_hash = $4
+                                   )
                           )
                       AND $2 = $3
                     "#,
@@ -271,6 +306,7 @@ impl FileUploadRepository {
                 .bind(source.file_id as i64)
                 .bind(uploader_id as i64)
                 .bind(source.uploader_id as i64)
+                .bind(source.file_hash.as_deref().unwrap_or_default())
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;

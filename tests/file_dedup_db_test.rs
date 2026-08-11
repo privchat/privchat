@@ -1262,6 +1262,137 @@ async fn a_stale_first_candidate_falls_through_to_the_next_one() {
     );
 }
 
+/// 同一份内容有多条记录时，按**请求者能读哪一条**授权，不是钉死最老那条。
+///
+/// 🔴 alice 发在群 A（较老的 file_id），bob 发在群 B（较新的）。charlie 只在群 B。
+/// `find_by_content` 按 `ORDER BY file_id` 返回最老那条，如果授权也照着它判，
+/// charlie 会被拒——而他明明有权拿到这份内容。物理文件是同一个，授权按记录算。
+///
+/// 走真实的 `claim_existing_file`（prepare → find_by_content → 授权 → copy），
+/// 只调 `copy_for_user` 是抓不到这个的：那样等于替服务端选好了源。
+#[tokio::test]
+async fn a_claimer_is_authorized_against_the_record_they_can_actually_read() {
+    use privchat::service::file_claim_service::claim_existing_file;
+    use privchat::service::upload_token_service::{
+        UploadIdentity, UploadTokenPurpose, UploadTokenService,
+    };
+    use privchat::service::FileService;
+
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
+
+    // 较老的一条：OWNER 上传，挂在 charlie 读不到的地方（不建任何引用即可——
+    // 无引用时只有上传者可读）。
+    let older = seed_original(&repo).await;
+    // 较新的一条：同 hash、同物理路径，挂在 charlie 在的群里。
+    let mut newer = older.clone();
+    newer.file_id = repo.next_file_id().await.expect("file id");
+    newer.uploader_id = OWNER as u64;
+    repo.insert(&newer).await.expect("insert newer record");
+    assert!(newer.file_id > older.file_id, "较新那条的 file_id 必须更大");
+
+    const CHARLIE: i64 = 9_980_021;
+    sqlx::query(
+        "INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+         VALUES ($1, 'dd_charlie', 'dd_charlie', 'dgc9980021')
+         ON CONFLICT (user_id) DO NOTHING",
+    )
+    .bind(CHARLIE)
+    .execute(pool.as_ref())
+    .await
+    .expect("charlie");
+    const GROUP: i64 = 975_001;
+    const MSG: i64 = 975_002;
+    sqlx::query(
+        "INSERT INTO privchat_groups (group_id, name, owner_id, qr_key)
+         VALUES ($1, 'dedup-pick', $2, 'dpq975001') ON CONFLICT (group_id) DO NOTHING",
+    )
+    .bind(GROUP)
+    .bind(OWNER)
+    .execute(pool.as_ref())
+    .await
+    .expect("group");
+    sqlx::query(
+        "INSERT INTO privchat_channels (channel_id, channel_type, group_id)
+         VALUES ($1, 1, $1) ON CONFLICT (channel_id) DO NOTHING",
+    )
+    .bind(GROUP)
+    .execute(pool.as_ref())
+    .await
+    .expect("group channel");
+    sqlx::query(
+        "INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, left_at)
+         VALUES ($1, $2, 2, now_millis(), NULL)
+         ON CONFLICT (group_id, user_id) DO UPDATE SET left_at = NULL",
+    )
+    .bind(GROUP)
+    .bind(CHARLIE)
+    .execute(pool.as_ref())
+    .await
+    .expect("charlie joins");
+    // 生产入群会同时写 participants（channel_repo.rs:409/631），规范判据
+    // `resolve_attachment_access` 的成员部分读的正是这张表。只写 group_members
+    // 的话，这里测的就不是「选对记录」，而是「fixture 少了一半」。
+    sqlx::query(
+        "INSERT INTO privchat_channel_participants (channel_id, user_id, role, joined_at, left_at)
+         VALUES ($1, $2, 2, now_millis(), NULL)
+         ON CONFLICT (channel_id, user_id) DO UPDATE SET left_at = NULL",
+    )
+    .bind(GROUP)
+    .bind(CHARLIE)
+    .execute(pool.as_ref())
+    .await
+    .expect("charlie participant row");
+    seed_message_ref(&pool, MSG, GROUP, newer.file_id).await;
+
+    let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
+    let token_service = Arc::new(UploadTokenService::new());
+    let token = token_service
+        .generate_token(
+            CHARLIE as u64,
+            FileType::Image,
+            10 * 1024 * 1024,
+            "message".to_string(),
+            None,
+            UploadIdentity {
+                sha256: Some(SHA.to_string()),
+                declared_size: Some(1024),
+                mime_type: Some("image/png".to_string()),
+                transform_version: 0,
+            },
+            UploadTokenPurpose::ClaimExisting,
+        )
+        .await
+        .expect("token");
+
+    let (messages, channels) = authorization_deps(&pool);
+    let claimed = claim_existing_file(
+        &file_service,
+        &token_service,
+        &messages,
+        &channels,
+        CHARLIE as u64,
+        &token.token,
+        SHA,
+    )
+    .await;
+
+    let claimed = claimed.expect(
+        "🔴 charlie 有权读较新那条记录，不能因为 find_by_content 先返回最老那条就拒绝",
+    );
+    assert_eq!(claimed.uploader_id, CHARLIE as u64, "拿到的是自己的记录");
+    assert_eq!(claimed.file_path, older.file_path, "指向同一个物理文件");
+
+    sqlx::query("DELETE FROM privchat_file_uploads WHERE uploader_id = $1")
+        .bind(CHARLIE)
+        .execute(pool.as_ref())
+        .await
+        .expect("clean charlie rows");
+    cleanup(&pool).await;
+}
+
 /// 锁等待超时必须是**可重试**的，不是终局失败。
 ///
 /// 占住 file_path 那把 advisory 锁不放，真实 claim 会在 `lock_timeout` 到点后
