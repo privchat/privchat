@@ -228,8 +228,12 @@ pub enum UploadTokenError {
     Expired,
     /// `aud` 不是 [`TOKEN_AUD`]。
     WrongAudience,
-    /// `prp` 不是已知用途。
-    BadPurpose,
+    /// `exp <= iat`：反向时间。
+    ReversedTime,
+    /// `iat` 在未来：签发时刻不可信。
+    IssuedInFuture,
+    /// claims 通不过共享不变量（见 [`validate_claims`]）。
+    BadClaims(IssueError),
     /// `exp - iat` 超过 24h + 宽限：签发侧配错了，不能因为「签名对」就接受。
     TtlTooLong,
     /// claims 版本不认识。
@@ -246,7 +250,9 @@ impl std::fmt::Display for UploadTokenError {
             Self::InvalidSignature => "invalid_signature",
             Self::Expired => "expired",
             Self::WrongAudience => "wrong_audience",
-            Self::BadPurpose => "bad_purpose",
+            Self::ReversedTime => "reversed_time",
+            Self::IssuedInFuture => "issued_in_future",
+            Self::BadClaims(e) => return write!(f, "bad_claims:{e}"),
             Self::TtlTooLong => "ttl_too_long",
             Self::UnknownVersion => "unknown_version",
             Self::Other => "other",
@@ -265,6 +271,14 @@ pub enum IssueError {
     FilenameTooLong,
     /// `UploadPlan` 内部不自洽，见 [`validate_plan`]。
     BadUploadPlan,
+    /// `upload_id` 不是安全字符集——它要当目录名。
+    UnsafeUploadId,
+    /// 声明大小超过该类型硬顶。
+    SizeAboveMax,
+    /// `sha256` 不是 64 位十六进制。
+    BadDigest,
+    /// 其它 claims 不合法（版本 / 用途 / 文件类型 / max_size）。
+    BadClaims,
     EncodeFailed,
 }
 
@@ -276,9 +290,72 @@ impl std::fmt::Display for IssueError {
             Self::NonPositiveSize => "non_positive_size",
             Self::FilenameTooLong => "filename_too_long",
             Self::BadUploadPlan => "bad_upload_plan",
+            Self::UnsafeUploadId => "unsafe_upload_id",
+            Self::SizeAboveMax => "size_above_max",
+            Self::BadDigest => "bad_digest",
+            Self::BadClaims => "bad_claims",
             Self::EncodeFailed => "encode_failed",
         })
     }
+}
+
+/// `upload_id` 会**直接成为磁盘路径的一段**（`tmp/uploads/{uid}/{upload_id}/`），
+/// 所以它的字符集必须收死。
+///
+/// 🔴 只允许十六进制：`..`、`/`、NUL、Unicode 花样一概进不来。签名正确只证明
+/// 「这串字节是我们发的」，证明不了里面的值拿去拼路径是安全的——旧版本签发器
+/// 或一次错误发布都可能签出别的东西。
+fn is_safe_upload_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 🔴 **签发与验证共用的一套不变量。**
+///
+/// 只在签发侧查是不够的：验证侧面对的是**别人（可能是旧版本、可能是配错的实例）
+/// 签出来的** claims。签名只保证来源，不保证内容今天仍然可用。
+pub fn validate_claims(claims: &UploadTokenClaims) -> Result<(), IssueError> {
+    if claims.v != CLAIMS_VERSION {
+        return Err(IssueError::BadClaims);
+    }
+    if !is_safe_upload_id(&claims.upload_id) {
+        return Err(IssueError::UnsafeUploadId);
+    }
+    if claims.purpose().is_none() {
+        return Err(IssueError::BadClaims);
+    }
+    if crate::model::file_upload::FileType::from_str(&claims.ft).is_none() {
+        return Err(IssueError::BadClaims);
+    }
+    if claims.mx <= 0 {
+        return Err(IssueError::BadClaims);
+    }
+    if let Some(size) = claims.sealed_blob_size {
+        if size <= 0 {
+            return Err(IssueError::NonPositiveSize);
+        }
+        // 声明大小超过该类型硬顶：这张 token 从一开始就不可能完成。
+        if size > claims.mx {
+            return Err(IssueError::SizeAboveMax);
+        }
+    }
+    if let Some(digest) = &claims.sha256 {
+        if !is_sha256_hex(digest) {
+            return Err(IssueError::BadDigest);
+        }
+    }
+    if let Some(name) = &claims.filename {
+        if name.len() > MAX_FILENAME_BYTES {
+            return Err(IssueError::FilenameTooLong);
+        }
+    }
+    if let Some(plan) = claims.upload_plan() {
+        validate_plan(&plan)?;
+    }
+    Ok(())
 }
 
 /// `UploadPlan` 的自洽性。
@@ -312,24 +389,14 @@ pub fn sign(
     if cfg.ttl_secs > MAX_TTL_SECS {
         return Err(IssueError::TtlTooLong);
     }
-    if let Some(size) = claims.sealed_blob_size {
-        if size <= 0 {
-            return Err(IssueError::NonPositiveSize);
-        }
-    }
-    if let Some(name) = &claims.filename {
-        if name.len() > MAX_FILENAME_BYTES {
-            return Err(IssueError::FilenameTooLong);
-        }
-    }
-    if let Some(plan) = claims.upload_plan() {
-        validate_plan(&plan)?;
-    }
 
     claims.v = CLAIMS_VERSION;
     claims.aud = TOKEN_AUD.to_string();
     claims.iat = now_secs;
     claims.exp = now_secs.saturating_add(cfg.ttl_secs);
+
+    // 与 verify 共用同一套；签发侧先拦一道，错误 token 根本不出门。
+    validate_claims(&claims)?;
 
     let kid = cfg.default_kid.clone();
     let secret = cfg.resolve_secret(Some(&kid)).ok_or(IssueError::UnknownKid)?;
@@ -358,6 +425,7 @@ pub fn looks_like_signed(token: &str) -> bool {
 /// 用途匹配、uid 归属、节点归属由调用方按端点各自判定。
 pub fn verify(
     cfg: &UploadTokenConfig,
+    now_secs: u64,
     token: &str,
 ) -> Result<UploadTokenClaims, UploadTokenError> {
     let header = decode_header(token).map_err(|_| UploadTokenError::MalformedHeader)?;
@@ -395,14 +463,28 @@ pub fn verify(
     if claims.v != CLAIMS_VERSION {
         return Err(UploadTokenError::UnknownVersion);
     }
-    if claims.purpose().is_none() {
-        return Err(UploadTokenError::BadPurpose);
+
+    // 🔴 时间三段，缺一条都能绕过 24h 上限：
+    //
+    // 1. `exp > iat`——反向时间。`exp - iat` 用饱和减法时会被压成 0，于是
+    //    `iat = now + 20 年 / exp = now + 10 年` 这种 token **既过得了 exp 检查、
+    //    又过得了上限检查**，实际有效十年。
+    // 2. `iat <= now + leeway`——未来签发。允许它等于放弃「从签发起 24h」这个语义。
+    // 3. `exp - iat <= 24h + leeway`——上限本身。
+    if claims.exp <= claims.iat {
+        return Err(UploadTokenError::ReversedTime);
     }
-    // 🔴 签名对不代表有效期合理：签发侧配错 `ttl_secs`（或换了实现）就可能签出
-    // 几年有效的 token。验证侧独立复核一遍上限。
-    if claims.exp.saturating_sub(claims.iat) > MAX_TTL_SECS.saturating_add(cfg.leeway_secs) {
+    if claims.iat > now_secs.saturating_add(cfg.leeway_secs) {
+        return Err(UploadTokenError::IssuedInFuture);
+    }
+    if claims.exp - claims.iat > MAX_TTL_SECS.saturating_add(cfg.leeway_secs) {
         return Err(UploadTokenError::TtlTooLong);
     }
+
+    // 🔴 与签发共用的不变量：签名只保证来源，不保证内容今天仍可安全使用
+    // （旧版本签发器、错误发布都可能签出别的东西），而 `upload_id` 紧接着
+    // 就要去当目录名。
+    validate_claims(&claims).map_err(UploadTokenError::BadClaims)?;
 
     Ok(claims)
 }
@@ -471,7 +553,7 @@ mod tests {
     fn a_signed_token_round_trips() {
         let c = cfg();
         let token = sign(&c, now(), claims()).expect("sign");
-        let back = verify(&c, &token).expect("verify");
+        let back = verify(&c, now(), &token).expect("verify");
         assert_eq!(back.upload_id, "0".repeat(32));
         assert_eq!(back.uid, 100_002_319);
         assert_eq!(back.purpose(), Some(UploadTokenPurpose::Upload));
@@ -491,7 +573,7 @@ mod tests {
         // 服务端已经轮到新 kid，但旧验证密钥仍在配置里。
         let mut rotated = cfg();
         rotated.default_kid = "upload-v1".to_string();
-        assert!(verify(&rotated, &token).is_ok());
+        assert!(verify(&rotated, now(), &token).is_ok());
     }
 
     #[test]
@@ -500,7 +582,7 @@ mod tests {
         let token = sign(&c, now(), claims()).expect("sign");
         let mut stripped = cfg();
         stripped.keys.remove("upload-v1");
-        assert_eq!(verify(&stripped, &token).unwrap_err(), UploadTokenError::UnknownKid);
+        assert_eq!(verify(&stripped, now(), &token).unwrap_err(), UploadTokenError::UnknownKid);
     }
 
     #[test]
@@ -511,7 +593,7 @@ mod tests {
         forged
             .keys
             .insert("upload-v1".to_string(), "another-secret".to_string());
-        assert_eq!(verify(&forged, &token).unwrap_err(), UploadTokenError::InvalidSignature);
+        assert_eq!(verify(&forged, now(), &token).unwrap_err(), UploadTokenError::InvalidSignature);
     }
 
     /// `typ` 是与登录 token 分家的第一道闸：没有它，任何一张同密钥域的 JWT
@@ -527,7 +609,7 @@ mod tests {
         cl.iat = now();
         cl.exp = cl.iat + 600;
         let token = encode(&header, &cl, &EncodingKey::from_secret(secret.as_bytes())).unwrap();
-        assert_eq!(verify(&c, &token).unwrap_err(), UploadTokenError::WrongTyp);
+        assert_eq!(verify(&c, now(), &token).unwrap_err(), UploadTokenError::WrongTyp);
     }
 
     /// `aud` 是第二道闸。room_ticket 的 verifier 关掉了它——这条测试就是
@@ -544,7 +626,7 @@ mod tests {
         cl.iat = now();
         cl.exp = cl.iat + 600;
         let token = encode(&header, &cl, &EncodingKey::from_secret(secret.as_bytes())).unwrap();
-        assert_eq!(verify(&c, &token).unwrap_err(), UploadTokenError::WrongAudience);
+        assert_eq!(verify(&c, now(), &token).unwrap_err(), UploadTokenError::WrongAudience);
     }
 
     /// 签名对不代表有效期合理：签发侧配错就可能签出超长期 token，
@@ -560,7 +642,7 @@ mod tests {
         cl.iat = now();
         cl.exp = cl.iat + MAX_TTL_SECS * 365; // 一年
         let token = encode(&header, &cl, &EncodingKey::from_secret(secret.as_bytes())).unwrap();
-        assert_eq!(verify(&c, &token).unwrap_err(), UploadTokenError::TtlTooLong);
+        assert_eq!(verify(&c, now(), &token).unwrap_err(), UploadTokenError::TtlTooLong);
     }
 
     #[test]
@@ -669,5 +751,120 @@ mod tests {
             worst_len <= MAX_TOKEN_BUDGET_BYTES,
             "最大合法 token {worst_len} 字节，超出预算 {MAX_TOKEN_BUDGET_BYTES}"
         );
+    }
+
+    /// 构造一张签名合法、但时间字段任意的 token（绕过 sign 的校验）。
+    fn forge(c: &UploadTokenConfig, mut cl: UploadTokenClaims) -> String {
+        let secret = c.resolve_secret(Some("upload-v1")).unwrap().clone();
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("upload-v1".to_string());
+        header.typ = Some(TOKEN_TYP.to_string());
+        cl.v = CLAIMS_VERSION;
+        cl.aud = TOKEN_AUD.to_string();
+        encode(&header, &cl, &EncodingKey::from_secret(secret.as_bytes())).unwrap()
+    }
+
+    /// 🔴 反向时间是真的能绕过 24h 上限：`exp - iat` 用饱和减法会被压成 0，
+    /// 于是这张「十年后才过期」的 token 曾经能验过。
+    #[test]
+    fn a_token_whose_issue_time_is_after_its_expiry_is_rejected() {
+        let c = cfg();
+        let mut cl = claims();
+        cl.exp = now() + 10 * 365 * 86_400; // 十年后过期
+        cl.iat = cl.exp + 86_400; // 签发时刻却在更远的未来
+        let token = forge(&c, cl);
+        assert_eq!(
+            verify(&c, now(), &token).unwrap_err(),
+            UploadTokenError::ReversedTime
+        );
+    }
+
+    /// 未来签发同样要拒：允许它就等于放弃「从签发起 24 小时」这个语义。
+    #[test]
+    fn a_token_issued_in_the_future_is_rejected() {
+        let c = cfg();
+        let mut cl = claims();
+        cl.iat = now() + 3600;
+        cl.exp = cl.iat + 600;
+        let token = forge(&c, cl);
+        assert_eq!(
+            verify(&c, now(), &token).unwrap_err(),
+            UploadTokenError::IssuedInFuture
+        );
+    }
+
+    /// 🔴 `upload_id` 紧接着就是目录名。签名正确不代表这个值拼进路径是安全的。
+    #[test]
+    fn an_upload_id_that_could_escape_the_directory_is_rejected() {
+        let c = cfg();
+        for evil in ["../../etc/passwd", "a/b", "..", "", "zz-not-hex", "名字"] {
+            let mut cl = claims();
+            cl.upload_id = evil.to_string();
+            cl.iat = now();
+            cl.exp = cl.iat + 600;
+            let token = forge(&c, cl);
+            assert_eq!(
+                verify(&c, now(), &token).unwrap_err(),
+                UploadTokenError::BadClaims(IssueError::UnsafeUploadId),
+                "upload_id {evil:?} 必须被拒"
+            );
+        }
+    }
+
+    /// 验证侧必须自己复核冻结字段——面对的是别人（旧版本 / 配错的实例）签出来的 claims。
+    #[test]
+    fn the_verifier_rechecks_the_frozen_invariants() {
+        let c = cfg();
+
+        let mut oversize = claims();
+        oversize.mx = 1024;
+        oversize.sealed_blob_size = Some(4096);
+        oversize.iat = now();
+        oversize.exp = oversize.iat + 600;
+        assert_eq!(
+            verify(&c, now(), &forge(&c, oversize)).unwrap_err(),
+            UploadTokenError::BadClaims(IssueError::SizeAboveMax)
+        );
+
+        let mut bad_digest = claims();
+        bad_digest.sha256 = Some("not-a-digest".to_string());
+        bad_digest.iat = now();
+        bad_digest.exp = bad_digest.iat + 600;
+        assert_eq!(
+            verify(&c, now(), &forge(&c, bad_digest)).unwrap_err(),
+            UploadTokenError::BadClaims(IssueError::BadDigest)
+        );
+
+        let mut bad_type = claims();
+        bad_type.ft = "hologram".to_string();
+        bad_type.iat = now();
+        bad_type.exp = bad_type.iat + 600;
+        assert_eq!(
+            verify(&c, now(), &forge(&c, bad_type)).unwrap_err(),
+            UploadTokenError::BadClaims(IssueError::BadClaims)
+        );
+
+        let mut bad_plan = claims();
+        bad_plan.set_upload_plan(Some(&UploadPlan {
+            base_unit: 65536,
+            initial_request_size: 65536 + 1, // 不对齐
+            max_request_size: 2 * 1024 * 1024,
+            session_threshold: 65536,
+            max_parallel_parts: 3,
+        }));
+        bad_plan.iat = now();
+        bad_plan.exp = bad_plan.iat + 600;
+        assert_eq!(
+            verify(&c, now(), &forge(&c, bad_plan)).unwrap_err(),
+            UploadTokenError::BadClaims(IssueError::BadUploadPlan)
+        );
+    }
+
+    #[test]
+    fn signing_refuses_an_unsafe_upload_id() {
+        let c = cfg();
+        let mut cl = claims();
+        cl.upload_id = "../escape".to_string();
+        assert_eq!(sign(&c, now(), cl).unwrap_err(), IssueError::UnsafeUploadId);
     }
 }
