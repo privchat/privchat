@@ -114,8 +114,21 @@ impl UploadSession {
     /// 🔴 目录名用 `upload_id` 而**不是 token**：token 是 bearer 凭证，会进日志、
     /// 错误信息和文件系统工具输出。`upload_id` 的字符集已在 token 验证时收死成
     /// 十六进制，拼路径是安全的。
-    pub fn open(root: &Path, uid: u64, upload_id: &str) -> Result<Self> {
-        // 二次防线：即便上游漏了校验，也不允许可疑的 id 拼进路径。
+    /// 只打开**已存在**的会话，不创建。
+    ///
+    /// 🔴 恢复类入口（回调 / 查状态 / complete）必须用它：`open` 会惰性建目录，
+    /// 于是「会话早就没了」被伪装成「有一个空会话」，既与 `SessionGone` 的语义相反，
+    /// 又在磁盘上留下垃圾目录。
+    pub fn open_existing(root: &Path, uid: u64, upload_id: &str) -> Result<Option<Self>> {
+        Self::guard_id(upload_id)?;
+        let dir = root.join(uid.to_string()).join(upload_id);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        Self::open(root, uid, upload_id).map(Some)
+    }
+
+    fn guard_id(upload_id: &str) -> Result<()> {
         if upload_id.is_empty()
             || upload_id.len() > 64
             || !upload_id.chars().all(|c| c.is_ascii_hexdigit())
@@ -124,6 +137,12 @@ impl UploadSession {
                 "upload_id 不是安全标识".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    pub fn open(root: &Path, uid: u64, upload_id: &str) -> Result<Self> {
+        // 二次防线：即便上游漏了校验，也不允许可疑的 id 拼进路径。
+        Self::guard_id(upload_id)?;
         let dir = root.join(uid.to_string()).join(upload_id);
         std::fs::create_dir_all(&dir)
             .map_err(|e| ServerError::Internal(format!("创建上传会话目录失败: {e}")))?;
@@ -178,6 +197,14 @@ impl UploadSession {
             let _ = d.sync_all();
         }
         Ok(())
+    }
+
+    /// 直接把会话标成已完成（用于「发现正式记录已存在」时补写墓碑）。
+    pub fn mark_completed(&self, file_id: u64) -> Result<()> {
+        let mut st = self.read_state()?;
+        st.status = UploadStatus::Completed;
+        st.file_id = Some(file_id);
+        self.write_state(&st)
     }
 
     /// 读出预留的 `file_id`（若有）。
@@ -432,6 +459,36 @@ mod tests {
         let fresh = UploadSession::open(r.path(), 7, "abc123").expect("reopen");
         assert_eq!(fresh.completed_file_id().expect("read"), None);
         assert_eq!(fresh.reserved_file_id().expect("read"), None);
+    }
+
+    /// 🔴 恢复类入口不得惰性建目录：会话没了就该说没了，而不是造一个空的出来，
+    /// 更不该在磁盘上留垃圾。
+    #[test]
+    fn opening_a_missing_session_for_recovery_creates_nothing() {
+        let r = root();
+        let got = UploadSession::open_existing(r.path(), 7, "abc123").expect("call");
+        assert!(got.is_none(), "不存在的会话必须报告不存在");
+        assert!(
+            !r.path().join("7").join("abc123").exists(),
+            "不得因为查询而建出目录"
+        );
+
+        // 正常创建之后就能打开了。
+        let _s = UploadSession::open(r.path(), 7, "abc123").expect("open");
+        assert!(UploadSession::open_existing(r.path(), 7, "abc123")
+            .expect("call")
+            .is_some());
+    }
+
+    /// 补墓碑：发现正式记录已存在时，不经过 guard 也要能把会话标成已完成。
+    #[test]
+    fn a_session_can_be_marked_completed_when_the_row_already_exists() {
+        let r = root();
+        let s = UploadSession::open(r.path(), 7, "abc123").expect("open");
+        s.reserve_file_id(555).expect("reserve");
+        s.mark_completed(555).expect("mark");
+        assert_eq!(s.completed_file_id().expect("read"), Some(555));
+        assert!(s.begin_whole().is_err(), "已完成的会话不能再开始");
     }
 
     /// `upload_id` 直接进路径，可疑值必须在这一层也拦住（纵深防御）。

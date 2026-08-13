@@ -107,12 +107,15 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         .file_service
         .upload_session_root()
         .map_err(|e| RpcError::internal(e.to_string()))?;
-    let session = crate::service::upload_session::UploadSession::open(
+    // 🔴 `open_existing`：恢复类入口不得惰性建目录。会话没了就是没了
+    //（`SessionGone` 语义），不该被伪装成「有一个空会话」，也不该留下垃圾目录。
+    let session = crate::service::upload_session::UploadSession::open_existing(
         &session_root,
         token_info.user_id,
         &token_info.upload_id,
     )
-    .map_err(|e| RpcError::internal(e.to_string()))?;
+    .map_err(|e| RpcError::internal(e.to_string()))?
+    .ok_or_else(|| RpcError::validation("该次上传的会话已不存在".to_string()))?;
     match session
         .completed_file_id()
         .map_err(|e| RpcError::internal(e.to_string()))?

@@ -446,13 +446,27 @@ impl FileService {
         let metadata = if inserted {
             metadata
         } else {
-            tracing::info!("♻️ file_id={} 上次已落库，回读既有记录", metadata.file_id);
-            self.file_upload_repo
+            // 🔴 主键冲突**只有在既有记录与本次身份一致时**才算「上次已落库」的幂等成功。
+            // 不核对就直接返回，等于把另一条文件记录交给当前调用者。
+            let existing = self
+                .file_upload_repo
                 .get_by_file_id(metadata.file_id)
                 .await?
                 .ok_or_else(|| {
                     ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
-                })?
+                })?;
+            let same_identity = existing.uploader_id == metadata.uploader_id
+                && existing.file_hash == metadata.file_hash
+                && existing.file_size == metadata.file_size
+                && existing.file_type.as_str() == metadata.file_type.as_str();
+            if !same_identity {
+                return Err(ServerError::Internal(format!(
+                    "file_id={} 已被另一份内容占用（uploader/摘要/大小/类型不符）",
+                    metadata.file_id
+                )));
+            }
+            tracing::info!("♻️ file_id={} 上次已落库且身份一致，回读既有记录", metadata.file_id);
+            existing
         };
         tx.commit()
             .await
@@ -557,6 +571,11 @@ impl FileService {
         self.file_upload_repo
             .find_claimed(uploader_id, claim_key_hash)
             .await
+    }
+
+    /// 预分配一个 `file_id`（在接收字节之前）。
+    pub async fn reserve_file_id(&self) -> Result<u64> {
+        self.file_upload_repo.next_file_id().await
     }
 
     /// 上传会话临时目录的根（`tmp/uploads/`）。

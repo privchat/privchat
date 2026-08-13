@@ -382,22 +382,48 @@ async fn upload_file(
 
     let _mode_guard = session.begin_whole()?;
 
-    // 预留 file_id 并落盘，然后才开始收字节。崩溃重试复用同一个 id，
-    // 上一次若已落库，这次提交会撞主键 → 回读，而不是产生第二条记录。
-    let reserved = session.reserved_file_id()?;
+    // 🔴 **预留必须在收字节之前**，而且要先落盘。
+    //
+    // 预留写在接收之后的话，传输中途崩溃就没有预留——重试会分配新 id，上一次的
+    // 半成品对象没人认领，变成垃圾。
+    let reserved = match session.reserved_file_id()? {
+        Some(id) => {
+            // 🔴 **带着预留 id 回来时，先问正式文件表：这个 id 是不是已经落库了。**
+            //
+            // 不问的话，下面会用同一个 file_id 推出**同一个正式对象路径**并直接打开
+            // writer——那就是在覆盖一个已被提交记录引用的文件；这次再失败，`abort()`
+            // 还会把它删掉。这是数据丢失，不是幂等。
+            if let Some(meta) = state.file_service.get_file_metadata(id).await? {
+                // 身份必须对得上，否则这个 id 属于别人，绝不能当成「我的重试」。
+                if meta.uploader_id != token_info.user_id {
+                    return Err(ServerError::Internal(format!(
+                        "预留的 file_id={id} 属于其他用户，拒绝继续"
+                    )));
+                }
+                tracing::info!("♻️ 预留的 file_id={id} 已落库，补写墓碑并返回");
+                let _ = session.mark_completed(id);
+                return completed_response(&state, id).await;
+            }
+            Some(id)
+        }
+        None => {
+            // 先分配、先落盘，再开 writer。
+            let id = state.file_service.reserve_file_id().await?;
+            session.reserve_file_id(id)?;
+            Some(id)
+        }
+    };
 
     tracing::info!(
-        "✅ Token 验证通过，用户: {} upload_id: {}",
+        "✅ Token 验证通过，用户: {} upload_id: {} 预留 file_id: {:?}",
         token_info.user_id,
-        token_info.upload_id
+        token_info.upload_id,
+        reserved
     );
 
     // P0-10：流式接收——数据边收边写存储，任何失败清理半文件，不再全量进内存。
     let (upload, filename, mime_type, business_id, encryption_version, cek, transform_version) =
         receive_streaming(&state, &token_info, reserved, &mut multipart).await?;
-    if reserved.is_none() {
-        session.reserve_file_id(upload.file_id)?;
-    }
 
     let uploader_id = token_info.user_id;
     let uploader_ip = client_ip_from_headers(&headers);
