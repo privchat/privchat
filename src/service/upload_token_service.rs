@@ -170,11 +170,33 @@ pub fn derive_legacy_upload_id(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// 服务端下发的上传方案（RESUMABLE_UPLOAD_SPEC §3.1）。
+///
+/// **缺席即整包直传**——这既是旧客户端的兼容路径，也是分片链路的关停阀：
+/// 服务端停发这一段，所有新客户端当场退回整包，不必等三端发版。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadPlan {
+    /// 区间寻址网格；冻结。客户端每次请求传几个 unit 由它自己按实测吞吐决定。
+    pub base_unit: u32,
+    /// 首个探测请求的大小。
+    pub initial_request_size: u32,
+    /// 单次请求上限。
+    pub max_request_size: u32,
+    /// 小于等于此值不值得建会话，直接整包传。
+    pub session_threshold: u64,
+    /// 并发上限。
+    pub max_parallel_parts: u8,
+}
+
 /// 上传凭证验证后的统一结果。
 ///
 /// 迁移期同时存在两种 token 格式（自包含签名 token 与旧的 Redis UUID token）。
 /// 验证器只输出这一个模型，**调用方不再判断 token 是什么格式**——否则模式锁、
 /// 会话目录、完成幂等每一处都要各写一遍分叉。
+///
+/// 🔴 **过期判定不在这里。** 有效期、时钟宽限和「以请求开始时刻为准」由验证器一次性
+/// 处理；拿到本模型即表示已经验过。模型自己再查一次当前时间，就是第二套判定，
+/// 迟早与验证器的口径分家。`expires_at` 只作数据保留，供日志与墓碑保留期使用。
 #[derive(Debug, Clone)]
 pub struct ValidatedUploadToken {
     /// 这次上传的唯一标识：会话目录名、模式锁与 `upload_completion_key` 的轴。
@@ -189,38 +211,52 @@ pub struct ValidatedUploadToken {
     pub filename: Option<String>,
     /// prepare 阶段冻结的文件身份，完成时逐项复核。
     pub sha256: Option<String>,
-    pub declared_size: Option<i64>,
+    /// 最终要上传的**密文**字节数。
+    ///
+    /// 📌 旧 token 的 `declared_size` 就是这个量（`file_service` 拿它与实际落盘字节数
+    /// 比对），换名不换义，映射时不需要任何换算。
+    pub sealed_blob_size: Option<i64>,
     pub mime_type: Option<String>,
     pub transform_version: i32,
+    /// 附件加密版本。旧 token 不带（当时由 multipart 表单提供）→ `None`。
+    pub encryption_version: Option<i32>,
+    /// 服务端下发的上传方案；`None` = 整包直传（旧 token 恒为 `None`）。
+    pub upload_plan: Option<UploadPlan>,
+    /// 分片字节落在哪个节点。`None` = 本节点（旧 token 没有这个概念）。
+    pub node_id: Option<String>,
+    /// 后续请求应当发往的地址。`None` = 本节点。
+    pub upload_base_url: Option<String>,
+    /// 仅作数据保留；**不要拿它再判一次过期**（见上）。
     pub expires_at: DateTime<Utc>,
 }
 
 impl ValidatedUploadToken {
-    /// 请求开始时是否仍然有效。
+    /// 旧 Redis UUID token 的投影。
     ///
-    /// 只看过期时间：一次性消费语义正在被移除（spec §5.2.5），
-    /// 重放由 `upload_completion_key` 与模式锁承担。
-    pub fn is_fresh(&self) -> bool {
-        Utc::now() < self.expires_at
-    }
-}
-
-impl From<&UploadToken> for ValidatedUploadToken {
-    /// 旧 UUID token 的投影：`upload_id` 由 token 派生，其余字段原样带过。
-    fn from(t: &UploadToken) -> Self {
+    /// 🔴 `raw_token` 必须是**客户端这次提交的原始凭证**，不能用 `record.token`：
+    /// 后者是 Redis 里序列化记录中的字段，正常情况下两者相同，但一旦分家
+    /// （写入与 key 不一致、记录被改写），`upload_id` 就会落到另一个目录，
+    /// 于是模式锁、会话目录和完成幂等三者集体指错地方。派生只认收到的那一份。
+    pub fn from_legacy(raw_token: &str, record: &UploadToken) -> Self {
         Self {
-            upload_id: derive_legacy_upload_id(&t.token),
-            user_id: t.user_id,
-            purpose: t.purpose,
-            file_type: t.file_type.clone(),
-            max_size: t.max_size,
-            business_type: t.business_type.clone(),
-            filename: t.filename.clone(),
-            sha256: t.sha256.clone(),
-            declared_size: t.declared_size,
-            mime_type: t.mime_type.clone(),
-            transform_version: t.transform_version,
-            expires_at: t.expires_at,
+            upload_id: derive_legacy_upload_id(raw_token),
+            user_id: record.user_id,
+            purpose: record.purpose,
+            file_type: record.file_type.clone(),
+            max_size: record.max_size,
+            business_type: record.business_type.clone(),
+            filename: record.filename.clone(),
+            sha256: record.sha256.clone(),
+            sealed_blob_size: record.declared_size,
+            mime_type: record.mime_type.clone(),
+            transform_version: record.transform_version,
+            // 下面四项旧 token 提供不了：加密版本当时走 multipart 表单，
+            // 分片方案与节点绑定是新协议才有的概念。
+            encryption_version: None,
+            upload_plan: None,
+            node_id: None,
+            upload_base_url: None,
+            expires_at: record.expires_at,
         }
     }
 }
@@ -485,8 +521,10 @@ mod tests {
         assert_eq!(derive_legacy_upload_id(token), derive_legacy_upload_id(token));
     }
 
+    /// 名字只承诺样例：两个样例证不了「任意两张 token 都不撞」，那是 SHA-256 的
+    /// 抗碰撞性，不是这条测试能给的保证。
     #[test]
-    fn two_legacy_tokens_never_share_an_upload_directory() {
+    fn different_legacy_tokens_derive_different_sample_ids() {
         let a = derive_legacy_upload_id("b3f1a2c4-0000-4000-8000-000000000001");
         let b = derive_legacy_upload_id("b3f1a2c4-0000-4000-8000-000000000002");
         assert_ne!(a, b);
@@ -538,7 +576,7 @@ mod tests {
             .await
             .unwrap();
 
-        let validated = ValidatedUploadToken::from(&token);
+        let validated = ValidatedUploadToken::from_legacy(&token.token, &token);
 
         assert_eq!(validated.upload_id, derive_legacy_upload_id(&token.token));
         assert_eq!(validated.user_id, 1001);
@@ -546,10 +584,64 @@ mod tests {
         assert_eq!(validated.business_type, "message");
         assert_eq!(validated.filename.as_deref(), Some("holiday.png"));
         assert_eq!(validated.sha256, Some("a".repeat(64)));
-        assert_eq!(validated.declared_size, Some(4096));
+        // 换名不换义：老字段本来就是密文字节数（file_service 拿它与落盘字节数比对）。
+        assert_eq!(validated.sealed_blob_size, Some(4096));
         assert_eq!(validated.mime_type.as_deref(), Some("image/png"));
         assert_eq!(validated.transform_version, 7);
         assert_eq!(validated.max_size, 10485760);
-        assert!(validated.is_fresh());
+        assert_eq!(validated.expires_at, token.expires_at);
+    }
+
+    /// 旧 token 给不出的四项必须是明确的「没有」，不能靠调用点各自脑补默认值。
+    #[tokio::test]
+    async fn a_legacy_token_declares_the_new_fields_absent() {
+        let service = UploadTokenService::new();
+        let token = service
+            .generate_token(
+                7,
+                FileType::File,
+                1024,
+                "message".to_string(),
+                None,
+                UploadIdentity::default(),
+                UploadTokenPurpose::Upload,
+            )
+            .await
+            .unwrap();
+
+        let validated = ValidatedUploadToken::from_legacy(&token.token, &token);
+
+        // upload_plan 缺席 = 整包直传，正是旧客户端唯一会走的路。
+        assert!(validated.upload_plan.is_none());
+        // 加密版本当时走 multipart 表单，不在 token 里。
+        assert!(validated.encryption_version.is_none());
+        // 节点绑定是新协议才有的概念；None 表示本节点。
+        assert!(validated.node_id.is_none());
+        assert!(validated.upload_base_url.is_none());
+    }
+
+    /// 派生只认**收到的那份凭证**。两者分家时若按记录里的字段派生，
+    /// 锁、目录和完成幂等会一起指向另一个 upload_id。
+    #[tokio::test]
+    async fn the_upload_id_follows_the_credential_that_was_presented() {
+        let service = UploadTokenService::new();
+        let record = service
+            .generate_token(
+                7,
+                FileType::File,
+                1024,
+                "message".to_string(),
+                None,
+                UploadIdentity::default(),
+                UploadTokenPurpose::Upload,
+            )
+            .await
+            .unwrap();
+
+        let presented = "the-credential-the-client-actually-sent";
+        let validated = ValidatedUploadToken::from_legacy(presented, &record);
+
+        assert_eq!(validated.upload_id, derive_legacy_upload_id(presented));
+        assert_ne!(validated.upload_id, derive_legacy_upload_id(&record.token));
     }
 }
