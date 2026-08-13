@@ -123,8 +123,7 @@ pub async fn request_upload_token(
         .upload_token_service
         .plan_for(file_size);
 
-    let expires_at = now_secs as i64 + 86_400;
-    let (token_str, _upload_id) = services
+    let (token_str, _upload_id, expires_at) = services
         .upload_token_service
         .issue(
             now_secs,

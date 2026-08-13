@@ -465,7 +465,11 @@ impl UploadTokenService {
         }
     }
 
-    /// 按当前 `issue_mode` 签发。返回 `(token 字符串, upload_id)`。
+    /// 按当前 `issue_mode` 签发。返回 `(token 字符串, upload_id, 真实过期时刻)`。
+    ///
+    /// 🔴 **过期时刻必须由签发路径给出，不能由调用方按「反正是 24h」推算。**
+    /// legacy 分支实际只签 5 分钟；把 24h 写进响应会让客户端持久化一个服务端早就
+    /// 作废的 token，而失败要等到它真去上传时才暴露。
     ///
     /// `issue_mode = legacy_uuid`（缺省）时行为与今天完全一致——这正是回滚开关的意义。
     #[allow(clippy::too_many_arguments)]
@@ -480,7 +484,7 @@ impl UploadTokenService {
         identity: UploadIdentity,
         purpose: UploadTokenPurpose,
         upload_plan: Option<&UploadPlan>,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String, i64)> {
         if self.issues_signed() {
             let cfg = self
                 .signing
@@ -510,7 +514,7 @@ impl UploadTokenService {
                 user_id,
                 file_type.as_str()
             );
-            return Ok((token, upload_id));
+            return Ok((token, upload_id, now_secs as i64 + cfg.ttl_secs as i64));
         }
 
         let record = self
@@ -525,7 +529,8 @@ impl UploadTokenService {
             )
             .await?;
         let upload_id = derive_legacy_upload_id(&record.token);
-        Ok((record.token, upload_id))
+        let expires_at = record.expires_at.timestamp();
+        Ok((record.token, upload_id, expires_at))
     }
 
     /// 验证 token 有效性

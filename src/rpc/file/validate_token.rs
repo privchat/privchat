@@ -32,12 +32,21 @@ pub async fn validate_upload_token(services: RpcServiceContext, params: Value) -
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("缺少 token 参数".to_string()))?;
 
-    tracing::debug!("🔐 验证上传 token: {}", upload_token);
+    // 🔴 日志不落完整 bearer token。
+    tracing::debug!(
+        "🔐 验证上传 token: {}…",
+        upload_token.chars().take(8).collect::<String>()
+    );
 
-    // 验证 token
+    // 🔴 走统一入口：只用 `validate_token` 的话，signed 模式下这个 RPC 恒失败
+    //（那条路只认 Redis 里的 UUID）。
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     match services
         .upload_token_service
-        .validate_token(upload_token)
+        .validate_any(now_secs, upload_token)
         .await
     {
         Ok(token_info) => {
@@ -55,11 +64,11 @@ pub async fn validate_upload_token(services: RpcServiceContext, params: Value) -
             }))
         }
         Err(e) => {
-            warn!("❌ Token 验证失败: {}", upload_token);
-            Ok(json!({
-                "valid": false,
-                "error": e.to_string(),
-            }))
+            warn!(
+                "❌ Token 验证失败: {}… ({e})",
+                upload_token.chars().take(8).collect::<String>()
+            );
+            Ok(json!({ "valid": false, "reason": e.to_string() }))
         }
     }
 }

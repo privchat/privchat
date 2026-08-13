@@ -287,6 +287,37 @@ async fn receive_streaming(
     ))
 }
 
+/// 已完成的上传：按 `file_id` 回读并构造与首次一致的响应。
+///
+/// 幂等重试拿到的必须是**同一份结果**，所以这里不重新计算任何东西，只回读。
+async fn completed_response(
+    state: &FileServerState,
+    file_id: u64,
+) -> ApiResult<UploadResponse> {
+    let meta = state
+        .file_service
+        .get_file_metadata(file_id)
+        .await?
+        .ok_or_else(|| {
+            ServerError::Internal(format!("幂等键指向的 file_id={file_id} 读不到"))
+        })?;
+    tracing::info!("♻️ 重复上传请求，返回原 file_id={file_id}");
+    Ok(ApiEnvelope::ok(UploadResponse {
+        file_id: meta.file_id,
+        file_url: state
+            .file_service
+            .build_access_url(&meta.file_path, meta.storage_source_id),
+        thumbnail_url: None,
+        file_size: meta.file_size,
+        original_size: meta.original_size,
+        width: meta.width,
+        height: meta.height,
+        mime_type: meta.mime_type,
+        uploaded_at: meta.uploaded_at,
+        storage_source_id: meta.storage_source_id,
+    }))
+}
+
 /// 文件上传处理器
 async fn upload_file(
     State(state): State<FileServerState>,
@@ -325,6 +356,25 @@ async fn upload_file(
         ));
     }
 
+    // 完成幂等键：`SHA256(upload_id)`。
+    let completion_key = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(token_info.upload_id.as_bytes()))
+    };
+
+    // 🔴 **幂等出口必须排在接收 body 之前。**
+    //
+    // 取消一次性消费后，重复 POST 是正常现象（响应丢了、客户端重试）。这时正确行为是
+    // **立刻返回原来那个 `file_id`**——而不是让用户把整个文件重新上传一遍，更不是
+    // 因为「这次上传已完成」而报错。
+    if let Some(existing) = state
+        .file_service
+        .find_completed_upload(token_info.user_id, &completion_key)
+        .await?
+    {
+        return completed_response(&state, existing).await;
+    }
+
     // 🔴 **`GETDEL` 一次性消费已移除。**
     //
     // 它原本同时兼任两件事：防重放，以及串行化并发的整包 POST。两件都由会话接管：
@@ -335,6 +385,13 @@ async fn upload_file(
         token_info.user_id,
         &token_info.upload_id,
     )?;
+
+    // 墓碑快路径：PG 那一行还没被上面查到（理论上不会，但墓碑与落库不是同一次写），
+    // 会话自己也记着结果。同样返回成功，不是错误。
+    if let Some(existing) = session.completed_file_id()? {
+        return completed_response(&state, existing).await;
+    }
+
     let _mode_guard = session.begin_whole()?;
 
     tracing::info!(
@@ -346,13 +403,6 @@ async fn upload_file(
     // P0-10：流式接收——数据边收边写存储，任何失败清理半文件，不再全量进内存。
     let (upload, filename, mime_type, business_id, encryption_version, cek, transform_version) =
         receive_streaming(&state, &token_info, &mut multipart).await?;
-
-    // 完成幂等键：`SHA256(upload_id)`。取消一次性 token 消费后，重复 POST
-    // 同一个请求体由它收敛到同一个 file_id，而不是建出第二条文件行。
-    let completion_key = {
-        use sha2::Digest as _;
-        hex::encode(sha2::Sha256::digest(token_info.upload_id.as_bytes()))
-    };
 
     let uploader_id = token_info.user_id;
     let uploader_ip = client_ip_from_headers(&headers);
