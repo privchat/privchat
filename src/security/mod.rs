@@ -33,6 +33,7 @@
 pub mod client_state;
 pub mod rate_limiter;
 pub mod room_ticket;
+pub mod upload_token;
 pub mod security_service;
 
 pub use client_state::{ClientState, ClientStateManager, TrustScore, ViolationType};
