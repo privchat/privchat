@@ -111,6 +111,7 @@ impl UploadToken {
         filename: Option<String>,
         identity: UploadIdentity,
         purpose: UploadTokenPurpose,
+        ttl_secs: i64,
     ) -> Self {
         let now = Utc::now();
         let token = Uuid::new_v4().to_string();
@@ -128,7 +129,10 @@ impl UploadToken {
             transform_version: identity.transform_version,
             purpose,
             created_at: now,
-            expires_at: now + Duration::minutes(5), // 5 分钟过期
+            // 🔴 有效期由调用方给，**新旧 token 一个口径**（产品拍板：一种 token、
+            // 24 小时）。格式可以不同，签发语义不能不同——否则响应说 24 小时、
+            // 实际 5 分钟，客户端会持久化一个早已作废的凭证。
+            expires_at: now + Duration::seconds(ttl_secs),
             used: false,
         }
     }
@@ -385,6 +389,14 @@ impl UploadTokenService {
         }
     }
 
+    /// 签发有效期（秒）。未配 `[upload.token]` 时用统一默认值 24 小时。
+    fn ttl_secs(&self) -> i64 {
+        self.signing
+            .as_ref()
+            .map(|c| c.ttl_secs as i64)
+            .unwrap_or(crate::security::upload_token::MAX_TTL_SECS as i64)
+    }
+
     /// 生成上传 token
     pub async fn generate_token(
         &self,
@@ -404,6 +416,7 @@ impl UploadTokenService {
             filename,
             identity,
             purpose,
+            self.ttl_secs(),
         );
 
         if let Some(redis) = &self.redis {
@@ -699,6 +712,32 @@ mod tests {
         // 再次验证应该失败
         let result = service.validate_token(&token.token).await;
         assert!(result.is_err());
+    }
+
+    /// 🔴 产品口径是「一种 token，24 小时」。格式可以不同，**签发语义不能不同**——
+    /// legacy 分支若还签 5 分钟，响应说 24 小时就是在骗客户端。
+    #[tokio::test]
+    async fn a_legacy_token_gets_the_same_lifetime_as_a_signed_one() {
+        let service = UploadTokenService::new();
+        let now = chrono::Utc::now();
+        let token = service
+            .generate_token(
+                1001,
+                FileType::Image,
+                10485760,
+                "message".to_string(),
+                None,
+                UploadIdentity::default(),
+                UploadTokenPurpose::Upload,
+            )
+            .await
+            .unwrap();
+
+        let lifetime = (token.expires_at - now).num_seconds();
+        assert!(
+            (86_400 - 60..=86_400 + 60).contains(&lifetime),
+            "legacy token 有效期应为 24 小时，实际 {lifetime} 秒"
+        );
     }
 
     #[tokio::test]
