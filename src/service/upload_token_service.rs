@@ -149,6 +149,82 @@ fn redact(token: &str) -> String {
     format!("{}…", token.chars().take(8).collect::<String>())
 }
 
+/// 派生 `upload_id` 时的域分隔前缀。
+///
+/// 加前缀是为了让这个哈希只在「旧 token → upload_id」这一个用途下有意义：
+/// 不加的话，任何别处对同一字符串取 SHA-256 的地方都会算出同一个值。
+const LEGACY_UPLOAD_ID_DOMAIN: &[u8] = b"legacy-upload-id\0";
+
+/// 旧 UUID token 没有 `upload_id`，但会话目录、模式锁和 `upload_completion_key`
+/// 全都以它为轴。这里从 token 稳定派生一个。
+///
+/// 🔴 **不能直接拿 token 当 `upload_id`**：它是 bearer 凭证，而 `upload_id` 会成为
+/// 目录名和日志字段（RESUMABLE_UPLOAD_SPEC §5.2.3 / §7）。
+///
+/// 纯函数 ⇒ 同一张旧 token 的每次重试都落到同一个会话目录，模式锁与完成幂等照常生效。
+pub fn derive_legacy_upload_id(token: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(LEGACY_UPLOAD_ID_DOMAIN);
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// 上传凭证验证后的统一结果。
+///
+/// 迁移期同时存在两种 token 格式（自包含签名 token 与旧的 Redis UUID token）。
+/// 验证器只输出这一个模型，**调用方不再判断 token 是什么格式**——否则模式锁、
+/// 会话目录、完成幂等每一处都要各写一遍分叉。
+#[derive(Debug, Clone)]
+pub struct ValidatedUploadToken {
+    /// 这次上传的唯一标识：会话目录名、模式锁与 `upload_completion_key` 的轴。
+    ///
+    /// 签名 token 直接读签进去的值；旧 UUID token 走 [`derive_legacy_upload_id`]。
+    pub upload_id: String,
+    pub user_id: u64,
+    pub purpose: UploadTokenPurpose,
+    pub file_type: FileType,
+    pub max_size: i64,
+    pub business_type: String,
+    pub filename: Option<String>,
+    /// prepare 阶段冻结的文件身份，完成时逐项复核。
+    pub sha256: Option<String>,
+    pub declared_size: Option<i64>,
+    pub mime_type: Option<String>,
+    pub transform_version: i32,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl ValidatedUploadToken {
+    /// 请求开始时是否仍然有效。
+    ///
+    /// 只看过期时间：一次性消费语义正在被移除（spec §5.2.5），
+    /// 重放由 `upload_completion_key` 与模式锁承担。
+    pub fn is_fresh(&self) -> bool {
+        Utc::now() < self.expires_at
+    }
+}
+
+impl From<&UploadToken> for ValidatedUploadToken {
+    /// 旧 UUID token 的投影：`upload_id` 由 token 派生，其余字段原样带过。
+    fn from(t: &UploadToken) -> Self {
+        Self {
+            upload_id: derive_legacy_upload_id(&t.token),
+            user_id: t.user_id,
+            purpose: t.purpose,
+            file_type: t.file_type.clone(),
+            max_size: t.max_size,
+            business_type: t.business_type.clone(),
+            filename: t.filename.clone(),
+            sha256: t.sha256.clone(),
+            declared_size: t.declared_size,
+            mime_type: t.mime_type.clone(),
+            transform_version: t.transform_version,
+            expires_at: t.expires_at,
+        }
+    }
+}
+
 /// 上传 Token 服务
 ///
 /// P0-10：优先走 Redis（key `upload_token:{token}`，SETEX 到期自灭，GETDEL 原子
@@ -399,5 +475,81 @@ mod tests {
 
         let result = service.validate_token("invalid-token").await;
         assert!(result.is_err());
+    }
+
+    /// 会话目录、模式锁和完成幂等都按 `upload_id` 定位。旧 token 的重试必须
+    /// 落回同一个目录，否则每次重试都会开一个新会话，断点续传无从谈起。
+    #[test]
+    fn the_same_legacy_token_always_names_the_same_upload() {
+        let token = "b3f1a2c4-0000-4000-8000-000000000001";
+        assert_eq!(derive_legacy_upload_id(token), derive_legacy_upload_id(token));
+    }
+
+    #[test]
+    fn two_legacy_tokens_never_share_an_upload_directory() {
+        let a = derive_legacy_upload_id("b3f1a2c4-0000-4000-8000-000000000001");
+        let b = derive_legacy_upload_id("b3f1a2c4-0000-4000-8000-000000000002");
+        assert_ne!(a, b);
+    }
+
+    /// `upload_id` 会成为磁盘上的目录名和日志字段；token 是 bearer 凭证。
+    /// 派生值一旦等于（或包含）token 本身，凭证就随着目录列表泄露了。
+    #[test]
+    fn the_upload_id_never_leaks_the_bearer_token() {
+        let token = "b3f1a2c4-0000-4000-8000-000000000001";
+        let id = derive_legacy_upload_id(token);
+        assert_ne!(id, token);
+        assert!(!id.contains(token));
+        // 目录名安全：只能是十六进制。
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(id.len(), 64);
+    }
+
+    /// 域分隔的意义：别处对同一字符串取裸 SHA-256 时，不会算出同一个 upload_id。
+    #[test]
+    fn the_derivation_is_domain_separated_from_a_bare_digest() {
+        use sha2::Digest as _;
+        let token = "b3f1a2c4-0000-4000-8000-000000000001";
+        let bare = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+        assert_ne!(derive_legacy_upload_id(token), bare);
+    }
+
+    /// 统一模型必须把冻结的文件身份原样带过：complete 时要拿它逐项复核，
+    /// 漏一个字段就等于那一项没有被校验。
+    #[tokio::test]
+    async fn the_validated_projection_carries_the_frozen_identity() {
+        let service = UploadTokenService::new();
+        let identity = UploadIdentity {
+            sha256: Some("a".repeat(64)),
+            declared_size: Some(4096),
+            mime_type: Some("image/png".to_string()),
+            transform_version: 7,
+        };
+        let token = service
+            .generate_token(
+                1001,
+                FileType::Image,
+                10485760,
+                "message".to_string(),
+                Some("holiday.png".to_string()),
+                identity,
+                UploadTokenPurpose::ClaimExisting,
+            )
+            .await
+            .unwrap();
+
+        let validated = ValidatedUploadToken::from(&token);
+
+        assert_eq!(validated.upload_id, derive_legacy_upload_id(&token.token));
+        assert_eq!(validated.user_id, 1001);
+        assert_eq!(validated.purpose, UploadTokenPurpose::ClaimExisting);
+        assert_eq!(validated.business_type, "message");
+        assert_eq!(validated.filename.as_deref(), Some("holiday.png"));
+        assert_eq!(validated.sha256, Some("a".repeat(64)));
+        assert_eq!(validated.declared_size, Some(4096));
+        assert_eq!(validated.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(validated.transform_version, 7);
+        assert_eq!(validated.max_size, 10485760);
+        assert!(validated.is_fresh());
     }
 }
