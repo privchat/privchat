@@ -429,50 +429,14 @@ impl FileUploadRepository {
     }
 
     /// 插入一条上传记录（file_id 已由 next_file_id 取得并用于生成 file_path）
-    /// 按完成幂等键找已经落库的那一行。
-    ///
-    /// 🔴 **这是 complete / 整包上传的幂等出口，必须排在做任何事之前。**
-    /// 覆盖的崩溃点是「PG 已提交，但写回状态之前崩了 / 会话目录已被清理」——
-    /// 只看目录会对一个其实已经成功的上传返回「会话不存在」。
-    pub async fn find_completed(
-        &self,
-        uploader_id: u64,
-        completion_key: &str,
-    ) -> Result<Option<u64>> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT file_id FROM privchat_file_uploads \
-             WHERE uploader_id = $1 AND upload_completion_key = $2",
-        )
-        .bind(uploader_id as i64)
-        .bind(completion_key)
-        .fetch_optional(&*self.pool)
-        .await
-        .map_err(|e| ServerError::Database(format!("查完成幂等键失败: {}", e)))?;
-        Ok(row.map(|(id,)| id as u64))
-    }
-
     pub async fn insert(&self, meta: &FileMetadata) -> Result<()> {
-        self.insert_with_completion_key(meta, None).await
-    }
-
-    /// 带完成幂等键的插入。
-    ///
-    /// 🔴 取消一次性 token 消费后，重复 POST 同一个请求体会走到这里两次。
-    /// 部分唯一索引把第二次挡成 0 行，调用方随后按键回读，拿到**同一个 file_id**。
-    pub async fn insert_with_completion_key(
-        &self,
-        meta: &FileMetadata,
-        completion_key: Option<&str>,
-    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO privchat_file_uploads (
                 file_id, original_filename, file_size, file_type, mime_type,
                 file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at, width, height, file_hash,
-                business_type, business_id, encryption_version, cek, upload_completion_key
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-            ON CONFLICT (uploader_id, upload_completion_key) WHERE upload_completion_key IS NOT NULL
-            DO NOTHING
+                business_type, business_id, encryption_version, cek
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             "#
         )
         .bind(meta.file_id as i64)
@@ -492,7 +456,6 @@ impl FileUploadRepository {
         .bind(&meta.business_id)
         .bind(meta.encryption_version)
         .bind(&meta.cek)
-        .bind(completion_key)
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("插入上传记录失败: {}", e)))?;
@@ -615,165 +578,5 @@ impl FileUploadRepository {
             .await
             .map_err(|e| ServerError::Database(format!("删除上传记录失败: {}", e)))?;
         Ok(result.rows_affected() > 0)
-    }
-}
-
-#[cfg(test)]
-mod completion_idempotency_tests {
-    use super::*;
-    use crate::model::file_upload::FileType;
-    use sqlx::postgres::PgPoolOptions;
-
-    // 🔴 每条用例一个独立 uploader。共用一个 id 时它们会并行地互相删数据、
-    // 互相读到对方的行——第一版就是这么「失败」的，而失败原因与被测行为无关。
-    const UPLOADER_SERIAL: u64 = 987_675_001;
-    const UPLOADER_CONCURRENT: u64 = 987_675_002;
-    const UPLOADER_CRITERION: u64 = 987_675_003;
-
-    async fn open_repo() -> Option<FileUploadRepository> {
-        // 缺库默认 panic（见 require_test_database_url）：静默跳过会被记成通过。
-        let url = crate::require_test_database_url()?;
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await
-            .ok()?;
-        Some(FileUploadRepository::new(Arc::new(pool)))
-    }
-
-    fn sample(uploader: u64, file_id: u64) -> FileMetadata {
-        FileMetadata {
-            file_id,
-            original_filename: "holiday.png".to_string(),
-            file_size: 4096,
-            original_size: None,
-            file_type: FileType::Image,
-            mime_type: "image/png".to_string(),
-            file_path: format!("images/{file_id}.png"),
-            storage_source_id: 0,
-            uploader_id: uploader,
-            uploader_ip: None,
-            uploaded_at: 1_700_000_000_000,
-            width: None,
-            height: None,
-            file_hash: Some("a".repeat(64)),
-            business_type: Some("message".to_string()),
-            business_id: None,
-            encryption_version: 0,
-            cek: None,
-        }
-    }
-
-    async fn cleanup(repo: &FileUploadRepository, uploader: u64) {
-        let _ = sqlx::query("DELETE FROM privchat_file_uploads WHERE uploader_id = $1")
-            .bind(uploader as i64)
-            .execute(&*repo.pool)
-            .await;
-    }
-
-    /// 🔴 这条测的是 `GETDEL` 被拿掉后顶上来的那道闸：同一次上传重复落库，
-    /// 必须收敛到**同一行**，而不是建出第二条文件记录。
-    #[tokio::test]
-    async fn a_repeated_completion_converges_to_one_row() {
-        let Some(repo) = open_repo().await else { return };
-        cleanup(&repo, UPLOADER_SERIAL).await;
-
-        let key = "k".repeat(64);
-        repo.insert_with_completion_key(&sample(UPLOADER_SERIAL, 987_675_101), Some(&key))
-            .await
-            .expect("first insert");
-        // 第二次：不同 file_id、同一个完成键 —— 模拟「响应丢了、客户端重传」。
-        repo.insert_with_completion_key(&sample(UPLOADER_SERIAL, 987_675_102), Some(&key))
-            .await
-            .expect("second insert must not error");
-
-        let rows: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM privchat_file_uploads WHERE uploader_id = $1",
-        )
-        .bind(UPLOADER_SERIAL as i64)
-        .fetch_one(&*repo.pool)
-        .await
-        .expect("count");
-        assert_eq!(rows.0, 1, "重复完成必须只留一行");
-
-        let found = repo
-            .find_completed(UPLOADER_SERIAL, &key)
-            .await
-            .expect("find")
-            .expect("幂等出口必须查得到");
-        assert_eq!(found, 987_675_101, "回读到的必须是先到的那一行");
-
-        cleanup(&repo, UPLOADER_SERIAL).await;
-    }
-
-    /// 并发版本：五个请求同时用同一个完成键落库，只能有一个真正插入，
-    /// 其余全部收敛，且都能读回同一个 file_id。
-    #[tokio::test]
-    async fn concurrent_completions_converge_to_one_row() {
-        let Some(repo) = open_repo().await else { return };
-        cleanup(&repo, UPLOADER_CONCURRENT).await;
-
-        let key = "c".repeat(64);
-        let repo = Arc::new(repo);
-        let mut handles = Vec::new();
-        for i in 0..5u64 {
-            let repo = repo.clone();
-            let key = key.clone();
-            handles.push(tokio::spawn(async move {
-                repo.insert_with_completion_key(
-                    &sample(UPLOADER_CONCURRENT, 987_675_200 + i),
-                    Some(&key),
-                )
-                .await
-            }));
-        }
-        for h in handles {
-            h.await.expect("join").expect("并发插入不应报错");
-        }
-
-        let rows: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM privchat_file_uploads WHERE uploader_id = $1",
-        )
-        .bind(UPLOADER_CONCURRENT as i64)
-        .fetch_one(&*repo.pool)
-        .await
-        .expect("count");
-        assert_eq!(rows.0, 1, "并发重复完成必须只留一行");
-
-        assert!(repo
-            .find_completed(UPLOADER_CONCURRENT, &key)
-            .await
-            .expect("find")
-            .is_some());
-        cleanup(&repo, UPLOADER_CONCURRENT).await;
-    }
-
-    /// 🔴 判据不许被污染：整传完成的行 `claim_key_hash` 必须仍为 NULL。
-    ///
-    /// `claim_key_hash IS NOT NULL` 是「秒传命中」唯一可信的判据
-    /// （MEDIA_REFERENCE_AND_FORWARD_SPEC §0.2）。完成键写进那一列的话，
-    /// 整传的文件会伪装成秒传命中。
-    #[tokio::test]
-    async fn a_full_upload_does_not_look_like_a_dedup_hit() {
-        let Some(repo) = open_repo().await else { return };
-        cleanup(&repo, UPLOADER_CRITERION).await;
-
-        let key = "d".repeat(64);
-        repo.insert_with_completion_key(&sample(UPLOADER_CRITERION, 987_675_301), Some(&key))
-            .await
-            .expect("insert");
-
-        let row: (Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT claim_key_hash, upload_completion_key FROM privchat_file_uploads \
-             WHERE uploader_id = $1",
-        )
-        .bind(UPLOADER_CRITERION as i64)
-        .fetch_one(&*repo.pool)
-        .await
-        .expect("row");
-        assert!(row.0.is_none(), "整传的行不得写 claim_key_hash");
-        assert_eq!(row.1.as_deref(), Some(key.as_str()));
-
-        cleanup(&repo, UPLOADER_CRITERION).await;
     }
 }

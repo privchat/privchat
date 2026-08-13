@@ -96,28 +96,31 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
     }
 
     // 🔴 `file_id` 必须**确实是这次上传的结果**，不能由调用方随口报一个。
-    // 判据是完成幂等键：它由 `upload_id` 派生，且与文件行同事务写入。
-    let completion_key = {
-        use sha2::Digest as _;
-        hex::encode(sha2::Sha256::digest(token_info.upload_id.as_bytes()))
-    };
+    //
+    // 判据取自**临时会话**（`state.json` 的墓碑），不查业务库：上传中间态不进
+    // PostgreSQL。会话已被清理或丢失时，这次回调就没有可核对的依据，直接拒绝——
+    // 客户端重新申请 token 从头传即可。
     let file_id_num: u64 = file_id
         .parse()
         .map_err(|_| RpcError::validation("file_id 不是合法数字".to_string()))?;
-    match services
+    let session_root = services
         .file_service
-        .find_completed_upload(token_info.user_id, &completion_key)
-        .await
+        .upload_session_root()
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    let session = crate::service::upload_session::UploadSession::open(
+        &session_root,
+        token_info.user_id,
+        &token_info.upload_id,
+    )
+    .map_err(|e| RpcError::internal(e.to_string()))?;
+    match session
+        .completed_file_id()
         .map_err(|e| RpcError::internal(e.to_string()))?
     {
         Some(expected) if expected == file_id_num => {}
         Some(expected) => {
-            warn!(
-                "❌ 上传回调 file_id 与该 upload_id 的完成结果不符: 报 {file_id_num}，实为 {expected}"
-            );
-            return Err(RpcError::validation(
-                "file_id 与该次上传不符".to_string(),
-            ));
+            warn!("❌ 上传回调 file_id 与该次上传的结果不符: 报 {file_id_num}，实为 {expected}");
+            return Err(RpcError::validation("file_id 与该次上传不符".to_string()));
         }
         None => {
             return Err(RpcError::validation(

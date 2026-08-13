@@ -73,6 +73,12 @@ pub struct SessionState {
     /// 完成后的 `file_id`；墓碑靠它回答迟到请求。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<u64>,
+    /// 🔴 接收 body **之前**就分配好的 `file_id`。
+    ///
+    /// 崩溃重试复用它，于是「上次其实已经落库了」在提交时表现为**主键冲突**
+    /// 而不是第二条记录——幂等因此不需要在正式文件表上加任何列。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_file_id: Option<u64>,
 }
 
 impl Default for SessionState {
@@ -81,6 +87,7 @@ impl Default for SessionState {
             mode: UploadMode::Unselected,
             status: UploadStatus::Idle,
             file_id: None,
+            reserved_file_id: None,
         }
     }
 }
@@ -171,6 +178,18 @@ impl UploadSession {
             let _ = d.sync_all();
         }
         Ok(())
+    }
+
+    /// 读出预留的 `file_id`（若有）。
+    pub fn reserved_file_id(&self) -> Result<Option<u64>> {
+        Ok(self.read_state()?.reserved_file_id)
+    }
+
+    /// 记下这次上传要用的 `file_id`。落盘后才去接收 body。
+    pub fn reserve_file_id(&self, file_id: u64) -> Result<()> {
+        let mut st = self.read_state()?;
+        st.reserved_file_id = Some(file_id);
+        self.write_state(&st)
     }
 
     /// 已完成的话给出 `file_id`（墓碑）。
@@ -378,6 +397,41 @@ mod tests {
             s.begin_whole().is_err(),
             "已选定分片的会话不能再走整包"
         );
+    }
+
+    /// 🔴 预留的 `file_id` 必须跨请求存活：崩溃重试要复用它，落库时才会撞主键
+    /// 而不是产生第二条文件记录。幂等因此不需要在业务库上加任何列。
+    #[test]
+    fn a_reserved_file_id_survives_for_the_retry() {
+        let r = root();
+        let s = UploadSession::open(r.path(), 7, "abc123").expect("open");
+        assert_eq!(s.reserved_file_id().expect("read"), None);
+
+        {
+            let _g = s.begin_whole().expect("first");
+            s.reserve_file_id(90210).expect("reserve");
+            // guard drop = 这次失败了
+        }
+
+        // 新的一次请求（新的会话对象，模拟新进程）读到同一个预留 id。
+        let again = UploadSession::open(r.path(), 7, "abc123").expect("reopen");
+        assert_eq!(again.reserved_file_id().expect("read"), Some(90210));
+        assert_eq!(again.read_state().expect("state").status, UploadStatus::Idle);
+    }
+
+    /// 会话没了就是没了：这里不做任何「从业务库恢复会话」的尝试。
+    #[test]
+    fn a_lost_session_starts_over_rather_than_recovering() {
+        let r = root();
+        let s = UploadSession::open(r.path(), 7, "abc123").expect("open");
+        s.begin_whole().expect("first").complete(4242).expect("complete");
+        assert_eq!(s.completed_file_id().expect("read"), Some(4242));
+
+        // 清理任务删掉目录后：状态回到「什么都没有」，而不是去别处找回来。
+        std::fs::remove_dir_all(s.dir()).expect("rm");
+        let fresh = UploadSession::open(r.path(), 7, "abc123").expect("reopen");
+        assert_eq!(fresh.completed_file_id().expect("read"), None);
+        assert_eq!(fresh.reserved_file_id().expect("read"), None);
     }
 
     /// `upload_id` 直接进路径，可疑值必须在这一层也拦住（纵深防御）。

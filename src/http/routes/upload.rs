@@ -87,6 +87,7 @@ pub fn create_route() -> Router<FileServerState> {
 async fn receive_streaming(
     state: &FileServerState,
     token_info: &crate::service::upload_token_service::ValidatedUploadToken,
+    reserved_file_id: Option<u64>,
     multipart: &mut Multipart,
 ) -> Result<
     (
@@ -155,7 +156,7 @@ async fn receive_streaming(
                     .unwrap_or_else(|| "application/octet-stream".to_string());
                 let mut sink = match state
                     .file_service
-                    .begin_streaming_upload(&mime, &fname, token_info.max_size, Some(token_info.file_type.clone()))
+                    .begin_streaming_upload(&mime, &fname, token_info.max_size, reserved_file_id, Some(token_info.file_type.clone()))
                     .await
                 {
                     Ok(sink) => sink,
@@ -356,25 +357,6 @@ async fn upload_file(
         ));
     }
 
-    // 完成幂等键：`SHA256(upload_id)`。
-    let completion_key = {
-        use sha2::Digest as _;
-        hex::encode(sha2::Sha256::digest(token_info.upload_id.as_bytes()))
-    };
-
-    // 🔴 **幂等出口必须排在接收 body 之前。**
-    //
-    // 取消一次性消费后，重复 POST 是正常现象（响应丢了、客户端重试）。这时正确行为是
-    // **立刻返回原来那个 `file_id`**——而不是让用户把整个文件重新上传一遍，更不是
-    // 因为「这次上传已完成」而报错。
-    if let Some(existing) = state
-        .file_service
-        .find_completed_upload(token_info.user_id, &completion_key)
-        .await?
-    {
-        return completed_response(&state, existing).await;
-    }
-
     // 🔴 **`GETDEL` 一次性消费已移除。**
     //
     // 它原本同时兼任两件事：防重放，以及串行化并发的整包 POST。两件都由会话接管：
@@ -386,13 +368,23 @@ async fn upload_file(
         &token_info.upload_id,
     )?;
 
-    // 墓碑快路径：PG 那一行还没被上面查到（理论上不会，但墓碑与落库不是同一次写），
-    // 会话自己也记着结果。同样返回成功，不是错误。
+    // 🔴 **幂等出口排在接收 body 之前，真源是会话自己的墓碑。**
+    //
+    // 取消一次性消费后，重复 POST 是正常现象（响应丢了、客户端重试）。这时正确行为是
+    // **立刻返回原来那个 `file_id`**——不是让用户把整个文件再传一遍，更不是因为
+    // 「这次上传已完成」而报错（客户端无法把它与失败区分开）。
+    //
+    // 📌 判据只看**临时会话状态**：上传中间态不进业务库。会话没了就是没了，
+    // 客户端重新申请 token 从头传（这正是 `SessionGone` 的语义）。
     if let Some(existing) = session.completed_file_id()? {
         return completed_response(&state, existing).await;
     }
 
     let _mode_guard = session.begin_whole()?;
+
+    // 预留 file_id 并落盘，然后才开始收字节。崩溃重试复用同一个 id，
+    // 上一次若已落库，这次提交会撞主键 → 回读，而不是产生第二条记录。
+    let reserved = session.reserved_file_id()?;
 
     tracing::info!(
         "✅ Token 验证通过，用户: {} upload_id: {}",
@@ -402,7 +394,10 @@ async fn upload_file(
 
     // P0-10：流式接收——数据边收边写存储，任何失败清理半文件，不再全量进内存。
     let (upload, filename, mime_type, business_id, encryption_version, cek, transform_version) =
-        receive_streaming(&state, &token_info, &mut multipart).await?;
+        receive_streaming(&state, &token_info, reserved, &mut multipart).await?;
+    if reserved.is_none() {
+        session.reserve_file_id(upload.file_id)?;
+    }
 
     let uploader_id = token_info.user_id;
     let uploader_ip = client_ip_from_headers(&headers);
@@ -435,7 +430,6 @@ async fn upload_file(
             // 客户端可以在 prepare 之后换掉；token 里那份是 prepare 当时签下的。
             token_info.sha256.clone(),
             token_info.sealed_blob_size,
-            Some(&completion_key),
         )
         .await?;
 
