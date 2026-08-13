@@ -267,6 +267,9 @@ impl FileService {
         mime_type: &str,
         filename: &str,
         token_max_size: i64,
+        // 崩溃重试时复用的 file_id（会话 `state.json` 里预留的那个）；
+        // `None` = 首次，现分配。
+        reserved_file_id: Option<u64>,
         // token 里签下的语义类型。🔴 优先于 multipart MIME：
         // 加密上传的 body 是不透明字节，客户端普遍标成 application/octet-stream，
         // 按它推导会把加密后的图片存成普通文件，之后按 image 预检自然对不上。
@@ -292,7 +295,12 @@ impl FileService {
                 ServerError::Internal(format!("未找到存储源 id={} 的 Operator", source_id))
             })?;
 
-        let file_id = self.file_upload_repo.next_file_id().await?;
+        // 🔴 崩溃重试要复用**同一个** file_id：会话把它记在 `state.json` 里，
+        // 于是「上次其实已经落库了」在提交时表现为主键冲突而不是第二条记录。
+        let file_id = match reserved_file_id {
+            Some(id) => id,
+            None => self.file_upload_repo.next_file_id().await?,
+        };
         let file_path = self.generate_file_path(file_id, &file_type, filename);
         let writer = op
             .writer(&file_path)
@@ -332,21 +340,7 @@ impl FileService {
         declared_content_sha256: Option<String>,
         // token 里签下的精确字节数；`None` = 老客户端没报。
         declared_size: Option<i64>,
-        // 完成幂等键 `SHA256(upload_id)`。取消一次性 token 消费后，重复 POST
-        // 由它收敛到同一个 file_id（RESUMABLE_UPLOAD_SPEC §9.3）。
-        completion_key: Option<&str>,
     ) -> Result<FileMetadata> {
-        // 🔴 幂等出口排在最前：已经完成过就直接返回原来那一行，
-        // 既不重新落库，也不重复发布对象。
-        if let Some(key) = completion_key {
-            if let Some(existing) = self.file_upload_repo.find_completed(uploader_id, key).await? {
-                if let Some(meta) = self.file_upload_repo.get_by_file_id(existing).await? {
-                    tracing::info!("♻️ 上传已完成过，返回原 file_id={existing}");
-                    upload.abort().await;
-                    return Ok(meta);
-                }
-            }
-        }
         let mut writer = upload
             .writer
             .take()
@@ -442,47 +436,27 @@ impl FileService {
             encryption_version: enc_version,
             cek: stored_cek,
         };
-        // 🔴 `ON CONFLICT DO NOTHING` 会静默地什么都不插。此时本次生成的 file_id
-        // **在数据库里并不存在**，直接返回 metadata 等于给客户端一个空 id。
-        // 必须按幂等键回读真正落库的那一行。
-        let inserted = self.insert_within(&mut tx, &metadata, completion_key).await?;
+        // 🔴 幂等完全靠**已有的主键**。`file_id` 在收 body 之前就分配好并记进会话
+        // （`state.json` 的 `reserved_file_id`），重试复用同一个 id；于是「上一次其实
+        // 已经落库了」在这里表现为主键冲突 → 0 行 → 回读那一行返回。
+        //
+        // 📌 **不为此在正式文件表上加任何列**：上传中间态是可丢弃的临时数据，
+        // 不进业务库。（本批曾加过 `upload_completion_key` 列 + 索引，属过度设计，已撤销。）
+        let inserted = self.insert_within(&mut tx, &metadata).await?;
         let metadata = if inserted {
             metadata
         } else {
-            let key = completion_key.ok_or_else(|| {
-                ServerError::Internal("插入 0 行但没有幂等键，无从回读".to_string())
-            })?;
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT file_id FROM privchat_file_uploads \
-                 WHERE uploader_id = $1 AND upload_completion_key = $2",
-            )
-            .bind(uploader_id as i64)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| ServerError::Database(format!("回读完成记录失败: {e}")))?;
-            let winner = row
-                .map(|(id,)| id as u64)
-                .ok_or_else(|| ServerError::Internal("冲突却查不到既有记录".to_string()))?;
-            tracing::info!("♻️ 并发重复上传收敛到既有 file_id={winner}");
+            tracing::info!("♻️ file_id={} 上次已落库，回读既有记录", metadata.file_id);
             self.file_upload_repo
-                .get_by_file_id(winner)
+                .get_by_file_id(metadata.file_id)
                 .await?
-                .ok_or_else(|| ServerError::Internal(format!("既有记录 {winner} 读不到")))?
+                .ok_or_else(|| {
+                    ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
+                })?
         };
-        let converged = metadata.file_id != upload.file_id;
         tx.commit()
             .await
             .map_err(|e| ServerError::Database(format!("提交上传收敛事务失败: {e}")))?;
-
-        // 输给了别人：本次落盘的对象没人指向，删掉（失败只记日志，交给 GC）。
-        if converged && upload.file_path != metadata.file_path {
-            if let Ok(op) = self.operator_for_source(upload.source_id).await {
-                if let Err(e) = op.delete(&upload.file_path).await {
-                    tracing::warn!("删除重复上传的物理文件失败 path={}: {e}", upload.file_path);
-                }
-            }
-        }
 
         if duplicate && upload.file_path != file_path {
             // 事务已提交，记录指向的是别人那份物理文件；我这份多余的对象可以删了。
@@ -513,7 +487,6 @@ impl FileService {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         meta: &FileMetadata,
-        completion_key: Option<&str>,
     ) -> Result<bool> {
         let done = sqlx::query(
             r#"
@@ -521,10 +494,9 @@ impl FileService {
                 file_id, original_filename, file_size, file_type, mime_type,
                 file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at,
                 width, height, file_hash, business_type, business_id,
-                encryption_version, cek, upload_completion_key
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-            ON CONFLICT (uploader_id, upload_completion_key) WHERE upload_completion_key IS NOT NULL
-            DO NOTHING
+                encryption_version, cek
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            ON CONFLICT (file_id) DO NOTHING
             "#,
         )
         .bind(meta.file_id as i64)
@@ -544,11 +516,10 @@ impl FileService {
         .bind(&meta.business_id)
         .bind(meta.encryption_version)
         .bind(&meta.cek)
-        .bind(completion_key)
         .execute(&mut **tx)
         .await
         .map_err(|e| ServerError::Database(format!("插入上传记录失败: {e}")))?;
-        // 0 行 = 撞上完成幂等键，调用方要回读而不是当作插入成功。
+        // 0 行 = 这个 file_id 上次已落库（崩溃重试复用了预留 id），回读而不是当新插入。
         Ok(done.rows_affected() > 0)
     }
 
@@ -585,17 +556,6 @@ impl FileService {
     pub async fn find_claimed(&self, uploader_id: u64, claim_key_hash: &str) -> Result<Option<u64>> {
         self.file_upload_repo
             .find_claimed(uploader_id, claim_key_hash)
-            .await
-    }
-
-    /// 按完成幂等键查已经落库的那次上传。
-    pub async fn find_completed_upload(
-        &self,
-        uploader_id: u64,
-        completion_key: &str,
-    ) -> Result<Option<u64>> {
-        self.file_upload_repo
-            .find_completed(uploader_id, completion_key)
             .await
     }
 
