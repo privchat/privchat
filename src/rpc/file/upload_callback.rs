@@ -64,23 +64,66 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         file_size
     );
 
-    // 🔴 **token 仍然有效是正常的，不是异常。**
+    // 🔴 **token 仍然有效是正常的，不是异常** —— 但无效必须拒绝。
     //
-    // 这里原本把「token 还能验过」当告警、随后 `remove_token`。两条语义都建立在
-    // 「一次性 5 分钟 token」上：现在 token 最长 24 小时、可复用，而且签名 token
-    // 服务端根本不存储，**没有东西可删**。
-    //
-    // 所谓「完成后清理 token」，实际含义是清理上传临时数据；token 到期自行失效。
+    // 这里原本把「token 还能验过」当告警、随后 `remove_token`，而验证失败只记一条
+    // warning 就照样返回成功。两条都不对：前者的语义建立在「一次性 5 分钟 token」上
+    //（现在 token 最长 24 小时、可复用，签名 token 服务端根本不存储，没有东西可删）；
+    // 后者等于**任何无效 token 都能拿到成功回调**。
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Err(e) = services
+    let token_info = services
         .upload_token_service
         .validate_any(now_secs, upload_token)
         .await
+        .map_err(|e| {
+            warn!(
+                "❌ 上传回调 token 无效: {}… ({e})",
+                upload_token.chars().take(8).collect::<String>()
+            );
+            RpcError::validation("上传 token 无效".to_string())
+        })?;
+
+    // claim 用途的 token 换不出「我传完了」这件事。
+    if token_info.purpose
+        != crate::service::upload_token_service::UploadTokenPurpose::Upload
     {
-        warn!("⚠️ 上传回调携带的 token 无效: {e}");
+        return Err(RpcError::validation(
+            "该 token 用于秒传取用，不能用作上传完成回调".to_string(),
+        ));
+    }
+
+    // 🔴 `file_id` 必须**确实是这次上传的结果**，不能由调用方随口报一个。
+    // 判据是完成幂等键：它由 `upload_id` 派生，且与文件行同事务写入。
+    let completion_key = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(token_info.upload_id.as_bytes()))
+    };
+    let file_id_num: u64 = file_id
+        .parse()
+        .map_err(|_| RpcError::validation("file_id 不是合法数字".to_string()))?;
+    match services
+        .file_service
+        .find_completed_upload(token_info.user_id, &completion_key)
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?
+    {
+        Some(expected) if expected == file_id_num => {}
+        Some(expected) => {
+            warn!(
+                "❌ 上传回调 file_id 与该 upload_id 的完成结果不符: 报 {file_id_num}，实为 {expected}"
+            );
+            return Err(RpcError::validation(
+                "file_id 与该次上传不符".to_string(),
+            ));
+        }
+        None => {
+            return Err(RpcError::validation(
+                "该次上传尚未完成，无法回调".to_string(),
+            ));
+        }
     }
 
     // TODO: 记录文件元数据到数据库

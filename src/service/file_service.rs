@@ -442,10 +442,47 @@ impl FileService {
             encryption_version: enc_version,
             cek: stored_cek,
         };
-        self.insert_within(&mut tx, &metadata, completion_key).await?;
+        // 🔴 `ON CONFLICT DO NOTHING` 会静默地什么都不插。此时本次生成的 file_id
+        // **在数据库里并不存在**，直接返回 metadata 等于给客户端一个空 id。
+        // 必须按幂等键回读真正落库的那一行。
+        let inserted = self.insert_within(&mut tx, &metadata, completion_key).await?;
+        let metadata = if inserted {
+            metadata
+        } else {
+            let key = completion_key.ok_or_else(|| {
+                ServerError::Internal("插入 0 行但没有幂等键，无从回读".to_string())
+            })?;
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT file_id FROM privchat_file_uploads \
+                 WHERE uploader_id = $1 AND upload_completion_key = $2",
+            )
+            .bind(uploader_id as i64)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("回读完成记录失败: {e}")))?;
+            let winner = row
+                .map(|(id,)| id as u64)
+                .ok_or_else(|| ServerError::Internal("冲突却查不到既有记录".to_string()))?;
+            tracing::info!("♻️ 并发重复上传收敛到既有 file_id={winner}");
+            self.file_upload_repo
+                .get_by_file_id(winner)
+                .await?
+                .ok_or_else(|| ServerError::Internal(format!("既有记录 {winner} 读不到")))?
+        };
+        let converged = metadata.file_id != upload.file_id;
         tx.commit()
             .await
             .map_err(|e| ServerError::Database(format!("提交上传收敛事务失败: {e}")))?;
+
+        // 输给了别人：本次落盘的对象没人指向，删掉（失败只记日志，交给 GC）。
+        if converged && upload.file_path != metadata.file_path {
+            if let Ok(op) = self.operator_for_source(upload.source_id).await {
+                if let Err(e) = op.delete(&upload.file_path).await {
+                    tracing::warn!("删除重复上传的物理文件失败 path={}: {e}", upload.file_path);
+                }
+            }
+        }
 
         if duplicate && upload.file_path != file_path {
             // 事务已提交，记录指向的是别人那份物理文件；我这份多余的对象可以删了。
@@ -477,8 +514,8 @@ impl FileService {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         meta: &FileMetadata,
         completion_key: Option<&str>,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<bool> {
+        let done = sqlx::query(
             r#"
             INSERT INTO privchat_file_uploads (
                 file_id, original_filename, file_size, file_type, mime_type,
@@ -511,7 +548,8 @@ impl FileService {
         .execute(&mut **tx)
         .await
         .map_err(|e| ServerError::Database(format!("插入上传记录失败: {e}")))?;
-        Ok(())
+        // 0 行 = 撞上完成幂等键，调用方要回读而不是当作插入成功。
+        Ok(done.rows_affected() > 0)
     }
 
     /// 秒传探测：这份内容在不在（不写任何东西）。
@@ -547,6 +585,17 @@ impl FileService {
     pub async fn find_claimed(&self, uploader_id: u64, claim_key_hash: &str) -> Result<Option<u64>> {
         self.file_upload_repo
             .find_claimed(uploader_id, claim_key_hash)
+            .await
+    }
+
+    /// 按完成幂等键查已经落库的那次上传。
+    pub async fn find_completed_upload(
+        &self,
+        uploader_id: u64,
+        completion_key: &str,
+    ) -> Result<Option<u64>> {
+        self.file_upload_repo
+            .find_completed(uploader_id, completion_key)
             .await
     }
 

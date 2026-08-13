@@ -173,6 +173,19 @@ impl UploadSession {
         Ok(())
     }
 
+    /// 已完成的话给出 `file_id`（墓碑）。
+    ///
+    /// 迟到的重复请求靠它拿到**成功**结果，而不是「这次上传已完成」这种错误——
+    /// 对客户端来说那和失败无法区分。
+    pub fn completed_file_id(&self) -> Result<Option<u64>> {
+        let st = self.read_state()?;
+        Ok(if st.status == UploadStatus::Completed {
+            st.file_id
+        } else {
+            None
+        })
+    }
+
     /// 非阻塞独占锁；拿不到返回 `false`（清理任务用）。
     pub fn try_lock_exclusive(&self) -> Result<bool> {
         match lock_impl(&self.lock, true) {
