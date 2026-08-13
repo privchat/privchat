@@ -429,14 +429,50 @@ impl FileUploadRepository {
     }
 
     /// 插入一条上传记录（file_id 已由 next_file_id 取得并用于生成 file_path）
+    /// 按完成幂等键找已经落库的那一行。
+    ///
+    /// 🔴 **这是 complete / 整包上传的幂等出口，必须排在做任何事之前。**
+    /// 覆盖的崩溃点是「PG 已提交，但写回状态之前崩了 / 会话目录已被清理」——
+    /// 只看目录会对一个其实已经成功的上传返回「会话不存在」。
+    pub async fn find_completed(
+        &self,
+        uploader_id: u64,
+        completion_key: &str,
+    ) -> Result<Option<u64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT file_id FROM privchat_file_uploads \
+             WHERE uploader_id = $1 AND upload_completion_key = $2",
+        )
+        .bind(uploader_id as i64)
+        .bind(completion_key)
+        .fetch_optional(&*self.pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("查完成幂等键失败: {}", e)))?;
+        Ok(row.map(|(id,)| id as u64))
+    }
+
     pub async fn insert(&self, meta: &FileMetadata) -> Result<()> {
+        self.insert_with_completion_key(meta, None).await
+    }
+
+    /// 带完成幂等键的插入。
+    ///
+    /// 🔴 取消一次性 token 消费后，重复 POST 同一个请求体会走到这里两次。
+    /// 部分唯一索引把第二次挡成 0 行，调用方随后按键回读，拿到**同一个 file_id**。
+    pub async fn insert_with_completion_key(
+        &self,
+        meta: &FileMetadata,
+        completion_key: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO privchat_file_uploads (
                 file_id, original_filename, file_size, file_type, mime_type,
                 file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at, width, height, file_hash,
-                business_type, business_id, encryption_version, cek
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                business_type, business_id, encryption_version, cek, upload_completion_key
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            ON CONFLICT (uploader_id, upload_completion_key) WHERE upload_completion_key IS NOT NULL
+            DO NOTHING
             "#
         )
         .bind(meta.file_id as i64)
@@ -456,6 +492,7 @@ impl FileUploadRepository {
         .bind(&meta.business_id)
         .bind(meta.encryption_version)
         .bind(&meta.cek)
+        .bind(completion_key)
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("插入上传记录失败: {}", e)))?;

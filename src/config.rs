@@ -117,6 +117,11 @@ pub struct ServerConfig {
     /// 校验：cid / ct / did / scope / exp 都必校验。
     #[serde(default)]
     pub room_ticket: Option<RoomTicketConfig>,
+
+    /// `[upload.token]`。`None` 表示未配置：只能签发/验证旧的 Redis UUID token，
+    /// 分片上传链路不可用（等价于关停阀常开）。
+    #[serde(skip)]
+    pub upload_token: Option<crate::security::upload_token::UploadTokenConfig>,
     /// QR 二维码 URL 基址（spec 02-server/QR_CODE_SPEC v1.3 §7.2）。
     ///
     /// 用于拼 `qr_code` 响应字段：`{qr_base_url}/privchat:protocol/<entity>/<action>?qrkey=...`
@@ -345,6 +350,7 @@ impl Default for ServerConfig {
             jwt: JwtConfig::default(),
             server_event: None,
             room_ticket: None,
+            upload_token: None,
             qr_base_url: default_qr_base_url(),
             unauth_session_timeout_secs: default_unauth_session_timeout_secs(),
             unauth_cleanup_interval_secs: default_unauth_cleanup_interval_secs(),
@@ -909,6 +915,7 @@ struct TomlConfig {
     push: Option<TomlPushConfig>,
     server_event: Option<TomlServerEventConfig>,
     room_ticket: Option<TomlRoomTicketConfig>,
+    upload: Option<TomlUploadConfig>,
 }
 
 /// TOML `[server_event]` 段（spec 02-server/SERVER_EVENT_DISPATCH_SPEC §3）。
@@ -923,6 +930,31 @@ struct TomlServerEventConfig {
     application_master_key: Option<String>,
     /// server → 下游 HTTP 调用超时，毫秒；缺省 3000。
     timeout_ms: Option<u64>,
+}
+
+/// TOML `[upload]` 段。
+#[derive(Debug, Deserialize)]
+struct TomlUploadConfig {
+    token: Option<TomlUploadTokenConfig>,
+}
+
+/// TOML `[upload.token]` 段（spec foundation/RESUMABLE_UPLOAD_SPEC §5.2）。
+///
+/// 与 `[auth.jwt]` **是独立密钥域**：登录 token 与上传 token 互不通用。
+#[derive(Debug, Deserialize)]
+struct TomlUploadTokenConfig {
+    /// 单 key 形式。
+    secret: Option<String>,
+    /// 多 key 形式：kid → secret。轮换期旧 key 必须保留 ≥ 24h + 时钟宽限，
+    /// 否则一次换密钥会打断所有在途续传。
+    #[serde(default)]
+    keys: std::collections::HashMap<String, String>,
+    default_kid: Option<String>,
+    leeway_secs: Option<u64>,
+    /// 签发有效期；缺省 24h，且不得超过硬上限。
+    ttl_secs: Option<u64>,
+    /// `legacy_uuid`（缺省）| `signed`。回滚开关：配置无热更，切换需重启。
+    issue_mode: Option<String>,
 }
 
 /// TOML `[room_ticket]` 段（spec 02-server/ROOM_CHANNEL_SPEC §4）
@@ -1752,6 +1784,39 @@ impl From<TomlConfig> for ServerConfig {
                     default_kid: rt.default_kid.unwrap_or_else(|| "v1".to_string()),
                     leeway_secs: leeway,
                 });
+            }
+        }
+
+        // [upload.token]：至少要有一个密钥才生效；没有密钥就签不了也验不了签名 token，
+        // 此时只剩旧 UUID 路径（与今天行为一致）。
+        if let Some(up) = toml.upload {
+            if let Some(t) = up.token {
+                let mut keys = t.keys;
+                if let Some(secret) = t.secret.filter(|s| !s.is_empty()) {
+                    keys.entry(
+                        t.default_kid.clone().unwrap_or_else(|| "upload-v1".to_string()),
+                    )
+                    .or_insert(secret);
+                }
+                if !keys.is_empty() {
+                    use crate::security::upload_token::{IssueMode, MAX_TTL_SECS};
+                    let issue_mode = match t.issue_mode.as_deref() {
+                        Some("signed") => IssueMode::Signed,
+                        // 🔴 认不出的值一律退回 legacy：配置写错不该顺便把 token
+                        // 格式切了。
+                        _ => IssueMode::LegacyUuid,
+                    };
+                    config.upload_token =
+                        Some(crate::security::upload_token::UploadTokenConfig {
+                            keys,
+                            default_kid: t
+                                .default_kid
+                                .unwrap_or_else(|| "upload-v1".to_string()),
+                            leeway_secs: t.leeway_secs.unwrap_or(30).min(300),
+                            ttl_secs: t.ttl_secs.unwrap_or(MAX_TTL_SECS).min(MAX_TTL_SECS),
+                            issue_mode,
+                        });
+                }
             }
         }
 

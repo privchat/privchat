@@ -86,7 +86,7 @@ pub fn create_route() -> Router<FileServerState> {
 /// 返回 (upload, filename, mime_type, business_id, encryption_version, cek, transform_version)。
 async fn receive_streaming(
     state: &FileServerState,
-    token_info: &crate::service::upload_token_service::UploadToken,
+    token_info: &crate::service::upload_token_service::ValidatedUploadToken,
     multipart: &mut Multipart,
 ) -> Result<
     (
@@ -305,15 +305,18 @@ async fn upload_file(
         upload_token.chars().take(8).collect::<String>()
     );
 
-    // 验证 token
+    // 🔴 统一验证入口：签名 token 与旧 UUID 各走各的，输出同一个模型。
+    // 三段点分的串**只按签名验**，失败即拒，绝不回退 Redis（那是降级通道）。
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let token_info = state
         .upload_token_service
-        .validate_token(upload_token)
+        .validate_any(now_secs, upload_token)
         .await?;
 
     // 🔴 预检命中时签发的是 claim 用途的 token，不能拿来传字节。
-    // 一次性只挡得住「同一入口用两次」，挡不住「两个入口各用一次」——
-    // 那会同时留下一条 claim 行和一条上传行。
     if token_info.purpose
         != crate::service::upload_token_service::UploadTokenPurpose::Upload
     {
@@ -322,17 +325,34 @@ async fn upload_file(
         ));
     }
 
-    // 标记 token 已使用（Redis 路径 GETDEL 原子消费，跨实例一次性）
-    state
-        .upload_token_service
-        .mark_token_used(upload_token)
-        .await?;
+    // 🔴 **`GETDEL` 一次性消费已移除。**
+    //
+    // 它原本同时兼任两件事：防重放，以及串行化并发的整包 POST。两件都由会话接管：
+    // 模式锁（`state.mode`/`status`，同一 upload_id 只允许一条路径、且整包接收期间
+    // 独占）+ `upload_completion_key`（重复 POST 收敛到同一个 file_id）。
+    let session = crate::service::upload_session::UploadSession::open(
+        &state.file_service.upload_session_root()?,
+        token_info.user_id,
+        &token_info.upload_id,
+    )?;
+    let _mode_guard = session.begin_whole()?;
 
-    tracing::info!("✅ Token 验证通过，用户: {}", token_info.user_id);
+    tracing::info!(
+        "✅ Token 验证通过，用户: {} upload_id: {}",
+        token_info.user_id,
+        token_info.upload_id
+    );
 
     // P0-10：流式接收——数据边收边写存储，任何失败清理半文件，不再全量进内存。
     let (upload, filename, mime_type, business_id, encryption_version, cek, transform_version) =
         receive_streaming(&state, &token_info, &mut multipart).await?;
+
+    // 完成幂等键：`SHA256(upload_id)`。取消一次性 token 消费后，重复 POST
+    // 同一个请求体由它收敛到同一个 file_id，而不是建出第二条文件行。
+    let completion_key = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(token_info.upload_id.as_bytes()))
+    };
 
     let uploader_id = token_info.user_id;
     let uploader_ip = client_ip_from_headers(&headers);
@@ -364,9 +384,18 @@ async fn upload_file(
             // 🔴 内容摘要取自 **token**，不取表单。表单里的值是这一次请求带来的，
             // 客户端可以在 prepare 之后换掉；token 里那份是 prepare 当时签下的。
             token_info.sha256.clone(),
-            token_info.declared_size,
+            token_info.sealed_blob_size,
+            Some(&completion_key),
         )
         .await?;
+
+    // 成功：把会话推到 Completed（墓碑），迟到的重复请求由它与幂等键一起回答。
+    // 失败路径不走这里——guard 的 Drop 会把状态放回 Idle，让同一张 token 能重试。
+    if let Err(e) = _mode_guard.complete(metadata.file_id) {
+        // 落库已经成功，会话状态没写上只影响墓碑；下次请求会走幂等出口拿回同一个
+        // file_id，所以不把整个上传判失败。
+        tracing::warn!("写入上传会话完成状态失败 file_id={}: {e}", metadata.file_id);
+    }
 
     info!("✅ 文件上传成功: {}", metadata.file_id);
 

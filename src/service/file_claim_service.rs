@@ -140,12 +140,13 @@ pub async fn claim_existing_file(
         .copy_for_user(&source, user_id, &token.business_type, Some(&key))
         .await?;
 
-    // 🔴 消费 token 放在数据库提交**之后**。放前面的话，后续任何失败都会把 token
-    // 烧掉，客户端连重试的机会都没有；幂等已经由 claim_key_hash 保证，
-    // 这里消费失败也不会多出一行。
-    if let Err(e) = token_service.mark_token_used(token_str).await {
-        tracing::warn!("标记上传 token 已使用失败（幂等由 claim_key_hash 保证）: {e}");
-    }
+    // 🔴 **不再消费 token。**
+    //
+    // 一次性消费原本是这条路径的防重放，但 token 现在最长 24 小时且可复用。
+    // 幂等真正的承担者是 `uq_privchat_file_uploads_claim_key
+    // (uploader_id, claim_key_hash)` 部分唯一索引——同一用户对同一份内容重复
+    // claim 会收敛到同一行，而不是多出一行。
+    let _ = token_service; // 保留参数签名，等清理批次一并移除
 
     // 🔴 按新 `file_id` **重新读库**，而不是克隆源行改个 id。
     //

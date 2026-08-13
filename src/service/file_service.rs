@@ -332,7 +332,21 @@ impl FileService {
         declared_content_sha256: Option<String>,
         // token 里签下的精确字节数；`None` = 老客户端没报。
         declared_size: Option<i64>,
+        // 完成幂等键 `SHA256(upload_id)`。取消一次性 token 消费后，重复 POST
+        // 由它收敛到同一个 file_id（RESUMABLE_UPLOAD_SPEC §9.3）。
+        completion_key: Option<&str>,
     ) -> Result<FileMetadata> {
+        // 🔴 幂等出口排在最前：已经完成过就直接返回原来那一行，
+        // 既不重新落库，也不重复发布对象。
+        if let Some(key) = completion_key {
+            if let Some(existing) = self.file_upload_repo.find_completed(uploader_id, key).await? {
+                if let Some(meta) = self.file_upload_repo.get_by_file_id(existing).await? {
+                    tracing::info!("♻️ 上传已完成过，返回原 file_id={existing}");
+                    upload.abort().await;
+                    return Ok(meta);
+                }
+            }
+        }
         let mut writer = upload
             .writer
             .take()
@@ -428,7 +442,7 @@ impl FileService {
             encryption_version: enc_version,
             cek: stored_cek,
         };
-        self.insert_within(&mut tx, &metadata).await?;
+        self.insert_within(&mut tx, &metadata, completion_key).await?;
         tx.commit()
             .await
             .map_err(|e| ServerError::Database(format!("提交上传收敛事务失败: {e}")))?;
@@ -462,6 +476,7 @@ impl FileService {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         meta: &FileMetadata,
+        completion_key: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             r#"
@@ -469,8 +484,10 @@ impl FileService {
                 file_id, original_filename, file_size, file_type, mime_type,
                 file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at,
                 width, height, file_hash, business_type, business_id,
-                encryption_version, cek
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                encryption_version, cek, upload_completion_key
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            ON CONFLICT (uploader_id, upload_completion_key) WHERE upload_completion_key IS NOT NULL
+            DO NOTHING
             "#,
         )
         .bind(meta.file_id as i64)
@@ -490,6 +507,7 @@ impl FileService {
         .bind(&meta.business_id)
         .bind(meta.encryption_version)
         .bind(&meta.cek)
+        .bind(completion_key)
         .execute(&mut **tx)
         .await
         .map_err(|e| ServerError::Database(format!("插入上传记录失败: {e}")))?;
@@ -530,6 +548,23 @@ impl FileService {
         self.file_upload_repo
             .find_claimed(uploader_id, claim_key_hash)
             .await
+    }
+
+    /// 上传会话临时目录的根（`tmp/uploads/`）。
+    ///
+    /// 挂在**默认本地存储源**的 root 之下：与最终对象同一个文件系统时，
+    /// complete 的发布就是一次 rename（RESUMABLE_UPLOAD_SPEC §9.2）。
+    /// 跨文件系统时走复制降级，那条路径在分片批次里落地。
+    pub fn upload_session_root(&self) -> Result<std::path::PathBuf> {
+        let src = self
+            .sources_by_id
+            .get(&self.default_storage_source_id)
+            .ok_or_else(|| ServerError::Internal("找不到默认存储源".to_string()))?;
+        if src.storage_type != "local" {
+            // 对象存储后端的临时目录仍落本机磁盘（会话是节点本地的）。
+            return Ok(std::path::PathBuf::from("./storage/tmp/uploads"));
+        }
+        Ok(std::path::Path::new(&src.storage_root).join("tmp/uploads"))
     }
 
     pub async fn get_file_metadata(&self, file_id: u64) -> Result<Option<FileMetadata>> {

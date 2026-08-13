@@ -237,6 +237,30 @@ impl ValidatedUploadToken {
     /// 后者是 Redis 里序列化记录中的字段，正常情况下两者相同，但一旦分家
     /// （写入与 key 不一致、记录被改写），`upload_id` 就会落到另一个目录，
     /// 于是模式锁、会话目录和完成幂等三者集体指错地方。派生只认收到的那一份。
+    /// 自包含签名 token 的投影：所有字段都是签进去的，无需派生。
+    pub fn from_claims(c: &crate::security::upload_token::UploadTokenClaims) -> Self {
+        Self {
+            upload_id: c.upload_id.clone(),
+            user_id: c.uid,
+            // verify() 已经拒过未知用途，这里的 unwrap_or 只是不 panic 的写法。
+            purpose: c.purpose().unwrap_or(UploadTokenPurpose::Upload),
+            file_type: crate::model::file_upload::FileType::from_str(&c.ft)
+                .unwrap_or(crate::model::file_upload::FileType::File),
+            max_size: c.mx,
+            business_type: c.bt.clone(),
+            filename: c.filename.clone(),
+            sha256: c.sha256.clone(),
+            sealed_blob_size: c.sealed_blob_size,
+            mime_type: c.mime_type.clone(),
+            transform_version: c.tv,
+            encryption_version: c.encryption_version,
+            upload_plan: c.upload_plan(),
+            node_id: c.node_id.clone(),
+            upload_base_url: c.upload_base_url.clone(),
+            expires_at: DateTime::from_timestamp(c.exp as i64, 0).unwrap_or_else(Utc::now),
+        }
+    }
+
     pub fn from_legacy(raw_token: &str, record: &UploadToken) -> Self {
         Self {
             upload_id: derive_legacy_upload_id(raw_token),
@@ -269,6 +293,34 @@ pub struct UploadTokenService {
     /// 内存回退存储（token -> UploadToken）
     tokens: Arc<RwLock<HashMap<String, UploadToken>>>,
     redis: Option<Arc<crate::infra::redis::RedisClient>>,
+    /// 签名 token 配置。`None` = 未配置密钥，只剩旧 UUID 路径（与今天行为一致）。
+    signing: Option<crate::security::upload_token::UploadTokenConfig>,
+}
+
+/// 一串上传凭证长什么样。
+///
+/// 🔴 **必须在验证之前分类，而且三类互斥。** 迁移期两种格式并存，如果「签名验失败」
+/// 会掉进旧 Redis 查询分支，那就等于给攻击者一条**降级**通道：伪造一个 kid 错、
+/// 签名错的 JWT，让服务端去查 Redis。分类之后，三段点分的串**只走签名验证，失败即拒**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialShape {
+    /// 三段点分：只按签名 token 验，失败绝不回退。
+    Signed,
+    /// 合法 UUID：走旧 Redis 路径。
+    LegacyUuid,
+    /// 其它一律直接拒绝——不去查任何后端。
+    Unrecognised,
+}
+
+/// 判形。只看形状，不做任何验证。
+pub fn classify_credential(token: &str) -> CredentialShape {
+    if token.split('.').count() == 3 {
+        return CredentialShape::Signed;
+    }
+    if Uuid::parse_str(token).is_ok() {
+        return CredentialShape::LegacyUuid;
+    }
+    CredentialShape::Unrecognised
 }
 
 const REDIS_KEY_PREFIX: &str = "upload_token:";
@@ -279,7 +331,49 @@ impl UploadTokenService {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             redis: None,
+            signing: None,
         }
+    }
+
+    /// 挂上签名 token 配置（`[upload.token]`）。
+    pub fn with_signing(
+        mut self,
+        cfg: Option<crate::security::upload_token::UploadTokenConfig>,
+    ) -> Self {
+        self.signing = cfg;
+        self
+    }
+
+    /// 这次上传该不该分片：返回 `Some(plan)` = 分片，`None` = 整包直传。
+    ///
+    /// 🔴 判断只在服务端一处。客户端**不实现「多大算小文件」**——收到 plan 就分片，
+    /// 没收到就整包。阈值调整因此不需要三端发版；恒不下发即是关停阀。
+    ///
+    /// 目前只在签发签名 token 时给出方案：旧 UUID token 没有承载它的字段。
+    pub fn plan_for(&self, sealed_blob_size: i64) -> Option<UploadPlan> {
+        if !self.issues_signed() {
+            return None;
+        }
+        const BASE_UNIT: u32 = 64 * 1024;
+        let plan = UploadPlan {
+            base_unit: BASE_UNIT,
+            initial_request_size: BASE_UNIT,
+            max_request_size: 2 * 1024 * 1024,
+            session_threshold: BASE_UNIT as u64,
+            max_parallel_parts: 3,
+        };
+        if sealed_blob_size <= plan.session_threshold as i64 {
+            return None;
+        }
+        Some(plan)
+    }
+
+    /// 当前是否按签名格式签发。未配密钥时恒为 false。
+    pub fn issues_signed(&self) -> bool {
+        matches!(
+            self.signing.as_ref().map(|c| c.issue_mode),
+            Some(crate::security::upload_token::IssueMode::Signed)
+        )
     }
 
     /// 带 Redis 后端创建（生产路径）：token 状态跨实例可见。
@@ -287,6 +381,7 @@ impl UploadTokenService {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             redis: Some(redis),
+            signing: None,
         }
     }
 
@@ -335,6 +430,102 @@ impl UploadTokenService {
         );
 
         Ok(token)
+    }
+
+    /// 🔴 **唯一的验证入口**：按形状分类后各走各的，输出统一模型。
+    ///
+    /// - 三段点分 → 只按签名验证，失败**直接拒绝**，绝不回退 Redis
+    /// - 合法 UUID → 旧 Redis / 内存路径
+    /// - 其它 → 直接拒绝，不查任何后端
+    ///
+    /// `now_secs` 是**请求开始时刻**（spec §5.3）：一个开始时有效的长传输不因为
+    /// 传输途中跨过过期时刻而失败。
+    pub async fn validate_any(&self, now_secs: u64, token: &str) -> Result<ValidatedUploadToken> {
+        match classify_credential(token) {
+            CredentialShape::Signed => {
+                let cfg = self.signing.as_ref().ok_or_else(|| {
+                    warn!("❌ 收到签名 token 但未配置 [upload.token]: {}", redact(token));
+                    ServerError::InvalidToken
+                })?;
+                let claims = crate::security::upload_token::verify(cfg, now_secs, token)
+                    .map_err(|e| {
+                        warn!("❌ 签名 token 验证失败({}): {}", e, redact(token));
+                        ServerError::InvalidToken
+                    })?;
+                Ok(ValidatedUploadToken::from_claims(&claims))
+            }
+            CredentialShape::LegacyUuid => {
+                let record = self.validate_token(token).await?;
+                Ok(ValidatedUploadToken::from_legacy(token, &record))
+            }
+            CredentialShape::Unrecognised => {
+                warn!("❌ 无法识别的上传凭证格式: {}", redact(token));
+                Err(ServerError::InvalidToken)
+            }
+        }
+    }
+
+    /// 按当前 `issue_mode` 签发。返回 `(token 字符串, upload_id)`。
+    ///
+    /// `issue_mode = legacy_uuid`（缺省）时行为与今天完全一致——这正是回滚开关的意义。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn issue(
+        &self,
+        now_secs: u64,
+        user_id: u64,
+        file_type: FileType,
+        max_size: i64,
+        business_type: String,
+        filename: Option<String>,
+        identity: UploadIdentity,
+        purpose: UploadTokenPurpose,
+        upload_plan: Option<&UploadPlan>,
+    ) -> Result<(String, String)> {
+        if self.issues_signed() {
+            let cfg = self
+                .signing
+                .as_ref()
+                .expect("issues_signed() 已保证配置存在");
+            // upload_id 由服务端生成：128 位随机，十六进制（目录名安全）。
+            let upload_id = Uuid::new_v4().simple().to_string();
+            let mut claims = crate::security::upload_token::UploadTokenClaims::new(
+                upload_id.clone(),
+                user_id,
+                purpose,
+                file_type.as_str(),
+                business_type,
+                max_size,
+                identity.transform_version,
+            );
+            claims.filename = filename;
+            claims.sha256 = identity.sha256;
+            claims.sealed_blob_size = identity.declared_size;
+            claims.mime_type = identity.mime_type;
+            claims.set_upload_plan(upload_plan);
+            let token = crate::security::upload_token::sign(cfg, now_secs, claims)
+                .map_err(|e| ServerError::Validation(format!("签发上传 token 失败: {e}")))?;
+            info!(
+                "🎫 签发上传 token(signed): upload_id={} 用户={} 类型={} 业务已签入",
+                upload_id,
+                user_id,
+                file_type.as_str()
+            );
+            return Ok((token, upload_id));
+        }
+
+        let record = self
+            .generate_token(
+                user_id,
+                file_type,
+                max_size,
+                business_type,
+                filename,
+                identity,
+                purpose,
+            )
+            .await?;
+        let upload_id = derive_legacy_upload_id(&record.token);
+        Ok((record.token, upload_id))
     }
 
     /// 验证 token 有效性

@@ -64,30 +64,28 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         file_size
     );
 
-    // 验证 token 是否存在（已使用）
-    match services
+    // 🔴 **token 仍然有效是正常的，不是异常。**
+    //
+    // 这里原本把「token 还能验过」当告警、随后 `remove_token`。两条语义都建立在
+    // 「一次性 5 分钟 token」上：现在 token 最长 24 小时、可复用，而且签名 token
+    // 服务端根本不存储，**没有东西可删**。
+    //
+    // 所谓「完成后清理 token」，实际含义是清理上传临时数据；token 到期自行失效。
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Err(e) = services
         .upload_token_service
-        .validate_token(upload_token)
+        .validate_any(now_secs, upload_token)
         .await
     {
-        Ok(_) => {
-            // Token 仍然有效，这不应该发生（应该在验证时已标记为已使用）
-            warn!("⚠️ 上传回调时 token 仍然有效: {}", upload_token);
-        }
-        Err(_) => {
-            // Token 已失效（已使用或过期），这是预期行为
-        }
+        warn!("⚠️ 上传回调携带的 token 无效: {e}");
     }
 
     // TODO: 记录文件元数据到数据库
     // TODO: 更新用户配额
     // TODO: 触发后续业务逻辑（如媒体处理、内容审核）
-
-    // 清理 token
-    let _ = services
-        .upload_token_service
-        .remove_token(upload_token)
-        .await;
 
     Ok(json!({
         "success": true,
