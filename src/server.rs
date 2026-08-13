@@ -814,11 +814,23 @@ impl ChatServer {
             )),
         );
 
-        // 创建上传 token 服务（P0-10：Redis 后端，token 一次性消费跨实例成立）
-        let upload_token_service = Arc::new(crate::service::UploadTokenService::new_with_redis(
-            redis_client.clone(),
-        ));
-        info!("✅ 上传 token 服务初始化完成（Redis 后端）");
+        // 上传 token 服务。
+        //
+        // 验证侧**始终双验**（签名 token + 旧 Redis UUID）；签发格式由
+        // `[upload.token].issue_mode` 决定，缺省 `legacy_uuid` = 行为与今天一致。
+        // 配置没有热更，所以回滚是「改配置 + 重启」（RESUMABLE_UPLOAD_SPEC §5.2.4）。
+        let upload_token_service = Arc::new(
+            crate::service::UploadTokenService::new_with_redis(redis_client.clone())
+                .with_signing(config.upload_token.clone()),
+        );
+        info!(
+            "✅ 上传 token 服务初始化完成（签发模式: {}）",
+            if upload_token_service.issues_signed() {
+                "signed"
+            } else {
+                "legacy_uuid"
+            }
+        );
 
         // 创建表情包服务
         info!("🔧 初始化表情包服务...");

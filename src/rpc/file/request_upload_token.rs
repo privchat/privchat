@@ -59,6 +59,24 @@ pub async fn request_upload_token(
     // TODO: 检查用户权限、存储配额、频率限制等
 
     // 检查文件大小限制
+    // 🔴 只有上限是不够的：`file_size = 0` 会让完成时的「声明 vs 实际」复核
+    // 退化成与 0 比对，等于没校验。
+    if file_size <= 0 {
+        return Err(RpcError::validation(
+            "file_size 必须大于 0".to_string(),
+        ));
+    }
+    // 🔴 文件名要签进 token，而 token 跟着每一个分片请求走。
+    // `original_filename` 列是 VARCHAR(512)，真放进来会把 token 撑破体积预算。
+    if let Some(name) = filename.as_ref() {
+        if name.len() > crate::security::upload_token::MAX_FILENAME_BYTES {
+            return Err(RpcError::validation(format!(
+                "文件名过长（最多 {} 字节）",
+                crate::security::upload_token::MAX_FILENAME_BYTES
+            )));
+        }
+    }
+
     let max_size = get_max_size_for_type(&file_type);
     if file_size > max_size {
         warn!("❌ 文件大小超限: {} bytes > {} bytes", file_size, max_size);
@@ -93,10 +111,23 @@ pub async fn request_upload_token(
             .is_some();
     }
 
-    // 生成上传 token（将 u64 转换为 String）
-    let token = services
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // 🔴 服务端**决定**这次走整包还是分片，客户端不做判断：
+    // 有 `upload_plan` 就分片、没有就整包。阈值策略只活在这一处，调整不用发版。
+    // 关停阀 = 恒不下发（`[upload.token]` 未配置或未切 signed 时天然如此）。
+    let upload_plan = services
         .upload_token_service
-        .generate_token(
+        .plan_for(file_size);
+
+    let expires_at = now_secs as i64 + 86_400;
+    let (token_str, _upload_id) = services
+        .upload_token_service
+        .issue(
+            now_secs,
             user_id,
             file_type,
             max_size,
@@ -117,6 +148,7 @@ pub async fn request_upload_token(
             } else {
                 crate::service::upload_token_service::UploadTokenPurpose::Upload
             },
+            upload_plan.as_ref(),
         )
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
@@ -133,15 +165,15 @@ pub async fn request_upload_token(
         })?;
 
     let response = FileRequestUploadTokenResponse {
-        token: token.token.clone(),
+        token: token_str,
         upload_url,
         // 命中只是**告知**：字节已经在服务端，不必再传。要拿到自己的 file_id
         // 还得带这个 token 调 `file/claim_existing`。
         already_exists,
         // request_upload_token 阶段尚未落盘具体文件，保留兼容空值
         file_id: String::new(),
-        expires_at: Some(token.expires_at.timestamp()),
-        max_size: Some(token.max_size),
+        expires_at: Some(expires_at),
+        max_size: Some(max_size),
     };
 
     serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))

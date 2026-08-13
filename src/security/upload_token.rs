@@ -191,6 +191,43 @@ pub struct UploadTokenClaims {
 }
 
 impl UploadTokenClaims {
+    /// 构造一张待签的 claims。
+    ///
+    /// `plan` 是内部紧凑类型，不对外暴露——外部只经由 [`Self::set_upload_plan`]
+    /// 用可读的 [`UploadPlan`] 写入。`v` / `aud` / `iat` / `exp` 由 [`sign`] 填。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        upload_id: String,
+        uid: u64,
+        purpose: UploadTokenPurpose,
+        file_type: &str,
+        business_type: String,
+        max_size: i64,
+        transform_version: i32,
+    ) -> Self {
+        Self {
+            v: CLAIMS_VERSION,
+            upload_id,
+            aud: TOKEN_AUD.to_string(),
+            uid,
+            prp: Self::purpose_code(purpose).to_string(),
+            ft: file_type.to_string(),
+            bt: business_type,
+            mx: max_size,
+            tv: transform_version,
+            filename: None,
+            sha256: None,
+            sealed_blob_size: None,
+            mime_type: None,
+            encryption_version: None,
+            node_id: None,
+            upload_base_url: None,
+            plan: None,
+            iat: 0,
+            exp: 0,
+        }
+    }
+
     /// 读出上传方案（转回可读模型）。
     pub fn upload_plan(&self) -> Option<UploadPlan> {
         self.plan.as_ref().map(UploadPlan::from)

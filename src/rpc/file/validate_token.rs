@@ -41,13 +41,11 @@ pub async fn validate_upload_token(services: RpcServiceContext, params: Value) -
         .await
     {
         Ok(token_info) => {
-            // Token 有效，标记为已使用
-            services
-                .upload_token_service
-                .mark_token_used(upload_token)
-                .await
-                .map_err(|e| RpcError::internal(e.to_string()))?;
-
+            // 🔴 **只校验，不消费。**
+            //
+            // 这里原本顺手 `mark_token_used`。5 分钟一次性 token 时代无所谓，
+            // 24 小时会话 token 下等于「任何人调一次校验就废掉别人整个上传」。
+            // 重放由 `upload_completion_key` 与模式锁承担，不靠烧 token。
             Ok(json!({
                 "valid": true,
                 "user_id": token_info.user_id,
