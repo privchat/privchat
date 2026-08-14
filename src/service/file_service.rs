@@ -113,6 +113,14 @@ pub struct FileService {
 ///
 /// 本地存储用 `link` + `unlink`：`rename` 会**静默覆盖**，而 `link` 在目标已存在时
 /// 返回 `EEXIST`——no-clobber 由内核保证，不是靠「先 stat 再动手」那种有竞态的写法。
+///
+/// 🔴 **没有任何降级到「先 stat 再 copy」的分支。** 那种写法有两处致命问题：
+/// stat 与 copy 之间的窗口里别人可以发布同一个路径（TOCTOU），而 `copy` 本身是**覆盖**
+/// 语义——一次失败的 link 就足以把 no-clobber 整条保证绕过去。所以：
+///   · 本地 link 失败（含 `EXDEV`）一律**报错**。临时对象是刻意放在同一个 operator
+///     根下的，真出现跨设备只能是部署配错，让它响，别让它悄悄降级；
+///   · 非本地后端走**条件写**（`if_not_exists`），由后端保证「目标已存在就失败」；
+///     后端不具备这个能力时同样报错，而不是假装发布成功。
 async fn publish_object(
     op: &Operator,
     local_root: Option<&str>,
@@ -126,39 +134,123 @@ async fn publish_object(
             std::fs::create_dir_all(parent)
                 .map_err(|e| ServerError::Internal(format!("创建目标目录失败: {e}")))?;
         }
+
+        // 🔴 **字节先落盘，目录项后指过去。**
+        //
+        // `hard_link` 只改目录项，不保证内容已经在盘上。少了这一步，掉电后完全可能
+        // 出现「PG 里有记录、正式路径上的文件是个空洞」——而记录一旦提交就是永久的。
+        fsync_file(&from)?;
+
         return match std::fs::hard_link(&from, &to) {
             Ok(()) => {
+                // 新目录项本身也要落盘，否则掉电后记录指向一个不存在的名字。
+                fsync_dir(to.parent())?;
                 // 发布成功后**立即**移除临时对象：客户端可能在这之后就离线了，
                 // 清理不能只靠 callback。
+                // 这次 unlink 不 fsync：最坏情况是留下一个临时文件，由扫描回收——
+                // 这个方向的错误是可回收的垃圾，而不是丢数据。
                 let _ = std::fs::remove_file(&from);
                 Ok(PublishOutcome::Published)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 Ok(PublishOutcome::AlreadyPresent)
             }
-            // 跨文件系统（EXDEV）等：退回复制。
-            Err(_) => {
-                if op.stat(final_path).await.is_ok() {
-                    return Ok(PublishOutcome::AlreadyPresent);
-                }
-                op.copy(staging, final_path)
-                    .await
-                    .map_err(|e| ServerError::Internal(format!("发布对象失败: {e}")))?;
-                let _ = op.delete(staging).await;
-                Ok(PublishOutcome::Published)
-            }
+            Err(e) => Err(ServerError::Internal(format!(
+                "发布对象失败（{from:?} → {to:?}）：{e}。\
+                 临时对象与正式对象必须在同一个存储根下——请检查存储源配置",
+            ))),
         };
     }
 
-    if op.stat(final_path).await.is_ok() {
-        return Ok(PublishOutcome::AlreadyPresent);
+    // 非本地后端：no-clobber 只能由后端的条件写提供。
+    if !op.info().full_capability().write_with_if_not_exists {
+        return Err(ServerError::Internal(
+            "该存储后端不支持条件写（if_not_exists），无法保证不覆盖已有对象，拒绝发布"
+                .to_string(),
+        ));
     }
-    op.copy(staging, final_path)
+    let total = op
+        .stat(staging)
         .await
-        .map_err(|e| ServerError::Internal(format!("发布对象失败: {e}")))?;
-    let _ = op.delete(staging).await;
-    Ok(PublishOutcome::Published)
+        .map_err(|e| ServerError::Internal(format!("读临时对象大小失败: {e}")))?
+        .content_length();
+    let reader = op
+        .reader(staging)
+        .await
+        .map_err(|e| ServerError::Internal(format!("打开临时对象失败: {e}")))?;
+    // 🔴 条件不满足可能在**两个**时刻报出来：后端要么在打开 writer 时就拒（本地文件
+    // 系统的 `O_EXCL` 是立刻知道的），要么等到收尾提交时才拒（S3 的 `If-None-Match`
+    // 跟着最后那个请求走）。两处都必须认成「已存在」，漏掉任何一处，一次正常的并发
+    // 发布就会变成 500。
+    let mut writer = match op.writer_with(final_path).if_not_exists(true).await {
+        Ok(w) => w,
+        Err(e) if e.kind() == opendal::ErrorKind::ConditionNotMatch => {
+            return Ok(PublishOutcome::AlreadyPresent);
+        }
+        Err(e) => return Err(ServerError::Internal(format!("打开发布 writer 失败: {e}"))),
+    };
+    let mut offset = 0u64;
+    while offset < total {
+        let end = (offset + VERIFY_CHUNK).min(total);
+        let buf = reader
+            .read(offset..end)
+            .await
+            .map_err(|e| ServerError::Internal(format!("读临时对象失败: {e}")))?;
+        writer
+            .write(buf)
+            .await
+            .map_err(|e| ServerError::Internal(format!("写正式对象失败: {e}")))?;
+        offset = end;
+    }
+    match writer.close().await {
+        Ok(_) => {
+            let _ = op.delete(staging).await;
+            Ok(PublishOutcome::Published)
+        }
+        Err(e) if e.kind() == opendal::ErrorKind::ConditionNotMatch => {
+            Ok(PublishOutcome::AlreadyPresent)
+        }
+        Err(e) => Err(ServerError::Internal(format!("发布对象失败: {e}"))),
+    }
 }
+
+/// 把文件内容刷到盘上。
+fn fsync_file(path: &std::path::Path) -> Result<()> {
+    let f = std::fs::File::open(path)
+        .map_err(|e| ServerError::Internal(format!("打开待同步文件 {path:?} 失败: {e}")))?;
+    f.sync_all()
+        .map_err(|e| ServerError::Internal(format!("同步文件 {path:?} 失败: {e}")))
+}
+
+/// 把目录项刷到盘上。
+fn fsync_dir(dir: Option<&std::path::Path>) -> Result<()> {
+    let Some(dir) = dir else { return Ok(()) };
+    let d = std::fs::File::open(dir)
+        .map_err(|e| ServerError::Internal(format!("打开目录 {dir:?} 失败: {e}")))?;
+    d.sync_all()
+        .map_err(|e| ServerError::Internal(format!("同步目录 {dir:?} 失败: {e}")))
+}
+
+/// 核验与发布时的分块大小：整个对象绝不一次性进内存。
+const VERIFY_CHUNK: u64 = 1 << 20;
+
+/// 崩溃注入点。**只在 debug 构建里存在**，release 是空函数。
+///
+/// 🔴 上传的崩溃安全性全在几个窄窗口上：校验完还没发布、发布完还没落库、落库完
+/// 还没立墓碑。这些窗口用「模拟」是测不出来的——同进程里 `Drop` 一定会跑，异步任务
+/// 也会被规规矩矩地取消，而真实事故是进程**当场消失**。所以测试要能在指定窗口把
+/// 服务端进程 `abort()` 掉，然后从磁盘和数据库的**实际残留**去验恢复。
+#[cfg(debug_assertions)]
+pub(crate) fn crash_point(name: &str) {
+    if std::env::var("PRIVCHAT_CRASH_POINT").ok().as_deref() == Some(name) {
+        eprintln!("💥 崩溃注入点命中：{name}");
+        std::process::abort();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+pub(crate) fn crash_point(_name: &str) {}
 
 /// 正式路径上那个对象是不是**这次要发布的东西**。
 ///
@@ -177,11 +269,26 @@ async fn verify_object(
     if meta.content_length() != expect_size {
         return Ok(false);
     }
-    let bytes = op
-        .read(final_path)
+    // 🔴 **分块读**。整个对象一次性进内存的话，一个 200MB 的附件在并发恢复时会把
+    // 内存放大成几百 MB——恢复路径恰恰是在故障之后跑的，那正是最不该雪上加霜的时候。
+    let reader = op
+        .reader(final_path)
         .await
         .map_err(|e| ServerError::Internal(format!("核验已发布对象失败: {e}")))?;
-    let actual = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes.to_vec()));
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    let mut offset = 0u64;
+    while offset < expect_size {
+        let end = (offset + VERIFY_CHUNK).min(expect_size);
+        let buf = reader
+            .read(offset..end)
+            .await
+            .map_err(|e| ServerError::Internal(format!("核验已发布对象失败: {e}")))?;
+        for chunk in buf {
+            sha2::Digest::update(&mut hasher, &chunk);
+        }
+        offset = end;
+    }
+    let actual = hex::encode(sha2::Digest::finalize(hasher));
     Ok(actual.eq_ignore_ascii_case(expect_sha256))
 }
 
@@ -491,6 +598,9 @@ impl FileService {
             }
         }
 
+        // 窗口一：字节收完并校验通过，但还没发布。
+        crash_point("after_verify_before_publish");
+
         // 并发首传收敛（见 `converge_upload`）。
         let mut tx = self
             .file_upload_repo
@@ -565,6 +675,9 @@ impl FileService {
                 }
             }
         }
+
+        // 窗口二：对象已经在正式路径上了，事务还没提交。
+        crash_point("after_publish_before_commit");
 
         let metadata = FileMetadata {
             file_id: upload.file_id,
@@ -1348,5 +1461,119 @@ mod publish_tests {
         assert!(!verify_object(&op, "images/nope.png", 1, &digest(b"x"))
             .await
             .expect("verify"));
+    }
+
+    /// 大于分块大小的对象也要能核验：分块读的边界必须对。
+    #[tokio::test]
+    async fn a_multi_chunk_object_verifies_by_streaming() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        let bytes: Vec<u8> = (0..(super::VERIFY_CHUNK as usize * 2 + 12345))
+            .map(|i| (i as u8).wrapping_mul(7))
+            .collect();
+        write(&op, "videos/big.bin", &bytes).await;
+
+        assert!(
+            verify_object(&op, "videos/big.bin", bytes.len() as u64, &digest(&bytes))
+                .await
+                .expect("verify"),
+            "跨多个分块的对象必须核验通过"
+        );
+        // 少一个字节就该判不一致——尾巴确实参与了摘要。
+        let mut short = bytes.clone();
+        short.pop();
+        assert!(
+            !verify_object(&op, "videos/big.bin", bytes.len() as u64, &digest(&short))
+                .await
+                .expect("verify")
+        );
+    }
+
+    // ---------------- 非本地后端（条件写）----------------
+    //
+    // 🔴 这条分支以前是「先 stat 再 copy」：stat 与 copy 之间别人可以发布同一个路径，
+    // 而 `copy` 是覆盖语义——no-clobber 在这里整个被绕过去了，且当时**一条测试都没有**。
+    // 现在由后端的条件写保证。fs 后端同样支持 `write_with_if_not_exists`，所以这几条
+    // 用例走的就是 S3 会走的那段代码。
+
+    #[tokio::test]
+    async fn a_conditional_write_publishes_when_the_path_is_free() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        write(&op, "tmp/uploads/7/aa/body.part", b"payload bytes").await;
+
+        let out = publish_object(&op, None, "tmp/uploads/7/aa/body.part", "files/1.bin")
+            .await
+            .expect("publish");
+        assert_eq!(out, PublishOutcome::Published);
+        assert_eq!(
+            op.read("files/1.bin").await.expect("read").to_vec(),
+            b"payload bytes"
+        );
+        assert!(
+            op.stat("tmp/uploads/7/aa/body.part").await.is_err(),
+            "发布后临时对象必须立即消失"
+        );
+    }
+
+    /// 🔴 目标已存在：必须报告已存在，且**已有内容一个字节都不能变**。
+    #[tokio::test]
+    async fn a_conditional_write_never_clobbers() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        write(&op, "files/1.bin", b"the original bytes").await;
+        write(&op, "tmp/uploads/7/aa/body.part", b"different").await;
+
+        let out = publish_object(&op, None, "tmp/uploads/7/aa/body.part", "files/1.bin")
+            .await
+            .expect("publish");
+        assert_eq!(
+            out,
+            PublishOutcome::AlreadyPresent,
+            "必须报告已存在，而不是覆盖"
+        );
+        assert_eq!(
+            op.read("files/1.bin").await.expect("read").to_vec(),
+            b"the original bytes",
+            "已有对象必须原封不动"
+        );
+    }
+
+    /// 超过一个分块的对象也要能发布：条件写路径是流式搬运，不是整个读进内存。
+    #[tokio::test]
+    async fn a_conditional_write_streams_multiple_chunks() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        let bytes: Vec<u8> = (0..(super::VERIFY_CHUNK as usize + 777))
+            .map(|i| (i as u8).wrapping_mul(13))
+            .collect();
+        write(&op, "tmp/uploads/7/aa/body.part", &bytes).await;
+
+        let out = publish_object(&op, None, "tmp/uploads/7/aa/body.part", "files/big.bin")
+            .await
+            .expect("publish");
+        assert_eq!(out, PublishOutcome::Published);
+        assert_eq!(op.read("files/big.bin").await.expect("read").to_vec(), bytes);
+    }
+
+    /// 🔴 本地 link 失败（这里用「临时对象不存在」构造）必须**报错**。
+    ///
+    /// 以前这里会掉进「先 stat 再 copy」的降级分支。降级本身才是问题：任何一次
+    /// link 失败都足以把 no-clobber 换成覆盖语义，所以现在没有降级，只有失败。
+    #[tokio::test]
+    async fn a_failed_link_is_an_error_not_a_fallback_copy() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        let root = dir.path().to_string_lossy().to_string();
+        write(&op, "images/1.png", b"the original bytes").await;
+
+        let out =
+            publish_object(&op, Some(&root), "tmp/uploads/7/aa/body.part", "images/1.png").await;
+        assert!(out.is_err(), "link 失败不能被当成某种成功：{out:?}");
+        assert_eq!(
+            op.read("images/1.png").await.expect("read").to_vec(),
+            b"the original bytes",
+            "失败路径上也不能碰已有对象"
+        );
     }
 }
