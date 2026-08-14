@@ -24,24 +24,37 @@ use tracing::warn;
 
 use crate::rpc::{RpcError, RpcResult, RpcServiceContext};
 
-/// 回调失败的两类，**必须分开**。
+/// 回调失败的三类。**分类的依据是「客户端接下来该做什么」，不是错误发生在哪一层。**
 ///
-/// 🔴 抽取编排时我把所有错误压成了 `&'static str`，于是磁盘 I/O 失败、状态 JSON
-/// 损坏、数据库暂时故障统统被映射成客户端参数错误——调用方据此认定「不用重试了」，
-/// 一次短暂的基础设施抖动就变成这次回调**永久失败**。
+/// 🔴 只分两类不够，而且两次都错在同一个地方：
+///   · 一开始全压成静态字符串 → 数据库抖动被标成参数错误，客户端**不再重试**；
+///   · 补成 Rejected/Internal 后 → 会话丢失被塞进这两类，一边让客户端永久放弃、
+///     一边让它对着一个**永远不会自愈**的状态反复重试。
 ///
-/// 授权判定的结论和基础设施的死活是两回事，不能共用一个出口。
+/// 会话丢失是既定协议里的第三种结局：**重来一遍**（重新 prepare 拿 token 再传），
+/// 它既不是客户端参数错，也不是重试能解决的抖动。
 #[derive(Debug)]
 pub(crate) enum CallbackError {
-    /// 授权拒绝：参数/身份不对，重试也没用 → `RpcError::validation`。
+    /// 参数/身份不对 → `RpcError::validation`（`InvalidParams`）。**重试无用，别重试。**
     Rejected(&'static str),
-    /// 基础设施故障：磁盘、状态文件、数据库 → `RpcError::internal`，可重试。
+    /// 临时会话没了或已损坏 → `RpcError::not_found`（`ResourceNotFound`）。
+    /// **重试同一个调用永远不会好**，客户端应清掉本地会话、重新 prepare 从头传。
+    SessionGone(&'static str),
+    /// 基础设施抖动：数据库、网络、磁盘 I/O → `RpcError::internal`。**可以重试。**
     Internal(String),
 }
 
 impl CallbackError {
     pub(crate) fn is_rejected(&self) -> bool {
         matches!(self, Self::Rejected(_))
+    }
+
+    pub(crate) fn is_session_gone(&self) -> bool {
+        matches!(self, Self::SessionGone(_))
+    }
+
+    pub(crate) fn is_internal(&self) -> bool {
+        matches!(self, Self::Internal(_))
     }
 }
 
@@ -77,11 +90,13 @@ where
         &token.upload_id,
     )
     .map_err(|e| CallbackError::Internal(format!("会话不可读: {e}")))?
-    .ok_or(CallbackError::Rejected("该次上传的会话已不存在"))?;
+    .ok_or(CallbackError::SessionGone("该次上传的会话已不存在"))?;
 
+    // 🔴 状态文件损坏是**持久**故障：重复回调不会让它变好，重试只是空转。
+    // 归到 SessionGone，让客户端重新 prepare。
     let tombstone = session
         .completed_file_id()
-        .map_err(|e| CallbackError::Internal(format!("会话状态不可读: {e}")))?;
+        .map_err(|_| CallbackError::SessionGone("会话状态已损坏"))?;
     check_callback_target_id(tombstone, reported).map_err(CallbackError::Rejected)?;
 
     let meta = fetch_meta(reported)
@@ -196,6 +211,14 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         CallbackError::Rejected(reason) => {
             warn!("❌ 上传回调被拒: {reason}（file_id={file_id_num}）");
             RpcError::validation(reason.to_string())
+        }
+        // 🔴 基础设施故障必须是 internal：标成 validation 等于告诉客户端
+        // 「别重试了」，一次数据库抖动就把这次回调永久判死。
+        // 会话没了 / 坏了：给一个客户端认得出的码，让它重新 prepare，
+        // 而不是永久放弃，也不是对着不会自愈的状态死循环。
+        CallbackError::SessionGone(reason) => {
+            warn!("🔁 上传会话不可恢复: {reason}（file_id={file_id_num}），需重新 prepare");
+            RpcError::not_found(reason.to_string())
         }
         // 🔴 基础设施故障必须是 internal：标成 validation 等于告诉客户端
         // 「别重试了」，一次数据库抖动就把这次回调永久判死。
@@ -338,7 +361,8 @@ mod tests {
     #[tokio::test]
     async fn a_callback_for_a_vanished_session_is_refused_without_creating_it() {
         let r = tempfile::tempdir().expect("tmp");
-        assert!(run(r.path(), 900, Some(meta())).await.is_err());
+        let err = run(r.path(), 900, Some(meta())).await.expect_err("必须失败");
+        assert!(err.is_session_gone());
         assert!(
             !r.path().join("42").join(UPLOAD_ID).exists(),
             "回调不得惰性建出会话目录"
@@ -372,9 +396,11 @@ mod tests {
         );
     }
 
-    /// 状态文件损坏同理：是本机的问题，不是调用方参数不对。
+    /// 🔴 损坏的 `state.json` 是**持久**故障：重复回调不会让它变好。
+    /// 标成 internal 会让客户端对着一个永不自愈的状态死循环；标成 validation
+    /// 又会让它永久放弃。正确结局是第三种：重新 prepare 从头传。
     #[tokio::test]
-    async fn a_corrupted_session_state_is_internal_not_a_rejection() {
+    async fn a_corrupted_session_state_tells_the_client_to_start_over() {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
         std::fs::write(
@@ -385,9 +411,47 @@ mod tests {
 
         let err = run(r.path(), 900, Some(meta())).await.expect_err("必须失败");
         assert!(
-            !err.is_rejected(),
-            "状态损坏必须是 internal（可重试），实际: {err:?}"
+            err.is_session_gone(),
+            "状态损坏必须是 SessionGone（重新 prepare），实际: {err:?}"
         );
+    }
+
+    /// 会话目录不存在同样是「重来一遍」，不是「你参数错了」——
+    /// 后者会让客户端永久放弃这次发送。
+    #[tokio::test]
+    async fn a_vanished_session_tells_the_client_to_start_over() {
+        let r = tempfile::tempdir().expect("tmp");
+        let err = run(r.path(), 900, Some(meta())).await.expect_err("必须失败");
+        assert!(
+            err.is_session_gone(),
+            "会话不存在必须是 SessionGone，实际: {err:?}"
+        );
+    }
+
+    /// 三类互斥的完整口径，防止「一律某一类」这种偷懒修法。
+    #[tokio::test]
+    async fn the_three_outcomes_stay_distinct() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
+
+        // 抖动 → 可重试
+        let transient = authorise_callback(r.path(), &token(), 900, |_| async move {
+            Err("connection reset".to_string())
+        })
+        .await
+        .expect_err("must fail");
+        assert!(transient.is_internal());
+
+        // 身份不符 → 别重试
+        let mut wrong = meta();
+        wrong.file_hash = Some("b".repeat(64));
+        let rejected = run(r.path(), 900, Some(wrong)).await.expect_err("must fail");
+        assert!(rejected.is_rejected());
+
+        // 会话没了 → 重来一遍
+        let empty = tempfile::tempdir().expect("tmp");
+        let gone = run(empty.path(), 900, Some(meta())).await.expect_err("must fail");
+        assert!(gone.is_session_gone());
     }
 
     /// 与上面成对：身份不符是**真正的**拒绝，不能因为怕误伤就一律 internal。
