@@ -47,6 +47,23 @@ struct Rig {
     root: PathBuf,
     // 持有 tempdir 的所有权：drop 掉就删目录。
     _dir: tempfile::TempDir,
+    // 跨盘跑法下，`tmp/` 指向的那个**另一个盘上**的目录。它不在 tempdir 里，
+    // 没人管就会一直堆积。
+    _xdev: Option<XdevDir>,
+}
+
+/// 另一个文件系统上的临时目录：**谁建的谁删**。
+///
+/// 🔴 它落在 `TempDir` 管辖之外——`tmp/` 只是一个指过去的符号链接，删掉链接不会动到
+/// 目标。少了这个 guard，每跑一遍全量测试就在那个盘上留下一堆目录；RAM 盘只有几十兆，
+/// 攒够了之后测试会因为「设备没空间」而失败，而那个失败和被测代码毫无关系——
+/// 排查它的人要先趟完一遍完全无关的路。
+struct XdevDir(PathBuf);
+
+impl Drop for XdevDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 async fn pool() -> Option<Arc<sqlx::PgPool>> {
@@ -85,7 +102,7 @@ async fn rig(pool: Arc<sqlx::PgPool>) -> Rig {
 /// 否则两边看到的根本不是同一个会话。
 async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, keep: Option<tempfile::TempDir>) -> Rig {
     let dir = keep.unwrap_or_else(|| tempfile::tempdir().expect("tempdir"));
-    link_temp_to_other_filesystem(&root);
+    let xdev = link_temp_to_other_filesystem(&root);
     let source = FileStorageSourceConfig {
         id: 0,
         storage_type: "local".to_string(),
@@ -109,6 +126,7 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, keep: Option<tempfile::T
         },
         root,
         _dir: dir,
+        _xdev: xdev,
     }
 }
 
@@ -119,13 +137,14 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, keep: Option<tempfile::T
 /// 覆盖的就是**跨挂载点的完整 HTTP 上传**，而不只是发布函数那一段。
 ///
 /// 没设就是同盘（今天生产的形态），照常跑。
-fn link_temp_to_other_filesystem(root: &Path) {
-    let Some(xdev) = std::env::var_os("PRIVCHAT_TEST_XDEV_DIR").map(PathBuf::from) else {
-        return;
-    };
+///
+/// 返回的 guard 由**创建者**持有。子进程看到链接已经在了会直接返回 `None`：
+/// 共享目录不能让一个随时会被 SIGKILL 的进程负责清理。
+fn link_temp_to_other_filesystem(root: &Path) -> Option<XdevDir> {
+    let xdev = std::env::var_os("PRIVCHAT_TEST_XDEV_DIR").map(PathBuf::from)?;
     let link = root.join("tmp");
     if link.exists() {
-        return;
+        return None;
     }
     let far = xdev.join(format!(
         "pcx-e2e-{}-{}",
@@ -138,6 +157,7 @@ fn link_temp_to_other_filesystem(root: &Path) {
     std::fs::create_dir_all(&far).expect("另一个盘上的临时目录");
     std::fs::create_dir_all(root).expect("存储根");
     std::os::unix::fs::symlink(&far, &link).expect("把 tmp/ 链到另一个盘");
+    Some(XdevDir(far))
 }
 
 impl Rig {
