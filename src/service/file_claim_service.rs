@@ -56,8 +56,14 @@ pub async fn claim_existing_file(
 ) -> Result<FileMetadata> {
     let key = claim_key_hash(token_str);
 
-    // 🔴 幂等查询必须排在 token 校验**之前**。成功过的 token 已经被消费掉，
-    // 先去校验只会得到「无效」，重试就永远拿不回那条记录。
+    // 🔴 幂等查询排在 token 校验**之前**：已经成功过的 claim，结果优先返回。
+    //
+    // 覆盖两种正常情况：**响应丢了**客户端拿同一张 token 重试；以及**token 已过期**
+    // （24 小时到了）才来重试——先校验的话后者只会得到「无效」，那条已经属于他的
+    // 记录就永远取不回来了。
+    //
+    // 幂等键由收到的凭证派生，查询按 `uploader_id` 限定，所以这条捷径只能取回
+    // **自己**那次 claim 的结果。
     if let Some(existing) = file_service.find_claimed(user_id, &key).await? {
         if let Some(meta) = file_service.get_file_metadata(existing).await? {
             return Ok(meta);
