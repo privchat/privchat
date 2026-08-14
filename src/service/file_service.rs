@@ -314,6 +314,34 @@ fn create_exclusive_temp(dir: &std::path::Path) -> Result<(std::fs::File, std::p
     )))
 }
 
+/// 逐级创建目录，**每新建一级都同步它的父目录**。
+///
+/// 🔴 `create_dir_all` 可能一口气建出好几级，而只 fsync 最后那一级的父目录，只保住了
+/// 最里面那个目录项。掉电时更外层的目录项照样可能没了，整条路径连同下面的一切一起消失
+/// ——而 PG 里的记录已经提交，又回到「记录在、对象不在」。持久化链上少一环等于没有。
+fn create_dir_all_synced(path: &std::path::Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            create_dir_all_synced(parent)?;
+        }
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        // 别人抢先建好了：目录已经在，继续同步父目录即可。
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
 /// 把文件内容刷到盘上。
 fn fsync_file(path: &std::path::Path) -> Result<()> {
     let f = std::fs::File::open(path)
@@ -478,15 +506,9 @@ impl FileService {
             let root_path = std::path::Path::new(root);
             // 目录不存在时自动创建，创建失败则返回明确错误
             if !root_path.exists() {
-                tokio::fs::create_dir_all(root_path).await.map_err(|e| {
+                create_dir_all_synced(root_path).map_err(|e| {
                     ServerError::Internal(format!("创建文件存储目录失败 \"{}\": {}", root, e))
                 })?;
-                // 🔴 **新建的根目录，它自己的目录项在父目录里。**
-                //
-                // 只 fsync 根目录能保住 `images/` 这些子目录项，却保不住「根目录存在」
-                // 这件事本身——首次启动就掉电的话，整个根连同下面一切一起消失，而 PG
-                // 里的记录已经提交。这是同一条链上更外面的一环。
-                fsync_dir(root_path.parent())?;
             }
             let abs_root = if root_path.is_absolute() {
                 root.to_string()
@@ -1716,9 +1738,13 @@ mod publish_tests {
         assert_eq!(leftover_tmp(dir.path().join("images").as_path()), 0, "中转文件不能留下");
     }
 
-    /// 中转文件名必须唯一：并发发布不能互相踩。
+    /// 连续多次跨盘发布，每一份内容都原样落到自己的目标上。
+    ///
+    /// 📌 **它证明不了中转名唯一**：串行执行、目标各不相同，本来就撞不上。
+    /// 唯一性的门禁是 [`exclusive_temps_never_hand_out_the_same_file`]（真并发）。
+    /// 这条盯的是另一件事：连着发布多次，内容不会串到别人的目标上去。
     #[test]
-    fn cross_filesystem_temp_names_do_not_collide() {
+    fn repeated_cross_filesystem_publishes_keep_their_own_bytes() {
         let dir = tempfile::tempdir().expect("tmp");
         let to = dir.path().join("images/1.png");
         std::fs::create_dir_all(to.parent().unwrap()).unwrap();
@@ -1764,9 +1790,20 @@ mod publish_tests {
         std::fs::create_dir_all(root.join("images")).unwrap();
 
         // 临时目录挪到另一个盘上，再从 operator 根链过去。
-        let far = xdev.join(format!("pcx-xdev-{}", std::process::id()));
+        // 🔴 用 guard 持有，别在末尾手动删：中间任何一条断言失败都会跳过那行清理，
+        // 于是每失败一次就在那个盘上留一个目录。RAM 盘只有几十兆，攒够了之后的失败
+        // 与被测代码毫无关系，却要人先去趟一遍。
+        let far = XdevScratch(xdev.join(format!(
+            "pcx-xdev-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        let far = &far.0;
         std::fs::create_dir_all(far.join("uploads/7/aa")).unwrap();
-        std::os::unix::fs::symlink(&far, root.join("tmp")).unwrap();
+        std::os::unix::fs::symlink(far, root.join("tmp")).unwrap();
         let staged = root.join("tmp/uploads/7/aa/body.part");
         std::fs::write(&staged, b"bytes from another filesystem").unwrap();
 
@@ -1815,7 +1852,6 @@ mod publish_tests {
             "已有对象必须原封不动"
         );
 
-        let _ = std::fs::remove_dir_all(&far);
     }
 
     /// 中转文件必须是**独占创建**：并发抢名字时绝不能打开同一个文件。
@@ -1850,6 +1886,15 @@ mod publish_tests {
             paths.len(),
             "同一个中转路径被交出去两次——两个并发发布会互相截断"
         );
+    }
+
+    /// 另一个盘上的临时目录：drop 即删。
+    struct XdevScratch(std::path::PathBuf);
+
+    impl Drop for XdevScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// 目标目录里遗留的中转文件数。
