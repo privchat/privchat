@@ -64,8 +64,16 @@ pub async fn claim_existing_file(
         }
     }
 
+    // 🔴 走**统一入口**。只用 `validate_token` 的话它仅认 Redis 里的 UUID：
+    // 一旦 `issue_mode` 切到 signed，预检命中签出的是 signed claim token，
+    // 这里当场判「token 无效」——**秒传全线断掉**。
+    // 迁移期漏掉一个验证点，效果和没迁一样。
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let token = token_service
-        .validate_token(token_str)
+        .validate_any(now_secs, token_str)
         .await
         .map_err(|_| ServerError::Validation("上传 token 无效或已过期".to_string()))?;
 

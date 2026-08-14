@@ -261,11 +261,20 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         }
         // 🔴 基础设施故障必须是 internal：标成 validation 等于告诉客户端
         // 「别重试了」，一次数据库抖动就把这次回调永久判死。
-        // 会话没了 / 坏了：给一个客户端认得出的码，让它重新 prepare，
-        // 而不是永久放弃，也不是对着不会自愈的状态死循环。
+        // 🔴 **兼容期映射：会话丢失要让客户端「重跑整条流程」，而不是永久失败。**
+        //
+        // 语义上这是 `ResourceNotFound`，但**已发布的 SDK 不认这个码**：
+        // `is_retryable_server_code` 不含它，outbox 会把附件判成终态失败并丢掉密文缓存。
+        //
+        // 而「重跑整条 outbox 流程」恰好就是我们要的恢复动作——它会重新 prepare、
+        // 复用磁盘上那份 sealed blob 再传一次。所以这里回 `ServiceUnavailable`：
+        // 对现网 SDK 而言语义正确、行为正确，零客户端改动。
+        //
+        // 📌 等 SDK 学会认 `ResourceNotFound` 并主动重新 prepare 后，换回 not_found；
+        // 在那之前**不要**改，否则一次会话丢失就是一条附件永久发不出去。
         CallbackError::SessionGone(reason) => {
-            warn!("🔁 上传会话不可恢复: {reason}（file_id={file_id_num}），需重新 prepare");
-            RpcError::not_found(reason.to_string())
+            warn!("🔁 上传会话不可恢复: {reason}（file_id={file_id_num}），让客户端重跑整条流程");
+            RpcError::from_code(privchat_protocol::ErrorCode::ServiceUnavailable, reason.to_string())
         }
         // 🔴 基础设施故障必须是 internal：标成 validation 等于告诉客户端
         // 「别重试了」，一次数据库抖动就把这次回调永久判死。
@@ -298,12 +307,22 @@ mod tests {
     const UPLOAD_ID: &str = "b3f1a2c40000400080000000000000ff";
     const RAW_TOKEN: &str = "b3f1a2c4-0000-4000-8000-000000000001";
 
-    /// claim 幂等记录的假实现：想让它返回什么就返回什么。
+    /// claim 幂等记录的假实现。
+    ///
+    /// 🔴 它**校验查询键**：早先这个 fake 忽略 key，于是把生产代码里的
+    /// `claim_key_hash(raw_token)` 换成 `upload_id`、换成常量，测试照样全绿——
+    /// 只证明了「lookup 返回的 id 会被采用」，没证明「查的是这次 claim」。
     struct Claims(Option<u64>);
 
     #[async_trait::async_trait]
     impl CallbackLookup for Claims {
-        async fn find_claimed(&self, _uploader: u64, _key: &str) -> Result<Option<u64>, String> {
+        async fn find_claimed(&self, uploader: u64, key: &str) -> Result<Option<u64>, String> {
+            assert_eq!(uploader, 42, "必须按 token 里的 uploader 查");
+            assert_eq!(
+                key,
+                crate::service::file_claim_service::claim_key_hash(RAW_TOKEN),
+                "幂等键必须由**客户端提交的原始 token** 派生"
+            );
             Ok(self.0)
         }
     }

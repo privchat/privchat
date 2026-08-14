@@ -588,8 +588,12 @@ impl UploadTokenService {
         Ok((record.token, upload_id, expires_at))
     }
 
-    /// 验证 token 有效性
-    pub async fn validate_token(&self, token: &str) -> Result<UploadToken> {
+    /// 验证**旧 UUID token**（Redis / 内存）。
+    ///
+    /// 🔴 **私有**：迁移期只要有一个调用点直接用它，那条路径就只认旧格式——
+    /// `issue_mode` 一切到 signed 就当场断掉。秒传入口正是这么断过一次。
+    /// 外部一律走 [`Self::validate_any`]，让「漏迁一个点」在编译期就不可能。
+    async fn validate_token(&self, token: &str) -> Result<UploadToken> {
         if let Some(redis) = &self.redis {
             let payload = redis.get(&format!("{REDIS_KEY_PREFIX}{token}")).await?;
             return match payload.and_then(|p| serde_json::from_str::<UploadToken>(&p).ok()) {
@@ -754,6 +758,66 @@ mod tests {
         // 再次验证应该失败
         let result = service.validate_token(&token.token).await;
         assert!(result.is_err());
+    }
+
+    /// 🔴 门禁：**claim 用途的 signed token 必须验得过统一入口**。
+    ///
+    /// `claim_existing_file` 曾经只调 `validate_token`（仅认 Redis UUID）。
+    /// 那样一旦 `issue_mode` 切到 signed，预检命中签出的 signed claim token
+    /// 在秒传入口当场被判无效——**秒传全线断掉**，而且是在 callback 之前就断。
+    /// 迁移期漏掉一个验证点，效果和没迁一样。
+    #[tokio::test]
+    async fn a_signed_claim_token_passes_the_unified_validator() {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("upload-v1".to_string(), "s3cr3t".to_string());
+        let service = UploadTokenService::new().with_signing(Some(
+            crate::security::upload_token::UploadTokenConfig {
+                keys,
+                default_kid: "upload-v1".to_string(),
+                leeway_secs: 30,
+                ttl_secs: crate::security::upload_token::MAX_TTL_SECS,
+                issue_mode: crate::security::upload_token::IssueMode::Signed,
+            },
+        ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // 预检命中 → 签 claim 用途的 signed token。
+        let (token, upload_id, _exp) = service
+            .issue(
+                now,
+                1001,
+                FileType::Image,
+                10485760,
+                "message".to_string(),
+                None,
+                UploadIdentity {
+                    sha256: Some("a".repeat(64)),
+                    declared_size: Some(4096),
+                    mime_type: Some("image/png".to_string()),
+                    transform_version: 0,
+                },
+                UploadTokenPurpose::ClaimExisting,
+                None,
+            )
+            .await
+            .expect("issue");
+        assert_eq!(
+            classify_credential(&token),
+            CredentialShape::Signed,
+            "signed 模式必须签出签名 token"
+        );
+
+        // 秒传入口用的就是这个统一入口。
+        let validated = service
+            .validate_any(now, &token)
+            .await
+            .expect("signed claim token 必须验得过");
+        assert_eq!(validated.purpose, UploadTokenPurpose::ClaimExisting);
+        assert_eq!(validated.upload_id, upload_id);
+        assert_eq!(validated.user_id, 1001);
     }
 
     /// 🔴 门禁：**签发路径**必须把摘要规范化后再签进去。
