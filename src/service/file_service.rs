@@ -116,11 +116,15 @@ pub struct FileService {
 ///
 /// 🔴 **没有任何降级到「先 stat 再 copy」的分支。** 那种写法有两处致命问题：
 /// stat 与 copy 之间的窗口里别人可以发布同一个路径（TOCTOU），而 `copy` 本身是**覆盖**
-/// 语义——一次失败的 link 就足以把 no-clobber 整条保证绕过去。所以：
-///   · 本地 link 失败（含 `EXDEV`）一律**报错**。临时对象是刻意放在同一个 operator
-///     根下的，真出现跨设备只能是部署配错，让它响，别让它悄悄降级；
-///   · 非本地后端走**条件写**（`if_not_exists`），由后端保证「目标已存在就失败」；
-///     后端不具备这个能力时同样报错，而不是假装发布成功。
+/// 语义——一次失败的 link 就足以把 no-clobber 整条保证绕过去。三条出路各归各的：
+///   · `EEXIST` → 目标已存在，交给调用方核验（大小 + 摘要）；
+///   · `EXDEV` → 走 [`publish_across_filesystems`]：复制到**目标盘内**的中转文件、
+///     fsync、再在该盘内 link（依然 no-clobber）。临时目录与存储根同盘只是当前部署
+///     的偶然，上传盘单独挂出来是常规操作，这条路不能没有（spec §9.2）；
+///   · 其它错误 → 报错，不猜。
+///
+/// 非本地后端走**条件写**（`if_not_exists`），由后端保证「目标已存在就失败」；
+/// 后端不具备这个能力时报错，而不是假装发布成功。
 async fn publish_object(
     op: &Operator,
     local_root: Option<&str>,
@@ -163,6 +167,7 @@ async fn publish_object(
             //
             // 📌 spec 原文写的是「原子 rename」，这里用 link + unlink：rename 会静默
             // 覆盖，与 no-clobber 冲突；link 同样原子，且目标存在时返回 EEXIST。
+
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
                 publish_across_filesystems(&from, &to)
             }
@@ -229,26 +234,17 @@ async fn publish_object(
 /// 🔴 临时名必须落在**目标目录**里，不能落在源盘：跨盘的 link 一样会 `EXDEV`，
 /// 绕了一圈还是发布不出去。
 ///
-/// 🔴 临时名要唯一（pid + 纳秒）。用固定名的话，两个并发上传会互相踩对方复制到
-/// 一半的内容，最后发布出去的是两份字节缝在一起的东西——而它的摘要谁都对不上。
+/// 🔴 中转文件必须**独占创建**（`create_new`），不能只靠名字「大概不会重」。
+/// 见 [`create_exclusive_temp`]。
 fn publish_across_filesystems(from: &std::path::Path, to: &std::path::Path) -> Result<PublishOutcome> {
     let dir = to.parent().ok_or_else(|| {
         ServerError::Internal(format!("正式路径 {to:?} 没有父目录"))
     })?;
-    let unique = format!(
-        ".publish-{}-{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let tmp = dir.join(unique);
+    let (mut dst, tmp) = create_exclusive_temp(dir)?;
 
     // 复制本身是流式的（`io::copy` 走固定大小缓冲），200MB 的文件不会进内存。
     let copy = (|| -> std::io::Result<()> {
         let mut src = std::fs::File::open(from)?;
-        let mut dst = std::fs::File::create(&tmp)?;
         std::io::copy(&mut src, &mut dst)?;
         // 先让内容落盘，再让目录项指过去——顺序和同盘那条路径是一样的。
         dst.sync_all()
@@ -276,6 +272,46 @@ fn publish_across_filesystems(from: &std::path::Path, to: &std::path::Path) -> R
     // 中转文件无论成败都要清掉：它已经完成使命，留着就是垃圾。
     let _ = std::fs::remove_file(&tmp);
     outcome
+}
+
+/// 在 `dir` 里**独占创建**一个中转文件，返回打开的句柄和它的路径。
+///
+/// 🔴 唯一性必须由 `create_new`（`O_EXCL`）保证，不能靠「pid + 时间戳大概率不重」。
+/// 同一个进程里两个并发发布可以在同一纳秒取到同一个名字，而 `File::create` 是
+/// **截断**语义：后者会把前者复制到一半的内容清空，两边继续往同一个 fd 写，最后
+/// 发布出去的是两份字节缝在一起的东西——它的摘要谁都对不上，却已经进了正式路径。
+///
+/// 计数器只是用来减少重试次数；正确性来自内核的 `O_EXCL`。
+fn create_exclusive_temp(dir: &std::path::Path) -> Result<(std::fs::File, std::path::PathBuf)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let mut last = None;
+    for _ in 0..64 {
+        let name = format!(
+            ".publish-{}-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        );
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => return Ok((f, path)),
+            // 撞名了：换一个再来，绝不去打开已经存在的那个。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(ServerError::Internal(format!(
+        "在 {dir:?} 里创建中转文件失败: {last:?}"
+    )))
 }
 
 /// 把文件内容刷到盘上。
@@ -445,6 +481,12 @@ impl FileService {
                 tokio::fs::create_dir_all(root_path).await.map_err(|e| {
                     ServerError::Internal(format!("创建文件存储目录失败 \"{}\": {}", root, e))
                 })?;
+                // 🔴 **新建的根目录，它自己的目录项在父目录里。**
+                //
+                // 只 fsync 根目录能保住 `images/` 这些子目录项，却保不住「根目录存在」
+                // 这件事本身——首次启动就掉电的话，整个根连同下面一切一起消失，而 PG
+                // 里的记录已经提交。这是同一条链上更外面的一环。
+                fsync_dir(root_path.parent())?;
             }
             let abs_root = if root_path.is_absolute() {
                 root.to_string()
@@ -1689,6 +1731,125 @@ mod publish_tests {
             seen.insert(std::fs::read(&target).unwrap());
         }
         assert_eq!(seen.len(), 50, "每份内容都该原样发布，说明中转没串");
+    }
+
+    /// 🔴 **真·跨挂载点**：`hard_link` 真的返回 `EXDEV`，`publish_object` 真的
+    /// 路由进降级分支。
+    ///
+    /// 上面几条只驱动降级函数本身，证明不了「`EXDEV` 会走到那里」——那一行 match 臂
+    /// 一旦写错（比如被当成普通错误报出去），它们照样全绿。这条才是判据 18a。
+    ///
+    /// 造法：把 operator 根下的临时目录做成指向**另一个文件系统**的符号链接。这既是
+    /// 最省事的构造，也正是真实部署的形态（上传盘单独挂出来）。
+    ///
+    /// 需要环境变量 `PRIVCHAT_TEST_XDEV_DIR` 指向另一个挂载点上的目录。没有时**显式
+    /// 报告未覆盖**并退出；设了 `PRIVCHAT_REQUIRE_XDEV_TESTS=1`（CI 门禁）则直接失败。
+    /// 无论哪种，都先断言这两个路径**确实不同盘**——否则整条用例是空转。
+    #[tokio::test]
+    async fn a_real_cross_mount_publish_takes_the_exdev_path() {
+        let Some(xdev) = std::env::var_os("PRIVCHAT_TEST_XDEV_DIR").map(std::path::PathBuf::from)
+        else {
+            let msg = "跨挂载点用例未覆盖：请设 PRIVCHAT_TEST_XDEV_DIR 指向另一个文件系统上的目录\
+                       （macOS: diskutil eraseVolume HFS+ x $(hdiutil attach -nomount ram://65536)；\
+                       Linux: /dev/shm 或第二个挂载点）";
+            if std::env::var_os("PRIVCHAT_REQUIRE_XDEV_TESTS").is_some() {
+                panic!("{msg}");
+            }
+            eprintln!("⚠️ {msg}");
+            return;
+        };
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("images")).unwrap();
+
+        // 临时目录挪到另一个盘上，再从 operator 根链过去。
+        let far = xdev.join(format!("pcx-xdev-{}", std::process::id()));
+        std::fs::create_dir_all(far.join("uploads/7/aa")).unwrap();
+        std::os::unix::fs::symlink(&far, root.join("tmp")).unwrap();
+        let staged = root.join("tmp/uploads/7/aa/body.part");
+        std::fs::write(&staged, b"bytes from another filesystem").unwrap();
+
+        // 🔴 先证明这两个位置**确实跨盘**。少了这一步，`PRIVCHAT_TEST_XDEV_DIR`
+        // 指到同盘目录时整条用例会「通过」，而它其实什么都没验。
+        let probe = root.join("images/probe.link");
+        let err = std::fs::hard_link(&staged, &probe).expect_err("同盘的话这里会成功，用例即失效");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EXDEV),
+            "PRIVCHAT_TEST_XDEV_DIR 必须在另一个文件系统上，实际错误：{err}"
+        );
+
+        let op = op_at(dir.path());
+        let out = publish_object(
+            &op,
+            Some(&root.to_string_lossy()),
+            "tmp/uploads/7/aa/body.part",
+            "images/1.png",
+        )
+        .await
+        .expect("跨盘发布必须成功");
+
+        assert_eq!(out, PublishOutcome::Published);
+        assert_eq!(
+            std::fs::read(root.join("images/1.png")).unwrap(),
+            b"bytes from another filesystem"
+        );
+        assert!(!staged.exists(), "源临时对象要清掉");
+        assert_eq!(leftover_tmp(&root.join("images")), 0, "中转文件不能留下");
+
+        // 同一路径再发布一次：跨盘路径同样**绝不覆盖**。
+        std::fs::write(&staged, b"different").unwrap();
+        let again = publish_object(
+            &op,
+            Some(&root.to_string_lossy()),
+            "tmp/uploads/7/aa/body.part",
+            "images/1.png",
+        )
+        .await
+        .expect("publish");
+        assert_eq!(again, PublishOutcome::AlreadyPresent);
+        assert_eq!(
+            std::fs::read(root.join("images/1.png")).unwrap(),
+            b"bytes from another filesystem",
+            "已有对象必须原封不动"
+        );
+
+        let _ = std::fs::remove_dir_all(&far);
+    }
+
+    /// 中转文件必须是**独占创建**：并发抢名字时绝不能打开同一个文件。
+    ///
+    /// 这条是真并发——串行跑 50 次证明不了任何事，因为串行本来就不会撞。
+    #[test]
+    fn exclusive_temps_never_hand_out_the_same_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = std::sync::Arc::new(dir.path().to_path_buf());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let root = root.clone();
+            let seen = seen.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..40 {
+                    let (f, p) = super::create_exclusive_temp(&root).expect("temp");
+                    drop(f);
+                    seen.lock().unwrap().push(p);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let paths = seen.lock().unwrap();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "同一个中转路径被交出去两次——两个并发发布会互相截断"
+        );
     }
 
     /// 目标目录里遗留的中转文件数。
