@@ -53,8 +53,12 @@ pub async fn validate_upload_token(services: RpcServiceContext, params: Value) -
             // 🔴 **只校验，不消费。**
             //
             // 这里原本顺手 `mark_token_used`。5 分钟一次性 token 时代无所谓，
-            // 24 小时会话 token 下等于「任何人调一次校验就废掉别人整个上传」。
-            // 重放由 `upload_completion_key` 与模式锁承担，不靠烧 token。
+            // 24 小时可复用 token 下等于「任何人调一次校验就废掉别人整个上传」。
+            //
+            // 重放不靠烧 token，由这几样承担，**都不在业务库里**：
+            // 会话模式锁（同一 upload_id 只允许一条路径且整包接收期间独占）、
+            // `reserved_file_id`（重试复用同一个 id）、墓碑（已完成就直接返回原结果）、
+            // 以及落库时 `file_id` 主键冲突收敛。
             Ok(json!({
                 "valid": true,
                 "user_id": token_info.user_id,

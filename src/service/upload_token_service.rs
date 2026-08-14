@@ -30,11 +30,16 @@ use uuid::Uuid;
 use crate::error::{Result, ServerError};
 use crate::service::file_service::FileType;
 
-/// 这张 token 是干什么用的。
+/// 这张 token 被授权做什么——**冻结的能力边界**，不是流程阶段。
 ///
-/// 🔴 一次性 token 只保证「同一入口不能用两次」，挡不住**两个入口各用一次**：
-/// claim 与实体上传都是先校验后消费，并发时可以双双通过，最后留下一条 claim 行
-/// 和一条上传行。用途签进 token，两个入口各自拒绝不属于自己的那种。
+/// 🔴 token 现在可复用（24 小时内反复用于上传 / 查状态 / complete），
+/// **可复用不等于可跨入口**：预检命中签的是 `ClaimExisting`，只能去换自己的
+/// `file_id`；未命中签的是 `Upload`，只能去传字节。用途签进 token，两个入口
+/// 各自拒绝不属于自己的那种，一张 token 因此不可能同时留下一条 claim 行和
+/// 一条上传行。
+///
+/// 📌 早先这条边界靠「一次性消费」兜着，那个机制已经删除（见 [`UploadToken`]），
+/// 现在完全由签进去的用途承担。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UploadTokenPurpose {
     /// 预检未命中：这张 token 只能拿去传字节。
@@ -160,8 +165,8 @@ fn redact(token: &str) -> String {
 /// 不加的话，任何别处对同一字符串取 SHA-256 的地方都会算出同一个值。
 const LEGACY_UPLOAD_ID_DOMAIN: &[u8] = b"legacy-upload-id\0";
 
-/// 旧 UUID token 没有 `upload_id`，但会话目录、模式锁和 `upload_completion_key`
-/// 全都以它为轴。这里从 token 稳定派生一个。
+/// 旧 UUID token 没有 `upload_id`，但会话目录、模式锁和完成幂等（预留 `file_id`
+/// + 墓碑）全都以它为轴。这里从 token 稳定派生一个。
 ///
 /// 🔴 **不能直接拿 token 当 `upload_id`**：它是 bearer 凭证，而 `upload_id` 会成为
 /// 目录名和日志字段（RESUMABLE_UPLOAD_SPEC §5.2.3 / §7）。
@@ -204,7 +209,7 @@ pub struct UploadPlan {
 /// 迟早与验证器的口径分家。`expires_at` 只作数据保留，供日志与墓碑保留期使用。
 #[derive(Debug, Clone)]
 pub struct ValidatedUploadToken {
-    /// 这次上传的唯一标识：会话目录名、模式锁与 `upload_completion_key` 的轴。
+    /// 这次上传的唯一标识：会话目录名、模式锁与完成幂等（`reserved_file_id` + 墓碑）的轴。
     ///
     /// 签名 token 直接读签进去的值；旧 UUID token 走 [`derive_legacy_upload_id`]。
     pub upload_id: String,
