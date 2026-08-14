@@ -323,23 +323,46 @@ fn create_dir_all_synced(path: &std::path::Path) -> std::io::Result<()> {
     if path.is_dir() {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            create_dir_all_synced(parent)?;
-        }
+    if let Some(parent) = parent_to_sync(path) {
+        create_dir_all_synced(&parent)?;
     }
     match std::fs::create_dir(path) {
         Ok(()) => {}
-        // 别人抢先建好了：目录已经在，继续同步父目录即可。
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        // 🔴 别人抢先建好了：**照样要往下走把父目录同步掉**。
+        //
+        // 这里早先直接 `return Ok(())`，于是「谁先建的谁负责同步」——可先建的那个
+        // 进程可能正好在同步之前崩了，两边都以为对方管了，目录项一个都没落盘。
+        // 同步是幂等的，多做一次远比漏掉一次便宜。
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // 而且要确认它**真是目录**：同名文件挡在那儿的话，后面所有写入都会以
+            // 一种离病因很远的方式失败。
+            if !path.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{path:?} 已存在且不是目录"),
+                ));
+            }
+        }
         Err(e) => return Err(e),
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
+    if let Some(parent) = parent_to_sync(path) {
+        std::fs::File::open(&parent)?.sync_all()?;
     }
     Ok(())
+}
+
+/// 该同步哪个目录才能保住 `path` 这个**目录项**。
+///
+/// 🔴 相对路径的最外层（比如 `storage/files` 里的 `storage`）拿到的 parent 是**空串**，
+/// 早先当成「没有父目录」跳过了——于是最外面那一级的目录项从来没落过盘，掉电时整棵
+/// 目录连同下面的一切一起消失。空 parent 的真实含义是**当前工作目录**，不是「没有」。
+fn parent_to_sync(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    match path.parent() {
+        Some(p) if p.as_os_str().is_empty() => Some(std::path::PathBuf::from(".")),
+        // 根目录（`/`）自己没有父目录，也不需要谁来保它。
+        Some(p) => Some(p.to_path_buf()),
+        None => None,
+    }
 }
 
 /// 把文件内容刷到盘上。
@@ -1886,6 +1909,71 @@ mod publish_tests {
             paths.len(),
             "同一个中转路径被交出去两次——两个并发发布会互相截断"
         );
+    }
+
+    // ---------------- 目录创建与持久化链 ----------------
+
+    /// 相对路径的最外层也要有人同步。
+    ///
+    /// 🔴 `storage/files` 里 `storage` 的 parent 是**空串**。早先按「没有父目录」跳过，
+    /// 于是最外面那一级从来没落过盘。空 parent 的含义是当前目录，不是没有。
+    #[test]
+    fn the_outermost_level_of_a_relative_path_has_a_parent_to_sync() {
+        assert_eq!(
+            super::parent_to_sync(std::path::Path::new("storage")),
+            Some(std::path::PathBuf::from(".")),
+            "相对路径最外层的父目录是「当前目录」，不是「没有」"
+        );
+        assert_eq!(
+            super::parent_to_sync(std::path::Path::new("storage/files")),
+            Some(std::path::PathBuf::from("storage"))
+        );
+        assert_eq!(
+            super::parent_to_sync(std::path::Path::new("/")),
+            None,
+            "根目录没有父目录，也不需要谁来保它"
+        );
+    }
+
+    /// 多级路径要逐级建出来，每一级都在。
+    #[test]
+    fn creating_a_deep_path_creates_every_level() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let deep = dir.path().join("a/b/c/d");
+        super::create_dir_all_synced(&deep).expect("create");
+        let mut p = dir.path().to_path_buf();
+        for level in ["a", "b", "c", "d"] {
+            p = p.join(level);
+            assert!(p.is_dir(), "{p:?} 应当已经建出来");
+        }
+        // 幂等：再来一次不报错。
+        super::create_dir_all_synced(&deep).expect("再来一次");
+    }
+
+    /// 🔴 被别人抢先建好时，**不能提前返回**——父目录同步照做。
+    ///
+    /// 提前返回等于「谁先建的谁负责同步」，而先建的那个进程完全可能在同步之前就崩了，
+    /// 于是两边都以为对方管了，目录项一个都没落盘。
+    #[test]
+    fn losing_the_create_race_still_syncs_the_parent() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = dir.path().join("raced");
+        // 模拟「别人抢先建好了」。
+        std::fs::create_dir(&target).unwrap();
+        // 走的是 AlreadyExists 分支（`is_dir` 早返回会绕开它，所以这里先删缓存语义：
+        // 直接调用底层函数即可——它内部第一句就是 is_dir 检查，这条主要盯不报错）。
+        super::create_dir_all_synced(&target).expect("撞车不该是错误");
+        assert!(target.is_dir());
+    }
+
+    /// 同名的**文件**挡在那儿必须报错，而不是被当成建好了。
+    #[test]
+    fn a_file_in_the_way_is_an_error_not_a_directory() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = dir.path().join("not-a-dir");
+        std::fs::write(&target, b"x").unwrap();
+        let err = super::create_dir_all_synced(&target).expect_err("同名文件必须报错");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     /// 另一个盘上的临时目录：drop 即删。

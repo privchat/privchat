@@ -152,15 +152,17 @@ fn link_temp_to_other_filesystem(root: &Path) -> Option<XdevDir> {
     if link.exists() {
         return None;
     }
-    let far = xdev.join(format!(
-        "pcx-e2e-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&far).expect("另一个盘上的临时目录");
+    // 🔴 **独占创建**，不是「pid + 纳秒大概不会重」。
+    //
+    // 两个并行用例撞上同一个名字的话，两边会共用同一个目录，而先 drop 的那个 guard
+    // 会把另一个**还在用**的目录删掉——表现出来是一个跟上传毫无关系的诡异失败。
+    // 生产的中转文件已经按这条规矩改成 `create_new` 了，测试 fixture 没有理由更松。
+    let far = tempfile::Builder::new()
+        .prefix("pcx-e2e-")
+        .tempdir_in(&xdev)
+        .expect("另一个盘上的临时目录")
+        // 目录的生命周期交给 `XdevDir` 管，这里只取路径。
+        .keep();
     std::fs::create_dir_all(root).expect("存储根");
     std::os::unix::fs::symlink(&far, &link).expect("把 tmp/ 链到另一个盘");
     Some(XdevDir(far))
