@@ -529,6 +529,17 @@ impl UploadTokenService {
         purpose: UploadTokenPurpose,
         upload_plan: Option<&UploadPlan>,
     ) -> Result<(String, String, i64)> {
+        // 🔴 **摘要规范化只在这里做一次**，覆盖所有签发路径。
+        //
+        // 放在调用方（某个 RPC）里的话，将来多一条签发入口就会漏掉：客户端报大写
+        // 十六进制是合法的，而服务端算出来的恒为小写，签了大写就会「首次上传成功、
+        // 重试报身份不符」。
+        let identity = UploadIdentity {
+            sha256: identity
+                .sha256
+                .map(|d| d.trim().to_ascii_lowercase()),
+            ..identity
+        };
         if self.issues_signed() {
             let cfg = self
                 .signing
@@ -743,6 +754,44 @@ mod tests {
         // 再次验证应该失败
         let result = service.validate_token(&token.token).await;
         assert!(result.is_err());
+    }
+
+    /// 🔴 门禁：**签发路径**必须把摘要规范化后再签进去。
+    ///
+    /// 只测 `matches_file` 的大小写容忍是不够的——那只证明比较处兜得住，
+    /// 证明不了 token 里存的是小写。删掉 `issue()` 里的规范化，这条必须变红。
+    #[tokio::test]
+    async fn issuing_normalises_the_digest_before_signing_it() {
+        let service = UploadTokenService::new();
+        let (token, _upload_id, _exp) = service
+            .issue(
+                1_700_000_000,
+                1001,
+                FileType::Image,
+                10485760,
+                "message".to_string(),
+                None,
+                UploadIdentity {
+                    sha256: Some("A".repeat(64)), // 客户端报大写
+                    declared_size: Some(4096),
+                    mime_type: Some("image/png".to_string()),
+                    transform_version: 0,
+                },
+                UploadTokenPurpose::Upload,
+                None,
+            )
+            .await
+            .expect("issue");
+
+        let validated = service
+            .validate_any(1_700_000_000, &token)
+            .await
+            .expect("validate");
+        assert_eq!(
+            validated.sha256.as_deref(),
+            Some("a".repeat(64).as_str()),
+            "签进 token 的摘要必须已规范化为小写"
+        );
     }
 
     /// 🔴 客户端报大写十六进制摘要是合法的，而服务端算出来的恒为小写。
