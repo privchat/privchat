@@ -70,7 +70,13 @@ async fn pool() -> Option<Arc<sqlx::PgPool>> {
     let url = privchat::require_test_database_url()?;
     Some(Arc::new(
         PgPoolOptions::new()
-            .max_connections(4)
+            .max_connections(if std::env::var_os("PRIVCHAT_E2E_TOKEN").is_some() {
+                // 崩溃子进程只跑一个请求，占一条就够；抢多了会在全量套件里把
+                // Postgres 的连接数耗光，表现成一个跟上传毫无关系的超时。
+                1
+            } else {
+                4
+            })
             .connect(&url)
             .await
             .unwrap_or_else(|e| panic!("连接测试数据库失败（{url}）: {e}")),
@@ -508,6 +514,10 @@ impl ChildGuard {
     fn wait(&mut self) -> std::process::ExitStatus {
         self.0.wait().expect("wait child")
     }
+    /// 已经退出就给出状态，还活着就是 `None`。
+    fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.try_wait().expect("try_wait child")
+    }
 }
 
 impl Drop for ChildGuard {
@@ -517,14 +527,24 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    for _ in 0..600 {
+/// 等一个条件成立，**同时盯着子进程别死了**。
+///
+/// 🔴 只等条件的话，子进程一旦提前失败（连不上库、装配报错），这里会一声不吭地干等
+/// 到超时，最后报的是「等 XXX 超时」——真正的原因在子进程的输出里，而排查的人手上
+/// 只有一句和病因无关的超时。子进程先退出就立刻带着它的退出状态失败。
+fn wait_until_child_alive(what: &str, child: &mut ChildGuard, mut ready: impl FnMut() -> bool) {
+    // 预算给足：全量套件并行跑的时候，子进程连库、装配都可能被拖慢，
+    // 而这个等待本身不是被测对象。
+    for _ in 0..1200 {
         if ready() {
             return;
         }
+        if let Some(status) = child.try_wait() {
+            panic!("等 {what} 的时候子进程先退出了：{status:?}");
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    panic!("等待 {what} 超时");
+    panic!("等待 {what} 超时（60s）");
 }
 
 /// 起一个子进程跑真实上传。`crash_point` 为 `None` 时是 stall 模式。
@@ -639,7 +659,7 @@ async fn an_upload_survives_a_kill_mid_transfer() {
     // 判据是**磁盘上真的有字节**，不是「文件出现了」。writer 一打开文件就存在，
     // 拿存在当同步点会在零字节时就开枪，那测的是「还没开始写」的恢复，不是
     // 「写了一半」的恢复——恰好把要覆盖的场景漏掉。
-    wait_until("子进程把部分字节写到 body.part", || {
+    wait_until_child_alive("子进程把部分字节写到 body.part", &mut child, || {
         std::fs::metadata(&staging).map(|m| m.len() > 0).unwrap_or(false)
     });
 
