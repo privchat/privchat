@@ -477,6 +477,9 @@ async fn upload_file(
         )
         .await?;
 
+    // 窗口三：记录已经提交，墓碑还没写。
+    crate::service::file_service::crash_point("after_commit_before_tombstone");
+
     // 成功：把会话推到 Completed（墓碑），迟到的重复请求由它与幂等键一起回答。
     // 失败路径不走这里——guard 的 Drop 会把状态放回 Idle，让同一张 token 能重试。
     if let Err(e) = _mode_guard.complete(metadata.file_id) {
