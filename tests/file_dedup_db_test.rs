@@ -642,16 +642,27 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
         "新行不继承源行的业务绑定：它要绑到取用者自己的那条消息上",
     );
 
-    // token 此刻已被消费——这正是重放路径的前提。
+    // 🔴 token **没有**被消费：一次性消费已经取消（一张 token、24 小时、可重复出示）。
+    //
+    // 这条断言原本写的是「第一次成功之后 token 应当已经作废」，那是旧模型的前提。
+    // 现在它反过来是必须成立的事实——而且正因为如此，下面那次重放的正确性
+    // **不能**再由「token 已作废」顺带解释：它只能来自幂等回查。
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     assert!(
-        token_service.validate_token(&token.token).await.is_err(),
-        "第一次成功之后 token 应当已经作废",
+        token_service
+            .validate_any(now_secs, &token.token)
+            .await
+            .is_ok(),
+        "取用成功不该让 token 失效：有效期内它一直可用",
     );
 
     // 「响应丢了」：客户端拿同一个 token 再来一次。
     let replay = claim_existing_file(&file_service, &token_service, &messages, &channels, OTHER as u64, &token.token, SHA)
         .await
-        .expect("replayed claim must succeed even though the token is spent");
+        .expect("replayed claim must succeed and must not create a second row");
     assert_eq!(first.file_id, replay.file_id, "重放必须返回同一个 file_id");
 
     let rows: i64 = sqlx::query_scalar(
