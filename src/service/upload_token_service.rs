@@ -95,9 +95,14 @@ pub struct UploadToken {
     pub purpose: UploadTokenPurpose,
     /// 创建时间
     pub created_at: DateTime<Utc>,
-    /// 过期时间（默认 5 分钟）
+    /// 过期时间。由签发方按配置 TTL 给出（缺省 24 小时），见 [`UploadToken::new`]。
     pub expires_at: DateTime<Utc>,
-    /// 是否已使用（一次性）
+    /// 🔴 **历史字段，只为反序列化迁移期还留在 Redis 里的旧记录。**
+    ///
+    /// 一次性消费语义已取消：一张 token 在 24 小时内要被分片、查状态、complete
+    /// 反复使用。新代码**不得**再置位它——设成 true 就等于把那次断点续传永久烧掉。
+    /// 销毁 token 的 API（`mark_token_used` / `remove_token`）已连同调用点一并删除。
+    #[serde(default)]
     pub used: bool,
 }
 
@@ -131,7 +136,7 @@ impl UploadToken {
             created_at: now,
             // 🔴 有效期由调用方给，**新旧 token 一个口径**（产品拍板：一种 token、
             // 24 小时）。格式可以不同，签发语义不能不同——否则响应说 24 小时、
-            // 实际 5 分钟，客户端会持久化一个早已作废的凭证。
+            // 报一个与实际不符的有效期，客户端会持久化一个早已作废的凭证。
             expires_at: now + Duration::seconds(ttl_secs),
             used: false,
         }
@@ -142,10 +147,6 @@ impl UploadToken {
         !self.used && Utc::now() < self.expires_at
     }
 
-    /// 标记 token 已使用
-    pub fn mark_used(&mut self) {
-        self.used = true;
-    }
 }
 
 /// 日志用 token 脱敏：只保留前 8 位（P0-10：上传 token 不落明文日志）。
@@ -322,8 +323,12 @@ impl ValidatedUploadToken {
 
 /// 上传 Token 服务
 ///
-/// P0-10：优先走 Redis（key `upload_token:{token}`，SETEX 到期自灭，GETDEL 原子
-/// 消费保证一次性语义跨实例成立）；无 Redis 时回退进程内存（单实例/测试）。
+/// Redis（key `upload_token:{token}`，SETEX 到期自灭）；无 Redis 时回退进程内存
+/// （单实例/测试）。
+///
+/// 📌 **不再有一次性消费。** 早先用 GETDEL 保证「同一张 token 只能用一次」，
+/// 而现在一张 token 在 24 小时内要被反复使用（分片、查状态、complete）。
+/// 重放由完成幂等（预留 `file_id` + 主键）与模式锁承担，不靠烧 token。
 pub struct UploadTokenService {
     /// 内存回退存储（token -> UploadToken）
     tokens: Arc<RwLock<HashMap<String, UploadToken>>>,
@@ -512,8 +517,8 @@ impl UploadTokenService {
     /// 按当前 `issue_mode` 签发。返回 `(token 字符串, upload_id, 真实过期时刻)`。
     ///
     /// 🔴 **过期时刻必须由签发路径给出，不能由调用方按「反正是 24h」推算。**
-    /// legacy 分支实际只签 5 分钟；把 24h 写进响应会让客户端持久化一个服务端早就
-    /// 作废的 token，而失败要等到它真去上传时才暴露。
+    /// 两条分支现在都用配置 TTL（缺省 24 小时），但「推算」和「给出」仍是两回事：
+    /// 将来任何一条分支改了有效期，响应必须跟着变，而不是继续报一个想当然的值。
     ///
     /// `issue_mode = legacy_uuid`（缺省）时行为与今天完全一致——这正是回滚开关的意义。
     #[allow(clippy::too_many_arguments)]
@@ -631,53 +636,6 @@ impl UploadTokenService {
         }
     }
 
-    /// 标记 token 已使用（一次性消费）。
-    /// Redis 路径用 GETDEL 原子消费：并发/跨实例重复使用只有一个赢家。
-    pub async fn mark_token_used(&self, token: &str) -> Result<()> {
-        if let Some(redis) = &self.redis {
-            return match redis.getdel(&format!("{REDIS_KEY_PREFIX}{token}")).await? {
-                Some(_) => {
-                    info!("✅ Token 已消费: {}", redact(token));
-                    Ok(())
-                }
-                None => {
-                    warn!("❌ Token 已被使用或过期: {}", redact(token));
-                    Err(ServerError::InvalidToken)
-                }
-            };
-        }
-
-        let mut tokens = self.tokens.write().await;
-        match tokens.get_mut(token) {
-            Some(upload_token) => {
-                if upload_token.is_valid() {
-                    upload_token.mark_used();
-                    info!("✅ Token 标记为已使用: {}", redact(token));
-                    Ok(())
-                } else {
-                    Err(ServerError::InvalidToken)
-                }
-            }
-            None => Err(ServerError::InvalidToken),
-        }
-    }
-
-    /// 删除 token（清理）
-    pub async fn remove_token(&self, token: &str) -> Result<()> {
-        if let Some(redis) = &self.redis {
-            redis.del(&format!("{REDIS_KEY_PREFIX}{token}")).await?;
-            return Ok(());
-        }
-        let mut tokens = self.tokens.write().await;
-        match tokens.remove(token) {
-            Some(_) => {
-                debug!("🗑️ Token 已删除: {}", redact(token));
-                Ok(())
-            }
-            None => Err(ServerError::InvalidToken),
-        }
-    }
-
     /// 清理过期的 token（定期调用）。Redis 路径由 SETEX TTL 自灭，无需清理。
     pub async fn cleanup_expired_tokens(&self) {
         if self.redis.is_some() {
@@ -741,23 +699,6 @@ mod tests {
         assert_eq!(validated.file_type, FileType::Image);
         assert_eq!(validated.business_type, "message");
         assert!(validated.is_valid());
-    }
-
-    #[tokio::test]
-    async fn test_mark_token_used() {
-        let service = UploadTokenService::new();
-
-        let token = service
-            .generate_token(1001, FileType::Image, 10485760, "message".to_string(), None, UploadIdentity::default(), UploadTokenPurpose::Upload)
-            .await
-            .unwrap();
-
-        // 标记已使用
-        service.mark_token_used(&token.token).await.unwrap();
-
-        // 再次验证应该失败
-        let result = service.validate_token(&token.token).await;
-        assert!(result.is_err());
     }
 
     /// 🔴 门禁：**claim 用途的 signed token 必须验得过统一入口**。
