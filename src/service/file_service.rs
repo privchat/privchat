@@ -320,22 +320,30 @@ fn create_exclusive_temp(dir: &std::path::Path) -> Result<(std::fs::File, std::p
 /// 最里面那个目录项。掉电时更外层的目录项照样可能没了，整条路径连同下面的一切一起消失
 /// ——而 PG 里的记录已经提交，又回到「记录在、对象不在」。持久化链上少一环等于没有。
 fn create_dir_all_synced(path: &std::path::Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        return Ok(());
-    }
+    create_dir_all_with_sync(path, &mut |dir| std::fs::File::open(dir)?.sync_all())
+}
+
+/// [`create_dir_all_synced`] 的可注入版本：`sync` 收到每一个**需要被同步的父目录**。
+///
+/// 分出来是为了让测试能证明「同步真的发生了」。只断言「目录存在」的话，把同步整段
+/// 删掉测试照样绿——那种测试保护不了任何东西。
+fn create_dir_all_with_sync(
+    path: &std::path::Path,
+    sync: &mut impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // 🔴 **不能因为「目录已经在」就直接返回。**
+    //
+    // 目录存在只说明有人 `mkdir` 过，**不说明那个目录项落盘了**：先建的那个进程完全
+    // 可能在 fsync 之前就崩了。早返回等于把持久化的责任推给一个已经死掉的进程，
+    // 于是谁都没做。同步是幂等的，多做一次远比漏掉一次便宜——尤其这段只在启动时跑。
     if let Some(parent) = parent_to_sync(path) {
-        create_dir_all_synced(&parent)?;
+        create_dir_all_with_sync(&parent, sync)?;
     }
     match std::fs::create_dir(path) {
         Ok(()) => {}
-        // 🔴 别人抢先建好了：**照样要往下走把父目录同步掉**。
-        //
-        // 这里早先直接 `return Ok(())`，于是「谁先建的谁负责同步」——可先建的那个
-        // 进程可能正好在同步之前崩了，两边都以为对方管了，目录项一个都没落盘。
-        // 同步是幂等的，多做一次远比漏掉一次便宜。
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // 而且要确认它**真是目录**：同名文件挡在那儿的话，后面所有写入都会以
-            // 一种离病因很远的方式失败。
+            // 要确认它**真是目录**：同名文件挡在那儿的话，后面所有写入都会以一种
+            // 离病因很远的方式失败。
             if !path.is_dir() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
@@ -346,7 +354,7 @@ fn create_dir_all_synced(path: &std::path::Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
     if let Some(parent) = parent_to_sync(path) {
-        std::fs::File::open(&parent)?.sync_all()?;
+        sync(&parent)?;
     }
     Ok(())
 }
@@ -357,12 +365,17 @@ fn create_dir_all_synced(path: &std::path::Path) -> std::io::Result<()> {
 /// 早先当成「没有父目录」跳过了——于是最外面那一级的目录项从来没落过盘，掉电时整棵
 /// 目录连同下面的一切一起消失。空 parent 的真实含义是**当前工作目录**，不是「没有」。
 fn parent_to_sync(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    match path.parent() {
-        Some(p) if p.as_os_str().is_empty() => Some(std::path::PathBuf::from(".")),
+    let parent = match path.parent() {
+        Some(p) if p.as_os_str().is_empty() => std::path::PathBuf::from("."),
         // 根目录（`/`）自己没有父目录，也不需要谁来保它。
-        Some(p) => Some(p.to_path_buf()),
-        None => None,
+        Some(p) => p.to_path_buf(),
+        None => return None,
+    };
+    // `.` 的父目录还是 `.`，不打住就是无限递归。
+    if parent == path {
+        return None;
     }
+    Some(parent)
 }
 
 /// 把文件内容刷到盘上。
@@ -1816,14 +1829,16 @@ mod publish_tests {
         // 🔴 用 guard 持有，别在末尾手动删：中间任何一条断言失败都会跳过那行清理，
         // 于是每失败一次就在那个盘上留一个目录。RAM 盘只有几十兆，攒够了之后的失败
         // 与被测代码毫无关系，却要人先去趟一遍。
-        let far = XdevScratch(xdev.join(format!(
-            "pcx-xdev-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
+        // 独占创建，跟生产的中转文件、E2E 的 fixture 同一条规矩：
+        // 「pid + 纳秒大概不会重」不是唯一性，异常退出或 pid 复用都能撞上残留目录。
+        let far = XdevScratch(
+            tempfile::Builder::new()
+                .prefix("pcx-xdev-")
+                .tempdir_in(&xdev)
+                .expect("另一个盘上的临时目录")
+                // 生命周期交给 `XdevScratch`，这里只取路径。
+                .keep(),
+        );
         let far = &far.0;
         std::fs::create_dir_all(far.join("uploads/7/aa")).unwrap();
         std::os::unix::fs::symlink(far, root.join("tmp")).unwrap();
@@ -1950,19 +1965,91 @@ mod publish_tests {
         super::create_dir_all_synced(&deep).expect("再来一次");
     }
 
-    /// 🔴 被别人抢先建好时，**不能提前返回**——父目录同步照做。
+    /// 记录每一次「同步了哪个目录」。
+    fn recording_sync() -> (
+        impl FnMut(&std::path::Path) -> std::io::Result<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+    ) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let f = move |dir: &std::path::Path| {
+            sink.lock().unwrap().push(dir.to_path_buf());
+            Ok(())
+        };
+        (f, log)
+    }
+
+    /// 🔴 **目录已经存在时，父目录照样要同步。**
     ///
-    /// 提前返回等于「谁先建的谁负责同步」，而先建的那个进程完全可能在同步之前就崩了，
-    /// 于是两边都以为对方管了，目录项一个都没落盘。
+    /// 「目录在」只说明有人 `mkdir` 过，**不说明那个目录项落盘了**——先建的那个进程
+    /// 完全可能在 fsync 之前就崩了。早返回等于把持久化推给一个已经死掉的进程。
+    ///
+    /// 这条不看「目录存不存在」（那个断言删掉同步代码照样过），只看**同步有没有发生**。
     #[test]
-    fn losing_the_create_race_still_syncs_the_parent() {
+    fn an_existing_directory_still_gets_its_parent_synced() {
         let dir = tempfile::tempdir().expect("tmp");
-        let target = dir.path().join("raced");
-        // 模拟「别人抢先建好了」。
+        let target = dir.path().join("already-there");
+        // 模拟「别人抢先建好了，但还没来得及 fsync」。
         std::fs::create_dir(&target).unwrap();
-        // 走的是 AlreadyExists 分支（`is_dir` 早返回会绕开它，所以这里先删缓存语义：
-        // 直接调用底层函数即可——它内部第一句就是 is_dir 检查，这条主要盯不报错）。
-        super::create_dir_all_synced(&target).expect("撞车不该是错误");
+
+        let (mut sync, log) = recording_sync();
+        super::create_dir_all_with_sync(&target, &mut sync).expect("已存在不该是错误");
+
+        assert!(
+            log.lock().unwrap().contains(&dir.path().to_path_buf()),
+            "目录已存在时也必须同步它的父目录，实际同步了：{:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    /// 多级路径：**每一级**的父目录都要被同步，不是只有最里面那一级。
+    #[test]
+    fn every_level_of_a_new_path_gets_its_parent_synced() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let deep = dir.path().join("a/b/c");
+
+        let (mut sync, log) = recording_sync();
+        super::create_dir_all_with_sync(&deep, &mut sync).expect("create");
+
+        let synced = log.lock().unwrap().clone();
+        for expect in [
+            dir.path().to_path_buf(),
+            dir.path().join("a"),
+            dir.path().join("a/b"),
+        ] {
+            assert!(synced.contains(&expect), "{expect:?} 没被同步：{synced:?}");
+        }
+    }
+
+    /// 真并发抢建：每个线程都必须看到自己那一级的父目录被同步过。
+    ///
+    /// 这条盯的正是「谁先建的谁负责」那个错误分工——16 个线程里只有一个会 `mkdir`
+    /// 成功，其余全走 `AlreadyExists`，而它们**每一个**都得把父目录同步掉。
+    #[test]
+    fn every_racer_syncs_the_parent_even_though_only_one_creates() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = std::sync::Arc::new(dir.path().join("contended"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let parent = dir.path().to_path_buf();
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let target = target.clone();
+            let barrier = barrier.clone();
+            let parent = parent.clone();
+            handles.push(std::thread::spawn(move || {
+                let (mut sync, log) = recording_sync();
+                barrier.wait();
+                super::create_dir_all_with_sync(&target, &mut sync).expect("create");
+                assert!(
+                    log.lock().unwrap().contains(&parent),
+                    "抢输的那些线程也必须同步父目录"
+                );
+            }));
+        }
+        for h in handles {
+            h.join().expect("线程内断言失败");
+        }
         assert!(target.is_dir());
     }
 
