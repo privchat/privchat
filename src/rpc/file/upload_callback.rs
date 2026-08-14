@@ -58,19 +58,20 @@ impl CallbackError {
     }
 }
 
-/// 回调的**完整编排**：开会话（不惰性创建）→ 读墓碑 → 回读正式行 → 核对身份。
+/// 回调的**完整编排**：核对这次报的 `file_id` 确实是本次上传的结果。
 ///
-/// 🔴 依赖收窄到「一个目录 + 一个按 id 取记录的闭包」，就是为了让**这条链路本身**
-/// 能被测试驱动，而不是只测最里层的判据。
-/// `RpcServiceContext` 有二十多个 Arc 服务、测试里构造不出来——那是缩小可测边界的
-/// 理由，不是不测的理由。RPC 于是退化成薄适配：解析参数、把服务接进来。
+/// 🔴 **判据是正式文件行与 token 冻结身份的一致性**，会话墓碑只是**加强项**。
 ///
-/// 两道闸缺一不可：
-/// 1. 墓碑说这次上传完成的就是这个 `file_id`——临时状态负责**定位**；
-/// 2. 正式文件行与 token 冻结的身份一致——临时状态**不构成授权**。
+/// 早先我把「必须有会话墓碑」当成必要条件，结果是：秒传命中根本不创建会话目录，
+/// 于是每一次秒传的回调都被拒 —— 而回调失败在 outbox 那边是**终态**，附件被判
+/// 永久失败。一个本来什么都不做的完成通知，被我变成了能否决发送的闸门。
 ///
-/// 只有第 1 道的话，一个被篡改或串了的墓碑就能让回调对着别人的文件生效。
-pub(crate) async fn authorise_callback<F, Fut>(
+/// 现在的边界：
+/// - 身份不符 → 拒绝（这才是这道闸真正保护的东西：不能对着别人的文件回调）；
+/// - 有会话且墓碑与报的 id 不一致 → 拒绝；
+/// - 没有会话（秒传命中 / 会话已被清理）→ **不是错误**，凭身份放行；
+/// - 会话状态损坏 → 忽略它，同样凭身份放行（它只是加强项，不该反过来阻断）。
+async fn authorise_callback<F, Fut>(
     session_root: &std::path::Path,
     token: &crate::service::upload_token_service::ValidatedUploadToken,
     reported: u64,
@@ -82,22 +83,21 @@ where
         Output = Result<Option<crate::service::file_service::FileMetadata>, String>,
     >,
 {
-    // 🔴 `open_existing`：恢复类入口不得惰性建目录。会话没了就是没了
-    //（`SessionGone` 语义），不该被伪装成「有一个空会话」，也不该留下垃圾目录。
+    // 会话在就用它加强一道；不在不算错。
+    // 🔴 `open_existing`：恢复类入口不得惰性建目录，否则「会话早就没了」会被伪装成
+    // 「有一个空会话」，还在磁盘上留垃圾。
     let session = crate::service::upload_session::UploadSession::open_existing(
         session_root,
         token.user_id,
         &token.upload_id,
     )
-    .map_err(|e| CallbackError::Internal(format!("会话不可读: {e}")))?
-    .ok_or(CallbackError::SessionGone("该次上传的会话已不存在"))?;
-
-    // 🔴 状态文件损坏是**持久**故障：重复回调不会让它变好，重试只是空转。
-    // 归到 SessionGone，让客户端重新 prepare。
-    let tombstone = session
-        .completed_file_id()
-        .map_err(|_| CallbackError::SessionGone("会话状态已损坏"))?;
-    check_callback_target_id(tombstone, reported).map_err(CallbackError::Rejected)?;
+    .map_err(|e| CallbackError::Internal(format!("会话不可读: {e}")))?;
+    if let Some(session) = session {
+        // 状态损坏时不阻断：墓碑是加强项，凭身份仍可放行。
+        if let Ok(Some(expected)) = session.completed_file_id() {
+            check_callback_target_id(Some(expected), reported).map_err(CallbackError::Rejected)?;
+        }
+    }
 
     let meta = fetch_meta(reported)
         .await
@@ -180,14 +180,14 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
             RpcError::validation("上传 token 无效".to_string())
         })?;
 
-    // claim 用途的 token 换不出「我传完了」这件事。
-    if token_info.purpose
-        != crate::service::upload_token_service::UploadTokenPurpose::Upload
-    {
-        return Err(RpcError::validation(
-            "该 token 用于秒传取用，不能用作上传完成回调".to_string(),
-        ));
-    }
+    // 🔴 **不按 purpose 拒绝。**
+    //
+    // 秒传命中时 SDK 拿到的是 claim token，随后照常调这个回调
+    //（`plan_attachment_upload` 两条分支都会走到 `upload_callback`）。
+    // 按 `purpose != Upload` 拒绝，等于**每一次秒传都把附件判成发送失败**——
+    // 回调失败在 outbox 那边是终态。
+    //
+    // 这个回调保护的东西由下面的身份核对承担，与 token 用途无关。
 
     // 🔴 `file_id` 必须**确实是这次上传的结果**，不能由调用方随口报一个。
     // 判据取自**临时会话**（墓碑）+ 正式行身份，全部在 `authorise_callback` 里，
@@ -251,6 +251,10 @@ mod tests {
     const UPLOAD_ID: &str = "b3f1a2c40000400080000000000000ff";
 
     fn token() -> ValidatedUploadToken {
+        token_with_purpose(UploadTokenPurpose::Upload)
+    }
+
+    fn token_with_purpose(purpose: UploadTokenPurpose) -> ValidatedUploadToken {
         let record = UploadToken::new(
             42,
             FileType::Image,
@@ -263,7 +267,7 @@ mod tests {
                 mime_type: Some("image/png".to_string()),
                 transform_version: 0,
             },
-            UploadTokenPurpose::Upload,
+            purpose,
             600,
         );
         let mut v = ValidatedUploadToken::from_legacy("irrelevant-raw-token", &record);
@@ -349,24 +353,56 @@ mod tests {
         assert!(run(r.path(), 901, Some(meta())).await.is_err());
     }
 
-    /// 会话还在但没完成：没有可核对的依据。
+    /// 会话还在但没完成：墓碑只是加强项，身份对得上就放行。
+    ///
+    /// （早先这里要求「必须完成」，那正是打断秒传的那条规则。）
     #[tokio::test]
-    async fn a_callback_without_a_completed_session_is_refused() {
+    async fn a_session_without_a_tombstone_still_passes_on_identity() {
         let r = tempfile::tempdir().expect("tmp");
         let _s = UploadSession::open(r.path(), 42, UPLOAD_ID).expect("open");
-        assert!(run(r.path(), 900, Some(meta())).await.is_err());
+        assert!(run(r.path(), 900, Some(meta())).await.is_ok());
     }
 
-    /// 🔴 会话已被清理 / 从未存在：拒绝，且**不得**因为这次查询建出目录。
+    /// 🔴 **秒传命中：claim 路径根本不创建会话目录。**
+    ///
+    /// 这条是那个回归的直接门禁。早先「必须有会话墓碑」的规则会让**每一次秒传**
+    /// 的回调被拒——而回调失败在 outbox 那边是终态，附件被判永久失败。
+    /// 也就是说：那版一上线，秒传（转发的核心）全线报错。
     #[tokio::test]
-    async fn a_callback_for_a_vanished_session_is_refused_without_creating_it() {
+    async fn a_callback_after_a_dedup_hit_has_no_session_and_must_still_pass() {
         let r = tempfile::tempdir().expect("tmp");
-        let err = run(r.path(), 900, Some(meta())).await.expect_err("必须失败");
-        assert!(err.is_session_gone());
+        // 没有任何会话目录，正是 claim 成功后的样子。
+        assert!(
+            run(r.path(), 900, Some(meta())).await.is_ok(),
+            "秒传命中后的回调必须通过"
+        );
         assert!(
             !r.path().join("42").join(UPLOAD_ID).exists(),
             "回调不得惰性建出会话目录"
         );
+    }
+
+    /// 🔴 **秒传命中时 SDK 手里的是 claim token**，随后照常调这个回调。
+    ///
+    /// 按 `purpose != Upload` 拒绝，就是每一次秒传都把附件判成发送失败。
+    /// 这条与上一条是同一个回归的两个必要条件，缺一个都会漏。
+    #[tokio::test]
+    async fn a_claim_token_may_report_its_completion() {
+        let r = tempfile::tempdir().expect("tmp");
+        let claim = token_with_purpose(UploadTokenPurpose::ClaimExisting);
+        let got = authorise_callback(r.path(), &claim, 900, |_| async move { Ok(Some(meta())) })
+            .await;
+        assert!(got.is_ok(), "claim 用途的 token 必须能完成回调: {got:?}");
+    }
+
+    /// 没有会话也**不能**放宽身份：能通过的只是「这份文件确实是我这次要传的」。
+    #[tokio::test]
+    async fn without_a_session_the_identity_check_still_bites() {
+        let r = tempfile::tempdir().expect("tmp");
+        let mut other = meta();
+        other.uploader_id = 43;
+        let err = run(r.path(), 900, Some(other)).await.expect_err("必须失败");
+        assert!(err.is_rejected());
     }
 
     #[tokio::test]
@@ -396,11 +432,9 @@ mod tests {
         );
     }
 
-    /// 🔴 损坏的 `state.json` 是**持久**故障：重复回调不会让它变好。
-    /// 标成 internal 会让客户端对着一个永不自愈的状态死循环；标成 validation
-    /// 又会让它永久放弃。正确结局是第三种：重新 prepare 从头传。
+    /// 损坏的 `state.json` 不该阻断一次身份正确的回调——墓碑只是加强项。
     #[tokio::test]
-    async fn a_corrupted_session_state_tells_the_client_to_start_over() {
+    async fn a_corrupted_session_state_does_not_block_a_valid_callback() {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
         std::fs::write(
@@ -409,22 +443,9 @@ mod tests {
         )
         .expect("corrupt it");
 
-        let err = run(r.path(), 900, Some(meta())).await.expect_err("必须失败");
         assert!(
-            err.is_session_gone(),
-            "状态损坏必须是 SessionGone（重新 prepare），实际: {err:?}"
-        );
-    }
-
-    /// 会话目录不存在同样是「重来一遍」，不是「你参数错了」——
-    /// 后者会让客户端永久放弃这次发送。
-    #[tokio::test]
-    async fn a_vanished_session_tells_the_client_to_start_over() {
-        let r = tempfile::tempdir().expect("tmp");
-        let err = run(r.path(), 900, Some(meta())).await.expect_err("必须失败");
-        assert!(
-            err.is_session_gone(),
-            "会话不存在必须是 SessionGone，实际: {err:?}"
+            run(r.path(), 900, Some(meta())).await.is_ok(),
+            "墓碑是加强项：它坏了不该反过来阻断一次身份正确的回调"
         );
     }
 
@@ -448,10 +469,9 @@ mod tests {
         let rejected = run(r.path(), 900, Some(wrong)).await.expect_err("must fail");
         assert!(rejected.is_rejected());
 
-        // 会话没了 → 重来一遍
+        // 会话没了 + 身份对 → 放行（秒传命中就是这样）
         let empty = tempfile::tempdir().expect("tmp");
-        let gone = run(empty.path(), 900, Some(meta())).await.expect_err("must fail");
-        assert!(gone.is_session_gone());
+        assert!(run(empty.path(), 900, Some(meta())).await.is_ok());
     }
 
     /// 与上面成对：身份不符是**真正的**拒绝，不能因为怕误伤就一律 internal。
