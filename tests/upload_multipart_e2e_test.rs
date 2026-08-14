@@ -129,6 +129,8 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, keep: Option<tempfile::T
             upload_token_service: Arc::new(
                 UploadTokenService::new().with_signing(Some(signing_config())),
             ),
+            // 整包路径不要求登录态（已发版客户端只带上传 token），这里也就不装验证器。
+            auth: None,
         },
         root,
         _dir: dir,

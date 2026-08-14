@@ -28,4 +28,6 @@ pub mod routes;
 pub mod server;
 
 pub use envelope::{ApiEnvelope, ApiResult};
-pub use server::{AdminHttpServer, AdminServerState, FileHttpServer, FileServerState};
+pub use server::{
+    AdminHttpServer, AdminServerState, FileHttpServer, FileServerState, UploadAuthenticator,
+};

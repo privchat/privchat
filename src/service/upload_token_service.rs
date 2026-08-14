@@ -405,7 +405,13 @@ impl UploadTokenService {
             initial_request_size: BASE_UNIT,
             max_request_size: 2 * 1024 * 1024,
             session_threshold: BASE_UNIT as u64,
-            max_parallel_parts: 3,
+            // 🔴 **1，不是 3。**
+            //
+            // 每个分片请求都要抢整个会话的非阻塞排他锁，所以第二个并发请求会立刻
+            // 拿到「忙」。下发 3 等于让客户端去撞一堵墙，还把「忙」当成服务端不稳定。
+            // 真要并发，得先把写入做成区间级、只串行化 journal 与状态切换——那是
+            // 独立一件事；在那之前，**下发的数字必须等于服务端真能做到的数字**。
+            max_parallel_parts: 1,
         };
         if sealed_blob_size <= plan.session_threshold as i64 {
             return None;
