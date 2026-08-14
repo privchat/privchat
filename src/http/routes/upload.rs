@@ -156,7 +156,15 @@ async fn receive_streaming(
                     .unwrap_or_else(|| "application/octet-stream".to_string());
                 let mut sink = match state
                     .file_service
-                    .begin_streaming_upload(&mime, &fname, token_info.max_size, reserved_file_id, Some(token_info.file_type.clone()))
+                    .begin_streaming_upload(
+                        &mime,
+                        &fname,
+                        token_info.max_size,
+                        reserved_file_id,
+                        Some(token_info.file_type.clone()),
+                        token_info.user_id,
+                        &token_info.upload_id,
+                    )
                     .await
                 {
                     Ok(sink) => sink,

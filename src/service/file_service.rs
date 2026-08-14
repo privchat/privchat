@@ -105,6 +105,95 @@ pub struct FileService {
     file_upload_repo: Arc<FileUploadRepository>,
 }
 
+/// 把校验通过的临时对象发布到正式路径。
+///
+/// 🔴 **no-clobber**：正式路径已存在时**绝不覆盖**。它可能是上一次「已发布但 PG
+/// 未提交」留下的对象，也可能正被某条已提交记录引用着。覆盖 = 拿新字节顶掉别人
+/// 正在引用的文件。已存在时交由调用方核验（大小 + 摘要）后决定继续还是报冲突。
+///
+/// 本地存储用 `link` + `unlink`：`rename` 会**静默覆盖**，而 `link` 在目标已存在时
+/// 返回 `EEXIST`——no-clobber 由内核保证，不是靠「先 stat 再动手」那种有竞态的写法。
+async fn publish_object(
+    op: &Operator,
+    local_root: Option<&str>,
+    staging: &str,
+    final_path: &str,
+) -> Result<PublishOutcome> {
+    if let Some(root) = local_root {
+        let from = std::path::Path::new(root).join(staging);
+        let to = std::path::Path::new(root).join(final_path);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ServerError::Internal(format!("创建目标目录失败: {e}")))?;
+        }
+        return match std::fs::hard_link(&from, &to) {
+            Ok(()) => {
+                // 发布成功后**立即**移除临时对象：客户端可能在这之后就离线了，
+                // 清理不能只靠 callback。
+                let _ = std::fs::remove_file(&from);
+                Ok(PublishOutcome::Published)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(PublishOutcome::AlreadyPresent)
+            }
+            // 跨文件系统（EXDEV）等：退回复制。
+            Err(_) => {
+                if op.stat(final_path).await.is_ok() {
+                    return Ok(PublishOutcome::AlreadyPresent);
+                }
+                op.copy(staging, final_path)
+                    .await
+                    .map_err(|e| ServerError::Internal(format!("发布对象失败: {e}")))?;
+                let _ = op.delete(staging).await;
+                Ok(PublishOutcome::Published)
+            }
+        };
+    }
+
+    if op.stat(final_path).await.is_ok() {
+        return Ok(PublishOutcome::AlreadyPresent);
+    }
+    op.copy(staging, final_path)
+        .await
+        .map_err(|e| ServerError::Internal(format!("发布对象失败: {e}")))?;
+    let _ = op.delete(staging).await;
+    Ok(PublishOutcome::Published)
+}
+
+/// 正式路径上那个对象是不是**这次要发布的东西**。
+///
+/// 用于「上次已发布、PG 未提交」的恢复窗口：一致就直接继续落库，不重传也不覆盖。
+/// 🔴 只比大小不够——同样长度的不同内容必须判为不一致。
+async fn verify_object(
+    op: &Operator,
+    final_path: &str,
+    expect_size: u64,
+    expect_sha256: &str,
+) -> Result<bool> {
+    let meta = match op.stat(final_path).await {
+        Ok(m) => m,
+        Err(_) => return Ok(false),
+    };
+    if meta.content_length() != expect_size {
+        return Ok(false);
+    }
+    let bytes = op
+        .read(final_path)
+        .await
+        .map_err(|e| ServerError::Internal(format!("核验已发布对象失败: {e}")))?;
+    let actual = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes.to_vec()));
+    Ok(actual.eq_ignore_ascii_case(expect_sha256))
+}
+
+/// 发布结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishOutcome {
+    /// 这次真的发布了。
+    Published,
+    /// 正式路径上已经有对象——可能是上次「已发布未提交」留下的，必须核验后再决定。
+    AlreadyPresent,
+}
+
 impl FileService {
     pub fn new(
         sources: Vec<FileStorageSourceConfig>,
@@ -275,6 +364,9 @@ impl FileService {
         // 按它推导会把加密后的图片存成普通文件，之后按 image 预检自然对不上。
         // multipart 只负责承载字节，「这是什么」由签名 token 说了算。
         token_file_type: Option<FileType>,
+        // 会话身份：临时对象落在这个会话目录下。
+        session_uid: u64,
+        session_upload_id: &str,
     ) -> Result<StreamingUpload> {
         let file_type = match token_file_type {
             Some(ft) => ft,
@@ -302,14 +394,22 @@ impl FileService {
             None => self.file_upload_repo.next_file_id().await?,
         };
         let file_path = self.generate_file_path(file_id, &file_type, filename);
+
+        // 🔴 **字节先写会话临时对象，校验通过后才发布到正式路径。**
+        //
+        // 早先直接对着正式路径开 writer：崩溃重试会覆盖一个可能已被提交记录引用的
+        // 对象，失败时 `abort()` 还会把它删掉。会话临时路径与正式对象在**同一个
+        // operator 根**下，所以发布是一次同盘 rename，不多一次拷贝。
+        let staging_path = Self::staging_path(session_uid, session_upload_id);
         let writer = op
-            .writer(&file_path)
+            .writer(&staging_path)
             .await
             .map_err(|e| ServerError::Internal(format!("打开存储 writer 失败: {}", e)))?;
 
         Ok(StreamingUpload {
             file_id,
             file_path,
+            staging_path,
             source_id,
             file_type,
             op,
@@ -368,8 +468,9 @@ impl FileService {
             size_check_target(declared_content_sha256.as_deref(), declared_size)
         {
             if declared_size != upload.written as i64 {
+                // 删的是**临时对象**：这一刻正式路径上什么都没有，字节还没发布。
                 if let Ok(op) = self.operator_for_source(upload.source_id).await {
-                    let _ = op.delete(&upload.file_path).await;
+                    let _ = op.delete(&upload.staging_path).await;
                 }
                 return Err(ServerError::Validation(format!(
                     "上传字节数与 prepare 阶段声明的不一致：声明 {declared_size}，实际 {}",
@@ -380,9 +481,9 @@ impl FileService {
 
         if let Some(declared) = declared_content_sha256.as_deref() {
             if !declared.eq_ignore_ascii_case(&stored_sha256) {
-                // 声明与实际不符：删掉刚写进去的对象，别留一份没人认领的字节。
+                // 声明与实际不符：删临时对象。正式路径从头到尾没被碰过。
                 if let Ok(op) = self.operator_for_source(upload.source_id).await {
-                    let _ = op.delete(&upload.file_path).await;
+                    let _ = op.delete(&upload.staging_path).await;
                 }
                 return Err(ServerError::Validation(
                     "上传内容与 prepare 阶段声明的摘要不一致".to_string(),
@@ -415,6 +516,55 @@ impl FileService {
             placement.cek.clone(),
             placement.duplicate,
         );
+
+        // ---- Verified → Published ----
+        //
+        // 🔴 **发布排在落库之前**：允许「对象在、记录不在」（孤儿由清理任务回收），
+        // 绝不允许「记录在、对象不在」（`file_id` 永久指向空）。
+        //
+        // 去重命中时**根本不发布**：字节已经有人存着了，这次的临时对象直接删掉。
+        if duplicate {
+            if let Ok(op) = self.operator_for_source(upload.source_id).await {
+                let _ = op.delete(&upload.staging_path).await;
+            }
+            tracing::info!("⚡ 内容已存在，复用 path={file_path}，不发布新对象");
+        } else {
+            match self
+                .publish_staged(upload.source_id, &upload.staging_path, &upload.file_path)
+                .await?
+            {
+                PublishOutcome::Published => {}
+                // 🔴 **恢复窗口**：上一次「已发布、PG 未提交」就崩了。同盘 rename
+                // 之后临时对象已经不在，正式路径上却有东西。
+                //
+                // 流式核验大小与摘要：一致就直接继续落库（不重传、不覆盖）；
+                // 不一致说明这个路径上是**别的内容**，报冲突——覆盖它就是拿新字节
+                // 顶掉可能正被引用的文件。
+                PublishOutcome::AlreadyPresent => {
+                    let same = self
+                        .verify_published(
+                            upload.source_id,
+                            &upload.file_path,
+                            upload.written,
+                            &stored_sha256,
+                        )
+                        .await?;
+                    if !same {
+                        return Err(ServerError::Internal(format!(
+                            "正式路径 {} 上已有**不同内容**的对象，拒绝覆盖",
+                            upload.file_path
+                        )));
+                    }
+                    // 一致：上次发布过了。把这次的临时对象清掉即可。
+                    if let Ok(op) = self.operator_for_source(upload.source_id).await {
+                        let _ = op.delete(&upload.staging_path).await;
+                    }
+                    tracing::info!(
+                        "♻️ 正式路径已存在且内容一致（上次已发布未提交），直接继续落库"
+                    );
+                }
+            }
+        }
 
         let metadata = FileMetadata {
             file_id: upload.file_id,
@@ -471,17 +621,6 @@ impl FileService {
         tx.commit()
             .await
             .map_err(|e| ServerError::Database(format!("提交上传收敛事务失败: {e}")))?;
-
-        if duplicate && upload.file_path != file_path {
-            // 事务已提交，记录指向的是别人那份物理文件；我这份多余的对象可以删了。
-            // 删失败只记日志：留一个没人指向的孤儿对象，交给 GC。
-            if let Ok(op) = self.operator_for_source(upload.source_id).await {
-                if let Err(e) = op.delete(&upload.file_path).await {
-                    tracing::warn!("删除重复上传的物理文件失败 path={}: {}", upload.file_path, e);
-                }
-            }
-            tracing::info!("⚡ 并发首传收敛: file_id={} 指向已有 path={}", upload.file_id, file_path);
-        }
 
         Ok(metadata)
     }
@@ -578,7 +717,7 @@ impl FileService {
         self.file_upload_repo.next_file_id().await
     }
 
-    /// 上传会话临时目录的根（`tmp/uploads/`）。
+        /// 上传会话临时目录的根（`tmp/uploads/`）。
     ///
     /// 挂在**默认本地存储源**的 root 之下：与最终对象同一个文件系统时，
     /// complete 的发布就是一次 rename（RESUMABLE_UPLOAD_SPEC §9.2）。
@@ -731,6 +870,45 @@ impl FileService {
         file_type.max_size_bytes() as usize
     }
 
+    /// 会话临时对象在 operator 里的相对路径。
+    ///
+    /// 与 [`Self::upload_session_root`] 指的是同一个目录，只是这里用 operator 相对路径
+    /// 表达——发布因此是同一文件系统内的 rename，不需要复制。
+    fn staging_path(uid: u64, upload_id: &str) -> String {
+        format!("tmp/uploads/{uid}/{upload_id}/body.part")
+    }
+
+    /// 把校验通过的临时对象发布到正式路径（薄委托，语义见 [`publish_object`]）。
+    async fn publish_staged(
+        &self,
+        source_id: u32,
+        staging: &str,
+        final_path: &str,
+    ) -> Result<PublishOutcome> {
+        let op = self.operator_for_source(source_id).await?;
+        publish_object(&op, self.local_root_of(source_id).as_deref(), staging, final_path).await
+    }
+
+    /// 本地存储源的根目录；非 local 返回 `None`。
+    fn local_root_of(&self, source_id: u32) -> Option<String> {
+        self.sources_by_id
+            .get(&source_id)
+            .filter(|s| s.storage_type == "local")
+            .map(|s| s.storage_root.clone())
+    }
+
+    /// 核验正式路径上的对象是不是这次要发布的东西（薄委托，见 [`verify_object`]）。
+    async fn verify_published(
+        &self,
+        source_id: u32,
+        final_path: &str,
+        expect_size: u64,
+        expect_sha256: &str,
+    ) -> Result<bool> {
+        let op = self.operator_for_source(source_id).await?;
+        verify_object(&op, final_path, expect_size, expect_sha256).await
+    }
+
     fn generate_file_path(&self, file_id: u64, file_type: &FileType, filename: &str) -> String {
         let extension = filename.split('.').last().unwrap_or("bin");
         let subdir = match file_type {
@@ -806,7 +984,10 @@ impl FileService {
 /// 失败/校验不过必须调 `abort()` 清掉已写入的半文件。
 pub struct StreamingUpload {
     pub file_id: u64,
+    /// 校验通过后要发布到的**正式**路径（由 `file_id` 决定，重试恒定）。
     pub file_path: String,
+    /// 字节先落在这里（会话临时对象）。与正式路径同一个 operator 根。
+    pub staging_path: String,
     pub source_id: u32,
     file_type: FileType,
     op: Operator,
@@ -853,8 +1034,15 @@ impl StreamingUpload {
         if let Some(mut writer) = self.writer.take() {
             let _ = writer.close().await;
         }
-        if let Err(e) = self.op.delete(&self.file_path).await {
-            tracing::warn!("⚠️ 清理中止上传的半文件失败 path={}: {}", self.file_path, e);
+        // 🔴 删的是**临时对象**。中止时字节还没发布，正式路径上要么什么都没有、
+        // 要么是上一次成功发布的那份——后者绝不能碰。早先这里删 `file_path`，
+        // 于是一次失败的重试会把一个已被提交记录引用的对象删掉。
+        if let Err(e) = self.op.delete(&self.staging_path).await {
+            tracing::warn!(
+                "⚠️ 清理中止上传的临时对象失败 path={}: {}",
+                self.staging_path,
+                e
+            );
         }
     }
 }
@@ -1066,5 +1254,99 @@ pub fn size_check_target(declared_digest: Option<&str>, declared_size: Option<i6
     match (declared_digest, declared_size) {
         (Some(_), Some(size)) => Some(size),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::{publish_object, verify_object, PublishOutcome};
+    use opendal::Operator;
+
+    fn op_at(root: &std::path::Path) -> Operator {
+        let builder = opendal::services::Fs::default().root(&root.to_string_lossy());
+        Operator::new(builder).expect("fs operator").finish()
+    }
+
+    async fn write(op: &Operator, path: &str, bytes: &[u8]) {
+        op.write(path, bytes.to_vec()).await.expect("write");
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes))
+    }
+
+    /// 发布 = 把临时对象搬到正式路径，**并立即移除临时对象**。
+    /// 清理不能只靠 callback：客户端可能上传成功后就离线了。
+    #[tokio::test]
+    async fn publishing_moves_the_staged_object_and_clears_it() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        let root = dir.path().to_string_lossy().to_string();
+        write(&op, "tmp/uploads/7/aa/body.part", b"hello").await;
+
+        let out = publish_object(&op, Some(&root), "tmp/uploads/7/aa/body.part", "images/1.png")
+            .await
+            .expect("publish");
+        assert_eq!(out, PublishOutcome::Published);
+        assert!(op.stat("images/1.png").await.is_ok(), "正式路径必须有对象");
+        assert!(
+            op.stat("tmp/uploads/7/aa/body.part").await.is_err(),
+            "发布后临时对象必须立即消失"
+        );
+    }
+
+    /// 🔴 **no-clobber**：正式路径已有对象时绝不覆盖——它可能正被某条已提交记录引用。
+    #[tokio::test]
+    async fn publishing_never_clobbers_an_existing_object() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        let root = dir.path().to_string_lossy().to_string();
+        write(&op, "images/1.png", b"the original bytes").await;
+        write(&op, "tmp/uploads/7/aa/body.part", b"different").await;
+
+        let out = publish_object(&op, Some(&root), "tmp/uploads/7/aa/body.part", "images/1.png")
+            .await
+            .expect("publish");
+        assert_eq!(out, PublishOutcome::AlreadyPresent, "必须报告已存在，而不是覆盖");
+        assert_eq!(
+            op.read("images/1.png").await.expect("read").to_vec(),
+            b"the original bytes",
+            "已有对象必须原封不动"
+        );
+    }
+
+    /// 恢复窗口：上次「已发布未提交」，核验一致 → 直接继续落库。
+    #[tokio::test]
+    async fn an_identical_published_object_verifies() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        let bytes = b"same bytes as last time";
+        write(&op, "images/1.png", bytes).await;
+
+        assert!(verify_object(&op, "images/1.png", bytes.len() as u64, &digest(bytes))
+            .await
+            .expect("verify"));
+    }
+
+    /// 🔴 同样长度的**不同内容**必须核验失败：只比大小等于没核验。
+    #[tokio::test]
+    async fn same_size_different_content_fails_verification() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        write(&op, "images/1.png", b"AAAAAAAA").await;
+
+        assert!(!verify_object(&op, "images/1.png", 8, &digest(b"BBBBBBBB"))
+            .await
+            .expect("verify"));
+    }
+
+    /// 正式路径上没有对象时，核验必须是 false 而不是报错。
+    #[tokio::test]
+    async fn a_missing_object_does_not_verify() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let op = op_at(dir.path());
+        assert!(!verify_object(&op, "images/nope.png", 1, &digest(b"x"))
+            .await
+            .expect("verify"));
     }
 }
