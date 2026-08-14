@@ -24,32 +24,60 @@ use tracing::warn;
 
 use crate::rpc::{RpcError, RpcResult, RpcServiceContext};
 
-/// 这次回调报的 `file_id` 能不能被接受。
+/// 回调的**完整编排**：开会话（不惰性创建）→ 读墓碑 → 回读正式行 → 核对身份。
 ///
-/// 抽成纯函数是为了**能被测试驱动**：`RpcServiceContext` 有二十多个 Arc 服务，
-/// 测试里构造不出来（本仓的 RPC 测试惯例也是抽纯判定，见 `rpc/group/group/info.rs`）。
+/// 🔴 依赖收窄到「一个目录 + 一个按 id 取记录的闭包」，就是为了让**这条链路本身**
+/// 能被测试驱动，而不是只测最里层的判据。
+/// `RpcServiceContext` 有二十多个 Arc 服务、测试里构造不出来——那是缩小可测边界的
+/// 理由，不是不测的理由。RPC 于是退化成薄适配：解析参数、把服务接进来。
 ///
 /// 两道闸缺一不可：
 /// 1. 墓碑说这次上传完成的就是这个 `file_id`——临时状态负责**定位**；
 /// 2. 正式文件行与 token 冻结的身份一致——临时状态**不构成授权**。
 ///
 /// 只有第 1 道的话，一个被篡改或串了的墓碑就能让回调对着别人的文件生效。
-fn check_callback_target(
-    tombstone: Option<u64>,
-    reported: u64,
-    meta: Option<&crate::service::file_service::FileMetadata>,
+pub(crate) async fn authorise_callback<F, Fut>(
+    session_root: &std::path::Path,
     token: &crate::service::upload_token_service::ValidatedUploadToken,
-) -> Result<(), &'static str> {
-    match tombstone {
-        Some(expected) if expected == reported => {}
-        Some(_) => return Err("file_id 与该次上传不符"),
-        None => return Err("该次上传尚未完成，无法回调"),
-    }
-    let meta = meta.ok_or("file_id 不存在")?;
-    if !token.matches_file(meta) {
+    reported: u64,
+    fetch_meta: F,
+) -> Result<crate::service::file_service::FileMetadata, &'static str>
+where
+    F: FnOnce(u64) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<Option<crate::service::file_service::FileMetadata>, String>,
+    >,
+{
+    // 🔴 `open_existing`：恢复类入口不得惰性建目录。会话没了就是没了
+    //（`SessionGone` 语义），不该被伪装成「有一个空会话」，也不该留下垃圾目录。
+    let session = crate::service::upload_session::UploadSession::open_existing(
+        session_root,
+        token.user_id,
+        &token.upload_id,
+    )
+    .map_err(|_| "会话不可读")?
+    .ok_or("该次上传的会话已不存在")?;
+
+    let tombstone = session.completed_file_id().map_err(|_| "会话状态不可读")?;
+    check_callback_target_id(tombstone, reported)?;
+
+    let meta = fetch_meta(reported)
+        .await
+        .map_err(|_| "读取文件记录失败")?
+        .ok_or("file_id 不存在")?;
+    if !token.matches_file(&meta) {
         return Err("file_id 与本次上传的身份不符");
     }
-    Ok(())
+    Ok(meta)
+}
+
+/// 墓碑这一道闸：报的 `file_id` 必须就是这次上传完成的那个。
+fn check_callback_target_id(tombstone: Option<u64>, reported: u64) -> Result<(), &'static str> {
+    match tombstone {
+        Some(expected) if expected == reported => Ok(()),
+        Some(_) => Err("file_id 与该次上传不符"),
+        None => Err("该次上传尚未完成，无法回调"),
+    }
 }
 
 /// 上传完成回调
@@ -124,10 +152,8 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
     }
 
     // 🔴 `file_id` 必须**确实是这次上传的结果**，不能由调用方随口报一个。
-    //
-    // 判据取自**临时会话**（`state.json` 的墓碑），不查业务库：上传中间态不进
-    // PostgreSQL。会话已被清理或丢失时，这次回调就没有可核对的依据，直接拒绝——
-    // 客户端重新申请 token 从头传即可。
+    // 判据取自**临时会话**（墓碑）+ 正式行身份，全部在 `authorise_callback` 里，
+    // 这里只负责把服务接进去。
     let file_id_num: u64 = file_id
         .parse()
         .map_err(|_| RpcError::validation("file_id 不是合法数字".to_string()))?;
@@ -135,28 +161,18 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         .file_service
         .upload_session_root()
         .map_err(|e| RpcError::internal(e.to_string()))?;
-    // 🔴 `open_existing`：恢复类入口不得惰性建目录。会话没了就是没了
-    //（`SessionGone` 语义），不该被伪装成「有一个空会话」，也不该留下垃圾目录。
-    let session = crate::service::upload_session::UploadSession::open_existing(
-        &session_root,
-        token_info.user_id,
-        &token_info.upload_id,
-    )
-    .map_err(|e| RpcError::internal(e.to_string()))?
-    .ok_or_else(|| RpcError::validation("该次上传的会话已不存在".to_string()))?;
-    let tombstone = session
-        .completed_file_id()
-        .map_err(|e| RpcError::internal(e.to_string()))?;
-    let meta = services
-        .file_service
-        .get_file_metadata(file_id_num)
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
-
-    if let Err(reason) = check_callback_target(tombstone, file_id_num, meta.as_ref(), &token_info) {
+    let file_service = services.file_service.clone();
+    authorise_callback(&session_root, &token_info, file_id_num, |id| async move {
+        file_service
+            .get_file_metadata(id)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|reason| {
         warn!("❌ 上传回调被拒: {reason}（file_id={file_id_num}）");
-        return Err(RpcError::validation(reason.to_string()));
-    }
+        RpcError::validation(reason.to_string())
+    })?;
 
     // TODO: 记录文件元数据到数据库
     // TODO: 更新用户配额
@@ -170,12 +186,15 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
 
 #[cfg(test)]
 mod tests {
-    use super::check_callback_target;
+    use super::{authorise_callback, check_callback_target_id};
     use crate::model::file_upload::FileType;
     use crate::service::file_service::FileMetadata;
+    use crate::service::upload_session::UploadSession;
     use crate::service::upload_token_service::{
         UploadIdentity, UploadToken, UploadTokenPurpose, ValidatedUploadToken,
     };
+
+    const UPLOAD_ID: &str = "b3f1a2c40000400080000000000000ff";
 
     fn token() -> ValidatedUploadToken {
         let record = UploadToken::new(
@@ -193,7 +212,10 @@ mod tests {
             UploadTokenPurpose::Upload,
             600,
         );
-        ValidatedUploadToken::from_legacy("b3f1a2c4-0000-4000-8000-000000000001", &record)
+        let mut v = ValidatedUploadToken::from_legacy("irrelevant-raw-token", &record);
+        // 直接指定 upload_id，好让测试自己布置会话目录。
+        v.upload_id = UPLOAD_ID.to_string();
+        v
     }
 
     fn meta() -> FileMetadata {
@@ -219,51 +241,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_matching_callback_is_accepted() {
-        assert!(check_callback_target(Some(900), 900, Some(&meta()), &token()).is_ok());
+    /// 布置一个「已完成」的会话。
+    fn completed_session(root: &std::path::Path, file_id: u64) {
+        let s = UploadSession::open(root, 42, UPLOAD_ID).expect("open");
+        s.mark_completed(file_id).expect("mark");
     }
 
-    /// 🔴 这条是 callback 身份门禁的直接守卫：**墓碑对得上，正式文件却不是这一份**。
+    async fn run(
+        root: &std::path::Path,
+        reported: u64,
+        found: Option<FileMetadata>,
+    ) -> Result<FileMetadata, &'static str> {
+        authorise_callback(root, &token(), reported, |_| async move { Ok(found) }).await
+    }
+
+    #[tokio::test]
+    async fn a_matching_callback_is_accepted() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
+        assert!(run(r.path(), 900, Some(meta())).await.is_ok());
+    }
+
+    /// 🔴 **这条守的是整条链路**：墓碑对得上，正式文件却不是这一份。
     ///
     /// 只比墓碑的话，一个被篡改或串了的墓碑就能让回调对着别人的文件生效。
-    /// 删掉 `check_callback_target` 里的 `matches_file`，下面三种都会漏过去。
-    #[test]
-    fn a_callback_whose_file_does_not_match_the_token_is_refused() {
-        let t = token();
+    /// 把 `authorise_callback` 里的 `matches_file` 去掉，这四种都会漏过去。
+    #[tokio::test]
+    async fn a_callback_whose_file_does_not_match_the_token_is_refused() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
 
         let mut wrong_digest = meta();
         wrong_digest.file_hash = Some("b".repeat(64));
-        assert!(check_callback_target(Some(900), 900, Some(&wrong_digest), &t).is_err());
+        assert!(run(r.path(), 900, Some(wrong_digest)).await.is_err());
 
         let mut wrong_size = meta();
         wrong_size.file_size = 8192;
-        assert!(check_callback_target(Some(900), 900, Some(&wrong_size), &t).is_err());
+        assert!(run(r.path(), 900, Some(wrong_size)).await.is_err());
 
         let mut wrong_type = meta();
         wrong_type.file_type = FileType::File;
-        assert!(check_callback_target(Some(900), 900, Some(&wrong_type), &t).is_err());
+        assert!(run(r.path(), 900, Some(wrong_type)).await.is_err());
 
         let mut other_owner = meta();
         other_owner.uploader_id = 43;
-        assert!(check_callback_target(Some(900), 900, Some(&other_owner), &t).is_err());
+        assert!(run(r.path(), 900, Some(other_owner)).await.is_err());
     }
 
-    /// 报的 file_id 与墓碑不符：调用方不能随口指定别的文件。
-    #[test]
-    fn a_callback_reporting_another_file_id_is_refused() {
-        assert!(check_callback_target(Some(900), 901, Some(&meta()), &token()).is_err());
+    #[tokio::test]
+    async fn a_callback_reporting_another_file_id_is_refused() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
+        assert!(run(r.path(), 901, Some(meta())).await.is_err());
     }
 
-    /// 会话还没完成（或墓碑已被清理）时不该有回调。
-    #[test]
-    fn a_callback_without_a_completed_session_is_refused() {
-        assert!(check_callback_target(None, 900, Some(&meta()), &token()).is_err());
+    /// 会话还在但没完成：没有可核对的依据。
+    #[tokio::test]
+    async fn a_callback_without_a_completed_session_is_refused() {
+        let r = tempfile::tempdir().expect("tmp");
+        let _s = UploadSession::open(r.path(), 42, UPLOAD_ID).expect("open");
+        assert!(run(r.path(), 900, Some(meta())).await.is_err());
     }
 
-    /// 墓碑指向一条读不到的记录：拒绝，而不是当成成功。
+    /// 🔴 会话已被清理 / 从未存在：拒绝，且**不得**因为这次查询建出目录。
+    #[tokio::test]
+    async fn a_callback_for_a_vanished_session_is_refused_without_creating_it() {
+        let r = tempfile::tempdir().expect("tmp");
+        assert!(run(r.path(), 900, Some(meta())).await.is_err());
+        assert!(
+            !r.path().join("42").join(UPLOAD_ID).exists(),
+            "回调不得惰性建出会话目录"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_callback_pointing_at_a_missing_row_is_refused() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
+        assert!(run(r.path(), 900, None).await.is_err());
+    }
+
     #[test]
-    fn a_callback_pointing_at_a_missing_row_is_refused() {
-        assert!(check_callback_target(Some(900), 900, None, &token()).is_err());
+    fn the_tombstone_gate_alone() {
+        assert!(check_callback_target_id(Some(900), 900).is_ok());
+        assert!(check_callback_target_id(Some(900), 901).is_err());
+        assert!(check_callback_target_id(None, 900).is_err());
     }
 }
