@@ -24,6 +24,27 @@ use tracing::warn;
 
 use crate::rpc::{RpcError, RpcResult, RpcServiceContext};
 
+/// 回调失败的两类，**必须分开**。
+///
+/// 🔴 抽取编排时我把所有错误压成了 `&'static str`，于是磁盘 I/O 失败、状态 JSON
+/// 损坏、数据库暂时故障统统被映射成客户端参数错误——调用方据此认定「不用重试了」，
+/// 一次短暂的基础设施抖动就变成这次回调**永久失败**。
+///
+/// 授权判定的结论和基础设施的死活是两回事，不能共用一个出口。
+#[derive(Debug)]
+pub(crate) enum CallbackError {
+    /// 授权拒绝：参数/身份不对，重试也没用 → `RpcError::validation`。
+    Rejected(&'static str),
+    /// 基础设施故障：磁盘、状态文件、数据库 → `RpcError::internal`，可重试。
+    Internal(String),
+}
+
+impl CallbackError {
+    pub(crate) fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected(_))
+    }
+}
+
 /// 回调的**完整编排**：开会话（不惰性创建）→ 读墓碑 → 回读正式行 → 核对身份。
 ///
 /// 🔴 依赖收窄到「一个目录 + 一个按 id 取记录的闭包」，就是为了让**这条链路本身**
@@ -41,7 +62,7 @@ pub(crate) async fn authorise_callback<F, Fut>(
     token: &crate::service::upload_token_service::ValidatedUploadToken,
     reported: u64,
     fetch_meta: F,
-) -> Result<crate::service::file_service::FileMetadata, &'static str>
+) -> Result<crate::service::file_service::FileMetadata, CallbackError>
 where
     F: FnOnce(u64) -> Fut,
     Fut: std::future::Future<
@@ -55,18 +76,20 @@ where
         token.user_id,
         &token.upload_id,
     )
-    .map_err(|_| "会话不可读")?
-    .ok_or("该次上传的会话已不存在")?;
+    .map_err(|e| CallbackError::Internal(format!("会话不可读: {e}")))?
+    .ok_or(CallbackError::Rejected("该次上传的会话已不存在"))?;
 
-    let tombstone = session.completed_file_id().map_err(|_| "会话状态不可读")?;
-    check_callback_target_id(tombstone, reported)?;
+    let tombstone = session
+        .completed_file_id()
+        .map_err(|e| CallbackError::Internal(format!("会话状态不可读: {e}")))?;
+    check_callback_target_id(tombstone, reported).map_err(CallbackError::Rejected)?;
 
     let meta = fetch_meta(reported)
         .await
-        .map_err(|_| "读取文件记录失败")?
-        .ok_or("file_id 不存在")?;
+        .map_err(|e| CallbackError::Internal(format!("读取文件记录失败: {e}")))?
+        .ok_or(CallbackError::Rejected("file_id 不存在"))?;
     if !token.matches_file(&meta) {
-        return Err("file_id 与本次上传的身份不符");
+        return Err(CallbackError::Rejected("file_id 与本次上传的身份不符"));
     }
     Ok(meta)
 }
@@ -169,9 +192,17 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|reason| {
-        warn!("❌ 上传回调被拒: {reason}（file_id={file_id_num}）");
-        RpcError::validation(reason.to_string())
+    .map_err(|e| match e {
+        CallbackError::Rejected(reason) => {
+            warn!("❌ 上传回调被拒: {reason}（file_id={file_id_num}）");
+            RpcError::validation(reason.to_string())
+        }
+        // 🔴 基础设施故障必须是 internal：标成 validation 等于告诉客户端
+        // 「别重试了」，一次数据库抖动就把这次回调永久判死。
+        CallbackError::Internal(detail) => {
+            warn!("💥 上传回调处理失败（可重试）: {detail}（file_id={file_id_num}）");
+            RpcError::internal(detail)
+        }
     })?;
 
     // TODO: 记录文件元数据到数据库
@@ -251,7 +282,7 @@ mod tests {
         root: &std::path::Path,
         reported: u64,
         found: Option<FileMetadata>,
-    ) -> Result<FileMetadata, &'static str> {
+    ) -> Result<FileMetadata, super::CallbackError> {
         authorise_callback(root, &token(), reported, |_| async move { Ok(found) }).await
     }
 
@@ -319,6 +350,56 @@ mod tests {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
         assert!(run(r.path(), 900, None).await.is_err());
+    }
+
+    /// 🔴 **基础设施故障不是客户端错误。**
+    ///
+    /// 数据库暂时读不到时，把它标成 validation 等于告诉调用方「别重试了」——
+    /// 一次抖动就把这次回调永久判死。这是「可重试性分类」那类错误的又一处实例。
+    #[tokio::test]
+    async fn a_database_failure_is_internal_not_a_rejection() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
+
+        let err = authorise_callback(r.path(), &token(), 900, |_| async move {
+            Err("connection reset by peer".to_string())
+        })
+        .await
+        .expect_err("必须失败");
+        assert!(
+            !err.is_rejected(),
+            "数据库故障必须是 internal（可重试），实际: {err:?}"
+        );
+    }
+
+    /// 状态文件损坏同理：是本机的问题，不是调用方参数不对。
+    #[tokio::test]
+    async fn a_corrupted_session_state_is_internal_not_a_rejection() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
+        std::fs::write(
+            r.path().join("42").join(UPLOAD_ID).join("state.json"),
+            b"{ this is not json",
+        )
+        .expect("corrupt it");
+
+        let err = run(r.path(), 900, Some(meta())).await.expect_err("必须失败");
+        assert!(
+            !err.is_rejected(),
+            "状态损坏必须是 internal（可重试），实际: {err:?}"
+        );
+    }
+
+    /// 与上面成对：身份不符是**真正的**拒绝，不能因为怕误伤就一律 internal。
+    #[tokio::test]
+    async fn an_identity_mismatch_is_a_rejection_not_an_internal_error() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
+        let mut wrong = meta();
+        wrong.file_hash = Some("b".repeat(64));
+
+        let err = run(r.path(), 900, Some(wrong)).await.expect_err("必须失败");
+        assert!(err.is_rejected(), "身份不符必须是 validation，实际: {err:?}");
     }
 
     #[test]
