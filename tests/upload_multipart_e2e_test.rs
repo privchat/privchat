@@ -397,8 +397,22 @@ async fn crash_child_runs_a_real_upload() {
         let whole = multipart_body(&body);
         let head = bytes::Bytes::copy_from_slice(&whole[..whole.len() / 2]);
         eprintln!("[child] 准备发 {} 字节（共 {}）", head.len(), whole.len());
+        // 🔴 小块之间要**隔开时间**，不能一次性把它们塞进流里。
+        //
+        // multer 会把连续可得的数据合并成一个 chunk 交给 handler，于是服务端只发生
+        // **一次** `write`；而 opendal 的 writer 手里压着最近一次 write 的缓冲不下盘，
+        // 一次 write 的结果就是磁盘上一个字节都没有。隔开时间才会有多次 write，
+        // 才谈得上「传输途中已有部分字节落盘」。
+        let chunks: Vec<bytes::Bytes> = head
+            .chunks(8 * 1024)
+            .map(bytes::Bytes::copy_from_slice)
+            .collect();
         let stream = futures::StreamExt::chain(
-            futures::stream::once(async move { Ok::<_, std::io::Error>(head) }),
+            futures::stream::unfold(chunks.into_iter(), |mut it| async move {
+                let next = it.next()?;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                Some((Ok::<_, std::io::Error>(next), it))
+            }),
             futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>(),
         );
         let router = privchat::http::routes::upload::create_route().with_state(rig.state.clone());
@@ -573,7 +587,12 @@ async fn an_upload_survives_a_kill_mid_transfer() {
     // 存储层什么时候把缓冲刷下去是它自己的事，拿字节数当同步点会把测试绑死在
     // opendal 的缓冲策略上。文件一出现就说明 token 验过了、会话占住了、预留落盘了、
     // writer 开着——正是要在这一刻开枪的状态。
-    wait_until("子进程开始接收 body", || staging.exists());
+    // 判据是**磁盘上真的有字节**，不是「文件出现了」。writer 一打开文件就存在，
+    // 拿存在当同步点会在零字节时就开枪，那测的是「还没开始写」的恢复，不是
+    // 「写了一半」的恢复——恰好把要覆盖的场景漏掉。
+    wait_until("子进程把部分字节写到 body.part", || {
+        std::fs::metadata(&staging).map(|m| m.len() > 0).unwrap_or(false)
+    });
 
     // SIGKILL：没有清理、没有 Drop、没有回滚。
     // SAFETY: pid 来自我们刚 spawn 的子进程。
@@ -588,19 +607,24 @@ async fn an_upload_survives_a_kill_mid_transfer() {
     );
     let partial = std::fs::metadata(&staging).expect("残留的临时对象").len();
     assert!(
-        partial < body.len() as u64,
-        "请求体只发了一半，落盘的不可能是完整的一份：{partial}"
+        partial > 0 && partial < body.len() as u64,
+        "崩溃现场必须是**写了一半**：0 说明还没开始写，等于完整长度说明根本没被打断。实际 {partial}"
     );
     assert_eq!(row_count(&pool, UPLOADER_CRASH).await, 0);
+    // 🔴 预留值必须**在重试之前**读出来单独存着。
+    //
+    // 早先这里写的是 `reserved_id(...).map(|_| file_id)`：它把预留值换成了返回值，
+    // 于是只要「预留存在」就恒等，根本没比较过两者——一条永远为真的断言。
+    let reserved_before_retry = reserved_id(&rig, UPLOADER_CRASH, &upload_id)
+        .expect("接收 body 之前就该把预留写进会话");
 
     // 重试：同一张 token 从头传完整的一份。
     let (status, json) = rig.post(&token, &body).await;
     assert_eq!(status, StatusCode::OK, "崩溃后必须还能传完：{json}");
     let file_id = file_id_of(&json);
     assert_eq!(
-        Some(file_id),
-        reserved_id(&rig, UPLOADER_CRASH, &upload_id).map(|_| file_id),
-        "重试必须复用崩溃前预留的 file_id"
+        file_id, reserved_before_retry,
+        "重试必须复用崩溃前预留的 file_id，否则上一次的半成品没人认领"
     );
 
     // 🔴 残留的半截字节不能被接在新内容前面：writer 必须是覆盖而不是追加。

@@ -155,9 +155,19 @@ async fn publish_object(
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 Ok(PublishOutcome::AlreadyPresent)
             }
+            // 🔴 跨文件系统（`EXDEV`）：**必须**有降级路径，不能报错了事。
+            //
+            // 会话临时目录与存储根今天同盘只是当前部署的偶然；文件长大之后把上传盘
+            // 单独挂出来是常规操作，那一刻所有上传都会失败。spec §9.2 明确要求：
+            // 流式复制到**目标文件系统内**的临时名 → fsync → 在该文件系统内原子发布。
+            //
+            // 📌 spec 原文写的是「原子 rename」，这里用 link + unlink：rename 会静默
+            // 覆盖，与 no-clobber 冲突；link 同样原子，且目标存在时返回 EEXIST。
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                publish_across_filesystems(&from, &to)
+            }
             Err(e) => Err(ServerError::Internal(format!(
-                "发布对象失败（{from:?} → {to:?}）：{e}。\
-                 临时对象与正式对象必须在同一个存储根下——请检查存储源配置",
+                "发布对象失败（{from:?} → {to:?}）：{e}"
             ))),
         };
     }
@@ -212,6 +222,60 @@ async fn publish_object(
         }
         Err(e) => Err(ServerError::Internal(format!("发布对象失败: {e}"))),
     }
+}
+
+/// 跨文件系统发布：复制到**目标盘内**的临时名 → fsync → 在该盘内原子发布。
+///
+/// 🔴 临时名必须落在**目标目录**里，不能落在源盘：跨盘的 link 一样会 `EXDEV`，
+/// 绕了一圈还是发布不出去。
+///
+/// 🔴 临时名要唯一（pid + 纳秒）。用固定名的话，两个并发上传会互相踩对方复制到
+/// 一半的内容，最后发布出去的是两份字节缝在一起的东西——而它的摘要谁都对不上。
+fn publish_across_filesystems(from: &std::path::Path, to: &std::path::Path) -> Result<PublishOutcome> {
+    let dir = to.parent().ok_or_else(|| {
+        ServerError::Internal(format!("正式路径 {to:?} 没有父目录"))
+    })?;
+    let unique = format!(
+        ".publish-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp = dir.join(unique);
+
+    // 复制本身是流式的（`io::copy` 走固定大小缓冲），200MB 的文件不会进内存。
+    let copy = (|| -> std::io::Result<()> {
+        let mut src = std::fs::File::open(from)?;
+        let mut dst = std::fs::File::create(&tmp)?;
+        std::io::copy(&mut src, &mut dst)?;
+        // 先让内容落盘，再让目录项指过去——顺序和同盘那条路径是一样的。
+        dst.sync_all()
+    })();
+    if let Err(e) = copy {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ServerError::Internal(format!(
+            "跨文件系统发布：复制到 {tmp:?} 失败: {e}"
+        )));
+    }
+
+    let outcome = match std::fs::hard_link(&tmp, to) {
+        Ok(()) => {
+            fsync_dir(Some(dir))?;
+            let _ = std::fs::remove_file(from);
+            Ok(PublishOutcome::Published)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishOutcome::AlreadyPresent)
+        }
+        Err(e) => Err(ServerError::Internal(format!(
+            "跨文件系统发布：{tmp:?} → {to:?} 失败: {e}"
+        ))),
+    };
+    // 中转文件无论成败都要清掉：它已经完成使命，留着就是垃圾。
+    let _ = std::fs::remove_file(&tmp);
+    outcome
 }
 
 /// 把文件内容刷到盘上。
@@ -354,6 +418,12 @@ impl FileService {
                         ))
                     })?;
                 }
+                // 🔴 **子目录本身的目录项也要落盘。**
+                //
+                // 发布时 fsync 的是 `images/` 这类目标目录，可它们是在这里创建的，
+                // 创建之后从没同步过存储根。掉电时丢的就是这一层目录项——正式路径
+                // 整个不存在，而 PG 里的记录已经提交，又变回「记录在、对象不在」。
+                fsync_dir(Some(std::path::Path::new(&src.storage_root)))?;
             }
             self.operators.write().await.insert(src.id, op);
         }
@@ -1562,6 +1632,76 @@ mod publish_tests {
         assert_eq!(op.read("files/big.bin").await.expect("read").to_vec(), bytes);
     }
 
+    // ---------------- 跨文件系统降级 ----------------
+    //
+    // 📌 **能测的和不能测的说清楚**：这几条直接驱动降级函数本身（复制 → fsync →
+    // no-clobber 发布 → 清理），因为在单元测试里造不出真的 `EXDEV`——那需要挂载
+    // 第二个文件系统。「`EXDEV` 会路由到这里」只有那一行 match 臂，靠阅读保证；
+    // 真·跨盘部署的验证属于部署演练，不属于这一层。
+
+    #[tokio::test]
+    async fn a_cross_filesystem_publish_moves_the_bytes() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let from = dir.path().join("body.part");
+        let to = dir.path().join("images/1.png");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::write(&from, b"cross device bytes").unwrap();
+
+        let out = super::publish_across_filesystems(&from, &to).expect("publish");
+        assert_eq!(out, PublishOutcome::Published);
+        assert_eq!(std::fs::read(&to).unwrap(), b"cross device bytes");
+        assert!(!from.exists(), "源临时对象要清掉");
+        assert_eq!(leftover_tmp(dir.path().join("images").as_path()), 0, "中转文件不能留下");
+    }
+
+    /// 🔴 降级路径同样**绝不覆盖**：它是 no-clobber 最容易被绕过去的那条。
+    #[tokio::test]
+    async fn a_cross_filesystem_publish_never_clobbers() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let from = dir.path().join("body.part");
+        let to = dir.path().join("images/1.png");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::write(&to, b"the original bytes").unwrap();
+        std::fs::write(&from, b"different").unwrap();
+
+        let out = super::publish_across_filesystems(&from, &to).expect("publish");
+        assert_eq!(out, PublishOutcome::AlreadyPresent);
+        assert_eq!(
+            std::fs::read(&to).unwrap(),
+            b"the original bytes",
+            "已有对象必须原封不动"
+        );
+        assert_eq!(leftover_tmp(dir.path().join("images").as_path()), 0, "中转文件不能留下");
+    }
+
+    /// 中转文件名必须唯一：并发发布不能互相踩。
+    #[test]
+    fn cross_filesystem_temp_names_do_not_collide() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let to = dir.path().join("images/1.png");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..50 {
+            let from = dir.path().join(format!("body-{i}.part"));
+            std::fs::write(&from, format!("bytes {i}")).unwrap();
+            let target = dir.path().join(format!("images/{i}.png"));
+            super::publish_across_filesystems(&from, &target).expect("publish");
+            seen.insert(std::fs::read(&target).unwrap());
+        }
+        assert_eq!(seen.len(), 50, "每份内容都该原样发布，说明中转没串");
+    }
+
+    /// 目标目录里遗留的中转文件数。
+    fn leftover_tmp(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(".publish-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// 🔴 本地 link 失败（这里用「临时对象不存在」构造）必须**报错**。
     ///
     /// 以前这里会掉进「先 stat 再 copy」的降级分支。降级本身才是问题：任何一次
@@ -1583,3 +1723,4 @@ mod publish_tests {
         );
     }
 }
+
