@@ -21,8 +21,8 @@
 //! 也不进 Redis（那样又要解决跨槽 Lua、逐出策略和租约 fencing，而这些问题在
 //! 本地文件上根本不存在）。
 //!
-//! 本批只落地**模式锁**所需的最小集合：`state.json` + `flock`。区间上传要用的
-//! `body.part` / bitmap / journal 在下一批。
+//! 组成：`state.json`（可变状态）+ `session.lock`（flock 互斥）+ `body.part`（字节）
+//! + `journal`（已确认区间的追加日志）。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -79,6 +79,11 @@ pub struct SessionState {
     /// 而不是第二条记录——幂等因此不需要在正式文件表上加任何列。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved_file_id: Option<u64>,
+    /// 分片上传的**总字节数**（token 里签下的那个值），选定模式时冻结。
+    ///
+    /// 越界的分片要能当场拒掉，`complete` 也要知道「传完了没有」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_size: Option<u64>,
 }
 
 impl Default for SessionState {
@@ -88,8 +93,45 @@ impl Default for SessionState {
             status: UploadStatus::Idle,
             file_id: None,
             reserved_file_id: None,
+            total_size: None,
         }
     }
+}
+
+/// journal 里的一条：某个区间已确认，以及它的内容摘要。
+#[derive(Debug, Clone)]
+struct JournalEntry {
+    offset: u64,
+    len: u64,
+    sha256: String,
+}
+
+/// 写一段字节的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkOutcome {
+    /// 这次真的写进去了。
+    Confirmed,
+    /// 同一区间、同样内容已经确认过——重试拿到的就该是成功。
+    AlreadyCovered,
+    /// 与已确认区间冲突（内容不同，或部分重叠）。磁盘未被改动。
+    Conflict,
+}
+
+/// 合并成不重叠且相邻已并的升序区间。
+fn merge_ranges(it: impl Iterator<Item = (u64, u64)>) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = it.collect();
+    v.sort_by_key(|(off, _)| *off);
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (off, len) in v {
+        match out.last_mut() {
+            Some((prev_off, prev_len)) if off <= *prev_off + *prev_len => {
+                let end = (off + len).max(*prev_off + *prev_len);
+                *prev_len = end - *prev_off;
+            }
+            _ => out.push((off, len)),
+        }
+    }
+    out
 }
 
 /// 一个上传任务的会话目录。
@@ -294,6 +336,196 @@ impl UploadSession {
             session: self,
             committed: std::cell::Cell::new(false),
         })
+    }
+
+    /// 分片模式：选定 `Resumable` 并占住会话。
+    ///
+    /// `total_size` 来自 token（`sealed_blob_size`），会话第一次选定模式时冻结。
+    pub fn begin_resumable(&self, total_size: u64) -> Result<ModeGuard<'_>> {
+        if !self.try_lock_exclusive()? {
+            return Err(ServerError::Validation(
+                "同一份上传正在进行中".to_string(),
+            ));
+        }
+        let mut state = self.read_state()?;
+        match (state.mode, state.status) {
+            (_, UploadStatus::Completed) => {
+                return Err(ServerError::Validation(format!(
+                    "该上传已完成（file_id={:?}）",
+                    state.file_id
+                )));
+            }
+            // 🔴 整包与分片互斥：同一张 token 只能走一条路。
+            (UploadMode::Whole, _) => {
+                return Err(ServerError::Validation(
+                    "该 token 已用于整包上传，不能再走分片".to_string(),
+                ));
+            }
+            // 拿到锁却看见「上传中」= 上一个进程崩了（真并发在 try_lock 就挡住了）。
+            // 分片上传本来就是为崩溃准备的，这里当然要接着传。
+            (_, UploadStatus::Uploading) => {}
+            _ => {}
+        }
+        if let Some(frozen) = state.total_size {
+            if frozen != total_size {
+                return Err(ServerError::Validation(format!(
+                    "该会话已冻结总大小 {frozen}，与本次声明的 {total_size} 不符"
+                )));
+            }
+        }
+        state.mode = UploadMode::Resumable;
+        state.status = UploadStatus::Uploading;
+        state.total_size = Some(total_size);
+        self.write_state(&state)?;
+        Ok(ModeGuard {
+            session: self,
+            committed: std::cell::Cell::new(false),
+        })
+    }
+
+    pub fn body_path(&self) -> PathBuf {
+        self.dir.join("body.part")
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.dir.join("journal")
+    }
+
+    /// 已确认的区间（按 offset 升序，且已合并相邻）。
+    ///
+    /// 🔴 真源是 **journal**，不是 `body.part` 的大小。文件大小只能说明「写到过这里」，
+    /// 说明不了「哪些区间的字节是完整可信的」——中间可能有空洞，也可能有写了一半就
+    /// 断电的段。journal 只在 `fdatasync(body.part)` **之后**追加，所以它记下的每一段
+    /// 都保证已经在盘上。
+    pub fn confirmed_ranges(&self) -> Result<Vec<(u64, u64)>> {
+        Ok(merge_ranges(
+            self.journal_entries()?.into_iter().map(|e| (e.offset, e.len)),
+        ))
+    }
+
+    /// 已确认的总字节数。
+    pub fn confirmed_bytes(&self) -> Result<u64> {
+        Ok(self.confirmed_ranges()?.iter().map(|(_, len)| len).sum())
+    }
+
+    fn journal_entries(&self) -> Result<Vec<JournalEntry>> {
+        let raw = match std::fs::read_to_string(self.journal_path()) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(ServerError::Internal(format!("读 journal 失败: {e}"))),
+        };
+        let mut out = Vec::new();
+        for line in raw.lines() {
+            // 🔴 **半行直接丢弃**：崩溃可能停在一行写到一半，那一段本来就不该算确认。
+            // 丢掉它只是让客户端重传一次；认下来就是「已确认但字节对不上」。
+            let mut parts = line.split(' ');
+            let (Some(off), Some(len), Some(sha), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (Ok(offset), Ok(len)) = (off.parse::<u64>(), len.parse::<u64>()) else {
+                continue;
+            };
+            if sha.len() != 64 {
+                continue;
+            }
+            out.push(JournalEntry {
+                offset,
+                len,
+                sha256: sha.to_string(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// 写一段字节。**幂等**：同一区间同样内容重传返回 `AlreadyCovered`。
+    pub fn write_chunk(&self, offset: u64, bytes: &[u8]) -> Result<ChunkOutcome> {
+        if bytes.is_empty() {
+            return Err(ServerError::Validation("分片不能为空".to_string()));
+        }
+        let state = self.read_state()?;
+        let total = state
+            .total_size
+            .ok_or_else(|| ServerError::Validation("会话尚未选定分片模式".to_string()))?;
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| ServerError::Validation("分片区间溢出".to_string()))?;
+        if end > total {
+            return Err(ServerError::Validation(format!(
+                "分片区间 [{offset}, {end}) 越过总大小 {total}"
+            )));
+        }
+
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes));
+        let entries = self.journal_entries()?;
+
+        // 完全相同的区间已经确认过：内容一致 = 幂等成功；不一致 = 冲突，磁盘不动。
+        if let Some(prev) = entries
+            .iter()
+            .find(|e| e.offset == offset && e.len == bytes.len() as u64)
+        {
+            return if prev.sha256 == digest {
+                Ok(ChunkOutcome::AlreadyCovered)
+            } else {
+                Ok(ChunkOutcome::Conflict)
+            };
+        }
+        // 部分重叠：客户端的区间视图和服务端不一致，让它按 confirmed_ranges 对齐后重来。
+        // 直接写下去会覆盖已确认的字节，那正是「已确认但摘要对不上」的来源。
+        if entries
+            .iter()
+            .any(|e| offset < e.offset + e.len && e.offset < end)
+        {
+            return Ok(ChunkOutcome::Conflict);
+        }
+
+        // 🔴 顺序：pwrite → fdatasync(body.part) → 追加 journal → fsync(journal)。
+        //
+        // 反过来的话，崩溃后 journal 说「这段确认了」而字节其实没落盘——那是最坏的
+        // 一种坏：客户端不会重传，最终摘要却对不上，而且要到 complete 才发现。
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(self.body_path())
+            .map_err(|e| ServerError::Internal(format!("打开 body.part 失败: {e}")))?;
+        {
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(bytes, offset)
+                .map_err(|e| ServerError::Internal(format!("写分片失败: {e}")))?;
+        }
+        file.sync_data()
+            .map_err(|e| ServerError::Internal(format!("同步 body.part 失败: {e}")))?;
+
+        let mut journal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.journal_path())
+            .map_err(|e| ServerError::Internal(format!("打开 journal 失败: {e}")))?;
+        writeln!(journal, "{offset} {} {digest}", bytes.len())
+            .map_err(|e| ServerError::Internal(format!("写 journal 失败: {e}")))?;
+        journal
+            .sync_all()
+            .map_err(|e| ServerError::Internal(format!("同步 journal 失败: {e}")))?;
+
+        Ok(ChunkOutcome::Confirmed)
+    }
+
+    /// 全部区间都确认了吗。
+    pub fn is_complete(&self) -> Result<bool> {
+        let Some(total) = self.read_state()?.total_size else {
+            return Ok(false);
+        };
+        Ok(self.confirmed_ranges()? == vec![(0, total)])
+    }
+
+    /// 丢弃整个会话目录。
+    pub fn discard(self) -> Result<()> {
+        let dir = self.dir.clone();
+        drop(self);
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| ServerError::Internal(format!("删除会话目录 {dir:?} 失败: {e}")))
     }
 }
 

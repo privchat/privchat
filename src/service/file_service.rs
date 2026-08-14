@@ -378,6 +378,25 @@ fn parent_to_sync(path: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(parent)
 }
 
+/// 从头到尾读一遍算 SHA-256。**分块**，整个文件绝不进内存。
+fn sha256_of_file(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| ServerError::Internal(format!("打开 {path:?} 失败: {e}")))?;
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    let mut buf = vec![0u8; VERIFY_CHUNK as usize];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| ServerError::Internal(format!("读 {path:?} 失败: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buf[..n]);
+    }
+    Ok(hex::encode(sha2::Digest::finalize(hasher)))
+}
+
 /// 把文件内容刷到盘上。
 fn fsync_file(path: &std::path::Path) -> Result<()> {
     let f = std::fs::File::open(path)
@@ -454,6 +473,32 @@ async fn verify_object(
     }
     let actual = hex::encode(sha2::Digest::finalize(hasher));
     Ok(actual.eq_ignore_ascii_case(expect_sha256))
+}
+
+/// 已经落盘并**校验通过**的一份字节，等着被发布 + 落库。
+pub(crate) struct StagedObject {
+    pub file_id: u64,
+    /// 校验通过后要发布到的正式路径（由 `file_id` 决定，重试恒定）。
+    pub file_path: String,
+    /// 字节现在在哪（会话临时对象）。
+    pub staging_path: String,
+    pub source_id: u32,
+    pub file_type: FileType,
+    pub written: u64,
+    /// 服务端自己算出来的权威摘要。
+    pub stored_sha256: String,
+}
+
+/// 落库要写的那些业务字段。
+pub(crate) struct RecordFields {
+    pub filename: String,
+    pub mime_type: String,
+    pub uploader_id: u64,
+    pub uploader_ip: Option<String>,
+    pub business_type: String,
+    pub business_id: Option<String>,
+    pub encryption_version: i32,
+    pub cek: Option<String>,
 }
 
 /// 发布结果。
@@ -768,6 +813,119 @@ impl FileService {
             }
         }
 
+        self.publish_and_record(
+            StagedObject {
+                file_id: upload.file_id,
+                file_path: upload.file_path.clone(),
+                staging_path: upload.staging_path.clone(),
+                source_id: upload.source_id,
+                file_type: upload.file_type.clone(),
+                written: upload.written,
+                stored_sha256,
+            },
+            RecordFields {
+                filename,
+                mime_type,
+                uploader_id,
+                uploader_ip,
+                business_type,
+                business_id,
+                encryption_version,
+                cek,
+            },
+        )
+        .await
+    }
+
+    /// 分片上传收尾：**流式**核验 `body.part` 的大小与摘要，然后走与整包**同一条**
+    /// 发布落库路径。
+    ///
+    /// 🔴 摘要必须由服务端在这里重算，不能拿分片的 journal 摘要拼。journal 只保证
+    /// 每一段落盘时是对的；整份文件对不对，只有从头读一遍才知道。这也顺带覆盖了
+    /// 「区间都确认了但拼起来不是那个文件」这种客户端错误。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_resumable_upload(
+        &self,
+        session: &crate::service::upload_session::UploadSession,
+        reserved_file_id: u64,
+        fields: RecordFields,
+        file_type: FileType,
+        declared_content_sha256: Option<String>,
+        declared_size: Option<i64>,
+        session_uid: u64,
+        session_upload_id: &str,
+    ) -> Result<FileMetadata> {
+        let body = session.body_path();
+        let written = std::fs::metadata(&body)
+            .map_err(|e| ServerError::Internal(format!("读 body.part 失败: {e}")))?
+            .len();
+
+        if let Some(expect) = size_check_target(declared_content_sha256.as_deref(), declared_size) {
+            if expect != written as i64 {
+                return Err(ServerError::Validation(format!(
+                    "上传字节数与 prepare 阶段声明的不一致：声明 {expect}，实际 {written}"
+                )));
+            }
+        }
+
+        let stored_sha256 = sha256_of_file(&body)?;
+        if let Some(declared) = declared_content_sha256.as_deref() {
+            if !declared.eq_ignore_ascii_case(&stored_sha256) {
+                return Err(ServerError::Validation(
+                    "上传内容与 prepare 阶段声明的摘要不一致".to_string(),
+                ));
+            }
+        }
+
+        let source = self.resolve_storage_source()?;
+        let source_id = source.id;
+        let file_path = self.generate_file_path(reserved_file_id, &file_type, &fields.filename);
+
+        self.publish_and_record(
+            StagedObject {
+                file_id: reserved_file_id,
+                file_path,
+                staging_path: Self::staging_path(session_uid, session_upload_id),
+                source_id,
+                file_type,
+                written,
+                stored_sha256,
+            },
+            fields,
+        )
+        .await
+    }
+
+    /// 已落盘并校验通过的一份字节 → 收敛、发布、落库。
+    ///
+    /// 🔴 整包与分片**共用这一条**。发布的 no-clobber、「已发布未提交」的恢复窗口、
+    /// 主键幂等都在这里，分片路径不再另写一份——两份实现迟早会在某一次修复里分家，
+    /// 而分家的那一半就是下一次数据事故。
+    pub(crate) async fn publish_and_record(
+        &self,
+        staged: StagedObject,
+        fields: RecordFields,
+    ) -> Result<FileMetadata> {
+        let StagedObject {
+            file_id,
+            file_path: my_path,
+            staging_path,
+            source_id: my_source_id,
+            file_type,
+            written,
+            stored_sha256,
+        } = staged;
+        let RecordFields {
+            filename,
+            mime_type,
+            uploader_id,
+            uploader_ip,
+            business_type,
+            business_id,
+            encryption_version,
+            cek,
+        } = fields;
+
         // 窗口一：字节收完并校验通过，但还没发布。
         crash_point("after_verify_before_publish");
 
@@ -783,8 +941,8 @@ impl FileService {
             &UploadPlacement {
                 stored_sha256: stored_sha256.clone(),
                 encryption_version,
-                my_path: upload.file_path.clone(),
-                my_source_id: upload.source_id as i32,
+                my_path: my_path.clone(),
+                my_source_id: my_source_id as i32,
                 my_cek: cek,
             },
         )
@@ -810,13 +968,13 @@ impl FileService {
         //
         // 去重命中时**根本不发布**：字节已经有人存着了，这次的临时对象直接删掉。
         if duplicate {
-            if let Ok(op) = self.operator_for_source(upload.source_id).await {
-                let _ = op.delete(&upload.staging_path).await;
+            if let Ok(op) = self.operator_for_source(my_source_id).await {
+                let _ = op.delete(&staging_path).await;
             }
             tracing::info!("⚡ 内容已存在，复用 path={file_path}，不发布新对象");
         } else {
             match self
-                .publish_staged(upload.source_id, &upload.staging_path, &upload.file_path)
+                .publish_staged(my_source_id, &staging_path, &my_path)
                 .await?
             {
                 PublishOutcome::Published => {}
@@ -829,21 +987,21 @@ impl FileService {
                 PublishOutcome::AlreadyPresent => {
                     let same = self
                         .verify_published(
-                            upload.source_id,
-                            &upload.file_path,
-                            upload.written,
+                            my_source_id,
+                            &my_path,
+                            written,
                             &stored_sha256,
                         )
                         .await?;
                     if !same {
                         return Err(ServerError::Internal(format!(
                             "正式路径 {} 上已有**不同内容**的对象，拒绝覆盖",
-                            upload.file_path
+                            my_path
                         )));
                     }
                     // 一致：上次发布过了。把这次的临时对象清掉即可。
-                    if let Ok(op) = self.operator_for_source(upload.source_id).await {
-                        let _ = op.delete(&upload.staging_path).await;
+                    if let Ok(op) = self.operator_for_source(my_source_id).await {
+                        let _ = op.delete(&staging_path).await;
                     }
                     tracing::info!(
                         "♻️ 正式路径已存在且内容一致（上次已发布未提交），直接继续落库"
@@ -856,11 +1014,11 @@ impl FileService {
         crash_point("after_publish_before_commit");
 
         let metadata = FileMetadata {
-            file_id: upload.file_id,
+            file_id: file_id,
             original_filename: filename,
-            file_size: upload.written,
+            file_size: written,
             original_size: None,
-            file_type: upload.file_type.clone(),
+            file_type: file_type.clone(),
             mime_type,
             file_path: file_path.clone(),
             storage_source_id: source_id as u32,
