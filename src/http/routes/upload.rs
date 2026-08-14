@@ -20,11 +20,16 @@
 //! 路由：POST /api/app/files/upload
 //! 认证：需要 X-Upload-Token header
 
-use axum::{extract::DefaultBodyLimit, extract::State, routing::post, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    extract::{Query, State},
+    routing::{get, post, put},
+    Router,
+};
 use axum_extra::extract::Multipart;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::error::ServerError;
@@ -73,6 +78,11 @@ fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
 pub fn create_route() -> Router<FileServerState> {
     Router::new()
         .route("/api/app/files/upload", post(upload_file))
+        // 断点续传（RESUMABLE_UPLOAD_SPEC §5）：字节走 chunk，其余三个是控制面。
+        .route("/api/app/files/chunk", put(put_chunk))
+        .route("/api/app/files/status", get(upload_status))
+        .route("/api/app/files/complete", post(complete_upload))
+        .route("/api/app/files/abort", post(abort_upload))
         // 从业务硬顶推导，不再写死一个会跟业务限额分家的数字：body limit 必须高于最大
         // 硬顶，否则 multipart 会在业务校验跑起来之前被拒，用户拿到一个没有业务含义的 413。
         .layer(DefaultBodyLimit::max(
@@ -503,4 +513,297 @@ async fn upload_file(
         uploaded_at: metadata.uploaded_at,
         storage_source_id: metadata.storage_source_id,
     }))
+}
+
+
+// ---------------------------------------------------------------- 断点续传
+
+/// 会话现状：客户端靠它决定「还差哪几段」。
+#[derive(Debug, Serialize)]
+pub struct UploadStatusResponse {
+    pub upload_id: String,
+    /// 总字节数（token 里签下的）。
+    pub total_size: u64,
+    /// 已确认区间 `[offset, offset+len)`，升序且已合并。
+    pub confirmed_ranges: Vec<RangeDto>,
+    pub confirmed_bytes: u64,
+    /// 全部确认完了吗——`true` 时客户端该调 complete。
+    pub complete: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RangeDto {
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// 写一段字节的结果。
+#[derive(Debug, Serialize)]
+pub struct ChunkResponse {
+    /// `confirmed` / `already_covered`。
+    pub outcome: &'static str,
+    pub confirmed_bytes: u64,
+    pub complete: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChunkQuery {
+    pub offset: u64,
+}
+
+/// `complete` 的可选补充字段：token 里没有、只有这一刻才知道的东西。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct CompleteRequest {
+    pub business_id: Option<String>,
+    /// 附件加密 v1 的 CEK（base64url 32B）。
+    pub cek: Option<String>,
+}
+
+/// 取出并校验 token，顺带把「这张 token 是用来传字节的」这条也验掉。
+async fn upload_token(
+    state: &FileServerState,
+    headers: &axum::http::HeaderMap,
+) -> Result<crate::service::upload_token_service::ValidatedUploadToken, ServerError> {
+    let raw = headers
+        .get("X-Upload-Token")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::Validation("缺少 X-Upload-Token header".to_string()))?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let token = state.upload_token_service.validate_any(now_secs, raw).await?;
+    if token.purpose != crate::service::upload_token_service::UploadTokenPurpose::Upload {
+        return Err(ServerError::Validation(
+            "该 token 用于秒传取用，不能用于实体上传".to_string(),
+        ));
+    }
+    Ok(token)
+}
+
+/// token 里签下的总字节数——分片模式必须有它，否则无从判断越界与完成。
+fn sealed_size(
+    token: &crate::service::upload_token_service::ValidatedUploadToken,
+) -> Result<u64, ServerError> {
+    token
+        .sealed_blob_size
+        .filter(|v| *v > 0)
+        .map(|v| v as u64)
+        .ok_or_else(|| {
+            ServerError::Validation("该 token 未签入文件大小，不能用于分片上传".to_string())
+        })
+}
+
+fn ranges_dto(ranges: Vec<(u64, u64)>) -> Vec<RangeDto> {
+    ranges
+        .into_iter()
+        .map(|(offset, len)| RangeDto { offset, len })
+        .collect()
+}
+
+/// `PUT /api/app/files/chunk?offset=N` —— 请求体就是这一段的原始字节。
+///
+/// 🔴 用**裸字节**而不是 multipart：分片是热路径，每个请求都要多解析一层 multipart
+/// 边界纯属浪费；而且 `offset` 属于寻址信息，放 query 比藏在表单字段里更难写错。
+async fn put_chunk(
+    State(state): State<FileServerState>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<ChunkQuery>,
+    body: axum::body::Bytes,
+) -> ApiResult<ChunkResponse> {
+    let token = upload_token(&state, &headers).await?;
+    let total = sealed_size(&token)?;
+
+    let session = crate::service::upload_session::UploadSession::open(
+        &state.file_service.upload_session_root()?,
+        token.user_id,
+        &token.upload_id,
+    )?;
+    // 每个分片请求都重新占一次会话：拿不到锁 = 同一份上传正有别的请求在写。
+    let _guard = session.begin_resumable(total)?;
+
+    // 预留排在收字节之前，理由与整包路径相同：崩溃重试要复用同一个 file_id。
+    if session.reserved_file_id()?.is_none() {
+        let id = state.file_service.reserve_file_id().await?;
+        session.reserve_file_id(id)?;
+    }
+
+    use crate::service::upload_session::ChunkOutcome;
+    let outcome = session.write_chunk(q.offset, &body)?;
+    let outcome = match outcome {
+        ChunkOutcome::Confirmed => "confirmed",
+        ChunkOutcome::AlreadyCovered => "already_covered",
+        // 🔴 冲突不是「重试一下就好」，是客户端的区间视图错了：让它先 GET status
+        // 对齐再继续。磁盘上什么都没被改动。
+        ChunkOutcome::Conflict => {
+            return Err(ServerError::Validation(
+                "该区间与已确认内容冲突，请先查询 status 对齐后重传".to_string(),
+            ))
+        }
+    };
+
+    Ok(ApiEnvelope::ok(ChunkResponse {
+        outcome,
+        confirmed_bytes: session.confirmed_bytes()?,
+        complete: session.is_complete()?,
+    }))
+}
+
+/// `GET /api/app/files/status` —— 进程重启、换网络、隔天回来，都靠它接上。
+async fn upload_status(
+    State(state): State<FileServerState>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<UploadStatusResponse> {
+    let token = upload_token(&state, &headers).await?;
+    let total = sealed_size(&token)?;
+
+    // 🔴 用 `open_existing`：会话没了就是**没了**（`SessionGone`），不能顺手建一个
+    // 空目录，把「早就过期/已清理」伪装成「一个字节都还没传」。
+    let session = crate::service::upload_session::UploadSession::open_existing(
+        &state.file_service.upload_session_root()?,
+        token.user_id,
+        &token.upload_id,
+    )?;
+
+    let (ranges, confirmed, complete) = match &session {
+        Some(s) => (s.confirmed_ranges()?, s.confirmed_bytes()?, s.is_complete()?),
+        // 还没开始传：空区间，不是错误。
+        None => (Vec::new(), 0, false),
+    };
+
+    Ok(ApiEnvelope::ok(UploadStatusResponse {
+        upload_id: token.upload_id.clone(),
+        total_size: total,
+        confirmed_ranges: ranges_dto(ranges),
+        confirmed_bytes: confirmed,
+        complete,
+    }))
+}
+
+/// `POST /api/app/files/complete` —— 全部区间确认之后，核验、发布、落库。
+async fn complete_upload(
+    State(state): State<FileServerState>,
+    headers: axum::http::HeaderMap,
+    body: Option<axum::Json<CompleteRequest>>,
+) -> ApiResult<UploadResponse> {
+    let token = upload_token(&state, &headers).await?;
+    let total = sealed_size(&token)?;
+    let extra = body.map(|axum::Json(b)| b).unwrap_or_default();
+
+    let session = crate::service::upload_session::UploadSession::open_existing(
+        &state.file_service.upload_session_root()?,
+        token.user_id,
+        &token.upload_id,
+    )?
+    .ok_or_else(|| {
+        ServerError::Validation("该上传的会话已不存在，请重新申请 token 上传".to_string())
+    })?;
+
+    // 幂等出口：墓碑在就直接回原来那个 file_id，别让客户端以为失败了。
+    if let Some(existing) = session.completed_file_id()? {
+        return completed_response(&state, &token, existing).await;
+    }
+
+    let _guard = session.begin_resumable(total)?;
+
+    if !session.is_complete()? {
+        return Err(ServerError::Validation(format!(
+            "还有区间没传完（已确认 {} / {total} 字节）",
+            session.confirmed_bytes()?
+        )));
+    }
+
+    let reserved = match session.reserved_file_id()? {
+        Some(id) => id,
+        None => {
+            let id = state.file_service.reserve_file_id().await?;
+            session.reserve_file_id(id)?;
+            id
+        }
+    };
+    // 与整包路径同一条规矩：预留的 id 已经落库就补墓碑回读，不重复发布。
+    if let Some(meta) = state.file_service.get_file_metadata(reserved).await? {
+        if !token.matches_file(&meta) {
+            return Err(ServerError::Internal(format!(
+                "预留的 file_id={reserved} 与本次上传身份不符，拒绝继续"
+            )));
+        }
+        let _ = session.mark_completed(reserved);
+        return completed_response(&state, &token, reserved).await;
+    }
+
+    let metadata = state
+        .file_service
+        .commit_resumable_upload(
+            &session,
+            reserved,
+            crate::service::file_service::RecordFields {
+                filename: token
+                    .filename
+                    .clone()
+                    .unwrap_or_else(|| "file.bin".to_string()),
+                mime_type: token
+                    .mime_type
+                    .clone()
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                uploader_id: token.user_id,
+                uploader_ip: client_ip_from_headers(&headers),
+                business_type: token.business_type.clone(),
+                business_id: extra.business_id,
+                encryption_version: token.encryption_version.unwrap_or(0),
+                cek: extra.cek,
+            },
+            token.file_type.clone(),
+            token.sha256.clone(),
+            token.sealed_blob_size,
+            token.user_id,
+            &token.upload_id,
+        )
+        .await?;
+
+    if let Err(e) = _guard.complete(metadata.file_id) {
+        tracing::warn!("写入上传会话完成状态失败 file_id={}: {e}", metadata.file_id);
+    }
+    info!("✅ 分片上传完成: {}", metadata.file_id);
+
+    Ok(ApiEnvelope::ok(UploadResponse {
+        file_id: metadata.file_id,
+        file_url: state
+            .file_service
+            .build_access_url(&metadata.file_path, metadata.storage_source_id),
+        thumbnail_url: None,
+        file_size: metadata.file_size,
+        original_size: metadata.original_size,
+        width: metadata.width,
+        height: metadata.height,
+        mime_type: metadata.mime_type,
+        uploaded_at: metadata.uploaded_at,
+        storage_source_id: metadata.storage_source_id,
+    }))
+}
+
+/// `POST /api/app/files/abort` —— 客户端主动放弃，整个会话目录删掉。
+async fn abort_upload(
+    State(state): State<FileServerState>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<serde_json::Value> {
+    let token = upload_token(&state, &headers).await?;
+
+    let session = crate::service::upload_session::UploadSession::open_existing(
+        &state.file_service.upload_session_root()?,
+        token.user_id,
+        &token.upload_id,
+    )?;
+    if let Some(session) = session {
+        // 已完成的会话不能删：墓碑还要回答迟到的重复请求。
+        if session.completed_file_id()?.is_some() {
+            return Err(ServerError::Validation(
+                "该上传已完成，不能中止".to_string(),
+            ));
+        }
+        session.discard()?;
+    }
+    Ok(ApiEnvelope::ok(serde_json::json!({ "aborted": true })))
 }
