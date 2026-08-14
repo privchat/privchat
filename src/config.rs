@@ -953,7 +953,14 @@ struct TomlUploadTokenConfig {
     leeway_secs: Option<u64>,
     /// 签发有效期；缺省 24h，且不得超过硬上限。
     ttl_secs: Option<u64>,
-    /// `legacy_uuid`（缺省）| `signed`。回滚开关：配置无热更，切换需重启。
+    /// `legacy_uuid`（缺省）| `signed`。
+    ///
+    /// 🔴 **只控制签发的 token 格式**（Redis UUID vs 自包含签名），
+    /// **不恢复旧语义**：两种格式都是 24 小时、可复用，整包路径同样受会话模式锁
+    /// 与完成幂等约束。想回到「5 分钟 + 一次性消费」只能回滚版本。
+    ///
+    /// 验证侧始终双验，与本开关无关。配置无热更（`ServerConfig::load` 只在启动时
+    /// 跑一次），切换需**改配置 + 重启服务**。
     issue_mode: Option<String>,
 }
 
