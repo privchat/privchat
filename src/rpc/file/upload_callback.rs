@@ -132,6 +132,22 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         }
     }
 
+    // 🔴 墓碑只**定位**，不构成授权：还要回读正式文件行，用与 HTTP 幂等出口、
+    // 预留恢复**同一个**判据核对身份。少了这一步，一个被篡改或串了的墓碑就能让
+    // 回调对着别人的文件生效。
+    let meta = services
+        .file_service
+        .get_file_metadata(file_id_num)
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?
+        .ok_or_else(|| RpcError::validation("file_id 不存在".to_string()))?;
+    if !token_info.matches_file(&meta) {
+        warn!("❌ 上传回调 file_id={file_id_num} 与 token 冻结的身份不符");
+        return Err(RpcError::validation(
+            "file_id 与本次上传的身份不符".to_string(),
+        ));
+    }
+
     // TODO: 记录文件元数据到数据库
     // TODO: 更新用户配额
     // TODO: 触发后续业务逻辑（如媒体处理、内容审核）

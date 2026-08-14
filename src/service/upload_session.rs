@@ -470,29 +470,38 @@ mod tests {
         assert_eq!(fresh.reserved_file_id().expect("read"), None);
     }
 
-    /// 🔴 进程被杀（`Drop` 不执行）后，状态停在 `WholeReceiving` 而锁已被内核释放。
-    /// 这时必须能接着传——把它当成「仍在进行中」就是让一次崩溃永久锁死这个上传。
+    /// 🔴 持锁进程死亡后必须能接着传——把残留的 `WholeReceiving` 当成「仍在进行中」
+    /// 就是让一次崩溃永久锁死这个上传。
+    ///
+    /// 📌 **这条测试证明到哪一步，说清楚**：它**真的**取得了 flock（`begin_whole`），
+    /// 然后 `mem::forget` 掉守卫让 `Drop` 不回滚状态（模拟 SIGKILL 跳过析构），
+    /// 再让会话对象析构——fd 关闭，内核释放锁，与进程死亡时的释放路径**是同一条**。
+    ///
+    /// 它**没有**覆盖的：真正跨进程的 SIGKILL。要那个还需要一个子进程持锁再被杀，
+    /// 属于尚未补的缺口，不要因为这条绿了就以为已经验过。
     #[test]
-    fn a_session_left_receiving_by_a_crash_can_be_resumed() {
+    fn a_session_left_receiving_after_the_lock_died_can_be_resumed() {
         let r = root();
 
-        // 模拟崩溃：写下 WholeReceiving 后让会话对象消失（fd 关闭 = 内核释放 flock），
-        // 磁盘状态没有回滚。
         {
             let s = UploadSession::open(r.path(), 7, "abc123").expect("open");
-            let mut st = s.read_state().expect("state");
-            st.mode = UploadMode::Whole;
-            st.status = UploadStatus::WholeReceiving;
-            st.reserved_file_id = Some(31337);
-            s.write_state(&st).expect("write");
+            let guard = s.begin_whole().expect("take the lock for real");
+            s.reserve_file_id(31337).expect("reserve");
+            // 跳过 Drop：状态停在 WholeReceiving，就像进程被 SIGKILL。
+            std::mem::forget(guard);
+            // s 在这里析构 → fd 关闭 → 内核释放 flock。
         }
 
-        // 新进程接手：必须能开始，并且看得见上次预留的 file_id。
         let again = UploadSession::open(r.path(), 7, "abc123").expect("reopen");
+        assert_eq!(
+            again.read_state().expect("state").status,
+            UploadStatus::WholeReceiving,
+            "前置条件：磁盘上确实留着 WholeReceiving"
+        );
         assert_eq!(again.reserved_file_id().expect("read"), Some(31337));
         let _guard = again
             .begin_whole()
-            .expect("崩溃留下的 WholeReceiving 必须可恢复，而不是永久拒绝");
+            .expect("锁已释放 + 残留 WholeReceiving 必须可恢复，而不是永久拒绝");
     }
 
     /// 与上一条的区别：**锁还被人拿着**时，第二个请求仍然必须被挡住。

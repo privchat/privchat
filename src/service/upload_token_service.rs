@@ -235,6 +235,37 @@ pub struct ValidatedUploadToken {
 }
 
 impl ValidatedUploadToken {
+    /// 这条**正式文件记录**是不是这张 token 描述的那份上传。
+    ///
+    /// 🔴 临时会话状态（`state.json` 的墓碑 / `reserved_file_id`）只能用来**定位**
+    /// 候选 `file_id`，不能单独构成「可以把这条正式记录交给你」的授权：同一个用户
+    /// 名下有成千上万个附件，只比 uploader 等于把别的文件当成本次上传的结果返回。
+    ///
+    /// 判据取 token 里**冻结**的事实，所有幂等出口（HTTP 墓碑返回、预留恢复、
+    /// 完成回调）必须共用这一个，不许各写一份。
+    pub fn matches_file(&self, meta: &crate::service::file_service::FileMetadata) -> bool {
+        if meta.uploader_id != self.user_id {
+            return false;
+        }
+        if meta.file_type.as_str() != self.file_type.as_str() {
+            return false;
+        }
+        if let Some(sha) = self.sha256.as_deref() {
+            // 🔴 摘要比较不区分大小写：客户端报大写十六进制是合法的，而服务端
+            // 算出来的恒为小写。用精确比较会让「首次成功、重试报身份不符」。
+            match meta.file_hash.as_deref() {
+                Some(stored) if stored.eq_ignore_ascii_case(sha) => {}
+                _ => return false,
+            }
+        }
+        if let Some(size) = self.sealed_blob_size {
+            if meta.file_size as i64 != size {
+                return false;
+            }
+        }
+        true
+    }
+
     /// 旧 Redis UUID token 的投影。
     ///
     /// 🔴 `raw_token` 必须是**客户端这次提交的原始凭证**，不能用 `record.token`：
@@ -712,6 +743,60 @@ mod tests {
         // 再次验证应该失败
         let result = service.validate_token(&token.token).await;
         assert!(result.is_err());
+    }
+
+    /// 🔴 客户端报大写十六进制摘要是合法的，而服务端算出来的恒为小写。
+    /// 精确比较会让「首次上传成功、重试报身份不符」——一次合法重试被判成攻击。
+    #[test]
+    fn a_digest_in_upper_case_still_matches_the_stored_one() {
+        use crate::service::file_service::FileMetadata;
+        let mut token = ValidatedUploadToken::from_legacy(
+            "b3f1a2c4-0000-4000-8000-000000000001",
+            &UploadToken::new(
+                42,
+                FileType::Image,
+                1024,
+                "message".to_string(),
+                None,
+                UploadIdentity::default(),
+                UploadTokenPurpose::Upload,
+                600,
+            ),
+        );
+        token.sha256 = Some("A".repeat(64)); // 客户端报大写
+        token.sealed_blob_size = Some(4096);
+
+        let meta = FileMetadata {
+            file_id: 1,
+            original_filename: "x.png".to_string(),
+            file_size: 4096,
+            original_size: None,
+            file_type: FileType::Image,
+            mime_type: "image/png".to_string(),
+            file_path: "images/1.png".to_string(),
+            storage_source_id: 0,
+            uploader_id: 42,
+            uploader_ip: None,
+            uploaded_at: 0,
+            width: None,
+            height: None,
+            file_hash: Some("a".repeat(64)), // 服务端算出来的小写
+            business_type: Some("message".to_string()),
+            business_id: None,
+            encryption_version: 0,
+            cek: None,
+        };
+        assert!(token.matches_file(&meta), "大小写不同的同一个摘要必须视为相同");
+
+        // 真正不同的摘要仍然要拒。
+        let mut other = meta.clone();
+        other.file_hash = Some("b".repeat(64));
+        assert!(!token.matches_file(&other));
+
+        // 同一用户的**另一个**附件（大小不同）也要拒——只比 uploader 是不够的。
+        let mut different_file = meta.clone();
+        different_file.file_size = 8192;
+        assert!(!token.matches_file(&different_file));
     }
 
     /// 🔴 产品口径是「一种 token，24 小时」。格式可以不同，**签发语义不能不同**——

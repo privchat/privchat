@@ -32,7 +32,7 @@ pub async fn request_upload_token(
     ctx: RpcContext,
 ) -> RpcResult<Value> {
     // ✨ 使用协议层类型自动反序列化
-    let request: FileRequestUploadTokenRequest = serde_json::from_value(params)
+    let mut request: FileRequestUploadTokenRequest = serde_json::from_value(params)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
     // uploader 必须取自鉴权 session，绝不信客户端传的 user_id（TS SDK 传 0，且客户端
@@ -103,6 +103,12 @@ pub async fn request_upload_token(
                 "sha256 必须是 64 位十六进制（SHA-256）".to_string(),
             ));
         }
+        // 🔴 **签进 token 的也必须是规范化后的那一份。**
+        //
+        // 预检按小写查库，token 却签原值：客户端报大写摘要时，首次上传的校验
+        // 不区分大小写因而通过，重试时按精确比较回读就会「身份不符」——一次
+        // 合法的重试被判成攻击。规范化只做一次，在这里。
+        request.sha256 = Some(normalized.clone());
         already_exists = services
             .file_service
             .find_by_content(&normalized)

@@ -288,34 +288,6 @@ async fn receive_streaming(
     ))
 }
 
-/// 正式记录是否**就是这张 token 描述的那份上传**。
-///
-/// 🔴 临时会话状态（`state.json`）只能用来**定位**候选 `file_id`，不能单独构成
-/// 「可以把这条正式记录交给你」的授权：同一个用户名下有大量附件，只比 uploader
-/// 等于把别的文件当成本次上传的结果返回。冻结在 token 里的身份必须逐项对上。
-fn matches_token_identity(
-    meta: &crate::service::file_service::FileMetadata,
-    token: &crate::service::upload_token_service::ValidatedUploadToken,
-) -> bool {
-    if meta.uploader_id != token.user_id {
-        return false;
-    }
-    if meta.file_type.as_str() != token.file_type.as_str() {
-        return false;
-    }
-    if let Some(sha) = token.sha256.as_deref() {
-        if meta.file_hash.as_deref() != Some(sha) {
-            return false;
-        }
-    }
-    if let Some(size) = token.sealed_blob_size {
-        if meta.file_size as i64 != size {
-            return false;
-        }
-    }
-    true
-}
-
 /// 已完成的上传：按 `file_id` 回读、**核对身份**并构造与首次一致的响应。
 ///
 /// 幂等重试拿到的必须是**同一份结果**，所以这里不重新计算任何东西，只回读。
@@ -331,7 +303,7 @@ async fn completed_response(
         .ok_or_else(|| {
             ServerError::Internal(format!("会话记录指向的 file_id={file_id} 读不到"))
         })?;
-    if !matches_token_identity(&meta, token) {
+    if !token.matches_file(&meta) {
         return Err(ServerError::Internal(format!(
             "file_id={file_id} 与本次上传的身份不符，拒绝返回"
         )));
@@ -393,9 +365,12 @@ async fn upload_file(
 
     // 🔴 **`GETDEL` 一次性消费已移除。**
     //
-    // 它原本同时兼任两件事：防重放，以及串行化并发的整包 POST。两件都由会话接管：
-    // 模式锁（`state.mode`/`status`，同一 upload_id 只允许一条路径、且整包接收期间
-    // 独占）+ `upload_completion_key`（重复 POST 收敛到同一个 file_id）。
+    // 它原本同时兼任两件事：防重放，以及串行化并发的整包 POST。两件都由**会话**接管，
+    // 业务库不参与：
+    //   · 模式锁（`state.mode` / `status`）——同一 upload_id 只允许一条路径，
+    //     且整包接收期间独占；
+    //   · `reserved_file_id` + 墓碑——重复 POST 复用同一个预留 id，落库时撞主键即回读。
+    // （早期版本曾用 `upload_completion_key` 列做这件事，属把临时态写进业务库，已撤销。）
     let session = crate::service::upload_session::UploadSession::open(
         &state.file_service.upload_session_root()?,
         token_info.user_id,
@@ -429,8 +404,8 @@ async fn upload_file(
             // 还会把它删掉。这是数据丢失，不是幂等。
             if let Some(meta) = state.file_service.get_file_metadata(id).await? {
                 // 🔴 只比 uploader 不够：同一个用户名下有成千上万个附件。
-                // 必须与主键冲突分支用**同一套**身份比较（摘要 / 密文字节数 / 类型）。
-                if !matches_token_identity(&meta, &token_info) {
+                // 与墓碑返回、主键冲突分支共用 `matches_file`（§身份判据只有一处）。
+                if !token_info.matches_file(&meta) {
                     return Err(ServerError::Internal(format!(
                         "预留的 file_id={id} 与本次上传身份不符，拒绝继续"
                     )));
