@@ -2212,6 +2212,7 @@ impl ChatServer {
         let file_server = crate::http::FileHttpServer::new(
             self.file_service.clone(),
             self.upload_token_service.clone(),
+            Some(self.unified_token_service.clone()),
             self.config.http_file_server_port,
         );
 

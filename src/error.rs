@@ -26,6 +26,17 @@ use std::fmt;
 /// 服务器错误类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerError {
+    /// 带**指定协议码**的错误。
+    ///
+    /// 🔴 上传这类协议里，客户端要靠错误码分流：重传这一片 / 去查 status 对齐 /
+    /// 重新申请 token / 永久失败。全压成 `Validation` 的话客户端只能猜，而猜错的两个
+    /// 方向分别是「无限重试一个终局拒绝」和「放弃一个本可自愈的上传」。
+    Coded {
+        code: privchat_protocol::ErrorCode,
+        /// HTTP 状态码（`u16`：`ServerError` 要能序列化，`StatusCode` 不支持 serde）。
+        status: u16,
+        message: String,
+    },
     /// 内部错误
     Internal(String),
     /// 认证错误
@@ -105,6 +116,7 @@ pub enum ServerError {
 impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ServerError::Coded { message, .. } => write!(f, "{}", message),
             ServerError::Internal(msg) => write!(f, "Internal error: {}", msg),
             ServerError::Authentication(msg) => write!(f, "Authentication error: {}", msg),
             ServerError::Authorization(msg) => write!(f, "Authorization error: {}", msg),
@@ -160,6 +172,7 @@ impl ServerError {
     pub fn protocol_code(&self) -> privchat_protocol::ErrorCode {
         use privchat_protocol::ErrorCode as P;
         match self {
+            ServerError::Coded { code, .. } => *code,
             ServerError::Internal(_) => P::InternalError,
             ServerError::Authentication(_) => P::AuthRequired,
             ServerError::Authorization(_) => P::PermissionDenied,
@@ -205,6 +218,9 @@ impl ServerError {
     /// 选择合适的 HTTP status code（见 ENVELOPE_SPEC §3.1 / §4.1）。
     pub fn http_status(&self) -> StatusCode {
         match self {
+            ServerError::Coded { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
+            }
             ServerError::Authentication(_)
             | ServerError::InvalidToken
             | ServerError::TokenExpired
@@ -392,6 +408,8 @@ pub enum ErrorCode {
 impl From<&ServerError> for ErrorCode {
     fn from(error: &ServerError) -> Self {
         match error {
+            // 已经带了协议码的错误不再二次映射：它自己就是权威。
+            ServerError::Coded { .. } => ErrorCode::Internal,
             ServerError::Internal(_) => ErrorCode::Internal,
             ServerError::Authentication(_) => ErrorCode::Authentication,
             ServerError::Authorization(_) => ErrorCode::Authorization,

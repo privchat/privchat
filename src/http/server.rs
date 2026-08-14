@@ -41,6 +41,38 @@ use crate::service::{
 pub struct FileServerState {
     pub file_service: Arc<FileService>,
     pub upload_token_service: Arc<UploadTokenService>,
+    /// 校验登录态（`Authorization: Bearer`）。
+    ///
+    /// 🔴 **上传要双凭证**：上传 token 说的是「允许上传这一份文件」，它不说明
+    /// 「现在是谁在操作」。token 有效期 24 小时，一旦泄露，只凭它就能读写整个上传
+    /// 会话——所以每个请求还要证明自己是**签这张 token 时的那个用户**。
+    ///
+    /// `None` = 没接验证器（单元测试装配），此时要求登录态的端点一律拒绝，
+    /// 而不是放行——缺省必须是拒绝。
+    pub auth: Option<Arc<dyn UploadAuthenticator>>,
+}
+
+/// 「这个 bearer 是谁」——文件服务需要知道的**全部**。
+///
+/// 🔴 收成这么窄的一个接口，而不是直接依赖 `UnifiedTokenService`：文件服务只关心
+/// 身份，不关心签发、刷新、吊销、设备会话版本。把整个 auth 栈拖进来，代价是它的
+/// 每一个依赖（RSA 密钥、设备表、refresh 仓库）都会变成文件服务测试的前置——
+/// 于是上传的测试要先把认证的 fixture 搭一遍，两件事从此绑死。
+#[async_trait::async_trait]
+pub trait UploadAuthenticator: Send + Sync {
+    /// 有效则返回用户 id；无效返回 `Err(原因)`（原因只进日志，不回给客户端）。
+    async fn user_of(&self, bearer: &str) -> std::result::Result<u64, String>;
+}
+
+#[async_trait::async_trait]
+impl UploadAuthenticator for crate::auth::UnifiedTokenService {
+    async fn user_of(&self, bearer: &str) -> std::result::Result<u64, String> {
+        let r = self.introspect(bearer).await;
+        if !r.active {
+            return Err(r.reason.unwrap_or_else(|| "inactive".to_string()));
+        }
+        r.user_id.ok_or_else(|| "no user_id".to_string())
+    }
 }
 
 /// 管理 API 服务器共享状态
@@ -82,12 +114,14 @@ impl FileHttpServer {
     pub fn new(
         file_service: Arc<FileService>,
         upload_token_service: Arc<UploadTokenService>,
+        auth: Option<Arc<dyn UploadAuthenticator>>,
         port: u16,
     ) -> Self {
         Self {
             state: FileServerState {
                 file_service,
                 upload_token_service,
+                auth,
             },
             port,
         }

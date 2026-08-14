@@ -79,7 +79,10 @@ pub fn create_route() -> Router<FileServerState> {
     Router::new()
         .route("/api/app/files/upload", post(upload_file))
         // 断点续传（RESUMABLE_UPLOAD_SPEC §5）：字节走 chunk，其余三个是控制面。
-        .route("/api/app/files/chunk", put(put_chunk))
+        .route(
+            "/api/app/files/chunk",
+            put(put_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES)),
+        )
         .route("/api/app/files/status", get(upload_status))
         .route("/api/app/files/complete", post(complete_upload))
         .route("/api/app/files/abort", post(abort_upload))
@@ -560,6 +563,54 @@ pub struct CompleteRequest {
     pub cek: Option<String>,
 }
 
+/// 上传专用的类型化错误。见 `ErrorCode` 20610-20617。
+fn coded(code: privchat_protocol::ErrorCode, status: u16, msg: impl Into<String>) -> ServerError {
+    ServerError::Coded {
+        code,
+        status,
+        message: msg.into(),
+    }
+}
+
+/// 🔴 **双凭证**：上传 token 说「允许上传这一份文件」，登录态说「现在是谁」。
+///
+/// 只认 token 的话，一张 24 小时有效的 bearer 泄露出去，持有者就能独立操作整个上传
+/// 会话——写分片、查进度、abort 掉别人正在传的东西。所以每个分片请求都要再证明
+/// 自己就是签这张 token 时的那个用户。
+///
+/// 没接验证器时**拒绝**，不是放行：缺省必须是安全的那一侧。
+async fn require_same_user(
+    state: &FileServerState,
+    headers: &axum::http::HeaderMap,
+    token_user: u64,
+) -> Result<(), ServerError> {
+    let Some(auth) = state.auth.as_ref() else {
+        return Err(ServerError::Authentication(
+            "服务端未配置登录态校验，拒绝分片上传".to_string(),
+        ));
+    };
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| ServerError::Authentication("缺少 Authorization".to_string()))?;
+
+    let user = auth.user_of(bearer).await.map_err(|reason| {
+        // 原因只进日志：回给客户端等于告诉它「是过期还是签名错」，那是探测面。
+        tracing::debug!("登录态无效：{reason}");
+        ServerError::Authentication("登录态无效".to_string())
+    })?;
+    if user != token_user {
+        // 🔴 当成**授权**失败而不是认证失败：凭证是有效的，只是不是这个人的上传。
+        return Err(ServerError::Authorization(
+            "登录用户与上传 token 的归属不一致".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// 取出并校验 token，顺带把「这张 token 是用来传字节的」这条也验掉。
 async fn upload_token(
     state: &FileServerState,
@@ -595,6 +646,78 @@ fn sealed_size(
         })
 }
 
+/// 分片单次请求的**硬上限**（路由层 body limit 用）。
+///
+/// 🔴 路由层的限制必须是常量：body 在进入 handler 之前就被读进内存，等拿到 token
+/// 再看 plan 已经晚了。业务上限（`plan.max_request_size`）在 handler 里再收一道，
+/// 两层职责不同——这一层挡的是「一个请求塞几百 MB 进内存」。
+const MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+/// 取出 token 里签下的分片方案，并按它校验这次请求的区间。
+///
+/// 🔴 **服务端必须自己执行 plan**。不执行的话，「停发 plan 即关闭分片」这个关停阀
+/// 就是假的：客户端照样能往 chunk 端点写，服务端照单全收。
+fn check_against_plan(
+    token: &crate::service::upload_token_service::ValidatedUploadToken,
+    offset: u64,
+    len: u64,
+    total: u64,
+) -> Result<(), ServerError> {
+    use privchat_protocol::ErrorCode as E;
+    let Some(plan) = token.upload_plan.as_ref() else {
+        return Err(coded(
+            E::UploadModeConflict,
+            400,
+            "该 token 未下发分片方案，请走整包上传",
+        ));
+    };
+    let base = plan.base_unit as u64;
+    if base == 0 || offset % base != 0 {
+        return Err(coded(
+            E::UploadChunkNotAligned,
+            400,
+            format!("offset {offset} 未按 {base} 字节的网格对齐"),
+        ));
+    }
+    if len > plan.max_request_size as u64 {
+        return Err(coded(
+            E::UploadChunkNotAligned,
+            400,
+            format!("单次分片 {len} 超过上限 {}", plan.max_request_size),
+        ));
+    }
+    // 非末段必须整格：留下不对齐的碎片，后续区间就再也拼不回网格上。
+    let is_final = offset + len == total;
+    if !is_final && len % base != 0 {
+        return Err(coded(
+            E::UploadChunkNotAligned,
+            400,
+            format!("非末段分片 {len} 必须是 {base} 的整数倍"),
+        ));
+    }
+    Ok(())
+}
+
+/// 客户端声明的分片摘要，必须带。
+///
+/// 🔴 少了它，一片在传输中被改坏也会被记成「已确认」，要等到 complete 核验整文件
+/// 才失败——而那时 status 显示区间齐全，客户端**不知道该重传哪一片**，只能整份重来。
+/// 带上之后，坏的那一片当场就能定位并单独重传。
+fn declared_chunk_digest(headers: &axum::http::HeaderMap) -> Result<String, ServerError> {
+    headers
+        .get("X-Chunk-SHA256")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            coded(
+                privchat_protocol::ErrorCode::UploadChunkChecksumMismatch,
+                400,
+                "缺少或非法的 X-Chunk-SHA256（必须是 64 位十六进制）",
+            )
+        })
+}
+
 fn ranges_dto(ranges: Vec<(u64, u64)>) -> Vec<RangeDto> {
     ranges
         .into_iter()
@@ -612,16 +735,29 @@ async fn put_chunk(
     Query(q): Query<ChunkQuery>,
     body: axum::body::Bytes,
 ) -> ApiResult<ChunkResponse> {
+    use privchat_protocol::ErrorCode as E;
     let token = upload_token(&state, &headers).await?;
+    require_same_user(&state, &headers, token.user_id).await?;
     let total = sealed_size(&token)?;
+    let declared = declared_chunk_digest(&headers)?;
+    check_against_plan(&token, q.offset, body.len() as u64, total)?;
+
+    // 🔴 摘要**先于**落盘校验：不匹配的字节一个都不该碰磁盘，更不能进 journal。
+    let actual = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body));
+    if actual != declared {
+        return Err(coded(
+            E::UploadChunkChecksumMismatch,
+            400,
+            "分片内容与 X-Chunk-SHA256 不符，请重传这一片",
+        ));
+    }
 
     let session = crate::service::upload_session::UploadSession::open(
         &state.file_service.upload_session_root()?,
         token.user_id,
         &token.upload_id,
     )?;
-    // 每个分片请求都重新占一次会话：拿不到锁 = 同一份上传正有别的请求在写。
-    let _guard = session.begin_resumable(total)?;
+    let _guard = session.begin_resumable(total).map_err(session_busy)?;
 
     // 预留排在收字节之前，理由与整包路径相同：崩溃重试要复用同一个 file_id。
     if session.reserved_file_id()?.is_none() {
@@ -630,15 +766,15 @@ async fn put_chunk(
     }
 
     use crate::service::upload_session::ChunkOutcome;
-    let outcome = session.write_chunk(q.offset, &body)?;
-    let outcome = match outcome {
+    let outcome = match session.write_chunk(q.offset, &body)? {
         ChunkOutcome::Confirmed => "confirmed",
         ChunkOutcome::AlreadyCovered => "already_covered",
-        // 🔴 冲突不是「重试一下就好」，是客户端的区间视图错了：让它先 GET status
-        // 对齐再继续。磁盘上什么都没被改动。
+        // 区间视图对不上：让客户端按 status 对齐再来。磁盘什么都没动。
         ChunkOutcome::Conflict => {
-            return Err(ServerError::Validation(
-                "该区间与已确认内容冲突，请先查询 status 对齐后重传".to_string(),
+            return Err(coded(
+                E::UploadRangeOverlap,
+                409,
+                "该区间与已确认内容冲突，请先 GET status 对齐后重传",
             ))
         }
     };
@@ -650,12 +786,37 @@ async fn put_chunk(
     }))
 }
 
+/// 会话被别人占着 → 类型化的「忙」，客户端可以稍后重试。
+///
+/// 会话锁是**非阻塞**的：撞上就立刻回答「忙」，而不是把 HTTP 请求挂在锁上等到超时。
+fn session_busy(e: ServerError) -> ServerError {
+    match &e {
+        ServerError::Validation(msg) if msg.contains("正在进行中") => coded(
+            privchat_protocol::ErrorCode::UploadSessionBusy,
+            409,
+            "该上传正被另一个请求占用，请稍后重试",
+        ),
+        ServerError::Validation(msg) if msg.contains("已完成") => coded(
+            privchat_protocol::ErrorCode::UploadSessionCompleted,
+            409,
+            msg.clone(),
+        ),
+        ServerError::Validation(msg) if msg.contains("不能再走") => coded(
+            privchat_protocol::ErrorCode::UploadModeConflict,
+            409,
+            msg.clone(),
+        ),
+        _ => e,
+    }
+}
+
 /// `GET /api/app/files/status` —— 进程重启、换网络、隔天回来，都靠它接上。
 async fn upload_status(
     State(state): State<FileServerState>,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<UploadStatusResponse> {
     let token = upload_token(&state, &headers).await?;
+    require_same_user(&state, &headers, token.user_id).await?;
     let total = sealed_size(&token)?;
 
     // 🔴 用 `open_existing`：会话没了就是**没了**（`SessionGone`），不能顺手建一个
@@ -688,6 +849,7 @@ async fn complete_upload(
     body: Option<axum::Json<CompleteRequest>>,
 ) -> ApiResult<UploadResponse> {
     let token = upload_token(&state, &headers).await?;
+    require_same_user(&state, &headers, token.user_id).await?;
     let total = sealed_size(&token)?;
     let extra = body.map(|axum::Json(b)| b).unwrap_or_default();
 
@@ -697,7 +859,11 @@ async fn complete_upload(
         &token.upload_id,
     )?
     .ok_or_else(|| {
-        ServerError::Validation("该上传的会话已不存在，请重新申请 token 上传".to_string())
+        coded(
+            privchat_protocol::ErrorCode::UploadSessionGone,
+            410,
+            "该上传的会话已不存在，请重新申请 token 从头上传",
+        )
     })?;
 
     // 幂等出口：墓碑在就直接回原来那个 file_id，别让客户端以为失败了。
@@ -705,13 +871,17 @@ async fn complete_upload(
         return completed_response(&state, &token, existing).await;
     }
 
-    let _guard = session.begin_resumable(total)?;
+    let _guard = session.begin_resumable(total).map_err(session_busy)?;
 
     if !session.is_complete()? {
-        return Err(ServerError::Validation(format!(
-            "还有区间没传完（已确认 {} / {total} 字节）",
-            session.confirmed_bytes()?
-        )));
+        return Err(coded(
+            privchat_protocol::ErrorCode::UploadMissingRanges,
+            409,
+            format!(
+                "还有区间没传完（已确认 {} / {total} 字节），请 GET status 补齐",
+                session.confirmed_bytes()?
+            ),
+        ));
     }
 
     let reserved = match session.reserved_file_id()? {
@@ -790,6 +960,7 @@ async fn abort_upload(
     headers: axum::http::HeaderMap,
 ) -> ApiResult<serde_json::Value> {
     let token = upload_token(&state, &headers).await?;
+    require_same_user(&state, &headers, token.user_id).await?;
 
     let session = crate::service::upload_session::UploadSession::open_existing(
         &state.file_service.upload_session_root()?,
@@ -797,10 +968,24 @@ async fn abort_upload(
         &token.upload_id,
     )?;
     if let Some(session) = session {
-        // 已完成的会话不能删：墓碑还要回答迟到的重复请求。
+        // 🔴 **先抢排他锁再删。**
+        //
+        // 不抢锁的话，`remove_dir_all` 会把另一个正在写分片、或正在 complete 核验的
+        // 请求脚下的目录抽掉：那个请求已经返回成功了、字节却没了；或者 writer 还在往
+        // 一个已经 unlink 的 inode 里写，谁都恢复不了。持锁失败就明说「忙」。
+        if !session.try_lock_exclusive()? {
+            return Err(coded(
+                privchat_protocol::ErrorCode::UploadSessionBusy,
+                409,
+                "该上传正被另一个请求占用，无法中止，请稍后重试",
+            ));
+        }
+        // 拿到锁之后**重新读**状态：等锁期间它可能刚刚完成。
         if session.completed_file_id()?.is_some() {
-            return Err(ServerError::Validation(
-                "该上传已完成，不能中止".to_string(),
+            return Err(coded(
+                privchat_protocol::ErrorCode::UploadSessionCompleted,
+                409,
+                "该上传已完成，不能中止",
             ));
         }
         session.discard()?;
