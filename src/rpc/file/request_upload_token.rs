@@ -175,6 +175,17 @@ pub async fn request_upload_token(
         file_id: String::new(),
         expires_at: Some(expires_at),
         max_size: Some(max_size),
+        // 客户端据此决定分片还是整包。同一份方案已经签进 token，服务端按它校验每个
+        // 分片请求——这里给的是**同一件事的可读副本**，不是第二个真源。
+        upload_plan: upload_plan.as_ref().map(|p| {
+            privchat_protocol::rpc::file::UploadPlanDto {
+                base_unit: p.base_unit,
+                initial_request_size: p.initial_request_size,
+                max_request_size: p.max_request_size,
+                session_threshold: p.session_threshold,
+                max_parallel_parts: p.max_parallel_parts,
+            }
+        }),
     };
 
     serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
