@@ -85,6 +85,7 @@ async fn rig(pool: Arc<sqlx::PgPool>) -> Rig {
 /// 否则两边看到的根本不是同一个会话。
 async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, keep: Option<tempfile::TempDir>) -> Rig {
     let dir = keep.unwrap_or_else(|| tempfile::tempdir().expect("tempdir"));
+    link_temp_to_other_filesystem(&root);
     let source = FileStorageSourceConfig {
         id: 0,
         storage_type: "local".to_string(),
@@ -109,6 +110,34 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, keep: Option<tempfile::T
         root,
         _dir: dir,
     }
+}
+
+/// 设了 `PRIVCHAT_TEST_XDEV_DIR` 时，把存储根下的 `tmp/` 指到**另一个文件系统**上。
+///
+/// 🔴 这不是给单元测试用的花招，而是真实部署形态：上传盘单独挂出来之后，会话临时目录
+/// 与正式对象就不同盘了，发布必须走 `EXDEV` 降级。整套 E2E 换个环境变量再跑一遍，
+/// 覆盖的就是**跨挂载点的完整 HTTP 上传**，而不只是发布函数那一段。
+///
+/// 没设就是同盘（今天生产的形态），照常跑。
+fn link_temp_to_other_filesystem(root: &Path) {
+    let Some(xdev) = std::env::var_os("PRIVCHAT_TEST_XDEV_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let link = root.join("tmp");
+    if link.exists() {
+        return;
+    }
+    let far = xdev.join(format!(
+        "pcx-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&far).expect("另一个盘上的临时目录");
+    std::fs::create_dir_all(root).expect("存储根");
+    std::os::unix::fs::symlink(&far, &link).expect("把 tmp/ 链到另一个盘");
 }
 
 impl Rig {
