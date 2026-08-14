@@ -58,23 +58,29 @@ impl CallbackError {
     }
 }
 
-/// 回调的**完整编排**：核对这次报的 `file_id` 确实是本次上传的结果。
+/// 回调的**完整编排**：核对这次报的 `file_id` 确实是本次操作的结果。
 ///
-/// 🔴 **判据是正式文件行与 token 冻结身份的一致性**，会话墓碑只是**加强项**。
+/// 🔴 **两种 purpose 各有自己的精确身份来源，不能互相替代，也不能合并。**
 ///
-/// 早先我把「必须有会话墓碑」当成必要条件，结果是：秒传命中根本不创建会话目录，
-/// 于是每一次秒传的回调都被拒 —— 而回调失败在 outbox 那边是**终态**，附件被判
-/// 永久失败。一个本来什么都不做的完成通知，被我变成了能否决发送的闸门。
+/// 一开始我要求「必须有会话墓碑」，那会打断每一次秒传（claim 路径不建会话）。
+/// 修的时候我又矫枉过正：干脆不看 purpose、一律凭「内容身份」放行——但**同一份
+/// 内容允许有多条独立的逻辑记录**，内容相同证明不了「这条就是这次操作产出的那条」。
+/// 而且实体上传因此也被放宽了，它本来是有会话可依的。
 ///
-/// 现在的边界：
-/// - 身份不符 → 拒绝（这才是这道闸真正保护的东西：不能对着别人的文件回调）；
-/// - 有会话且墓碑与报的 id 不一致 → 拒绝；
-/// - 没有会话（秒传命中 / 会话已被清理）→ **不是错误**，凭身份放行；
-/// - 会话状态损坏 → 忽略它，同样凭身份放行（它只是加强项，不该反过来阻断）。
+/// 现在各归各：
+/// - `ClaimExisting`：按 `claim_key_hash(raw_token)` 找回**这次 claim** 唯一的
+///   `file_id`（`uq_privchat_file_uploads_claim_key` 保证唯一）。不需要会话——
+///   claim 本来就不创建会话。
+/// - `Upload`：会话墓碑说了算，它记的就是这次上传落库的 `file_id`。
+///   会话缺失或损坏 → `SessionGone`，让客户端重新 prepare，而不是凭内容蒙混过去。
+///
+/// 两条之后再叠一层 `matches_file`（属主/类型/摘要/大小）作纵深防御。
 async fn authorise_callback<F, Fut>(
     session_root: &std::path::Path,
     token: &crate::service::upload_token_service::ValidatedUploadToken,
+    raw_token: &str,
     reported: u64,
+    lookup: &dyn CallbackLookup,
     fetch_meta: F,
 ) -> Result<crate::service::file_service::FileMetadata, CallbackError>
 where
@@ -83,21 +89,36 @@ where
         Output = Result<Option<crate::service::file_service::FileMetadata>, String>,
     >,
 {
-    // 会话在就用它加强一道；不在不算错。
-    // 🔴 `open_existing`：恢复类入口不得惰性建目录，否则「会话早就没了」会被伪装成
-    // 「有一个空会话」，还在磁盘上留垃圾。
-    let session = crate::service::upload_session::UploadSession::open_existing(
-        session_root,
-        token.user_id,
-        &token.upload_id,
-    )
-    .map_err(|e| CallbackError::Internal(format!("会话不可读: {e}")))?;
-    if let Some(session) = session {
-        // 状态损坏时不阻断：墓碑是加强项，凭身份仍可放行。
-        if let Ok(Some(expected)) = session.completed_file_id() {
-            check_callback_target_id(Some(expected), reported).map_err(CallbackError::Rejected)?;
+    use crate::service::upload_token_service::UploadTokenPurpose;
+
+    let expected = match token.purpose {
+        UploadTokenPurpose::ClaimExisting => {
+            // 这次 claim 的精确结果：幂等键由**收到的那份凭证**派生。
+            let key = crate::service::file_claim_service::claim_key_hash(raw_token);
+            lookup
+                .find_claimed(token.user_id, &key)
+                .await
+                .map_err(CallbackError::Internal)?
+                .ok_or(CallbackError::Rejected("这次秒传没有产生记录"))?
         }
-    }
+        UploadTokenPurpose::Upload => {
+            // 🔴 `open_existing`：恢复类入口不得惰性建目录。
+            let session = crate::service::upload_session::UploadSession::open_existing(
+                session_root,
+                token.user_id,
+                &token.upload_id,
+            )
+            .map_err(|e| CallbackError::Internal(format!("会话不可读: {e}")))?
+            .ok_or(CallbackError::SessionGone("该次上传的会话已不存在"))?;
+
+            session
+                .completed_file_id()
+                .map_err(|_| CallbackError::SessionGone("会话状态已损坏"))?
+                .ok_or(CallbackError::Rejected("该次上传尚未完成，无法回调"))?
+        }
+    };
+
+    check_callback_target_id(Some(expected), reported).map_err(CallbackError::Rejected)?;
 
     let meta = fetch_meta(reported)
         .await
@@ -107,6 +128,24 @@ where
         return Err(CallbackError::Rejected("file_id 与本次上传的身份不符"));
     }
     Ok(meta)
+}
+
+/// claim 幂等记录的查询口。抽成 trait 只为让编排能被测试驱动。
+#[async_trait::async_trait]
+pub(crate) trait CallbackLookup: Sync {
+    async fn find_claimed(&self, uploader_id: u64, key: &str) -> Result<Option<u64>, String>;
+}
+
+struct RepoLookup(std::sync::Arc<crate::service::file_service::FileService>);
+
+#[async_trait::async_trait]
+impl CallbackLookup for RepoLookup {
+    async fn find_claimed(&self, uploader_id: u64, key: &str) -> Result<Option<u64>, String> {
+        self.0
+            .find_claimed(uploader_id, key)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// 墓碑这一道闸：报的 `file_id` 必须就是这次上传完成的那个。
@@ -200,12 +239,20 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         .upload_session_root()
         .map_err(|e| RpcError::internal(e.to_string()))?;
     let file_service = services.file_service.clone();
-    authorise_callback(&session_root, &token_info, file_id_num, |id| async move {
-        file_service
-            .get_file_metadata(id)
-            .await
-            .map_err(|e| e.to_string())
-    })
+    let lookup = RepoLookup(services.file_service.clone());
+    authorise_callback(
+        &session_root,
+        &token_info,
+        upload_token,
+        file_id_num,
+        &lookup,
+        |id| async move {
+            file_service
+                .get_file_metadata(id)
+                .await
+                .map_err(|e| e.to_string())
+        },
+    )
     .await
     .map_err(|e| match e {
         CallbackError::Rejected(reason) => {
@@ -240,7 +287,7 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
 
 #[cfg(test)]
 mod tests {
-    use super::{authorise_callback, check_callback_target_id};
+    use super::{authorise_callback, check_callback_target_id, CallbackLookup};
     use crate::model::file_upload::FileType;
     use crate::service::file_service::FileMetadata;
     use crate::service::upload_session::UploadSession;
@@ -249,9 +296,25 @@ mod tests {
     };
 
     const UPLOAD_ID: &str = "b3f1a2c40000400080000000000000ff";
+    const RAW_TOKEN: &str = "b3f1a2c4-0000-4000-8000-000000000001";
 
-    fn token() -> ValidatedUploadToken {
-        token_with_purpose(UploadTokenPurpose::Upload)
+    /// claim 幂等记录的假实现：想让它返回什么就返回什么。
+    struct Claims(Option<u64>);
+
+    #[async_trait::async_trait]
+    impl CallbackLookup for Claims {
+        async fn find_claimed(&self, _uploader: u64, _key: &str) -> Result<Option<u64>, String> {
+            Ok(self.0)
+        }
+    }
+
+    struct BrokenClaims;
+
+    #[async_trait::async_trait]
+    impl CallbackLookup for BrokenClaims {
+        async fn find_claimed(&self, _uploader: u64, _key: &str) -> Result<Option<u64>, String> {
+            Err("connection reset".to_string())
+        }
     }
 
     fn token_with_purpose(purpose: UploadTokenPurpose) -> ValidatedUploadToken {
@@ -270,8 +333,7 @@ mod tests {
             purpose,
             600,
         );
-        let mut v = ValidatedUploadToken::from_legacy("irrelevant-raw-token", &record);
-        // 直接指定 upload_id，好让测试自己布置会话目录。
+        let mut v = ValidatedUploadToken::from_legacy(RAW_TOKEN, &record);
         v.upload_id = UPLOAD_ID.to_string();
         v
     }
@@ -299,166 +361,194 @@ mod tests {
         }
     }
 
-    /// 布置一个「已完成」的会话。
     fn completed_session(root: &std::path::Path, file_id: u64) {
         let s = UploadSession::open(root, 42, UPLOAD_ID).expect("open");
         s.mark_completed(file_id).expect("mark");
     }
 
-    async fn run(
+    async fn run_upload(
         root: &std::path::Path,
         reported: u64,
         found: Option<FileMetadata>,
     ) -> Result<FileMetadata, super::CallbackError> {
-        authorise_callback(root, &token(), reported, |_| async move { Ok(found) }).await
+        let lookup = Claims(None);
+        authorise_callback(
+            root,
+            &token_with_purpose(UploadTokenPurpose::Upload),
+            RAW_TOKEN,
+            reported,
+            &lookup,
+            |_| async move { Ok(found) },
+        )
+        .await
     }
 
+    async fn run_claim(
+        root: &std::path::Path,
+        claimed: Option<u64>,
+        reported: u64,
+        found: Option<FileMetadata>,
+    ) -> Result<FileMetadata, super::CallbackError> {
+        let lookup = Claims(claimed);
+        authorise_callback(
+            root,
+            &token_with_purpose(UploadTokenPurpose::ClaimExisting),
+            RAW_TOKEN,
+            reported,
+            &lookup,
+            |_| async move { Ok(found) },
+        )
+        .await
+    }
+
+    // ---------- 实体上传 ----------
+
     #[tokio::test]
-    async fn a_matching_callback_is_accepted() {
+    async fn an_upload_callback_matching_its_tombstone_is_accepted() {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
-        assert!(run(r.path(), 900, Some(meta())).await.is_ok());
+        assert!(run_upload(r.path(), 900, Some(meta())).await.is_ok());
     }
 
-    /// 🔴 **这条守的是整条链路**：墓碑对得上，正式文件却不是这一份。
-    ///
-    /// 只比墓碑的话，一个被篡改或串了的墓碑就能让回调对着别人的文件生效。
-    /// 把 `authorise_callback` 里的 `matches_file` 去掉，这四种都会漏过去。
     #[tokio::test]
-    async fn a_callback_whose_file_does_not_match_the_token_is_refused() {
+    async fn an_upload_callback_reporting_another_file_id_is_refused() {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
-
-        let mut wrong_digest = meta();
-        wrong_digest.file_hash = Some("b".repeat(64));
-        assert!(run(r.path(), 900, Some(wrong_digest)).await.is_err());
-
-        let mut wrong_size = meta();
-        wrong_size.file_size = 8192;
-        assert!(run(r.path(), 900, Some(wrong_size)).await.is_err());
-
-        let mut wrong_type = meta();
-        wrong_type.file_type = FileType::File;
-        assert!(run(r.path(), 900, Some(wrong_type)).await.is_err());
-
-        let mut other_owner = meta();
-        other_owner.uploader_id = 43;
-        assert!(run(r.path(), 900, Some(other_owner)).await.is_err());
+        assert!(run_upload(r.path(), 901, Some(meta())).await.is_err());
     }
 
+    /// 🔴 实体上传**有**会话可依，不该因为修秒传而被放宽：会话没了就重来一遍。
     #[tokio::test]
-    async fn a_callback_reporting_another_file_id_is_refused() {
+    async fn an_upload_without_a_session_must_start_over() {
         let r = tempfile::tempdir().expect("tmp");
-        completed_session(r.path(), 900);
-        assert!(run(r.path(), 901, Some(meta())).await.is_err());
-    }
-
-    /// 会话还在但没完成：墓碑只是加强项，身份对得上就放行。
-    ///
-    /// （早先这里要求「必须完成」，那正是打断秒传的那条规则。）
-    #[tokio::test]
-    async fn a_session_without_a_tombstone_still_passes_on_identity() {
-        let r = tempfile::tempdir().expect("tmp");
-        let _s = UploadSession::open(r.path(), 42, UPLOAD_ID).expect("open");
-        assert!(run(r.path(), 900, Some(meta())).await.is_ok());
-    }
-
-    /// 🔴 **秒传命中：claim 路径根本不创建会话目录。**
-    ///
-    /// 这条是那个回归的直接门禁。早先「必须有会话墓碑」的规则会让**每一次秒传**
-    /// 的回调被拒——而回调失败在 outbox 那边是终态，附件被判永久失败。
-    /// 也就是说：那版一上线，秒传（转发的核心）全线报错。
-    #[tokio::test]
-    async fn a_callback_after_a_dedup_hit_has_no_session_and_must_still_pass() {
-        let r = tempfile::tempdir().expect("tmp");
-        // 没有任何会话目录，正是 claim 成功后的样子。
-        assert!(
-            run(r.path(), 900, Some(meta())).await.is_ok(),
-            "秒传命中后的回调必须通过"
-        );
+        let err = run_upload(r.path(), 900, Some(meta())).await.expect_err("必须失败");
+        assert!(err.is_session_gone(), "实际: {err:?}");
         assert!(
             !r.path().join("42").join(UPLOAD_ID).exists(),
             "回调不得惰性建出会话目录"
         );
     }
 
-    /// 🔴 **秒传命中时 SDK 手里的是 claim token**，随后照常调这个回调。
-    ///
-    /// 按 `purpose != Upload` 拒绝，就是每一次秒传都把附件判成发送失败。
-    /// 这条与上一条是同一个回归的两个必要条件，缺一个都会漏。
     #[tokio::test]
-    async fn a_claim_token_may_report_its_completion() {
+    async fn an_upload_with_a_corrupted_session_must_start_over() {
         let r = tempfile::tempdir().expect("tmp");
-        let claim = token_with_purpose(UploadTokenPurpose::ClaimExisting);
-        let got = authorise_callback(r.path(), &claim, 900, |_| async move { Ok(Some(meta())) })
-            .await;
-        assert!(got.is_ok(), "claim 用途的 token 必须能完成回调: {got:?}");
+        completed_session(r.path(), 900);
+        std::fs::write(
+            r.path().join("42").join(UPLOAD_ID).join("state.json"),
+            b"{ not json",
+        )
+        .expect("corrupt");
+        let err = run_upload(r.path(), 900, Some(meta())).await.expect_err("必须失败");
+        assert!(err.is_session_gone(), "实际: {err:?}");
     }
 
-    /// 没有会话也**不能**放宽身份：能通过的只是「这份文件确实是我这次要传的」。
+    // ---------- 秒传 ----------
+
+    /// 🔴 claim 路径**根本不创建会话**。要求会话就是把每一次秒传判成发送失败——
+    /// 而回调失败在 outbox 那边是终态。
     #[tokio::test]
-    async fn without_a_session_the_identity_check_still_bites() {
+    async fn a_claim_callback_needs_no_session() {
         let r = tempfile::tempdir().expect("tmp");
-        let mut other = meta();
-        other.uploader_id = 43;
-        let err = run(r.path(), 900, Some(other)).await.expect_err("必须失败");
-        assert!(err.is_rejected());
+        assert!(run_claim(r.path(), Some(900), 900, Some(meta())).await.is_ok());
+        assert!(!r.path().join("42").join(UPLOAD_ID).exists());
+    }
+
+    /// 🔴 但**不能**退化成「内容相同就行」：同一份内容允许有多条独立记录，
+    /// 判据必须是**这次 claim** 产生的那一条（`claim_key_hash` 唯一确定）。
+    #[tokio::test]
+    async fn a_claim_callback_must_name_the_row_this_claim_created() {
+        let r = tempfile::tempdir().expect("tmp");
+        // 这次 claim 产生的是 900；调用方却报同用户、同内容的另一条 901。
+        let mut same_content = meta();
+        same_content.file_id = 901;
+        let err = run_claim(r.path(), Some(900), 901, Some(same_content))
+            .await
+            .expect_err("同内容的另一条记录必须被拒");
+        assert!(err.is_rejected(), "实际: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_claim_callback_without_a_claim_record_is_refused() {
+        let r = tempfile::tempdir().expect("tmp");
+        let err = run_claim(r.path(), None, 900, Some(meta())).await.expect_err("必须失败");
+        assert!(err.is_rejected(), "实际: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_claim_lookup_is_internal_not_a_rejection() {
+        let r = tempfile::tempdir().expect("tmp");
+        let err = authorise_callback(
+            r.path(),
+            &token_with_purpose(UploadTokenPurpose::ClaimExisting),
+            RAW_TOKEN,
+            900,
+            &BrokenClaims,
+            |_| async move { Ok(Some(meta())) },
+        )
+        .await
+        .expect_err("必须失败");
+        assert!(err.is_internal(), "实际: {err:?}");
+    }
+
+    // ---------- 共通 ----------
+
+    #[tokio::test]
+    async fn a_callback_whose_file_does_not_match_the_token_is_refused() {
+        let r = tempfile::tempdir().expect("tmp");
+        completed_session(r.path(), 900);
+        for mutate in [
+            (|m: &mut FileMetadata| m.file_hash = Some("b".repeat(64))) as fn(&mut FileMetadata),
+            |m: &mut FileMetadata| m.file_size = 8192,
+            |m: &mut FileMetadata| m.file_type = FileType::File,
+            |m: &mut FileMetadata| m.uploader_id = 43,
+        ] {
+            let mut wrong = meta();
+            mutate(&mut wrong);
+            assert!(run_upload(r.path(), 900, Some(wrong)).await.is_err());
+        }
     }
 
     #[tokio::test]
     async fn a_callback_pointing_at_a_missing_row_is_refused() {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
-        assert!(run(r.path(), 900, None).await.is_err());
+        assert!(run_upload(r.path(), 900, None).await.is_err());
     }
 
-    /// 🔴 **基础设施故障不是客户端错误。**
-    ///
-    /// 数据库暂时读不到时，把它标成 validation 等于告诉调用方「别重试了」——
-    /// 一次抖动就把这次回调永久判死。这是「可重试性分类」那类错误的又一处实例。
     #[tokio::test]
     async fn a_database_failure_is_internal_not_a_rejection() {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
-
-        let err = authorise_callback(r.path(), &token(), 900, |_| async move {
-            Err("connection reset by peer".to_string())
-        })
+        let lookup = Claims(None);
+        let err = authorise_callback(
+            r.path(),
+            &token_with_purpose(UploadTokenPurpose::Upload),
+            RAW_TOKEN,
+            900,
+            &lookup,
+            |_| async move { Err("connection reset".to_string()) },
+        )
         .await
         .expect_err("必须失败");
-        assert!(
-            !err.is_rejected(),
-            "数据库故障必须是 internal（可重试），实际: {err:?}"
-        );
+        assert!(err.is_internal(), "实际: {err:?}");
     }
 
-    /// 损坏的 `state.json` 不该阻断一次身份正确的回调——墓碑只是加强项。
-    #[tokio::test]
-    async fn a_corrupted_session_state_does_not_block_a_valid_callback() {
-        let r = tempfile::tempdir().expect("tmp");
-        completed_session(r.path(), 900);
-        std::fs::write(
-            r.path().join("42").join(UPLOAD_ID).join("state.json"),
-            b"{ this is not json",
-        )
-        .expect("corrupt it");
-
-        assert!(
-            run(r.path(), 900, Some(meta())).await.is_ok(),
-            "墓碑是加强项：它坏了不该反过来阻断一次身份正确的回调"
-        );
-    }
-
-    /// 三类互斥的完整口径，防止「一律某一类」这种偷懒修法。
+    /// 三类结局互斥，防止将来被悄悄合并。
     #[tokio::test]
     async fn the_three_outcomes_stay_distinct() {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
+        let lookup = Claims(None);
 
         // 抖动 → 可重试
-        let transient = authorise_callback(r.path(), &token(), 900, |_| async move {
-            Err("connection reset".to_string())
-        })
+        let transient = authorise_callback(
+            r.path(),
+            &token_with_purpose(UploadTokenPurpose::Upload),
+            RAW_TOKEN,
+            900,
+            &lookup,
+            |_| async move { Err("boom".to_string()) },
+        )
         .await
         .expect_err("must fail");
         assert!(transient.is_internal());
@@ -466,24 +556,17 @@ mod tests {
         // 身份不符 → 别重试
         let mut wrong = meta();
         wrong.file_hash = Some("b".repeat(64));
-        let rejected = run(r.path(), 900, Some(wrong)).await.expect_err("must fail");
-        assert!(rejected.is_rejected());
+        assert!(run_upload(r.path(), 900, Some(wrong))
+            .await
+            .expect_err("must fail")
+            .is_rejected());
 
-        // 会话没了 + 身份对 → 放行（秒传命中就是这样）
+        // 会话没了 → 重来一遍
         let empty = tempfile::tempdir().expect("tmp");
-        assert!(run(empty.path(), 900, Some(meta())).await.is_ok());
-    }
-
-    /// 与上面成对：身份不符是**真正的**拒绝，不能因为怕误伤就一律 internal。
-    #[tokio::test]
-    async fn an_identity_mismatch_is_a_rejection_not_an_internal_error() {
-        let r = tempfile::tempdir().expect("tmp");
-        completed_session(r.path(), 900);
-        let mut wrong = meta();
-        wrong.file_hash = Some("b".repeat(64));
-
-        let err = run(r.path(), 900, Some(wrong)).await.expect_err("必须失败");
-        assert!(err.is_rejected(), "身份不符必须是 validation，实际: {err:?}");
+        assert!(run_upload(empty.path(), 900, Some(meta()))
+            .await
+            .expect_err("must fail")
+            .is_session_gone());
     }
 
     #[test]
