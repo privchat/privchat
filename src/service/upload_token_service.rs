@@ -533,7 +533,8 @@ impl UploadTokenService {
     /// 两条分支现在都用配置 TTL（缺省 24 小时），但「推算」和「给出」仍是两回事：
     /// 将来任何一条分支改了有效期，响应必须跟着变，而不是继续报一个想当然的值。
     ///
-    /// `issue_mode = legacy_uuid`（缺省）时行为与今天完全一致——这正是回滚开关的意义。
+    /// `issue_mode = legacy_uuid`（缺省）签出的是**旧格式**（Redis UUID），
+    /// 旧客户端照常透明使用；有效期与可复用语义**不随之回滚**（见上）。
     #[allow(clippy::too_many_arguments)]
     pub async fn issue(
         &self,

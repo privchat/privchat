@@ -69,10 +69,14 @@ pub const TYPICAL_TOKEN_BUDGET_BYTES: usize = 700;
 /// 会多分配一次大缓冲，不会失败。
 pub const MAX_TOKEN_BUDGET_BYTES: usize = 1400;
 
-/// 签发模式（RESUMABLE_UPLOAD_SPEC §5.2.4 回滚开关）。
+/// 签发模式（RESUMABLE_UPLOAD_SPEC §5.2.4）。
 ///
-/// 🔴 验证侧**始终双验**，与本开关无关；开关只管「新 token 签成什么格式」。
-/// 配置无热更（`ServerConfig::load` 只在启动时跑），所以回滚动作是改配置 + 重启。
+/// 🔴 **只管「新 token 签成什么格式」**，不管语义：两种格式都是 24 小时、可复用，
+/// 一次性消费已删除。它是「签名 token 出问题时退回旧格式」的开关，
+/// **不是**「回到改动前」的开关——那只能回滚版本。
+///
+/// 验证侧**始终双验**，与本开关无关。配置无热更（`ServerConfig::load` 只在启动时
+/// 跑），所以切换动作是改配置 + 重启。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueMode {
