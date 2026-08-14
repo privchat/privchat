@@ -269,10 +269,19 @@ impl UploadSession {
                     "该 token 已用于分片上传，不能再走整包".to_string(),
                 ));
             }
+            // 🔴 **拿到锁 + 状态是 WholeReceiving = 上一个进程崩了。**
+            //
+            // 真正并发的请求根本走不到这里：它在上面的 `try_lock` 就失败了。
+            // 能拿到锁却看见「接收中」，只能说明持锁进程已经死亡、内核释放了 flock，
+            // 而磁盘上的状态没来得及回滚（`Drop` 不会在 SIGKILL 时执行）。
+            //
+            // 把它当成「仍在上传」永久拒绝，等于让一次崩溃把这个上传**永久锁死**——
+            // 而「进程崩了还能接着传」正是断点续传的核心场景。
             (_, UploadStatus::WholeReceiving) => {
-                return Err(ServerError::Validation(
-                    "同一份上传正在进行中".to_string(),
-                ));
+                tracing::warn!(
+                    "🔧 会话 {:?} 停在 WholeReceiving 但锁是空的：按崩溃恢复处理",
+                    self.dir
+                );
             }
             _ => {}
         }
@@ -459,6 +468,42 @@ mod tests {
         let fresh = UploadSession::open(r.path(), 7, "abc123").expect("reopen");
         assert_eq!(fresh.completed_file_id().expect("read"), None);
         assert_eq!(fresh.reserved_file_id().expect("read"), None);
+    }
+
+    /// 🔴 进程被杀（`Drop` 不执行）后，状态停在 `WholeReceiving` 而锁已被内核释放。
+    /// 这时必须能接着传——把它当成「仍在进行中」就是让一次崩溃永久锁死这个上传。
+    #[test]
+    fn a_session_left_receiving_by_a_crash_can_be_resumed() {
+        let r = root();
+
+        // 模拟崩溃：写下 WholeReceiving 后让会话对象消失（fd 关闭 = 内核释放 flock），
+        // 磁盘状态没有回滚。
+        {
+            let s = UploadSession::open(r.path(), 7, "abc123").expect("open");
+            let mut st = s.read_state().expect("state");
+            st.mode = UploadMode::Whole;
+            st.status = UploadStatus::WholeReceiving;
+            st.reserved_file_id = Some(31337);
+            s.write_state(&st).expect("write");
+        }
+
+        // 新进程接手：必须能开始，并且看得见上次预留的 file_id。
+        let again = UploadSession::open(r.path(), 7, "abc123").expect("reopen");
+        assert_eq!(again.reserved_file_id().expect("read"), Some(31337));
+        let _guard = again
+            .begin_whole()
+            .expect("崩溃留下的 WholeReceiving 必须可恢复，而不是永久拒绝");
+    }
+
+    /// 与上一条的区别：**锁还被人拿着**时，第二个请求仍然必须被挡住。
+    #[test]
+    fn a_live_upload_still_blocks_a_second_one() {
+        let r = root();
+        let a = UploadSession::open(r.path(), 7, "abc123").expect("open");
+        let _held = a.begin_whole().expect("first");
+
+        let b = UploadSession::open(r.path(), 7, "abc123").expect("open");
+        assert!(b.begin_whole().is_err(), "活着的上传必须挡住第二个");
     }
 
     /// 🔴 恢复类入口不得惰性建目录：会话没了就该说没了，而不是造一个空的出来，

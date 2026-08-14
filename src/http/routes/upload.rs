@@ -288,11 +288,40 @@ async fn receive_streaming(
     ))
 }
 
-/// 已完成的上传：按 `file_id` 回读并构造与首次一致的响应。
+/// 正式记录是否**就是这张 token 描述的那份上传**。
+///
+/// 🔴 临时会话状态（`state.json`）只能用来**定位**候选 `file_id`，不能单独构成
+/// 「可以把这条正式记录交给你」的授权：同一个用户名下有大量附件，只比 uploader
+/// 等于把别的文件当成本次上传的结果返回。冻结在 token 里的身份必须逐项对上。
+fn matches_token_identity(
+    meta: &crate::service::file_service::FileMetadata,
+    token: &crate::service::upload_token_service::ValidatedUploadToken,
+) -> bool {
+    if meta.uploader_id != token.user_id {
+        return false;
+    }
+    if meta.file_type.as_str() != token.file_type.as_str() {
+        return false;
+    }
+    if let Some(sha) = token.sha256.as_deref() {
+        if meta.file_hash.as_deref() != Some(sha) {
+            return false;
+        }
+    }
+    if let Some(size) = token.sealed_blob_size {
+        if meta.file_size as i64 != size {
+            return false;
+        }
+    }
+    true
+}
+
+/// 已完成的上传：按 `file_id` 回读、**核对身份**并构造与首次一致的响应。
 ///
 /// 幂等重试拿到的必须是**同一份结果**，所以这里不重新计算任何东西，只回读。
 async fn completed_response(
     state: &FileServerState,
+    token: &crate::service::upload_token_service::ValidatedUploadToken,
     file_id: u64,
 ) -> ApiResult<UploadResponse> {
     let meta = state
@@ -300,8 +329,13 @@ async fn completed_response(
         .get_file_metadata(file_id)
         .await?
         .ok_or_else(|| {
-            ServerError::Internal(format!("幂等键指向的 file_id={file_id} 读不到"))
+            ServerError::Internal(format!("会话记录指向的 file_id={file_id} 读不到"))
         })?;
+    if !matches_token_identity(&meta, token) {
+        return Err(ServerError::Internal(format!(
+            "file_id={file_id} 与本次上传的身份不符，拒绝返回"
+        )));
+    }
     tracing::info!("♻️ 重复上传请求，返回原 file_id={file_id}");
     Ok(ApiEnvelope::ok(UploadResponse {
         file_id: meta.file_id,
@@ -377,7 +411,7 @@ async fn upload_file(
     // 📌 判据只看**临时会话状态**：上传中间态不进业务库。会话没了就是没了，
     // 客户端重新申请 token 从头传（这正是 `SessionGone` 的语义）。
     if let Some(existing) = session.completed_file_id()? {
-        return completed_response(&state, existing).await;
+        return completed_response(&state, &token_info, existing).await;
     }
 
     let _mode_guard = session.begin_whole()?;
@@ -394,15 +428,16 @@ async fn upload_file(
             // writer——那就是在覆盖一个已被提交记录引用的文件；这次再失败，`abort()`
             // 还会把它删掉。这是数据丢失，不是幂等。
             if let Some(meta) = state.file_service.get_file_metadata(id).await? {
-                // 身份必须对得上，否则这个 id 属于别人，绝不能当成「我的重试」。
-                if meta.uploader_id != token_info.user_id {
+                // 🔴 只比 uploader 不够：同一个用户名下有成千上万个附件。
+                // 必须与主键冲突分支用**同一套**身份比较（摘要 / 密文字节数 / 类型）。
+                if !matches_token_identity(&meta, &token_info) {
                     return Err(ServerError::Internal(format!(
-                        "预留的 file_id={id} 属于其他用户，拒绝继续"
+                        "预留的 file_id={id} 与本次上传身份不符，拒绝继续"
                     )));
                 }
                 tracing::info!("♻️ 预留的 file_id={id} 已落库，补写墓碑并返回");
                 let _ = session.mark_completed(id);
-                return completed_response(&state, id).await;
+                return completed_response(&state, &token_info, id).await;
             }
             Some(id)
         }
