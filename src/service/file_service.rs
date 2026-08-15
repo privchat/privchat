@@ -837,55 +837,39 @@ impl FileService {
         .await
     }
 
-    /// 分片上传收尾：**流式**核验 `body.part` 的大小与摘要，然后走与整包**同一条**
-    /// 发布落库路径。
+    /// 分片上传收尾（RESUMABLE_UPLOAD_SPEC §3.3 第 5 步）：拼接文件已由
+    /// `ChunkedSession::assemble` 流式核验过大小与摘要，这里只负责把它交给与整包
+    /// **同一条**发布 / 秒传去重 / 建行路径，用 `reserved_file_id` 建行。
     ///
-    /// 🔴 摘要必须由服务端在这里重算，不能拿分片的 journal 摘要拼。journal 只保证
-    /// 每一段落盘时是对的；整份文件对不对，只有从头读一遍才知道。这也顺带覆盖了
-    /// 「区间都确认了但拼起来不是那个文件」这种客户端错误。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn commit_resumable_upload(
+    /// `session_dir` 是会话目录的绝对路径；发布走的是**相对存储根**的 staging 路径，
+    /// 所以这里把它换算成 `tmp/uploads/chunked/{upload_id}/body.complete.tmp`。
+    pub(crate) async fn commit_chunked_upload(
         &self,
-        session: &crate::service::upload_session::UploadSession,
-        reserved_file_id: u64,
+        session: &crate::service::chunked_upload::ChunkedSession,
+        written: u64,
+        stored_sha256: String,
         fields: RecordFields,
-        file_type: FileType,
-        declared_content_sha256: Option<String>,
-        declared_size: Option<i64>,
-        session_uid: u64,
-        session_upload_id: &str,
     ) -> Result<FileMetadata> {
-        let body = session.body_path();
-        let written = std::fs::metadata(&body)
-            .map_err(|e| ServerError::Internal(format!("读 body.part 失败: {e}")))?
-            .len();
-
-        if let Some(expect) = size_check_target(declared_content_sha256.as_deref(), declared_size) {
-            if expect != written as i64 {
-                return Err(ServerError::Validation(format!(
-                    "上传字节数与 prepare 阶段声明的不一致：声明 {expect}，实际 {written}"
-                )));
-            }
-        }
-
-        let stored_sha256 = sha256_of_file(&body)?;
-        if let Some(declared) = declared_content_sha256.as_deref() {
-            if !declared.eq_ignore_ascii_case(&stored_sha256) {
-                return Err(ServerError::Validation(
-                    "上传内容与 prepare 阶段声明的摘要不一致".to_string(),
-                ));
-            }
-        }
-
+        let m = session.manifest();
+        let file_type = FileType::from_str(&m.file_type).unwrap_or(FileType::File);
         let source = self.resolve_storage_source()?;
         let source_id = source.id;
-        let file_path = self.generate_file_path(reserved_file_id, &file_type, &fields.filename);
+        let file_path = self.generate_file_path(m.reserved_file_id, &file_type, &fields.filename);
+        let staging_path = format!(
+            "tmp/uploads/chunked/{}/{}",
+            session.upload_id(),
+            session
+                .assembled_path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("body.complete.tmp")
+        );
 
         self.publish_and_record(
             StagedObject {
-                file_id: reserved_file_id,
+                file_id: m.reserved_file_id,
                 file_path,
-                staging_path: Self::staging_path(session_uid, session_upload_id),
+                staging_path,
                 source_id,
                 file_type,
                 written,

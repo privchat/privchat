@@ -78,10 +78,12 @@ fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
 pub fn create_route() -> Router<FileServerState> {
     Router::new()
         .route("/api/app/files/upload", post(upload_file))
-        // 断点续传（RESUMABLE_UPLOAD_SPEC §5）：字节走 chunk，其余三个是控制面。
+        // 分片上传（RESUMABLE_UPLOAD_SPEC §3）：字节走 chunk，其余三个是控制面。
         .route(
             "/api/app/files/chunk",
-            put(put_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES)),
+            put(put_chunk).layer(DefaultBodyLimit::max(
+                crate::service::chunked_upload::MAX_CHUNK_BYTES,
+            )),
         )
         .route("/api/app/files/status", get(upload_status))
         .route("/api/app/files/complete", post(complete_upload))
@@ -518,34 +520,32 @@ async fn upload_file(
     }))
 }
 
+// ---------------------------------------------------------------- 分片上传（RESUMABLE_UPLOAD_SPEC §3）
 
-// ---------------------------------------------------------------- 断点续传
+use crate::service::chunked_upload::{
+    AssembleError, ChunkError, ChunkedSession, OpenError, PartOutcome, Range,
+};
 
-/// 会话现状：客户端靠它决定「还差哪几段」。
+/// `GET /files/status` 的响应：已收与缺失**都回**——`missing` 是客户端直接可用的工作
+/// 清单，让它自己求补集就是把区间运算实现两遍。
 #[derive(Debug, Serialize)]
-pub struct UploadStatusResponse {
-    pub upload_id: String,
-    /// 总字节数（token 里签下的）。
+pub struct ChunkedStatusResponse {
+    pub received: Vec<Range>,
+    pub missing: Vec<Range>,
+    pub received_bytes: u64,
     pub total_size: u64,
-    /// 已确认区间 `[offset, offset+len)`，升序且已合并。
-    pub confirmed_ranges: Vec<RangeDto>,
-    pub confirmed_bytes: u64,
-    /// 全部确认完了吗——`true` 时客户端该调 complete。
-    pub complete: bool,
+    /// 已经完成（墓碑在）：客户端直接调 complete 拿 `file_id`。
+    pub completed: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RangeDto {
-    pub offset: u64,
-    pub len: u64,
-}
-
-/// 写一段字节的结果。
+/// `PUT /files/chunk` 的响应。
 #[derive(Debug, Serialize)]
 pub struct ChunkResponse {
-    /// `confirmed` / `already_covered`。
+    /// `written` / `already_present`。
     pub outcome: &'static str,
-    pub confirmed_bytes: u64,
+    pub received_bytes: u64,
+    pub total_size: u64,
+    /// 全部收齐 → 客户端该调 complete 了。
     pub complete: bool,
 }
 
@@ -554,13 +554,13 @@ pub struct ChunkQuery {
     pub offset: u64,
 }
 
-/// `complete` 的可选补充字段：token 里没有、只有这一刻才知道的东西。
+/// `POST /files/complete` 请求体：只带申请 token 时还不知道、而建行又必需的字段。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CompleteRequest {
-    pub business_id: Option<String>,
-    /// 附件加密 v1 的 CEK（base64url 32B）。
     pub cek: Option<String>,
+    pub business_id: Option<String>,
+    pub encryption_version: i32,
 }
 
 /// 上传专用的类型化错误。见 `ErrorCode` 20610-20617。
@@ -572,137 +572,41 @@ fn coded(code: privchat_protocol::ErrorCode, status: u16, msg: impl Into<String>
     }
 }
 
-/// 🔴 **双凭证**：上传 token 说「允许上传这一份文件」，登录态说「现在是谁」。
+/// 从 `X-Upload-Token` 打开分片会话。**单凭据**（决策 7）：token 已完整表达授权。
 ///
-/// 只认 token 的话，一张 24 小时有效的 bearer 泄露出去，持有者就能独立操作整个上传
-/// 会话——写分片、查进度、abort 掉别人正在传的东西。所以每个分片请求都要再证明
-/// 自己就是签这张 token 时的那个用户。
-///
-/// 没接验证器时**拒绝**，不是放行：缺省必须是安全的那一侧。
-async fn require_same_user(
-    state: &FileServerState,
-    headers: &axum::http::HeaderMap,
-    token_user: u64,
-) -> Result<(), ServerError> {
-    let Some(auth) = state.auth.as_ref() else {
-        return Err(ServerError::Authentication(
-            "服务端未配置登录态校验，拒绝分片上传".to_string(),
-        ));
-    };
-    let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| ServerError::Authentication("缺少 Authorization".to_string()))?;
-
-    let user = auth.user_of(bearer).await.map_err(|reason| {
-        // 原因只进日志：回给客户端等于告诉它「是过期还是签名错」，那是探测面。
-        tracing::debug!("登录态无效：{reason}");
-        ServerError::Authentication("登录态无效".to_string())
-    })?;
-    if user != token_user {
-        // 🔴 当成**授权**失败而不是认证失败：凭证是有效的，只是不是这个人的上传。
-        return Err(ServerError::Authorization(
-            "登录用户与上传 token 的归属不一致".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// 取出并校验 token，顺带把「这张 token 是用来传字节的」这条也验掉。
-async fn upload_token(
-    state: &FileServerState,
-    headers: &axum::http::HeaderMap,
-) -> Result<crate::service::upload_token_service::ValidatedUploadToken, ServerError> {
+/// 🔴 Gone / BadSecret / Expired 三种对客户端**同一句话**（`UploadSessionGone`）：分开说
+/// 这个端点就成了会话存在性探测器。
+fn open_session(state: &FileServerState, headers: &axum::http::HeaderMap) -> Result<ChunkedSession, ServerError> {
     let raw = headers
         .get("X-Upload-Token")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ServerError::Validation("缺少 X-Upload-Token header".to_string()))?;
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let token = state.upload_token_service.validate_any(now_secs, raw).await?;
-    if token.purpose != crate::service::upload_token_service::UploadTokenPurpose::Upload {
-        return Err(ServerError::Validation(
-            "该 token 用于秒传取用，不能用于实体上传".to_string(),
-        ));
-    }
-    Ok(token)
+    let root = state.file_service.upload_session_root()?;
+    ChunkedSession::open(&root, raw).map_err(|e| match e {
+        OpenError::Malformed => ServerError::Validation("X-Upload-Token 不是分片上传凭据".to_string()),
+        OpenError::Gone | OpenError::BadSecret | OpenError::Expired => coded(
+            privchat_protocol::ErrorCode::UploadSessionGone,
+            410,
+            "该上传的会话已不存在或已过期，请重新申请 token 从头上传",
+        ),
+        OpenError::Io(e) => e,
+    })
 }
 
-/// token 里签下的总字节数——分片模式必须有它，否则无从判断越界与完成。
-fn sealed_size(
-    token: &crate::service::upload_token_service::ValidatedUploadToken,
-) -> Result<u64, ServerError> {
-    token
-        .sealed_blob_size
-        .filter(|v| *v > 0)
-        .map(|v| v as u64)
+async fn lock_or_busy(session: &ChunkedSession) -> Result<crate::service::chunked_upload::SessionLock, ServerError> {
+    session
+        .lock(std::time::Duration::from_secs(2))
+        .await?
         .ok_or_else(|| {
-            ServerError::Validation("该 token 未签入文件大小，不能用于分片上传".to_string())
+            coded(
+                privchat_protocol::ErrorCode::UploadSessionBusy,
+                409,
+                "该上传正被另一个请求占用，请稍后重试",
+            )
         })
 }
 
-/// 分片单次请求的**硬上限**（路由层 body limit 用）。
-///
-/// 🔴 路由层的限制必须是常量：body 在进入 handler 之前就被读进内存，等拿到 token
-/// 再看 plan 已经晚了。业务上限（`plan.max_request_size`）在 handler 里再收一道，
-/// 两层职责不同——这一层挡的是「一个请求塞几百 MB 进内存」。
-const MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
-
-/// 取出 token 里签下的分片方案，并按它校验这次请求的区间。
-///
-/// 🔴 **服务端必须自己执行 plan**。不执行的话，「停发 plan 即关闭分片」这个关停阀
-/// 就是假的：客户端照样能往 chunk 端点写，服务端照单全收。
-fn check_against_plan(
-    token: &crate::service::upload_token_service::ValidatedUploadToken,
-    offset: u64,
-    len: u64,
-    total: u64,
-) -> Result<(), ServerError> {
-    use privchat_protocol::ErrorCode as E;
-    let Some(plan) = token.upload_plan.as_ref() else {
-        return Err(coded(
-            E::UploadModeConflict,
-            400,
-            "该 token 未下发分片方案，请走整包上传",
-        ));
-    };
-    let base = plan.base_unit as u64;
-    if base == 0 || offset % base != 0 {
-        return Err(coded(
-            E::UploadChunkNotAligned,
-            400,
-            format!("offset {offset} 未按 {base} 字节的网格对齐"),
-        ));
-    }
-    if len > plan.max_request_size as u64 {
-        return Err(coded(
-            E::UploadChunkNotAligned,
-            400,
-            format!("单次分片 {len} 超过上限 {}", plan.max_request_size),
-        ));
-    }
-    // 非末段必须整格：留下不对齐的碎片，后续区间就再也拼不回网格上。
-    let is_final = offset + len == total;
-    if !is_final && len % base != 0 {
-        return Err(coded(
-            E::UploadChunkNotAligned,
-            400,
-            format!("非末段分片 {len} 必须是 {base} 的整数倍"),
-        ));
-    }
-    Ok(())
-}
-
-/// 客户端声明的分片摘要，必须带。
-///
-/// 🔴 少了它，一片在传输中被改坏也会被记成「已确认」，要等到 complete 核验整文件
-/// 才失败——而那时 status 显示区间齐全，客户端**不知道该重传哪一片**，只能整份重来。
-/// 带上之后，坏的那一片当场就能定位并单独重传。
+/// 客户端声明的分片摘要，必须带（坏的那一片当场定位并单独重传）。
 fn declared_chunk_digest(headers: &axum::http::HeaderMap) -> Result<String, ServerError> {
     headers
         .get("X-Chunk-SHA256")
@@ -718,17 +622,7 @@ fn declared_chunk_digest(headers: &axum::http::HeaderMap) -> Result<String, Serv
         })
 }
 
-fn ranges_dto(ranges: Vec<(u64, u64)>) -> Vec<RangeDto> {
-    ranges
-        .into_iter()
-        .map(|(offset, len)| RangeDto { offset, len })
-        .collect()
-}
-
 /// `PUT /api/app/files/chunk?offset=N` —— 请求体就是这一段的原始字节。
-///
-/// 🔴 用**裸字节**而不是 multipart：分片是热路径，每个请求都要多解析一层 multipart
-/// 边界纯属浪费；而且 `offset` 属于寻址信息，放 query 比藏在表单字段里更难写错。
 async fn put_chunk(
     State(state): State<FileServerState>,
     headers: axum::http::HeaderMap,
@@ -736,222 +630,239 @@ async fn put_chunk(
     body: axum::body::Bytes,
 ) -> ApiResult<ChunkResponse> {
     use privchat_protocol::ErrorCode as E;
-    let token = upload_token(&state, &headers).await?;
-    require_same_user(&state, &headers, token.user_id).await?;
-    let total = sealed_size(&token)?;
+    let session = open_session(&state, &headers)?;
     let declared = declared_chunk_digest(&headers)?;
-    check_against_plan(&token, q.offset, body.len() as u64, total)?;
+    let _lock = lock_or_busy(&session).await?;
 
-    // 🔴 摘要**先于**落盘校验：不匹配的字节一个都不该碰磁盘，更不能进 journal。
-    let actual = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body));
-    if actual != declared {
-        return Err(coded(
-            E::UploadChunkChecksumMismatch,
-            400,
-            "分片内容与 X-Chunk-SHA256 不符，请重传这一片",
-        ));
+    // 已完成的会话不再收字节：迟到的分片对结果没有意义。
+    if session.completed_file_id()?.is_some() {
+        return Err(coded(E::UploadSessionCompleted, 409, "该上传已完成"));
     }
 
-    let session = crate::service::upload_session::UploadSession::open(
-        &state.file_service.upload_session_root()?,
-        token.user_id,
-        &token.upload_id,
-    )?;
-    let _guard = session.begin_resumable(total).map_err(session_busy)?;
-
-    // 预留排在收字节之前，理由与整包路径相同：崩溃重试要复用同一个 file_id。
-    if session.reserved_file_id()?.is_none() {
-        let id = state.file_service.reserve_file_id().await?;
-        session.reserve_file_id(id)?;
-    }
-
-    use crate::service::upload_session::ChunkOutcome;
-    let outcome = match session.write_chunk(q.offset, &body)? {
-        ChunkOutcome::Confirmed => "confirmed",
-        ChunkOutcome::AlreadyCovered => "already_covered",
-        // 区间视图对不上：让客户端按 status 对齐再来。磁盘什么都没动。
-        ChunkOutcome::Conflict => {
+    let outcome = match session.write_part(q.offset, &body, &declared) {
+        Ok(PartOutcome::Written) => "written",
+        Ok(PartOutcome::AlreadyPresent) => "already_present",
+        Err(ChunkError::OutOfRange(m)) | Err(ChunkError::NotAligned(m)) => {
+            return Err(coded(E::UploadChunkNotAligned, 400, m))
+        }
+        Err(ChunkError::Digest) => {
             return Err(coded(
-                E::UploadRangeOverlap,
-                409,
-                "该区间与已确认内容冲突，请先 GET status 对齐后重传",
+                E::UploadChunkChecksumMismatch,
+                422,
+                "分片内容与 X-Chunk-SHA256 不符，请重传这一片",
             ))
         }
+        Err(ChunkError::Overlap(m)) => return Err(coded(E::UploadRangeOverlap, 409, m)),
+        Err(ChunkError::Io(e)) => return Err(e),
     };
-
+    let (_, missing, received_bytes) = session.status()?;
     Ok(ApiEnvelope::ok(ChunkResponse {
         outcome,
-        confirmed_bytes: session.confirmed_bytes()?,
-        complete: session.is_complete()?,
+        received_bytes,
+        total_size: session.manifest().total_size,
+        complete: missing.is_empty(),
     }))
-}
-
-/// 会话被别人占着 → 类型化的「忙」，客户端可以稍后重试。
-///
-/// 会话锁是**非阻塞**的：撞上就立刻回答「忙」，而不是把 HTTP 请求挂在锁上等到超时。
-fn session_busy(e: ServerError) -> ServerError {
-    match &e {
-        ServerError::Validation(msg) if msg.contains("正在进行中") => coded(
-            privchat_protocol::ErrorCode::UploadSessionBusy,
-            409,
-            "该上传正被另一个请求占用，请稍后重试",
-        ),
-        ServerError::Validation(msg) if msg.contains("已完成") => coded(
-            privchat_protocol::ErrorCode::UploadSessionCompleted,
-            409,
-            msg.clone(),
-        ),
-        ServerError::Validation(msg) if msg.contains("不能再走") => coded(
-            privchat_protocol::ErrorCode::UploadModeConflict,
-            409,
-            msg.clone(),
-        ),
-        _ => e,
-    }
 }
 
 /// `GET /api/app/files/status` —— 进程重启、换网络、隔天回来，都靠它接上。
 async fn upload_status(
     State(state): State<FileServerState>,
     headers: axum::http::HeaderMap,
-) -> ApiResult<UploadStatusResponse> {
-    let token = upload_token(&state, &headers).await?;
-    require_same_user(&state, &headers, token.user_id).await?;
-    let total = sealed_size(&token)?;
-
-    // 🔴 用 `open_existing`：会话没了就是**没了**（`SessionGone`），不能顺手建一个
-    // 空目录，把「早就过期/已清理」伪装成「一个字节都还没传」。
-    let session = crate::service::upload_session::UploadSession::open_existing(
-        &state.file_service.upload_session_root()?,
-        token.user_id,
-        &token.upload_id,
-    )?;
-
-    let (ranges, confirmed, complete) = match &session {
-        Some(s) => (s.confirmed_ranges()?, s.confirmed_bytes()?, s.is_complete()?),
-        // 还没开始传：空区间，不是错误。
-        None => (Vec::new(), 0, false),
-    };
-
-    Ok(ApiEnvelope::ok(UploadStatusResponse {
-        upload_id: token.upload_id.clone(),
-        total_size: total,
-        confirmed_ranges: ranges_dto(ranges),
-        confirmed_bytes: confirmed,
-        complete,
+) -> ApiResult<ChunkedStatusResponse> {
+    let session = open_session(&state, &headers)?;
+    let completed = session.completed_file_id()?.is_some();
+    let (received, missing, received_bytes) = session.status()?;
+    Ok(ApiEnvelope::ok(ChunkedStatusResponse {
+        received,
+        missing,
+        received_bytes,
+        total_size: session.manifest().total_size,
+        completed,
     }))
 }
 
-/// `POST /api/app/files/complete` —— 全部区间确认之后，核验、发布、落库。
+/// 已完成的上传：按 `file_id` 回读、**核对身份**并构造与首次一致的响应。
+async fn chunked_completed_response(
+    state: &FileServerState,
+    session: &ChunkedSession,
+    file_id: u64,
+) -> ApiResult<UploadResponse> {
+    let meta = state
+        .file_service
+        .get_file_metadata(file_id)
+        .await?
+        .ok_or_else(|| ServerError::Internal(format!("墓碑指向的 file_id={file_id} 读不到")))?;
+    if !manifest_matches(session, &meta) {
+        return Err(ServerError::Internal(format!(
+            "file_id={file_id} 与本次上传的身份不符，拒绝返回"
+        )));
+    }
+    tracing::info!("♻️ 分片 complete 重复请求，返回原 file_id={file_id}");
+    Ok(ApiEnvelope::ok(upload_response_of(state, meta)))
+}
+
+fn upload_response_of(state: &FileServerState, meta: crate::service::FileMetadata) -> UploadResponse {
+    UploadResponse {
+        file_id: meta.file_id,
+        file_url: state
+            .file_service
+            .build_access_url(&meta.file_path, meta.storage_source_id),
+        thumbnail_url: None,
+        file_size: meta.file_size,
+        original_size: meta.original_size,
+        width: meta.width,
+        height: meta.height,
+        mime_type: meta.mime_type,
+        uploaded_at: meta.uploaded_at,
+        storage_source_id: meta.storage_source_id,
+    }
+}
+
+/// 正式行是不是这个会话那份上传：uploader / 类型 / 摘要 / 大小四项都对。
+pub(crate) fn manifest_matches(session: &ChunkedSession, meta: &crate::service::FileMetadata) -> bool {
+    let m = session.manifest();
+    meta.uploader_id == m.uploader_id
+        && meta.file_type.as_str() == m.file_type
+        && meta.file_size == m.total_size
+        && meta
+            .file_hash
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&m.sealed_sha256))
+}
+
+/// 与整包表单同一套 cek 校验规则。
+fn validate_cek(encryption_version: i32, cek: &Option<String>) -> Result<(), ServerError> {
+    match encryption_version {
+        0 => {
+            if cek.is_some() {
+                return Err(ServerError::Validation(
+                    "encryption_version=0 时不应携带 cek".to_string(),
+                ));
+            }
+        }
+        1 => {
+            let Some(cek_str) = cek.as_deref() else {
+                return Err(ServerError::Validation("encryption_version=1 缺少 cek".to_string()));
+            };
+            let decoded = URL_SAFE_NO_PAD
+                .decode(cek_str.as_bytes())
+                .map_err(|_| ServerError::Validation("cek 不是合法 base64url".to_string()))?;
+            if decoded.len() != 32 {
+                return Err(ServerError::Validation(format!(
+                    "cek 解码后必须为 32 字节，实际 {}",
+                    decoded.len()
+                )));
+            }
+        }
+        v => {
+            return Err(ServerError::Validation(format!("不支持的 encryption_version: {v}")));
+        }
+    }
+    Ok(())
+}
+
+/// `POST /api/app/files/complete` —— 顺序冻结（spec §3.3），持锁全程：
+///
+/// 1. 墓碑在 → 回原 `file_id`
+/// 2. 按 `reserved_file_id` 查正式行 → 在且身份一致 → 补墓碑回原 id
+/// 3. 拼接 + 核验
+/// 4. 发布 / 建行（预留 id）
+/// 5. PG 提交后写墓碑 + fsync
+/// 6. 然后才删 parts
 async fn complete_upload(
     State(state): State<FileServerState>,
     headers: axum::http::HeaderMap,
     body: Option<axum::Json<CompleteRequest>>,
 ) -> ApiResult<UploadResponse> {
-    let token = upload_token(&state, &headers).await?;
-    require_same_user(&state, &headers, token.user_id).await?;
-    let total = sealed_size(&token)?;
+    use privchat_protocol::ErrorCode as E;
+    let session = open_session(&state, &headers)?;
     let extra = body.map(|axum::Json(b)| b).unwrap_or_default();
+    let _lock = lock_or_busy(&session).await?;
 
-    let session = crate::service::upload_session::UploadSession::open_existing(
-        &state.file_service.upload_session_root()?,
-        token.user_id,
-        &token.upload_id,
-    )?
-    .ok_or_else(|| {
-        coded(
-            privchat_protocol::ErrorCode::UploadSessionGone,
-            410,
-            "该上传的会话已不存在，请重新申请 token 从头上传",
-        )
-    })?;
-
-    // 幂等出口：墓碑在就直接回原来那个 file_id，别让客户端以为失败了。
+    // 1. 墓碑
     if let Some(existing) = session.completed_file_id()? {
-        return completed_response(&state, &token, existing).await;
+        return chunked_completed_response(&state, &session, existing).await;
     }
 
-    let _guard = session.begin_resumable(total).map_err(session_busy)?;
-
-    if !session.is_complete()? {
-        return Err(coded(
-            privchat_protocol::ErrorCode::UploadMissingRanges,
-            409,
-            format!(
-                "还有区间没传完（已确认 {} / {total} 字节），请 GET status 补齐",
-                session.confirmed_bytes()?
-            ),
-        ));
-    }
-
-    let reserved = match session.reserved_file_id()? {
-        Some(id) => id,
-        None => {
-            let id = state.file_service.reserve_file_id().await?;
-            session.reserve_file_id(id)?;
-            id
-        }
-    };
-    // 与整包路径同一条规矩：预留的 id 已经落库就补墓碑回读，不重复发布。
+    // 2. 预留 id 已落库？（PG 提交后、墓碑前崩溃的恢复路径）
+    let reserved = session.manifest().reserved_file_id;
     if let Some(meta) = state.file_service.get_file_metadata(reserved).await? {
-        if !token.matches_file(&meta) {
+        if !manifest_matches(&session, &meta) {
             return Err(ServerError::Internal(format!(
-                "预留的 file_id={reserved} 与本次上传身份不符，拒绝继续"
+                "预留的 file_id={reserved} 已被另一份内容占用，拒绝继续"
             )));
         }
-        let _ = session.mark_completed(reserved);
-        return completed_response(&state, &token, reserved).await;
+        tracing::info!("♻️ 预留的 file_id={reserved} 已落库，补写墓碑并返回");
+        session.write_completed(reserved)?;
+        session.drop_payload();
+        return chunked_completed_response(&state, &session, reserved).await;
     }
 
+    // cek 只在这一刻校验：走到拼接之前就把参数错拦掉，别让用户白等一次拼接。
+    validate_cek(extra.encryption_version, &extra.cek)?;
+
+    // 3. 拼接 + 核验
+    let (_, written, stored_sha256) = match session.assemble() {
+        Ok(v) => v,
+        Err(AssembleError::Missing(missing)) => {
+            let received: u64 = session.manifest().total_size
+                - missing.iter().map(|r| r.length).sum::<u64>();
+            return Err(coded(
+                E::UploadMissingRanges,
+                409,
+                format!(
+                    "还有区间没传完（已收 {received} / {} 字节），请 GET status 补齐",
+                    session.manifest().total_size
+                ),
+            ));
+        }
+        Err(AssembleError::Overlap) => {
+            return Err(coded(E::UploadRangeOverlap, 409, "分片区间有重叠，请 GET status 对齐"))
+        }
+        Err(AssembleError::DigestMismatch) => {
+            return Err(coded(
+                E::UploadChunkChecksumMismatch,
+                422,
+                "拼接后的内容与申请 token 时声明的摘要不一致",
+            ))
+        }
+        Err(AssembleError::Io(e)) => return Err(e),
+    };
+
+    // 4. 发布 / 建行（与整包同一条路径，预留 id）
+    let m = session.manifest().clone();
     let metadata = state
         .file_service
-        .commit_resumable_upload(
+        .commit_chunked_upload(
             &session,
-            reserved,
+            written,
+            stored_sha256,
             crate::service::file_service::RecordFields {
-                filename: token
-                    .filename
-                    .clone()
-                    .unwrap_or_else(|| "file.bin".to_string()),
-                mime_type: token
-                    .mime_type
-                    .clone()
-                    .filter(|m| !m.trim().is_empty())
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                uploader_id: token.user_id,
+                filename: m.filename.clone(),
+                mime_type: m.mime_type.clone(),
+                uploader_id: m.uploader_id,
                 uploader_ip: client_ip_from_headers(&headers),
-                business_type: token.business_type.clone(),
+                business_type: m.business_type.clone(),
                 business_id: extra.business_id,
-                encryption_version: token.encryption_version.unwrap_or(0),
+                encryption_version: extra.encryption_version,
                 cek: extra.cek,
             },
-            token.file_type.clone(),
-            token.sha256.clone(),
-            token.sealed_blob_size,
-            token.user_id,
-            &token.upload_id,
         )
         .await?;
 
-    if let Err(e) = _guard.complete(metadata.file_id) {
-        tracing::warn!("写入上传会话完成状态失败 file_id={}: {e}", metadata.file_id);
-    }
-    info!("✅ 分片上传完成: {}", metadata.file_id);
+    // 窗口：PG 已提交，墓碑还没写。判据 8 的故障注入点。
+    crate::service::file_service::crash_point("after_commit_before_tombstone");
 
-    Ok(ApiEnvelope::ok(UploadResponse {
-        file_id: metadata.file_id,
-        file_url: state
-            .file_service
-            .build_access_url(&metadata.file_path, metadata.storage_source_id),
-        thumbnail_url: None,
-        file_size: metadata.file_size,
-        original_size: metadata.original_size,
-        width: metadata.width,
-        height: metadata.height,
-        mime_type: metadata.mime_type,
-        uploaded_at: metadata.uploaded_at,
-        storage_source_id: metadata.storage_source_id,
-    }))
+    // 5. 墓碑（原子 + fsync）——落库成功后墓碑写不上只影响下次重试走第 2 步，不判失败。
+    if let Err(e) = session.write_completed(metadata.file_id) {
+        tracing::warn!("写分片完成墓碑失败 file_id={}: {e}", metadata.file_id);
+    } else {
+        // 6. 墓碑之后才删 parts。
+        session.drop_payload();
+    }
+    info!("✅ 分片上传完成: file_id={} upload_id={}", metadata.file_id, session.upload_id());
+
+    Ok(ApiEnvelope::ok(upload_response_of(&state, metadata)))
 }
 
 /// `POST /api/app/files/abort` —— 客户端主动放弃，整个会话目录删掉。
@@ -959,36 +870,31 @@ async fn abort_upload(
     State(state): State<FileServerState>,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<serde_json::Value> {
-    let token = upload_token(&state, &headers).await?;
-    require_same_user(&state, &headers, token.user_id).await?;
-
-    let session = crate::service::upload_session::UploadSession::open_existing(
-        &state.file_service.upload_session_root()?,
-        token.user_id,
-        &token.upload_id,
-    )?;
-    if let Some(session) = session {
-        // 🔴 **先抢排他锁再删。**
-        //
-        // 不抢锁的话，`remove_dir_all` 会把另一个正在写分片、或正在 complete 核验的
-        // 请求脚下的目录抽掉：那个请求已经返回成功了、字节却没了；或者 writer 还在往
-        // 一个已经 unlink 的 inode 里写，谁都恢复不了。持锁失败就明说「忙」。
-        if !session.try_lock_exclusive()? {
-            return Err(coded(
-                privchat_protocol::ErrorCode::UploadSessionBusy,
-                409,
-                "该上传正被另一个请求占用，无法中止，请稍后重试",
-            ));
+    let session = match open_session(&state, &headers) {
+        Ok(s) => s,
+        // 已经没了：abort 的目标状态就是「没了」，幂等成功。
+        Err(ServerError::Coded { code, .. })
+            if code == privchat_protocol::ErrorCode::UploadSessionGone =>
+        {
+            return Ok(ApiEnvelope::ok(serde_json::json!({ "aborted": true })));
         }
-        // 拿到锁之后**重新读**状态：等锁期间它可能刚刚完成。
-        if session.completed_file_id()?.is_some() {
-            return Err(coded(
-                privchat_protocol::ErrorCode::UploadSessionCompleted,
-                409,
-                "该上传已完成，不能中止",
-            ));
-        }
-        session.discard()?;
+        Err(e) => return Err(e),
+    };
+    // 拿不到锁 → 409 busy，不强删别人脚下的目录。
+    let Some(_lock) = session.try_lock()? else {
+        return Err(coded(
+            privchat_protocol::ErrorCode::UploadSessionBusy,
+            409,
+            "该上传正被另一个请求占用，无法中止，请稍后重试",
+        ));
+    };
+    if session.completed_file_id()?.is_some() {
+        return Err(coded(
+            privchat_protocol::ErrorCode::UploadSessionCompleted,
+            409,
+            "该上传已完成，不能中止",
+        ));
     }
+    session.discard()?;
     Ok(ApiEnvelope::ok(serde_json::json!({ "aborted": true })))
 }

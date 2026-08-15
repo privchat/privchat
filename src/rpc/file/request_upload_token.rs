@@ -118,12 +118,10 @@ pub async fn request_upload_token(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // 🔴 服务端**决定**这次走整包还是分片，客户端不做判断：
-    // 有 `upload_plan` 就分片、没有就整包。阈值策略只活在这一处，调整不用发版。
-    // 关停阀 = 恒不下发（`[upload.token]` 未配置或未切 signed 时天然如此）。
-    let upload_plan = services
-        .upload_token_service
-        .plan_for(file_size);
+    // 🔴 整包接口**不再下发分片方案**：分片走独立 RPC `file/request_chunked_upload_token`
+    //（RESUMABLE_UPLOAD_SPEC §2）。靠"响应里有没有 upload_plan"暗示走哪条路的那版
+    // 已作废——它让分片路径静默退化成整包而没有任何报错。
+    let upload_plan: Option<crate::service::upload_token_service::UploadPlan> = None;
 
     let (token_str, _upload_id, expires_at) = services
         .upload_token_service

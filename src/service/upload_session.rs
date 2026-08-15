@@ -21,8 +21,10 @@
 //! 也不进 Redis（那样又要解决跨槽 Lua、逐出策略和租约 fencing，而这些问题在
 //! 本地文件上根本不存在）。
 //!
-//! 组成：`state.json`（可变状态）+ `session.lock`（flock 互斥）+ `body.part`（字节）
-//! + `journal`（已确认区间的追加日志）。
+//! 组成：`state.json`（可变状态）+ `session.lock`（flock 互斥）。
+//!
+//! 📌 这里只服务**整包**上传（模式锁 + 预留 file_id + 墓碑）。分片上传是另一套目录
+//! 形态，见 `chunked_upload.rs`；早先塞在这里的顺序游标实现（`confirmed_offset`）已作废。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -79,18 +81,6 @@ pub struct SessionState {
     /// 而不是第二条记录——幂等因此不需要在正式文件表上加任何列。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved_file_id: Option<u64>,
-    /// 分片上传的**总字节数**（token 里签下的那个值），选定模式时冻结。
-    ///
-    /// 越界的分片要能当场拒掉，`complete` 也要知道「传完了没有」。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_size: Option<u64>,
-    /// 🔴 **顺序分片的唯一游标**：`[0, confirmed_offset)` 的字节已经落盘且可信。
-    ///
-    /// 分片严格顺序提交，所以「传到哪了」是一个数,不是一组区间。之前用 append-only
-    /// journal + 每段摘要 + 区间合并,是在给「乱序 + 并发分片」做持久化保证——而那个
-    /// 能力我们并不要。一个游标能表达的东西,不需要一个日志文件来表达。
-    #[serde(default)]
-    pub confirmed_offset: u64,
 }
 
 impl Default for SessionState {
@@ -100,24 +90,9 @@ impl Default for SessionState {
             status: UploadStatus::Idle,
             file_id: None,
             reserved_file_id: None,
-            total_size: None,
-            confirmed_offset: 0,
         }
     }
 }
-
-/// 写一段字节的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChunkOutcome {
-    /// 这次真的写进去了。
-    Confirmed,
-    /// 这段已经在游标后面了——上次写成功但响应丢了，重试就该是成功。
-    AlreadyCovered,
-    /// offset 越过了游标，中间会留洞。磁盘未被改动，客户端按回传的
-    /// `confirmed_offset` 对齐后继续。
-    Conflict,
-}
-
 
 /// 一个上传任务的会话目录。
 pub struct UploadSession {
@@ -321,137 +296,6 @@ impl UploadSession {
             session: self,
             committed: std::cell::Cell::new(false),
         })
-    }
-
-    /// 分片模式：选定 `Resumable` 并占住会话。
-    ///
-    /// `total_size` 来自 token（`sealed_blob_size`），会话第一次选定模式时冻结。
-    pub fn begin_resumable(&self, total_size: u64) -> Result<ModeGuard<'_>> {
-        if !self.try_lock_exclusive()? {
-            return Err(ServerError::Validation(
-                "同一份上传正在进行中".to_string(),
-            ));
-        }
-        let mut state = self.read_state()?;
-        match (state.mode, state.status) {
-            (_, UploadStatus::Completed) => {
-                return Err(ServerError::Validation(format!(
-                    "该上传已完成（file_id={:?}）",
-                    state.file_id
-                )));
-            }
-            // 🔴 整包与分片互斥：同一张 token 只能走一条路。
-            (UploadMode::Whole, _) => {
-                return Err(ServerError::Validation(
-                    "该 token 已用于整包上传，不能再走分片".to_string(),
-                ));
-            }
-            // 拿到锁却看见「上传中」= 上一个进程崩了（真并发在 try_lock 就挡住了）。
-            // 分片上传本来就是为崩溃准备的，这里当然要接着传。
-            (_, UploadStatus::Uploading) => {}
-            _ => {}
-        }
-        if let Some(frozen) = state.total_size {
-            if frozen != total_size {
-                return Err(ServerError::Validation(format!(
-                    "该会话已冻结总大小 {frozen}，与本次声明的 {total_size} 不符"
-                )));
-            }
-        }
-        state.mode = UploadMode::Resumable;
-        state.status = UploadStatus::Uploading;
-        state.total_size = Some(total_size);
-        self.write_state(&state)?;
-        Ok(ModeGuard {
-            session: self,
-            committed: std::cell::Cell::new(false),
-        })
-    }
-
-    pub fn body_path(&self) -> PathBuf {
-        self.dir.join("body.part")
-    }
-
-    /// 已确认区间。顺序游标之下永远是「一段连续的前缀」。
-    ///
-    /// 保留数组形态是为了不动线上协议;真源是 `confirmed_offset`。
-    pub fn confirmed_ranges(&self) -> Result<Vec<(u64, u64)>> {
-        let at = self.read_state()?.confirmed_offset;
-        Ok(if at == 0 { Vec::new() } else { vec![(0, at)] })
-    }
-
-    /// 已确认的总字节数 == 游标。
-    pub fn confirmed_bytes(&self) -> Result<u64> {
-        Ok(self.read_state()?.confirmed_offset)
-    }
-
-    /// 顺序写入一段字节。
-    ///
-    /// 只接受 `offset == confirmed_offset`:
-    /// - 落后(`offset < 游标`)= 上次写成功但响应丢了,回 `AlreadyCovered`;
-    /// - 超前(`offset > 游标`)= 中间会留洞,回 `Conflict`,由调用方把当前游标带回给
-    ///   客户端。客户端不需要自己记进度,服务端说了算。
-    ///
-    /// 🔴 顺序:pwrite → `fdatasync(body.part)` → 原子更新游标。
-    /// 反过来的话,崩在中间就成了「游标说确认了、字节没落盘」——客户端不会重传,
-    /// 却要等到 complete 校验摘要时才发现,是最难查的一种坏。按这个顺序,崩溃的
-    /// 最坏后果只是这一片重传一次。
-    pub fn write_chunk(&self, offset: u64, bytes: &[u8]) -> Result<ChunkOutcome> {
-        if bytes.is_empty() {
-            return Err(ServerError::Validation("分片不能为空".to_string()));
-        }
-        let mut state = self.read_state()?;
-        let total = state
-            .total_size
-            .ok_or_else(|| ServerError::Validation("会话尚未选定分片模式".to_string()))?;
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| ServerError::Validation("分片区间溢出".to_string()))?;
-        if end > total {
-            return Err(ServerError::Validation(format!(
-                "分片区间 [{offset}, {end}) 越过总大小 {total}"
-            )));
-        }
-
-        if offset < state.confirmed_offset {
-            // 整段都在游标之内 = 纯重试。跨越游标说明客户端的分片边界变了,
-            // 让它按游标重新对齐,不要就着旧边界往里写。
-            return Ok(if end <= state.confirmed_offset {
-                ChunkOutcome::AlreadyCovered
-            } else {
-                ChunkOutcome::Conflict
-            });
-        }
-        if offset > state.confirmed_offset {
-            return Ok(ChunkOutcome::Conflict);
-        }
-
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(self.body_path())
-            .map_err(|e| ServerError::Internal(format!("打开 body.part 失败: {e}")))?;
-        {
-            use std::os::unix::fs::FileExt;
-            file.write_all_at(bytes, offset)
-                .map_err(|e| ServerError::Internal(format!("写分片失败: {e}")))?;
-        }
-        file.sync_data()
-            .map_err(|e| ServerError::Internal(format!("同步 body.part 失败: {e}")))?;
-
-        state.confirmed_offset = end;
-        self.write_state(&state)?;
-        Ok(ChunkOutcome::Confirmed)
-    }
-
-    /// 传完了吗。
-    pub fn is_complete(&self) -> Result<bool> {
-        let state = self.read_state()?;
-        let Some(total) = state.total_size else {
-            return Ok(false);
-        };
-        Ok(state.confirmed_offset == total)
     }
 
     /// 丢弃整个会话目录。
@@ -721,60 +565,5 @@ mod tests {
                 "upload_id {evil:?} 必须被拒"
             );
         }
-    }
-
-    /// 🔴 崩溃窗口：字节已 fsync 落盘、游标还没更新时进程死掉。
-    ///
-    /// 这是删掉 journal 之后**唯一**新增的风险面。旧实现里"确认"这件事记在 journal
-    /// 里，现在记在 `state.json` 的游标上，于是 `pwrite → fdatasync → 更新游标` 这三
-    /// 步之间多了一个可以死人的缝。
-    ///
-    /// 必须保证死在缝里是**安全**的那一侧：游标没动 → status 仍报旧值 → 客户端重传
-    /// 这一段。代价是白传一片，而不是"游标说传完了、字节其实没落盘"——后者要等到
-    /// complete 校验摘要才暴露，是最难查的一种坏。
-    ///
-    /// 这里直接构造那个中间态（写完不更新游标），因为游标只存在于 `state.json`，
-    /// 没有任何内存态参与——杀不杀进程，能观察到的东西完全一样。
-    #[test]
-    fn bytes_on_disk_without_a_cursor_bump_are_not_counted_as_confirmed() {
-        let root = tempfile::tempdir().unwrap();
-        let s = UploadSession::open(root.path(), 7, "c7a5f0").unwrap();
-        let _g = s.begin_resumable(8).unwrap();
-
-        s.write_chunk(0, b"aaaa").unwrap();
-        assert_eq!(s.confirmed_bytes().unwrap(), 4);
-
-        // ---- 崩溃窗口：字节落盘，游标未更新 ----
-        {
-            use std::os::unix::fs::FileExt;
-            let f = OpenOptions::new()
-                .write(true)
-                .truncate(false)
-                .open(s.body_path())
-                .unwrap();
-            f.write_all_at(b"bbbb", 4).unwrap();
-            f.sync_data().unwrap();
-        }
-
-        // 重启后的视角：那 4 个字节在盘上，但**不算数**。
-        let again = UploadSession::open(root.path(), 7, "c7a5f0").unwrap();
-        assert_eq!(
-            again.confirmed_bytes().unwrap(),
-            4,
-            "没更新游标的字节被当成已确认了——客户端不会重传，文件会缺一段"
-        );
-        assert!(!again.is_complete().unwrap());
-
-        // 客户端按 status 重传该段（可以换更小的分片），一切照常。
-        assert_eq!(
-            again.write_chunk(4, b"bb").unwrap(),
-            ChunkOutcome::Confirmed
-        );
-        assert_eq!(
-            again.write_chunk(6, b"bb").unwrap(),
-            ChunkOutcome::Confirmed
-        );
-        assert!(again.is_complete().unwrap());
-        assert_eq!(std::fs::read(again.body_path()).unwrap(), b"aaaabbbb");
     }
 }

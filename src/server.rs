@@ -1843,6 +1843,32 @@ impl ChatServer {
         // 启动在线状态清理任务
         self.start_presence_timeout_sweeper().await;
 
+        // 分片上传会话 24 小时扫描（RESUMABLE_UPLOAD_SPEC §4）：只删过期且能拿到锁的目录。
+        {
+            let file_service = self.file_service.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    tick.tick().await;
+                    let root = match file_service.upload_session_root() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("⚠️ 分片上传扫描：取不到会话根目录: {e}");
+                            continue;
+                        }
+                    };
+                    let removed = tokio::task::spawn_blocking(move || {
+                        crate::service::chunked_upload::sweep_expired(&root)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if removed > 0 {
+                        info!("🧹 分片上传扫描：清理过期会话 {removed} 个");
+                    }
+                }
+            });
+        }
+
         // 启动缓存统计任务
         self.start_cache_stats_reporter().await;
 

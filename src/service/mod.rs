@@ -50,6 +50,7 @@ pub mod read_state_service;
 // 新增文件服务
 pub mod file_service;
 // 新增上传 token 服务
+pub mod chunked_upload;
 pub mod upload_session;
 pub mod upload_token_service;
 // 新增表情包服务
