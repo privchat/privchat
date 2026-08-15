@@ -4,6 +4,11 @@
 // 真的路由，字节落到真的磁盘，记录进真的 Postgres，中间用「换一个进程」来模拟服务端
 // 重启——重启之后仍然只补缺口，而不是从头再来，这正是断点续传要给用户的东西。
 
+//! 分片上传 E2E（RESUMABLE_UPLOAD_SPEC §7，冻结于 privchat-docs `bdef282`）。
+//!
+//! 直接打 axum Router，走真实的本地存储与 PostgreSQL。凭据由
+//! `ChunkedSession::create` 生成——**与生产 RPC 是同一个函数**，不是夹具另造。
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,47 +18,25 @@ use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
 use privchat::config::FileStorageSourceConfig;
-use privchat::http::{FileServerState, UploadAuthenticator};
-use privchat::model::file_upload::FileType;
-use privchat::security::upload_token::{IssueMode, UploadTokenConfig};
+use privchat::http::FileServerState;
+use privchat::service::chunked_upload::{ChunkedSession, NewSession, BASE_UNIT};
 use privchat::service::file_service::FileService;
-use privchat::service::upload_token_service::{
-    UploadIdentity, UploadTokenPurpose, UploadTokenService,
-};
+use privchat::service::upload_token_service::UploadTokenService;
 
 const UPLOADER_FLOW: u64 = 9_971_001;
 const UPLOADER_RESUME: u64 = 9_971_002;
 const UPLOADER_IDEMPOTENT: u64 = 9_971_003;
 const UPLOADER_CONFLICT: u64 = 9_971_004;
 const UPLOADER_ABORT: u64 = 9_971_005;
-const UPLOADER_BIG: u64 = 9_971_006;
+const UPLOADER_ORDER: u64 = 9_971_006;
+const UPLOADER_REPLAY: u64 = 9_971_007;
+const UPLOADER_TOMB: u64 = 9_971_008;
 
-/// 服务端下发的寻址网格。分片必须按它对齐。
-const BASE_UNIT: usize = 64 * 1024;
-
-/// 测试用的登录态：`Bearer u:<uid>` 就代表那个用户。
-///
-/// 🔴 用窄接口而不是真 `UnifiedTokenService`：后者要 RSA 密钥、设备表、refresh 仓库，
-/// 把认证的整套 fixture 拖进上传测试里，两件事从此绑死。这里要验的是**上传端点有没有
-/// 校验身份、有没有比对归属**，验证器本身正不正确是 auth 那边的门禁。
-struct FakeAuth;
-
-#[async_trait::async_trait]
-impl UploadAuthenticator for FakeAuth {
-    async fn user_of(&self, bearer: &str) -> Result<u64, String> {
-        bearer
-            .strip_prefix("u:")
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| "bad test bearer".to_string())
-    }
-}
+const UNIT: usize = BASE_UNIT as usize;
 
 struct Rig {
     state: FileServerState,
     root: PathBuf,
-    /// 只有「自己开的临时目录」才由自己删。**跨重启的用例必须把目录留在外面**：
-    /// 让 Rig 持有它的话，第一段人生结束时连存储根一起删掉，「重启」就成了「换台机器」，
-    /// 而那正好把要测的东西——磁盘上的会话还在不在——绕过去了。
     _dir: Option<tempfile::TempDir>,
 }
 
@@ -68,29 +51,13 @@ async fn pool() -> Option<Arc<sqlx::PgPool>> {
     ))
 }
 
-fn signing_config() -> UploadTokenConfig {
-    UploadTokenConfig {
-        keys: [(
-            "e2e".to_string(),
-            "resumable-e2e-secret-resumable-e2e".to_string(),
-        )]
-        .into_iter()
-        .collect(),
-        default_kid: "e2e".to_string(),
-        leeway_secs: 30,
-        ttl_secs: 24 * 3600,
-        issue_mode: IssueMode::Signed,
-    }
-}
-
 async fn rig(pool: Arc<sqlx::PgPool>) -> Rig {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
     rig_at(root, pool, Some(dir)).await
 }
 
-/// 在指定根目录上装配。**「服务端重启」就是丢掉这个 Rig 再用同一个根目录建一个新的**：
-/// 进程内的一切都没了，能接上就只能靠磁盘上的会话。
+/// 「服务端重启」= 丢掉这个 Rig，在同一个根目录上建一个新的。
 async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, dir: Option<tempfile::TempDir>) -> Rig {
     let source = FileStorageSourceConfig {
         id: 0,
@@ -108,10 +75,8 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, dir: Option<tempfile::Te
     Rig {
         state: FileServerState {
             file_service: Arc::new(file_service),
-            upload_token_service: Arc::new(
-                UploadTokenService::new().with_signing(Some(signing_config())),
-            ),
-            auth: Some(Arc::new(FakeAuth)),
+            upload_token_service: Arc::new(UploadTokenService::new()),
+            auth: None,
         },
         root,
         _dir: dir,
@@ -123,48 +88,31 @@ impl Rig {
         privchat::http::routes::upload::create_route().with_state(self.state.clone())
     }
 
+    /// 与生产 RPC 同一条构造路径：预留 file_id → `ChunkedSession::create`。
     async fn issue(&self, uid: u64, body: &[u8]) -> String {
-        self.issue_with_plan(uid, body, true).await
+        let reserved = self.state.file_service.reserve_file_id().await.expect("reserve");
+        let root = self.state.file_service.upload_session_root().expect("root");
+        let (_, token, _) = ChunkedSession::create(
+            &root,
+            NewSession {
+                uploader_id: uid,
+                total_size: body.len() as u64,
+                sealed_sha256: sha256_hex(body),
+                file_type: "file".into(),
+                business_type: "message".into(),
+                filename: "resumable.bin".into(),
+                mime_type: "application/octet-stream".into(),
+                transform_version: 0,
+                reserved_file_id: reserved,
+            },
+        )
+        .expect("create session");
+        token
     }
 
-    /// `with_plan=false` 时签一张**没有分片方案**的 token：用来验「服务端停发 plan
-    /// 就等于关掉分片」这个关停阀是真的。
-    async fn issue_with_plan(&self, uid: u64, body: &[u8], with_plan: bool) -> String {
-        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body));
-        let plan = if with_plan {
-            self.state
-                .upload_token_service
-                .plan_for(body.len() as i64)
-        } else {
-            None
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let (token, _upload_id, _exp) = self
-            .state
-            .upload_token_service
-            .issue(
-                now,
-                uid,
-                FileType::File,
-                64 * 1024 * 1024,
-                "message".to_string(),
-                Some("resumable.bin".to_string()),
-                UploadIdentity {
-                    sha256: Some(sha),
-                    declared_size: Some(body.len() as i64),
-                    mime_type: Some("application/octet-stream".to_string()),
-                    transform_version: 0,
-                },
-                UploadTokenPurpose::Upload,
-                // 分片方案由服务端决定并签进 token——生产的 prepare 也是这么做的。
-                plan.as_ref(),
-            )
-            .await
-            .expect("issue token");
-        token
+    fn session_dir(&self, token: &str) -> PathBuf {
+        let root = self.state.file_service.upload_session_root().expect("root");
+        ChunkedSession::open(&root, token).expect("open").dir().to_path_buf()
     }
 
     async fn send(&self, req: Request<Body>) -> (StatusCode, serde_json::Value) {
@@ -179,22 +127,13 @@ impl Rig {
         )
     }
 
-    /// 写一段字节（带双凭证与分片摘要——这就是协议要求的样子）。
-    async fn chunk(
-        &self,
-        token: &str,
-        uid: u64,
-        offset: usize,
-        bytes: &[u8],
-    ) -> (StatusCode, serde_json::Value) {
-        self.chunk_with_digest(token, uid, offset, bytes, &sha256_hex(bytes))
-            .await
+    async fn chunk(&self, token: &str, offset: usize, bytes: &[u8]) -> (StatusCode, serde_json::Value) {
+        self.chunk_with_digest(token, offset, bytes, &sha256_hex(bytes)).await
     }
 
     async fn chunk_with_digest(
         &self,
         token: &str,
-        uid: u64,
         offset: usize,
         bytes: &[u8],
         digest: &str,
@@ -204,7 +143,6 @@ impl Rig {
                 .method("PUT")
                 .uri(format!("/api/app/files/chunk?offset={offset}"))
                 .header("X-Upload-Token", token)
-                .header("Authorization", format!("Bearer u:{uid}"))
                 .header("X-Chunk-SHA256", digest)
                 .body(Body::from(bytes.to_vec()))
                 .expect("request"),
@@ -212,33 +150,13 @@ impl Rig {
         .await
     }
 
-    /// 不带 Authorization 的分片请求——用来验「必须有登录态」。
-    async fn chunk_without_auth(
-        &self,
-        token: &str,
-        offset: usize,
-        bytes: &[u8],
-    ) -> (StatusCode, serde_json::Value) {
-        self.send(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/api/app/files/chunk?offset={offset}"))
-                .header("X-Upload-Token", token)
-                .header("X-Chunk-SHA256", sha256_hex(bytes))
-                .body(Body::from(bytes.to_vec()))
-                .expect("request"),
-        )
-        .await
-    }
-
-    async fn status(&self, token: &str, uid: u64) -> serde_json::Value {
+    async fn status(&self, token: &str) -> serde_json::Value {
         let (code, json) = self
             .send(
                 Request::builder()
                     .method("GET")
                     .uri("/api/app/files/status")
                     .header("X-Upload-Token", token)
-                    .header("Authorization", format!("Bearer u:{uid}"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -247,27 +165,25 @@ impl Rig {
         json["data"].clone()
     }
 
-    async fn complete(&self, token: &str, uid: u64) -> (StatusCode, serde_json::Value) {
+    async fn complete(&self, token: &str) -> (StatusCode, serde_json::Value) {
         self.send(
             Request::builder()
                 .method("POST")
                 .uri("/api/app/files/complete")
                 .header("X-Upload-Token", token)
-                .header("Authorization", format!("Bearer u:{uid}"))
                 .header("content-type", "application/json")
-                .body(Body::from("{}"))
+                .body(Body::from(r#"{"encryption_version":0}"#))
                 .expect("request"),
         )
         .await
     }
 
-    async fn abort(&self, token: &str, uid: u64) -> (StatusCode, serde_json::Value) {
+    async fn abort(&self, token: &str) -> (StatusCode, serde_json::Value) {
         self.send(
             Request::builder()
                 .method("POST")
                 .uri("/api/app/files/abort")
                 .header("X-Upload-Token", token)
-                .header("Authorization", format!("Bearer u:{uid}"))
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -284,13 +200,22 @@ impl Rig {
             .expect("row");
         std::fs::read(self.root.join(meta.file_path.trim_start_matches('/'))).expect("读正式对象")
     }
+
+    async fn rows_of(&self, pool: &sqlx::PgPool, uid: u64) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM privchat_file_uploads WHERE uploader_id = $1",
+        )
+        .bind(uid as i64)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes))
 }
 
-/// 可复现且逐字节可断言的负载。
 fn payload(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| ((i as u32).wrapping_mul(2654435761) >> 13) as u8 ^ seed)
@@ -311,470 +236,263 @@ fn file_id_of(json: &serde_json::Value) -> u64 {
     json["data"]["file_id"].as_u64().expect("file_id")
 }
 
-fn ranges(status: &serde_json::Value) -> Vec<(u64, u64)> {
-    status["confirmed_ranges"]
-        .as_array()
+fn ranges(v: &serde_json::Value) -> Vec<(u64, u64)> {
+    v.as_array()
         .expect("ranges")
         .iter()
-        .map(|r| (r["offset"].as_u64().unwrap(), r["len"].as_u64().unwrap()))
+        .map(|r| (r["offset"].as_u64().unwrap(), r["length"].as_u64().unwrap()))
         .collect()
+}
+
+fn code_of(json: &serde_json::Value) -> u64 {
+    json["code"].as_u64().unwrap_or(u64::MAX)
 }
 
 // ---------------------------------------------------------------- 用例
 
-/// 主流程：按 64KiB 网格分片传完 → complete → 字节与库都对。
+/// 判据 1：全新文件 → parts/ 出现分片 → complete → 逐字节一致。
 #[tokio::test]
 async fn a_chunked_upload_completes_and_matches_byte_for_byte() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool, &[UPLOADER_FLOW]).await;
-    let uid = UPLOADER_FLOW;
     let rig = rig(pool.clone()).await;
 
-    // 刻意不是 base_unit 的整数倍：最后一片是短的，这正是最容易写错的地方。
-    let body = payload(BASE_UNIT * 3 + 12_345, 0x5a);
+    let body = payload(UNIT * 3 + 12_345, 0x5a);
     let token = rig.issue(UPLOADER_FLOW, &body).await;
+    let dir = rig.session_dir(&token);
 
-    for (i, part) in body.chunks(BASE_UNIT).enumerate() {
-        let (code, json) = rig.chunk(&token, uid, i * BASE_UNIT, part).await;
+    for (i, part) in body.chunks(UNIT).enumerate() {
+        let (code, json) = rig.chunk(&token, i * UNIT, part).await;
         assert_eq!(code, StatusCode::OK, "第 {i} 片失败：{json}");
-        assert_eq!(json["data"]["outcome"], "confirmed");
+        assert_eq!(json["data"]["outcome"], "written");
+        assert!(dir.join("parts").join(format!("{}-{}.part", i * UNIT, part.len())).exists());
     }
 
-    let st = rig.status(&token, uid).await;
-    assert_eq!(st["complete"], true, "{st}");
-    assert_eq!(st["confirmed_bytes"].as_u64().unwrap(), body.len() as u64);
-    assert_eq!(ranges(&st), vec![(0, body.len() as u64)], "应当合并成一段");
+    let st = rig.status(&token).await;
+    assert_eq!(st["received_bytes"].as_u64().unwrap(), body.len() as u64);
+    assert_eq!(ranges(&st["received"]), vec![(0, body.len() as u64)], "应当合并成一段");
+    assert!(ranges(&st["missing"]).is_empty());
 
-    let (code, json) = rig.complete(&token, uid).await;
+    let (code, json) = rig.complete(&token).await;
     assert_eq!(code, StatusCode::OK, "{json}");
     let file_id = file_id_of(&json);
     assert_eq!(rig.stored_bytes(file_id).await, body, "落盘内容必须逐字节相同");
-    assert_eq!(json["data"]["file_size"].as_u64().unwrap(), body.len() as u64);
+    // 墓碑在、parts 没了。
+    assert!(dir.join("completed.json").exists());
+    assert!(!dir.join("parts").exists());
 
     cleanup(&pool, &[UPLOADER_FLOW]).await;
 }
 
-/// 🔴 **断点续传本体**：传一半 → 服务端「重启」→ 查缺口 → 只补缺口 → 完成。
-///
-/// 重启用的是「丢掉整个 Rig，再用同一个存储根建一个新的」：进程内的状态一个都不留，
-/// 能接上就只能靠磁盘上的会话。补传时**只发缺的那几片**——多传的话这条用例发现不了，
-/// 所以最后要拿「补传字节数」跟「缺口大小」对齐。
+/// 判据 3：传一半 → 服务端「重启」→ status 只回缺失 → 只补缺失 → 完成；线上总字节 = 文件大小。
 #[tokio::test]
 async fn an_interrupted_upload_resumes_from_the_gap_after_a_restart() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool, &[UPLOADER_RESUME]).await;
-    let uid = UPLOADER_RESUME;
+    let keep = tempfile::tempdir().expect("tempdir");
+    let root = keep.path().to_path_buf();
+    let body = payload(UNIT * 4, 0x11);
 
-    // 🔴 目录留在用例作用域里，跨越两段人生。
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
-    let body = payload(BASE_UNIT * 5, 0x27);
-    let parts: Vec<&[u8]> = body.chunks(BASE_UNIT).collect();
-
-    // ---- 第一段人生：传前两片就「断网」了 ----
     let token = {
         let rig = rig_at(root.clone(), pool.clone(), None).await;
-        let token = rig.issue(uid, &body).await;
-        for i in 0..2 {
-            let (code, _) = rig.chunk(&token, uid, i * BASE_UNIT, parts[i]).await;
-            assert_eq!(code, StatusCode::OK);
+        let token = rig.issue(UPLOADER_RESUME, &body).await;
+        for i in [0usize, 2] {
+            let (code, json) = rig.chunk(&token, i * UNIT, &body[i * UNIT..(i + 1) * UNIT]).await;
+            assert_eq!(code, StatusCode::OK, "{json}");
         }
         token
-    }; // rig 在这里被丢掉 = 服务端进程没了
+    };
 
-    // ---- 第二段人生：新进程，同一个存储根 ----
-    let rig = rig_at(root.clone(), pool.clone(), None).await;
+    let rig = rig_at(root, pool.clone(), None).await;
+    let st = rig.status(&token).await;
+    let missing = ranges(&st["missing"]);
+    assert_eq!(missing, vec![(UNIT as u64, UNIT as u64), (3 * UNIT as u64, UNIT as u64)]);
+    assert_eq!(ranges(&st["received"]), vec![(0, UNIT as u64), (2 * UNIT as u64, UNIT as u64)]);
 
-    let st = rig.status(&token, uid).await;
-    assert_eq!(
-        ranges(&st),
-        vec![(0, (BASE_UNIT * 2) as u64)],
-        "重启后必须还认得已传的那两片：{st}"
-    );
-    assert!(!st["complete"].as_bool().unwrap());
-
-    // 只补缺口。
-    let already = st["confirmed_bytes"].as_u64().unwrap() as usize;
-    let mut resent = 0usize;
-    for (i, part) in parts.iter().enumerate() {
-        let offset = i * BASE_UNIT;
-        if offset < already {
-            continue; // 已确认，不重传——这就是断点续传省下来的
-        }
-        let (code, _) = rig.chunk(&token, uid, offset, part).await;
-        assert_eq!(code, StatusCode::OK);
-        resent += part.len();
+    let mut sent = 2 * UNIT as u64;
+    for (off, len) in missing {
+        let (code, json) = rig
+            .chunk(&token, off as usize, &body[off as usize..(off + len) as usize])
+            .await;
+        assert_eq!(code, StatusCode::OK, "{json}");
+        sent += len;
     }
-    assert_eq!(
-        resent,
-        body.len() - already,
-        "🔴 补传的字节数必须正好等于缺口——多一个字节就说明没在续传"
-    );
+    assert_eq!(sent, body.len() as u64, "多一个字节，省下的带宽就是假的");
 
-    let (code, json) = rig.complete(&token, uid).await;
+    let (code, json) = rig.complete(&token).await;
     assert_eq!(code, StatusCode::OK, "{json}");
-    let file_id = file_id_of(&json);
-    assert_eq!(
-        rig.stored_bytes(file_id).await,
-        body,
-        "跨进程拼起来的文件必须与原文逐字节相同"
-    );
-
+    assert_eq!(rig.stored_bytes(file_id_of(&json)).await, body);
     cleanup(&pool, &[UPLOADER_RESUME]).await;
 }
 
-/// 同一片重传：幂等，不重复计数。
+/// 判据 4：同一片重复上传 → 幂等成功、磁盘不变；同边界不同内容 → 409，磁盘不变。
 #[tokio::test]
-async fn resending_the_same_chunk_is_idempotent() {
+async fn resending_the_same_chunk_is_idempotent_and_other_bytes_conflict() {
     let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_IDEMPOTENT]).await;
-    let uid = UPLOADER_IDEMPOTENT;
     let rig = rig(pool.clone()).await;
-
-    let body = payload(BASE_UNIT * 2, 0x11);
+    let body = payload(UNIT * 2, 0x22);
     let token = rig.issue(UPLOADER_IDEMPOTENT, &body).await;
-    let parts: Vec<&[u8]> = body.chunks(BASE_UNIT).collect();
+    let dir = rig.session_dir(&token);
+    let part = dir.join("parts").join(format!("0-{UNIT}.part"));
 
-    let (_, first) = rig.chunk(&token, uid, 0, parts[0]).await;
-    assert_eq!(first["data"]["outcome"], "confirmed");
-    let (code, again) = rig.chunk(&token, uid, 0, parts[0]).await;
-    assert_eq!(code, StatusCode::OK, "{again}");
-    assert_eq!(
-        again["data"]["outcome"], "already_covered",
-        "同一片同样内容重传就该是成功，不是错误"
-    );
-    assert_eq!(
-        again["data"]["confirmed_bytes"].as_u64().unwrap(),
-        BASE_UNIT as u64,
-        "重传不能把已确认字节数算两遍"
-    );
+    let (code, json) = rig.chunk(&token, 0, &body[..UNIT]).await;
+    assert_eq!(code, StatusCode::OK, "{json}");
+    let mtime = std::fs::metadata(&part).unwrap().modified().unwrap();
+    let (code, json) = rig.chunk(&token, 0, &body[..UNIT]).await;
+    assert_eq!(code, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["outcome"], "already_present");
+    assert_eq!(std::fs::metadata(&part).unwrap().modified().unwrap(), mtime, "磁盘不能动");
 
-    rig.chunk(&token, uid, BASE_UNIT, parts[1]).await;
-    let (code, json) = rig.complete(&token, uid).await;
+    let other = payload(UNIT, 0x99);
+    let (code, json) = rig.chunk(&token, 0, &other).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{json}");
+    assert_eq!(code_of(&json), 20610);
+    assert_eq!(std::fs::read(&part).unwrap(), &body[..UNIT]);
+    // 边界重叠不相同（跨两片的一段）也拒。
+    let (code, json) = rig.chunk(&token, UNIT / 2 * 0, &body[..UNIT + UNIT]).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{json}");
+    assert_eq!(std::fs::read_dir(dir.join("parts")).unwrap().count(), 1);
+}
+
+/// 判据 5：乱序上传 → complete 仍拼对。
+#[tokio::test]
+async fn out_of_order_chunks_still_assemble() {
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool, &[UPLOADER_ORDER]).await;
+    let rig = rig(pool.clone()).await;
+    let body = payload(UNIT * 3 + 777, 0x33);
+    let token = rig.issue(UPLOADER_ORDER, &body).await;
+    let mut pieces: Vec<(usize, &[u8])> = body.chunks(UNIT).enumerate().map(|(i, c)| (i * UNIT, c)).collect();
+    pieces.reverse();
+    for (off, part) in pieces {
+        let (code, json) = rig.chunk(&token, off, part).await;
+        assert_eq!(code, StatusCode::OK, "{json}");
+    }
+    let (code, json) = rig.complete(&token).await;
     assert_eq!(code, StatusCode::OK, "{json}");
     assert_eq!(rig.stored_bytes(file_id_of(&json)).await, body);
-
-    cleanup(&pool, &[UPLOADER_IDEMPOTENT]).await;
+    cleanup(&pool, &[UPLOADER_ORDER]).await;
 }
 
-/// 🔴 同一区间**不同内容**：拒绝，且磁盘上已确认的字节不能被改动。
+/// 判据 7：complete 成功后重放 → 同一个 file_id、表不多一行。
 #[tokio::test]
-async fn resending_a_confirmed_range_with_other_bytes_changes_nothing() {
+async fn replaying_complete_returns_the_same_file_id() {
     let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_CONFLICT]).await;
-    let uid = UPLOADER_CONFLICT;
+    cleanup(&pool, &[UPLOADER_REPLAY]).await;
     let rig = rig(pool.clone()).await;
-
-    let body = payload(BASE_UNIT * 2, 0x33);
-    let token = rig.issue(UPLOADER_CONFLICT, &body).await;
-    let parts: Vec<&[u8]> = body.chunks(BASE_UNIT).collect();
-    rig.chunk(&token, uid, 0, parts[0]).await;
-
-    // 同一区间，换一份内容。
-    //
-    // 🔴 顺序模型下这是**幂等成功**而不是拒绝：整段都在游标之内 = 上次写成功但
-    // 响应丢了，客户端重试拿到成功才是对的。要守住的性质没变——已确认的字节
-    // 一个都不能被覆盖，所以服务端直接跳过、根本不碰磁盘。
-    let evil = payload(BASE_UNIT, 0x99);
-    let (code, json) = rig.chunk(&token, uid, 0, &evil).await;
-    assert_eq!(code, StatusCode::OK, "游标之内的重发是幂等成功：{json}");
-
-    // 补完剩下的，完成后内容必须还是原文——那片新内容一个字节都没写进去。
-    rig.chunk(&token, uid, BASE_UNIT, parts[1]).await;
-    let (code, json) = rig.complete(&token, uid).await;
-    assert_eq!(code, StatusCode::OK, "{json}");
-    assert_eq!(
-        rig.stored_bytes(file_id_of(&json)).await,
-        body,
-        "重发的新内容覆盖了已确认字节"
-    );
-
-    cleanup(&pool, &[UPLOADER_CONFLICT]).await;
+    let body = payload(UNIT + 5, 0x44);
+    let token = rig.issue(UPLOADER_REPLAY, &body).await;
+    for (i, part) in body.chunks(UNIT).enumerate() {
+        rig.chunk(&token, i * UNIT, part).await;
+    }
+    let (_, first) = rig.complete(&token).await;
+    let id = file_id_of(&first);
+    let (code, again) = rig.complete(&token).await;
+    assert_eq!(code, StatusCode::OK, "{again}");
+    assert_eq!(file_id_of(&again), id);
+    assert_eq!(rig.rows_of(&pool, UPLOADER_REPLAY).await, 1);
+    // status 也要报告 completed。
+    let st = rig.status(&token).await;
+    assert_eq!(st["completed"], true);
+    // 迟到的分片：拒。
+    let (code, json) = rig.chunk(&token, 0, &body[..UNIT]).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{json}");
+    assert_eq!(code_of(&json), 20614);
+    // 已完成不能 abort。
+    let (code, _) = rig.abort(&token).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    cleanup(&pool, &[UPLOADER_REPLAY]).await;
 }
 
-/// 没传完就 complete → 拒绝并说明还差多少；abort 之后会话就没了。
+/// 判据 8（进程内版）：PG 已提交、墓碑没写 → 重试 complete → 同 id、不多行、对象不重写。
+///
+/// 这里模拟的是「墓碑丢了」这一态：把 completed.json 删掉，parts 也没了——恢复必须
+/// 靠 manifest 里的 `reserved_file_id` 查到正式行。真正的 SIGKILL 注入见
+/// `PRIVCHAT_CRASH_POINT=after_commit_before_tombstone`。
+#[tokio::test]
+async fn a_lost_tombstone_is_recovered_through_the_reserved_file_id() {
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool, &[UPLOADER_TOMB]).await;
+    let rig = rig(pool.clone()).await;
+    let body = payload(UNIT * 2, 0x55);
+    let token = rig.issue(UPLOADER_TOMB, &body).await;
+    for (i, part) in body.chunks(UNIT).enumerate() {
+        rig.chunk(&token, i * UNIT, part).await;
+    }
+    let (_, first) = rig.complete(&token).await;
+    let id = file_id_of(&first);
+    let dir = rig.session_dir(&token);
+    std::fs::remove_file(dir.join("completed.json")).unwrap();
+    let meta = rig.state.file_service.get_file_metadata(id).await.unwrap().unwrap();
+    let obj = rig.root.join(meta.file_path.trim_start_matches('/'));
+    let mtime = std::fs::metadata(&obj).unwrap().modified().unwrap();
+
+    let (code, again) = rig.complete(&token).await;
+    assert_eq!(code, StatusCode::OK, "{again}");
+    assert_eq!(file_id_of(&again), id);
+    assert_eq!(rig.rows_of(&pool, UPLOADER_TOMB).await, 1);
+    assert_eq!(std::fs::metadata(&obj).unwrap().modified().unwrap(), mtime, "对象不得重写");
+    assert!(dir.join("completed.json").exists(), "墓碑要补回来");
+    cleanup(&pool, &[UPLOADER_TOMB]).await;
+}
+
+/// 没传完就 complete → 409 + 缺失区间；abort 删目录；之后所有请求 SessionGone；abort 幂等。
 #[tokio::test]
 async fn completing_early_is_refused_and_abort_drops_the_session() {
     let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_ABORT]).await;
-    let uid = UPLOADER_ABORT;
     let rig = rig(pool.clone()).await;
-
-    let body = payload(BASE_UNIT * 3, 0x44);
+    let body = payload(UNIT * 2, 0x66);
     let token = rig.issue(UPLOADER_ABORT, &body).await;
-    rig.chunk(&token, uid, 0, &body[..BASE_UNIT]).await;
+    rig.chunk(&token, 0, &body[..UNIT]).await;
+    let (code, json) = rig.complete(&token).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{json}");
+    assert_eq!(code_of(&json), 20615);
 
-    let (code, json) = rig.complete(&token, uid).await;
-    assert_ne!(code, StatusCode::OK, "没传完不能完成：{json}");
-
-    let (code, json) = rig.abort(&token, uid).await;
-    assert_eq!(code, StatusCode::OK, "{json}");
-
-    // 会话没了：status 归零，而不是报错。
-    let st = rig.status(&token, uid).await;
-    assert_eq!(st["confirmed_bytes"].as_u64().unwrap(), 0);
-    assert!(ranges(&st).is_empty());
-
-    cleanup(&pool, &[UPLOADER_ABORT]).await;
-}
-
-/// 大文件 + 乱序分片：区间合并与最终拼装都要对。
-///
-/// 乱序是真实情况（并发上传几片，谁先到不一定），顺序发的话这条路径永远测不到。
-#[tokio::test]
-async fn a_chunk_ahead_of_the_cursor_is_refused_and_leaves_no_trace() {
-    let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_BIG]).await;
-    let uid = UPLOADER_BIG;
-    let rig = rig(pool.clone()).await;
-
-    let body = payload(BASE_UNIT * 16 + 777, 0x6b);
-    let token = rig.issue(UPLOADER_BIG, &body).await;
-    let parts: Vec<(usize, &[u8])> = body
-        .chunks(BASE_UNIT)
-        .enumerate()
-        .map(|(i, p)| (i * BASE_UNIT, p))
-        .collect();
-
-    // 🔴 顺序模型：超前的分片必须被拒,而且**磁盘一个字节都不能动**。
-    //
-    // 旧实现允许乱序落盘,再靠 journal 记录离散区间、complete 时合并。那套机制是
-    // 为「并发 + 乱序」准备的,而我们只要「把一次上传拆成多次传输」——顺序传完全
-    // 够用,却省掉了 journal、区间合并和一整个拼接状态机。代价是这里:客户端不能
-    // 想从哪传就从哪传,必须跟着服务端游标走。
-    for (offset, part) in parts.iter().filter(|(o, _)| (o / BASE_UNIT) % 2 == 1) {
-        let (code, _) = rig.chunk(&token, uid, *offset, part).await;
-        assert_ne!(code, StatusCode::OK, "offset={offset} 超前于游标,不该被接受");
-    }
-    let st = rig.status(&token, uid).await;
-    assert!(
-        ranges(&st).is_empty(),
-        "被拒的分片不能在服务端留下任何痕迹：{st}"
-    );
-
-    // 按顺序补齐,每一片都跟着游标走。
-    for (offset, part) in parts.iter() {
-        let (code, _) = rig.chunk(&token, uid, *offset, part).await;
-        assert_eq!(code, StatusCode::OK, "offset={offset} 应当被接受");
-    }
-    let st = rig.status(&token, uid).await;
-    assert_eq!(
-        ranges(&st),
-        vec![(0, body.len() as u64)],
-        "传完之后必须是完整一段：{st}"
-    );
-
-    let (code, json) = rig.complete(&token, uid).await;
-    assert_eq!(code, StatusCode::OK, "{json}");
-    assert_eq!(rig.stored_bytes(file_id_of(&json)).await, body);
-
-    cleanup(&pool, &[UPLOADER_BIG]).await;
-}
-
-// ---------------------------------------------------------------- 协议边界
-
-const UPLOADER_AUTH: u64 = 9_971_007;
-const UPLOADER_NOPLAN: u64 = 9_971_008;
-const UPLOADER_ALIGN: u64 = 9_971_009;
-const UPLOADER_DIGEST: u64 = 9_971_010;
-const UPLOADER_BUSY: u64 = 9_971_011;
-
-/// 错误码：客户端就是靠它分流的，所以必须逐个钉死。
-fn code_of(json: &serde_json::Value) -> u64 {
-    json["code"].as_u64().expect("code")
-}
-
-/// 🔴 **双凭证**：只有上传 token 不够。
-///
-/// 一张 24 小时的 bearer 泄露出去，如果只认它，持有者就能写别人的分片、看别人的进度、
-/// abort 别人正在传的东西。
-#[tokio::test]
-async fn a_chunk_needs_both_the_upload_token_and_a_login() {
-    let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_AUTH]).await;
-    let uid = UPLOADER_AUTH;
-    let rig = rig(pool.clone()).await;
-
-    let body = payload(BASE_UNIT * 2, 0x71);
-    let token = rig.issue(uid, &body).await;
-
-    // 没有 Authorization → 拒。
-    let (code, json) = rig.chunk_without_auth(&token, 0, &body[..BASE_UNIT]).await;
-    assert_eq!(code, StatusCode::UNAUTHORIZED, "缺登录态必须拒绝：{json}");
-
-    // 登录态是**别人** → 拒，而且是授权失败（凭证有效，只是不是这个人的上传）。
+    let dir = rig.session_dir(&token);
+    let (code, _) = rig.abort(&token).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(!dir.exists());
     let (code, json) = rig
-        .chunk(&token, uid + 1, 0, &body[..BASE_UNIT])
-        .await;
-    assert_eq!(code, StatusCode::FORBIDDEN, "换个人必须拒绝：{json}");
-
-    // 两者一致 → 放行。
-    let (code, json) = rig.chunk(&token, uid, 0, &body[..BASE_UNIT]).await;
-    assert_eq!(code, StatusCode::OK, "{json}");
-
-    // 被拒的两次一个字节都没写进去。
-    let st = rig.status(&token, uid).await;
-    assert_eq!(st["confirmed_bytes"].as_u64().unwrap(), BASE_UNIT as u64);
-
-    cleanup(&pool, &[UPLOADER_AUTH]).await;
-}
-
-/// 🔴 **关停阀**：token 不带 plan，分片端点就必须关着。
-///
-/// 服务端不自己执行 plan 的话，「停发 plan 即关闭分片」只是一句话——客户端照样能写。
-#[tokio::test]
-async fn a_token_without_a_plan_cannot_use_chunks() {
-    let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_NOPLAN]).await;
-    let uid = UPLOADER_NOPLAN;
-    let rig = rig(pool.clone()).await;
-
-    let body = payload(BASE_UNIT * 2, 0x72);
-    let token = rig.issue_with_plan(uid, &body, false).await;
-
-    let (code, json) = rig.chunk(&token, uid, 0, &body[..BASE_UNIT]).await;
-    assert_ne!(code, StatusCode::OK, "没有 plan 不该能传分片：{json}");
-    assert_eq!(
-        code_of(&json),
-        20616,
-        "要给客户端一个能识别的「模式冲突」，好让它回落整包：{json}"
-    );
-
-    cleanup(&pool, &[UPLOADER_NOPLAN]).await;
-}
-
-/// 未按网格对齐 / 超过单次上限 → 拒绝，且带可识别的错误码。
-#[tokio::test]
-async fn misaligned_or_oversized_chunks_are_refused() {
-    let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_ALIGN]).await;
-    let uid = UPLOADER_ALIGN;
-    let rig = rig(pool.clone()).await;
-
-    let body = payload(BASE_UNIT * 4, 0x73);
-    let token = rig.issue(uid, &body).await;
-
-    // offset 不在网格上。
-    let (code, json) = rig.chunk(&token, uid, 1234, &body[..BASE_UNIT]).await;
-    assert_ne!(code, StatusCode::OK, "{json}");
-    assert_eq!(code_of(&json), 20617, "{json}");
-
-    // 非末段长度不是整格。
-    let (code, json) = rig.chunk(&token, uid, 0, &body[..BASE_UNIT + 7]).await;
-    assert_ne!(code, StatusCode::OK, "{json}");
-    assert_eq!(code_of(&json), 20617, "{json}");
-
-    // 超过单次上限（plan 是 2MiB，这里给 3MiB）——路由层的 body limit 先挡下来，
-    // 挡不住也会被业务上限拒掉。两层都在，才不会有人靠一个请求把几百 MB 塞进内存。
-    let huge = payload(3 * 1024 * 1024, 0x74);
-    let (code, _) = rig.chunk(&token, uid, 0, &huge).await;
-    assert_ne!(code, StatusCode::OK, "超大分片必须被拒");
-
-    // 全程什么都没写进去。
-    let st = rig.status(&token, uid).await;
-    assert_eq!(st["confirmed_bytes"].as_u64().unwrap(), 0);
-
-    cleanup(&pool, &[UPLOADER_ALIGN]).await;
-}
-
-/// 🔴 分片摘要对不上 → 当场拒绝，**不能**记成已确认。
-///
-/// 记成已确认的话，要等 complete 核验整文件才失败，而那时 status 显示区间齐全，
-/// 客户端根本不知道该重传哪一片，只能整份重来——断点续传就白做了。
-#[tokio::test]
-async fn a_corrupted_chunk_is_caught_immediately_not_at_complete() {
-    let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_DIGEST]).await;
-    let uid = UPLOADER_DIGEST;
-    let rig = rig(pool.clone()).await;
-
-    let body = payload(BASE_UNIT * 2, 0x75);
-    let token = rig.issue(uid, &body).await;
-
-    // 声明的是原文摘要，发的是被改坏的字节——传输中翻了一位就是这样。
-    let mut corrupted = body[..BASE_UNIT].to_vec();
-    corrupted[100] ^= 0xff;
-    let (code, json) = rig
-        .chunk_with_digest(&token, uid, 0, &corrupted, &sha256_hex(&body[..BASE_UNIT]))
-        .await;
-    assert_ne!(code, StatusCode::OK, "坏片必须当场拒：{json}");
-    assert_eq!(
-        code_of(&json),
-        20611,
-        "要能让客户端认出「就重传这一片」：{json}"
-    );
-
-    // 关键：它**没有**被记成已确认。
-    let st = rig.status(&token, uid).await;
-    assert_eq!(
-        st["confirmed_bytes"].as_u64().unwrap(),
-        0,
-        "坏片绝不能进 journal：{st}"
-    );
-
-    // 缺 X-Chunk-SHA256 同样拒绝——协议要求带。
-    let (code, _) = rig
         .send(
             Request::builder()
-                .method("PUT")
-                .uri("/api/app/files/chunk?offset=0")
+                .method("GET")
+                .uri("/api/app/files/status")
                 .header("X-Upload-Token", &token)
-                .header("Authorization", format!("Bearer u:{uid}"))
-                .body(Body::from(body[..BASE_UNIT].to_vec()))
-                .expect("request"),
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
-    assert_ne!(code, StatusCode::OK, "不带分片摘要必须拒绝");
-
-    // 重传正确内容 → 成功，整条链路还能走完。
-    let (code, _) = rig.chunk(&token, uid, 0, &body[..BASE_UNIT]).await;
-    assert_eq!(code, StatusCode::OK);
-    rig.chunk(&token, uid, BASE_UNIT, &body[BASE_UNIT..]).await;
-    let (code, json) = rig.complete(&token, uid).await;
-    assert_eq!(code, StatusCode::OK, "{json}");
-    assert_eq!(rig.stored_bytes(file_id_of(&json)).await, body);
-
-    cleanup(&pool, &[UPLOADER_DIGEST]).await;
+    assert_eq!(code, StatusCode::GONE, "{json}");
+    assert_eq!(code_of(&json), 20613);
+    let (code, _) = rig.abort(&token).await;
+    assert_eq!(code, StatusCode::OK, "abort 幂等");
 }
 
-/// 🔴 **abort 不能把别人脚下的目录抽掉**：持锁时中止要被拒绝。
-///
-/// 不抢锁就删的话，另一个正在写分片、或正在 complete 核验的请求会突然找不到文件——
-/// 它可能已经回了成功，字节却没了。
+/// 单凭据：错 secret 与不存在同一句话；坏摘要当场 422 且不落盘；不对齐 400。
 #[tokio::test]
-async fn abort_cannot_delete_a_session_someone_else_holds() {
+async fn bad_credentials_and_bad_chunks_are_refused_up_front() {
     let Some(pool) = pool().await else { return };
-    cleanup(&pool, &[UPLOADER_BUSY]).await;
-    let uid = UPLOADER_BUSY;
     let rig = rig(pool.clone()).await;
+    let body = payload(UNIT * 2, 0x77);
+    let token = rig.issue(UPLOADER_CONFLICT, &body).await;
+    let dir = rig.session_dir(&token);
 
-    let body = payload(BASE_UNIT * 2, 0x76);
-    let token = rig.issue(uid, &body).await;
-    rig.chunk(&token, uid, 0, &body[..BASE_UNIT]).await;
+    let (id, _) = token.split_once('.').unwrap();
+    let forged = format!("{id}.{}", "f".repeat(64));
+    let (code, json) = rig.chunk(&forged, 0, &body[..UNIT]).await;
+    assert_eq!(code, StatusCode::GONE, "{json}");
+    assert_eq!(code_of(&json), 20613);
 
-    // 在另一个「请求」手里持着会话锁的时候去 abort。
-    let session_root = rig.root.join("tmp/uploads");
-    let upload_id = rig.status(&token, uid).await["upload_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let holder =
-        privchat::service::upload_session::UploadSession::open(&session_root, uid, &upload_id)
-            .expect("open");
-    assert!(holder.try_lock_exclusive().expect("lock"), "应当能拿到锁");
+    let (code, json) = rig.chunk_with_digest(&token, 0, &body[..UNIT], &"0".repeat(64)).await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_eq!(code_of(&json), 20611);
+    assert_eq!(std::fs::read_dir(dir.join("parts")).unwrap().count(), 0, "坏字节不许碰磁盘");
 
-    let (code, json) = rig.abort(&token, uid).await;
-    assert_eq!(code, StatusCode::CONFLICT, "占用时中止必须被拒：{json}");
-    assert_eq!(code_of(&json), 20612, "{json}");
-
-    // 已确认的字节完好无损，放开锁之后还能继续传完。
-    drop(holder);
-    let st = rig.status(&token, uid).await;
-    assert_eq!(st["confirmed_bytes"].as_u64().unwrap(), BASE_UNIT as u64);
-    rig.chunk(&token, uid, BASE_UNIT, &body[BASE_UNIT..]).await;
-    let (code, json) = rig.complete(&token, uid).await;
-    assert_eq!(code, StatusCode::OK, "{json}");
-    assert_eq!(rig.stored_bytes(file_id_of(&json)).await, body);
-
-    cleanup(&pool, &[UPLOADER_BUSY]).await;
+    let (code, json) = rig.chunk(&token, 1, &body[1..UNIT]).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(code_of(&json), 20617);
+    let (code, json) = rig.chunk(&token, 0, &body[..100]).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "非末段不整格：{json}");
+    let (code, json) = rig.chunk(&token, UNIT * 2, &body[..10]).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "越界：{json}");
 }

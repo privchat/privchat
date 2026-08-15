@@ -19,12 +19,14 @@
 
 pub mod get_url;
 pub mod claim_existing;
+pub mod request_chunked_upload_token;
 pub mod request_upload_token;
 pub mod upload_callback;
 pub mod validate_token;
 
 pub use get_url::get_file_url;
 pub use claim_existing::claim_existing;
+pub use request_chunked_upload_token::request_chunked_upload_token;
 pub use request_upload_token::request_upload_token;
 pub use upload_callback::upload_callback;
 pub use validate_token::validate_upload_token;
@@ -41,6 +43,18 @@ pub async fn register_routes(services: RpcServiceContext) {
             let services = services1.clone();
             Box::pin(async move { request_upload_token(services, params, ctx).await })
         })
+        .await;
+
+    // 分片上传：独立 RPC（RESUMABLE_UPLOAD_SPEC §2），与整包互不影响。
+    let services_chunked = services.clone();
+    GLOBAL_RPC_ROUTER
+        .register(
+            privchat_protocol::rpc::routes::file::REQUEST_CHUNKED_UPLOAD_TOKEN,
+            move |params, ctx| {
+                let services = services_chunked.clone();
+                Box::pin(async move { request_chunked_upload_token(services, params, ctx).await })
+            },
+        )
         .await;
 
     // 秒传命中后取得所有权：与探测分开的独立入口（见 claim_existing 模块说明）。
@@ -63,9 +77,9 @@ pub async fn register_routes(services: RpcServiceContext) {
 
     let services3 = services.clone();
     GLOBAL_RPC_ROUTER
-        .register("file/upload_callback", move |params, _ctx| {
+        .register("file/upload_callback", move |params, ctx| {
             let services = services3.clone();
-            Box::pin(async move { upload_callback(services, params).await })
+            Box::pin(async move { upload_callback(services, params, ctx).await })
         })
         .await;
 

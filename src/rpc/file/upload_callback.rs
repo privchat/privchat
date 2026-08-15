@@ -22,7 +22,7 @@
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::rpc::{RpcError, RpcResult, RpcServiceContext};
+use crate::rpc::{RpcContext, RpcError, RpcResult, RpcServiceContext};
 
 /// 回调失败的三类。**分类的依据是「客户端接下来该做什么」，不是错误发生在哪一层。**
 ///
@@ -158,7 +158,11 @@ fn check_callback_target_id(tombstone: Option<u64>, reported: u64) -> Result<(),
 }
 
 /// 上传完成回调
-pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcResult<Value> {
+pub async fn upload_callback(
+    services: RpcServiceContext,
+    params: Value,
+    ctx: RpcContext,
+) -> RpcResult<Value> {
     // 解析参数
     let upload_token = params
         .get("token")
@@ -196,6 +200,18 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         file_id,
         file_size
     );
+
+    // ---- 分片上传（RESUMABLE_UPLOAD_SPEC §3.3.1）：token 前半段就是 upload_id ----
+    //
+    // callback 不新增任何字段：拆 token → 定位会话 → 恒定时间验 secret →
+    // 核对 completed.json.file_id → 删目录。三种结果分开：身份不符**拒绝**；
+    // 目录已不在但行确实是本人的 → **幂等成功**；删目录 I/O 错 → 告警仍成功。
+    if crate::service::chunked_upload::looks_like_chunked_token(upload_token) {
+        let file_id_num: u64 = file_id
+            .parse()
+            .map_err(|_| RpcError::validation("file_id 不是合法数字".to_string()))?;
+        return chunked_callback(&services, &ctx, upload_token, file_id_num).await;
+    }
 
     // 🔴 **token 仍然有效是正常的，不是异常** —— 但无效必须拒绝。
     //
@@ -292,6 +308,81 @@ pub async fn upload_callback(services: RpcServiceContext, params: Value) -> RpcR
         "success": true,
         "message": "文件上传成功",
     }))
+}
+
+/// 分片上传的完成回调。
+async fn chunked_callback(
+    services: &RpcServiceContext,
+    ctx: &RpcContext,
+    raw_token: &str,
+    reported: u64,
+) -> RpcResult<Value> {
+    use crate::service::chunked_upload::{ChunkedSession, OpenError};
+
+    let session_root = services
+        .file_service
+        .upload_session_root()
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    let ok = json!({ "success": true, "message": "文件上传成功" });
+
+    let session = match ChunkedSession::open(&session_root, raw_token) {
+        Ok(s) => s,
+        Err(OpenError::Malformed) => {
+            return Err(RpcError::validation("上传 token 无效".to_string()));
+        }
+        // 🔴 secret 不符：拒绝。目录在、凭据不对，就是别人的会话。
+        Err(OpenError::BadSecret) => {
+            warn!("❌ 分片上传回调 secret 不符（file_id={reported}）");
+            return Err(RpcError::validation("上传 token 无效".to_string()));
+        }
+        // 目录已不在（上次 callback 已删 / 扫描已清 / 过期）：只要这条行确实是
+        // 调用者本人的，就是幂等成功——上传早已完成，回执重发而已。
+        Err(OpenError::Gone) | Err(OpenError::Expired) => {
+            let caller = crate::rpc::get_current_user_id(ctx)?;
+            let meta = services
+                .file_service
+                .get_file_metadata(reported)
+                .await
+                .map_err(|e| RpcError::internal(e.to_string()))?
+                .ok_or_else(|| RpcError::validation("file_id 不存在".to_string()))?;
+            if meta.uploader_id != caller {
+                warn!("❌ 分片上传回调 file_id={reported} 不属于调用者 {caller}");
+                return Err(RpcError::validation("file_id 与本次上传的身份不符".to_string()));
+            }
+            tracing::info!("♻️ 分片会话已清理，回调按幂等成功处理 file_id={reported}");
+            return Ok(ok);
+        }
+        Err(OpenError::Io(e)) => return Err(RpcError::internal(e.to_string())),
+    };
+
+    let expected = session
+        .completed_file_id()
+        .map_err(|e| RpcError::internal(e.to_string()))?
+        .ok_or_else(|| RpcError::validation("该次上传尚未完成，无法回调".to_string()))?;
+    check_callback_target_id(Some(expected), reported)
+        .map_err(|reason| RpcError::validation(reason.to_string()))?;
+    let meta = services
+        .file_service
+        .get_file_metadata(reported)
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?
+        .ok_or_else(|| RpcError::validation("file_id 不存在".to_string()))?;
+    if !crate::http::routes::upload::manifest_matches(&session, &meta) {
+        return Err(RpcError::validation("file_id 与本次上传的身份不符".to_string()));
+    }
+
+    // 身份全对 → 删目录。删不掉只告警，交 24 小时扫描；不能因为清理临时文件失败
+    // 把一条已完成的消息判成发送失败。
+    match session.try_lock() {
+        Ok(Some(_lock)) => {
+            if let Err(e) = session.discard() {
+                warn!("⚠️ 分片会话目录清理失败（交扫描兜底）: {e}");
+            }
+        }
+        Ok(None) => warn!("⚠️ 分片会话被占用，本次不清理（交扫描兜底） upload_id={}", session.upload_id()),
+        Err(e) => warn!("⚠️ 分片会话锁不可用（交扫描兜底）: {e}"),
+    }
+    Ok(ok)
 }
 
 #[cfg(test)]
