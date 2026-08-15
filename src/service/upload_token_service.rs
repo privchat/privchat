@@ -394,11 +394,17 @@ impl UploadTokenService {
     /// 🔴 判断只在服务端一处。客户端**不实现「多大算小文件」**——收到 plan 就分片，
     /// 没收到就整包。阈值调整因此不需要三端发版；恒不下发即是关停阀。
     ///
-    /// 目前只在签发签名 token 时给出方案：旧 UUID token 没有承载它的字段。
+    /// 🔴 **不依赖签名 token**。
+    ///
+    /// 之前这里要求 `issues_signed()`，于是不配 `[upload.token]` 的部署——包括本地
+    /// 和当时的生产——`plan_for()` 恒返回 None，客户端一律走整包直传：分片路径
+    /// 等于从未开启，而且没有任何报错，只是"看起来正常"。整个功能因此在两端都
+    /// 写完之后仍然一次没被真正执行过。
+    ///
+    /// 分片是**传输方式**，不是安全边界：token 从哪来、怎么验，与"这次要不要拆成
+    /// 多段传"无关。申请 token 的接口本身已经过用户鉴权，token 只授权上传这一份
+    /// 已冻结大小与摘要的文件；拆不拆段不改变任何授权语义。
     pub fn plan_for(&self, sealed_blob_size: i64) -> Option<UploadPlan> {
-        if !self.issues_signed() {
-            return None;
-        }
         const BASE_UNIT: u32 = 64 * 1024;
         let plan = UploadPlan {
             base_unit: BASE_UNIT,

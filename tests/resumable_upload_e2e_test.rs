@@ -459,7 +459,7 @@ async fn resending_the_same_chunk_is_idempotent() {
 
 /// 🔴 同一区间**不同内容**：拒绝，且磁盘上已确认的字节不能被改动。
 #[tokio::test]
-async fn a_conflicting_chunk_is_refused_and_changes_nothing() {
+async fn resending_a_confirmed_range_with_other_bytes_changes_nothing() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool, &[UPLOADER_CONFLICT]).await;
     let uid = UPLOADER_CONFLICT;
@@ -471,18 +471,22 @@ async fn a_conflicting_chunk_is_refused_and_changes_nothing() {
     rig.chunk(&token, uid, 0, parts[0]).await;
 
     // 同一区间，换一份内容。
+    //
+    // 🔴 顺序模型下这是**幂等成功**而不是拒绝：整段都在游标之内 = 上次写成功但
+    // 响应丢了，客户端重试拿到成功才是对的。要守住的性质没变——已确认的字节
+    // 一个都不能被覆盖，所以服务端直接跳过、根本不碰磁盘。
     let evil = payload(BASE_UNIT, 0x99);
     let (code, json) = rig.chunk(&token, uid, 0, &evil).await;
-    assert_ne!(code, StatusCode::OK, "冲突的分片不该被接受：{json}");
+    assert_eq!(code, StatusCode::OK, "游标之内的重发是幂等成功：{json}");
 
-    // 补完剩下的，完成后内容必须还是原文——被拒的那片一个字节都没写进去。
+    // 补完剩下的，完成后内容必须还是原文——那片新内容一个字节都没写进去。
     rig.chunk(&token, uid, BASE_UNIT, parts[1]).await;
     let (code, json) = rig.complete(&token, uid).await;
     assert_eq!(code, StatusCode::OK, "{json}");
     assert_eq!(
         rig.stored_bytes(file_id_of(&json)).await,
         body,
-        "被拒的分片污染了已确认区间"
+        "重发的新内容覆盖了已确认字节"
     );
 
     cleanup(&pool, &[UPLOADER_CONFLICT]).await;
@@ -518,7 +522,7 @@ async fn completing_early_is_refused_and_abort_drops_the_session() {
 ///
 /// 乱序是真实情况（并发上传几片，谁先到不一定），顺序发的话这条路径永远测不到。
 #[tokio::test]
-async fn out_of_order_chunks_of_a_large_file_assemble_correctly() {
+async fn a_chunk_ahead_of_the_cursor_is_refused_and_leaves_no_trace() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool, &[UPLOADER_BIG]).await;
     let uid = UPLOADER_BIG;
@@ -532,24 +536,32 @@ async fn out_of_order_chunks_of_a_large_file_assemble_correctly() {
         .map(|(i, p)| (i * BASE_UNIT, p))
         .collect();
 
-    // 先发奇数片，再发偶数片：中间必然出现空洞。
+    // 🔴 顺序模型：超前的分片必须被拒,而且**磁盘一个字节都不能动**。
+    //
+    // 旧实现允许乱序落盘,再靠 journal 记录离散区间、complete 时合并。那套机制是
+    // 为「并发 + 乱序」准备的,而我们只要「把一次上传拆成多次传输」——顺序传完全
+    // 够用,却省掉了 journal、区间合并和一整个拼接状态机。代价是这里:客户端不能
+    // 想从哪传就从哪传,必须跟着服务端游标走。
     for (offset, part) in parts.iter().filter(|(o, _)| (o / BASE_UNIT) % 2 == 1) {
         let (code, _) = rig.chunk(&token, uid, *offset, part).await;
-        assert_eq!(code, StatusCode::OK);
+        assert_ne!(code, StatusCode::OK, "offset={offset} 超前于游标,不该被接受");
     }
     let st = rig.status(&token, uid).await;
-    assert!(ranges(&st).len() > 1, "这时候应当是好几段离散区间：{st}");
-    assert!(!st["complete"].as_bool().unwrap());
+    assert!(
+        ranges(&st).is_empty(),
+        "被拒的分片不能在服务端留下任何痕迹：{st}"
+    );
 
-    for (offset, part) in parts.iter().filter(|(o, _)| (o / BASE_UNIT) % 2 == 0) {
+    // 按顺序补齐,每一片都跟着游标走。
+    for (offset, part) in parts.iter() {
         let (code, _) = rig.chunk(&token, uid, *offset, part).await;
-        assert_eq!(code, StatusCode::OK);
+        assert_eq!(code, StatusCode::OK, "offset={offset} 应当被接受");
     }
     let st = rig.status(&token, uid).await;
     assert_eq!(
         ranges(&st),
         vec![(0, body.len() as u64)],
-        "补齐之后必须合并成完整一段：{st}"
+        "传完之后必须是完整一段：{st}"
     );
 
     let (code, json) = rig.complete(&token, uid).await;
