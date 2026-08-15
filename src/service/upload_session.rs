@@ -84,6 +84,13 @@ pub struct SessionState {
     /// 越界的分片要能当场拒掉，`complete` 也要知道「传完了没有」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_size: Option<u64>,
+    /// 🔴 **顺序分片的唯一游标**：`[0, confirmed_offset)` 的字节已经落盘且可信。
+    ///
+    /// 分片严格顺序提交，所以「传到哪了」是一个数,不是一组区间。之前用 append-only
+    /// journal + 每段摘要 + 区间合并,是在给「乱序 + 并发分片」做持久化保证——而那个
+    /// 能力我们并不要。一个游标能表达的东西,不需要一个日志文件来表达。
+    #[serde(default)]
+    pub confirmed_offset: u64,
 }
 
 impl Default for SessionState {
@@ -94,16 +101,9 @@ impl Default for SessionState {
             file_id: None,
             reserved_file_id: None,
             total_size: None,
+            confirmed_offset: 0,
         }
     }
-}
-
-/// journal 里的一条：某个区间已确认，以及它的内容摘要。
-#[derive(Debug, Clone)]
-struct JournalEntry {
-    offset: u64,
-    len: u64,
-    sha256: String,
 }
 
 /// 写一段字节的结果。
@@ -111,28 +111,13 @@ struct JournalEntry {
 pub enum ChunkOutcome {
     /// 这次真的写进去了。
     Confirmed,
-    /// 同一区间、同样内容已经确认过——重试拿到的就该是成功。
+    /// 这段已经在游标后面了——上次写成功但响应丢了，重试就该是成功。
     AlreadyCovered,
-    /// 与已确认区间冲突（内容不同，或部分重叠）。磁盘未被改动。
+    /// offset 越过了游标，中间会留洞。磁盘未被改动，客户端按回传的
+    /// `confirmed_offset` 对齐后继续。
     Conflict,
 }
 
-/// 合并成不重叠且相邻已并的升序区间。
-fn merge_ranges(it: impl Iterator<Item = (u64, u64)>) -> Vec<(u64, u64)> {
-    let mut v: Vec<(u64, u64)> = it.collect();
-    v.sort_by_key(|(off, _)| *off);
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    for (off, len) in v {
-        match out.last_mut() {
-            Some((prev_off, prev_len)) if off <= *prev_off + *prev_len => {
-                let end = (off + len).max(*prev_off + *prev_len);
-                *prev_len = end - *prev_off;
-            }
-            _ => out.push((off, len)),
-        }
-    }
-    out
-}
 
 /// 一个上传任务的会话目录。
 pub struct UploadSession {
@@ -387,64 +372,35 @@ impl UploadSession {
         self.dir.join("body.part")
     }
 
-    fn journal_path(&self) -> PathBuf {
-        self.dir.join("journal")
-    }
-
-    /// 已确认的区间（按 offset 升序，且已合并相邻）。
+    /// 已确认区间。顺序游标之下永远是「一段连续的前缀」。
     ///
-    /// 🔴 真源是 **journal**，不是 `body.part` 的大小。文件大小只能说明「写到过这里」，
-    /// 说明不了「哪些区间的字节是完整可信的」——中间可能有空洞，也可能有写了一半就
-    /// 断电的段。journal 只在 `fdatasync(body.part)` **之后**追加，所以它记下的每一段
-    /// 都保证已经在盘上。
+    /// 保留数组形态是为了不动线上协议;真源是 `confirmed_offset`。
     pub fn confirmed_ranges(&self) -> Result<Vec<(u64, u64)>> {
-        Ok(merge_ranges(
-            self.journal_entries()?.into_iter().map(|e| (e.offset, e.len)),
-        ))
+        let at = self.read_state()?.confirmed_offset;
+        Ok(if at == 0 { Vec::new() } else { vec![(0, at)] })
     }
 
-    /// 已确认的总字节数。
+    /// 已确认的总字节数 == 游标。
     pub fn confirmed_bytes(&self) -> Result<u64> {
-        Ok(self.confirmed_ranges()?.iter().map(|(_, len)| len).sum())
+        Ok(self.read_state()?.confirmed_offset)
     }
 
-    fn journal_entries(&self) -> Result<Vec<JournalEntry>> {
-        let raw = match std::fs::read_to_string(self.journal_path()) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(ServerError::Internal(format!("读 journal 失败: {e}"))),
-        };
-        let mut out = Vec::new();
-        for line in raw.lines() {
-            // 🔴 **半行直接丢弃**：崩溃可能停在一行写到一半，那一段本来就不该算确认。
-            // 丢掉它只是让客户端重传一次；认下来就是「已确认但字节对不上」。
-            let mut parts = line.split(' ');
-            let (Some(off), Some(len), Some(sha), None) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let (Ok(offset), Ok(len)) = (off.parse::<u64>(), len.parse::<u64>()) else {
-                continue;
-            };
-            if sha.len() != 64 {
-                continue;
-            }
-            out.push(JournalEntry {
-                offset,
-                len,
-                sha256: sha.to_string(),
-            });
-        }
-        Ok(out)
-    }
-
-    /// 写一段字节。**幂等**：同一区间同样内容重传返回 `AlreadyCovered`。
+    /// 顺序写入一段字节。
+    ///
+    /// 只接受 `offset == confirmed_offset`:
+    /// - 落后(`offset < 游标`)= 上次写成功但响应丢了,回 `AlreadyCovered`;
+    /// - 超前(`offset > 游标`)= 中间会留洞,回 `Conflict`,由调用方把当前游标带回给
+    ///   客户端。客户端不需要自己记进度,服务端说了算。
+    ///
+    /// 🔴 顺序:pwrite → `fdatasync(body.part)` → 原子更新游标。
+    /// 反过来的话,崩在中间就成了「游标说确认了、字节没落盘」——客户端不会重传,
+    /// 却要等到 complete 校验摘要时才发现,是最难查的一种坏。按这个顺序,崩溃的
+    /// 最坏后果只是这一片重传一次。
     pub fn write_chunk(&self, offset: u64, bytes: &[u8]) -> Result<ChunkOutcome> {
         if bytes.is_empty() {
             return Err(ServerError::Validation("分片不能为空".to_string()));
         }
-        let state = self.read_state()?;
+        let mut state = self.read_state()?;
         let total = state
             .total_size
             .ok_or_else(|| ServerError::Validation("会话尚未选定分片模式".to_string()))?;
@@ -457,33 +413,19 @@ impl UploadSession {
             )));
         }
 
-        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes));
-        let entries = self.journal_entries()?;
-
-        // 完全相同的区间已经确认过：内容一致 = 幂等成功；不一致 = 冲突，磁盘不动。
-        if let Some(prev) = entries
-            .iter()
-            .find(|e| e.offset == offset && e.len == bytes.len() as u64)
-        {
-            return if prev.sha256 == digest {
-                Ok(ChunkOutcome::AlreadyCovered)
+        if offset < state.confirmed_offset {
+            // 整段都在游标之内 = 纯重试。跨越游标说明客户端的分片边界变了,
+            // 让它按游标重新对齐,不要就着旧边界往里写。
+            return Ok(if end <= state.confirmed_offset {
+                ChunkOutcome::AlreadyCovered
             } else {
-                Ok(ChunkOutcome::Conflict)
-            };
+                ChunkOutcome::Conflict
+            });
         }
-        // 部分重叠：客户端的区间视图和服务端不一致，让它按 confirmed_ranges 对齐后重来。
-        // 直接写下去会覆盖已确认的字节，那正是「已确认但摘要对不上」的来源。
-        if entries
-            .iter()
-            .any(|e| offset < e.offset + e.len && e.offset < end)
-        {
+        if offset > state.confirmed_offset {
             return Ok(ChunkOutcome::Conflict);
         }
 
-        // 🔴 顺序：pwrite → fdatasync(body.part) → 追加 journal → fsync(journal)。
-        //
-        // 反过来的话，崩溃后 journal 说「这段确认了」而字节其实没落盘——那是最坏的
-        // 一种坏：客户端不会重传，最终摘要却对不上，而且要到 complete 才发现。
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -498,26 +440,18 @@ impl UploadSession {
         file.sync_data()
             .map_err(|e| ServerError::Internal(format!("同步 body.part 失败: {e}")))?;
 
-        let mut journal = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.journal_path())
-            .map_err(|e| ServerError::Internal(format!("打开 journal 失败: {e}")))?;
-        writeln!(journal, "{offset} {} {digest}", bytes.len())
-            .map_err(|e| ServerError::Internal(format!("写 journal 失败: {e}")))?;
-        journal
-            .sync_all()
-            .map_err(|e| ServerError::Internal(format!("同步 journal 失败: {e}")))?;
-
+        state.confirmed_offset = end;
+        self.write_state(&state)?;
         Ok(ChunkOutcome::Confirmed)
     }
 
-    /// 全部区间都确认了吗。
+    /// 传完了吗。
     pub fn is_complete(&self) -> Result<bool> {
-        let Some(total) = self.read_state()?.total_size else {
+        let state = self.read_state()?;
+        let Some(total) = state.total_size else {
             return Ok(false);
         };
-        Ok(self.confirmed_ranges()? == vec![(0, total)])
+        Ok(state.confirmed_offset == total)
     }
 
     /// 丢弃整个会话目录。
@@ -787,5 +721,60 @@ mod tests {
                 "upload_id {evil:?} 必须被拒"
             );
         }
+    }
+
+    /// 🔴 崩溃窗口：字节已 fsync 落盘、游标还没更新时进程死掉。
+    ///
+    /// 这是删掉 journal 之后**唯一**新增的风险面。旧实现里"确认"这件事记在 journal
+    /// 里，现在记在 `state.json` 的游标上，于是 `pwrite → fdatasync → 更新游标` 这三
+    /// 步之间多了一个可以死人的缝。
+    ///
+    /// 必须保证死在缝里是**安全**的那一侧：游标没动 → status 仍报旧值 → 客户端重传
+    /// 这一段。代价是白传一片，而不是"游标说传完了、字节其实没落盘"——后者要等到
+    /// complete 校验摘要才暴露，是最难查的一种坏。
+    ///
+    /// 这里直接构造那个中间态（写完不更新游标），因为游标只存在于 `state.json`，
+    /// 没有任何内存态参与——杀不杀进程，能观察到的东西完全一样。
+    #[test]
+    fn bytes_on_disk_without_a_cursor_bump_are_not_counted_as_confirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let s = UploadSession::open(root.path(), 7, "c7a5f0").unwrap();
+        let _g = s.begin_resumable(8).unwrap();
+
+        s.write_chunk(0, b"aaaa").unwrap();
+        assert_eq!(s.confirmed_bytes().unwrap(), 4);
+
+        // ---- 崩溃窗口：字节落盘，游标未更新 ----
+        {
+            use std::os::unix::fs::FileExt;
+            let f = OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .open(s.body_path())
+                .unwrap();
+            f.write_all_at(b"bbbb", 4).unwrap();
+            f.sync_data().unwrap();
+        }
+
+        // 重启后的视角：那 4 个字节在盘上，但**不算数**。
+        let again = UploadSession::open(root.path(), 7, "c7a5f0").unwrap();
+        assert_eq!(
+            again.confirmed_bytes().unwrap(),
+            4,
+            "没更新游标的字节被当成已确认了——客户端不会重传，文件会缺一段"
+        );
+        assert!(!again.is_complete().unwrap());
+
+        // 客户端按 status 重传该段（可以换更小的分片），一切照常。
+        assert_eq!(
+            again.write_chunk(4, b"bb").unwrap(),
+            ChunkOutcome::Confirmed
+        );
+        assert_eq!(
+            again.write_chunk(6, b"bb").unwrap(),
+            ChunkOutcome::Confirmed
+        );
+        assert!(again.is_complete().unwrap());
+        assert_eq!(std::fs::read(again.body_path()).unwrap(), b"aaaabbbb");
     }
 }
