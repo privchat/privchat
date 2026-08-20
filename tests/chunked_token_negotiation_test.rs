@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::FutureExt as _;
 use sha2::Digest as _;
 use sqlx::postgres::PgPoolOptions;
 
@@ -30,9 +31,21 @@ use privchat_protocol::rpc::FileRequestChunkedUploadTokenRequest;
 const UPLOADER: u64 = 9_972_001;
 
 struct Rig {
+    pool: Arc<sqlx::PgPool>,
     file_service: FileService,
     upload_token_service: UploadTokenService,
     _dir: tempfile::TempDir,
+}
+
+/// 🔴 真库卫生：本测试的秒传对照用例会往 `privchat_file_uploads` 写正式行，而
+/// TempDir 销毁后物理对象就没了——不清库就会留下「有记录、无对象」的垃圾行，
+/// 后续重跑的秒传对照可能靠陈旧记录假绿，也会污染共享真库的其他测试。
+/// 按 uploader 全量清：测试开头清一次（吃掉上次 panic 留下的残留），结尾再清一次。
+async fn cleanup(pool: &sqlx::PgPool) {
+    let _ = sqlx::query("DELETE FROM privchat_file_uploads WHERE uploader_id = $1")
+        .bind(UPLOADER as i64)
+        .execute(pool)
+        .await;
 }
 
 async fn rig() -> Rig {
@@ -57,9 +70,11 @@ async fn rig() -> Rig {
         secret_access_key: None,
         path_prefix: None,
     };
-    let file_service = FileService::new(vec![source], 0, pool);
+    let file_service = FileService::new(vec![source], 0, pool.clone());
     file_service.init().await.expect("init storage");
+    cleanup(&pool).await;
     Rig {
+        pool,
         file_service,
         upload_token_service: UploadTokenService::new(),
         _dir: dir,
@@ -179,6 +194,18 @@ async fn s3_only_transport_set_is_rejected() {
 #[tokio::test]
 async fn invalid_transport_set_is_rejected_even_when_dedup_would_hit() {
     let rig = rig().await;
+    // 失败路径也必须清库：用 catch_unwind 接住用例主体（含断言 panic），先清掉
+    // 本 uploader 的行，再把失败原样重新抛出；双保险：下次 rig() 开头还会再清一次。
+    let outcome = std::panic::AssertUnwindSafe(ordering_case_core(&rig))
+        .catch_unwind()
+        .await;
+    cleanup(&rig.pool).await;
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+async fn ordering_case_core(rig: &Rig) {
     let bytes: &[u8] = b"privchat negotiation ordering fixture";
     let sha = hex::encode(sha2::Sha256::digest(bytes));
 
@@ -220,7 +247,7 @@ async fn invalid_transport_set_is_rejected_even_when_dedup_would_hit() {
 
     // 非法集合 → 即便秒传会命中，也必须参数错误（校验在秒传预检之前）。
     let err = issue_chunked_upload_token(
-        &services(&rig),
+        &services(rig),
         UPLOADER,
         req(&sha, Some(vec!["s3_multipart_v1"])),
     )
@@ -230,7 +257,7 @@ async fn invalid_transport_set_is_rejected_even_when_dedup_would_hit() {
 
     // 反向对照：同一摘要的旧格式请求确实命中秒传，证明文件存在、上面的拒绝
     // 不是因为「文件不存在」。
-    let resp = issue_chunked_upload_token(&services(&rig), UPLOADER, req(&sha, None))
+    let resp = issue_chunked_upload_token(&services(rig), UPLOADER, req(&sha, None))
         .await
         .expect("旧格式请求应成功");
     assert!(resp.already_exists, "同摘要旧请求应命中秒传");
