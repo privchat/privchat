@@ -128,10 +128,17 @@ pub struct Manifest {
     /// 仅 `s3_multipart_v1`：总分片数。
     #[serde(default)]
     pub total_parts: Option<u32>,
-    /// 仅 `s3_multipart_v1`：进行中 MPU 的可持久化引用（bucket/key/uploadId
-    /// 三件套，RESUMABLE §8.7）。进程重启后靠它恢复控制面操作，不依赖进程内映射。
+    /// 仅 `s3_multipart_v1`：S3 bucket（spec 冻结的 manifest 平铺字段）。
     #[serde(default)]
-    pub s3_reference: Option<crate::service::numbered_parts::UploadReference>,
+    pub bucket: Option<String>,
+    /// 仅 `s3_multipart_v1`：最终对象 key（spec 字段名 `final_key`）。
+    #[serde(default)]
+    pub final_key: Option<String>,
+    /// 仅 `s3_multipart_v1`：provider 的原始 MPU UploadId，不下发客户端。
+    /// 🔴 三字段与 `part_size`/`total_parts` 作为整体原子使用（RESUMABLE §8.7），
+    /// 进程重启后靠它们恢复控制面操作，不依赖进程内映射。
+    #[serde(default)]
+    pub provider_upload_id: Option<String>,
     #[serde(default)]
     pub created_at: i64,
 }
@@ -310,7 +317,9 @@ impl ChunkedSession {
             // S3 分片参数在直传门禁接入（实现顺序第 5 步）建 S3 会话时才写入。
             part_size: None,
             total_parts: None,
-            s3_reference: None,
+            bucket: None,
+            final_key: None,
+            provider_upload_id: None,
             created_at: now,
         };
         write_json_atomic(&dir, "manifest.json", &manifest)?;

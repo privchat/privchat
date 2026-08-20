@@ -706,8 +706,8 @@ async fn part_urls(
 ) -> ApiResult<PartUrlResponse> {
     use crate::service::chunked_upload::TRANSPORT_S3_MULTIPART_V1;
     use crate::service::numbered_parts::{
-        check_part_geometry, checksum_b64_from_hex, NumberedPartError, MAX_PARTS_PER_REQUEST,
-        PART_URL_TTL_SECS,
+        check_part_geometry, checksum_b64_from_hex, NumberedPartError, UploadReference,
+        MAX_PARTS_PER_REQUEST, PART_URL_TTL_SECS,
     };
     use privchat_protocol::ErrorCode as E;
 
@@ -731,15 +731,28 @@ async fn part_urls(
     }
 
     let manifest = session.manifest();
+    // spec 冻结的 manifest 平铺字段：bucket/final_key/provider_upload_id 与分片参数
+    // 作为整体原子使用，缺一即会话半建，按内部错误处理。
     let (part_size, total_parts, reference) = match (
         manifest.part_size,
         manifest.total_parts,
-        manifest.s3_reference.as_ref(),
+        manifest.bucket.as_deref(),
+        manifest.final_key.as_deref(),
+        manifest.provider_upload_id.as_deref(),
     ) {
-        (Some(ps), Some(tp), Some(r)) => (ps, tp, r.clone()),
+        (Some(ps), Some(tp), Some(bucket), Some(final_key), Some(pid)) => (
+            ps,
+            tp,
+            UploadReference {
+                bucket: bucket.to_string(),
+                final_key: final_key.to_string(),
+                provider_upload_id: pid.to_string(),
+            },
+        ),
         _ => {
             return Err(ServerError::Internal(
-                "S3 会话缺少 part_size/total_parts/s3_reference".to_string(),
+                "S3 会话缺少 part_size/total_parts/bucket/final_key/provider_upload_id"
+                    .to_string(),
             ))
         }
     };

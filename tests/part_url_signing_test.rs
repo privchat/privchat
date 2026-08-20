@@ -60,7 +60,7 @@ impl NumberedPartBackend for FakeBackend {
         &self,
         _session_upload_id: &str,
         _bucket: &str,
-        _key: &str,
+        _final_key: &str,
         _total_size: u64,
     ) -> Result<UploadReference, NumberedPartError> {
         Err(NumberedPartError::Backend("create 不在本测试路径上".into()))
@@ -147,7 +147,8 @@ async fn rig() -> Rig {
 }
 
 /// 建一个会话并把 manifest 改写成第 5 步建 S3 会话后的形态：
-/// transport=s3_multipart_v1 + 分片参数 + 可持久化的 s3_reference。
+/// transport=s3_multipart_v1 + 分片参数 + spec 冻结的 bucket/final_key/provider_upload_id
+/// 三个平铺字段。
 async fn create_s3_session(rig: &Rig) -> (ChunkedSession, String) {
     let root = rig.state.file_service.upload_session_root().expect("session root");
     let (session, token, _) = ChunkedSession::create(
@@ -175,14 +176,9 @@ async fn create_s3_session(rig: &Rig) -> (ChunkedSession, String) {
     let obj = manifest.as_object_mut().expect("object");
     obj.insert("part_size".into(), serde_json::json!(PART_SIZE));
     obj.insert("total_parts".into(), serde_json::json!(TOTAL_PARTS));
-    obj.insert(
-        "s3_reference".into(),
-        serde_json::json!({
-            "bucket": "privchat-e2e",
-            "key": "files/s3-payload.bin",
-            "provider_upload_id": "mpu-abc-123",
-        }),
-    );
+    obj.insert("bucket".into(), serde_json::json!("privchat-e2e"));
+    obj.insert("final_key".into(), serde_json::json!("files/s3-payload.bin"));
+    obj.insert("provider_upload_id".into(), serde_json::json!("mpu-abc-123"));
     std::fs::write(&manifest_path, manifest.to_string()).expect("rewrite manifest");
     (session, token)
 }
@@ -244,7 +240,7 @@ async fn valid_batch_signs_urls_and_returns_checksum_headers_verbatim() {
     assert_eq!(calls[0].ttl_secs, 15 * 60, "TTL 冻结 15 分钟");
     // manifest 里的三件套必须原样透传给 backend（不得靠进程内映射）。
     assert_eq!(calls[0].reference.bucket, "privchat-e2e");
-    assert_eq!(calls[0].reference.key, "files/s3-payload.bin");
+    assert_eq!(calls[0].reference.final_key, "files/s3-payload.bin");
     assert_eq!(calls[0].reference.provider_upload_id, "mpu-abc-123");
 }
 

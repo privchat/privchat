@@ -37,25 +37,29 @@ pub enum NumberedPartError {
     /// MPU 已被关闭（abort / complete / 过期）。🔴 它**不是**归属证明
     /// （RESUMABLE §2.2）：调用方按自己的恢复分支处理，不得据此删对象。
     NoSuchUpload,
-    /// complete 的条件冲突（409 语义）：`If-None-Match: *` 守护的条件不满足，
-    /// 目标对象已存在（RESUMABLE §8.5）。
+    /// `CompleteMultipartUpload` 带 `If-None-Match: *` 收到 **409**：MPU 作废，
+    /// 调用方回 20618 RestartUpload，客户端废弃会话从零重来（RESUMABLE §8.5）。
+    /// 🔴 与 [`NumberedPartError::PreconditionFailed`] 不得混同：那是「目标已存在、
+    /// 可核验复用」，这个是「本次上传作废」。
     Conflict,
-    /// complete 的预条件失败（412 语义）：逐片 checksum / 组装校验不通过。
-    /// 🔴 与 [`NumberedPartError::Conflict`] 分开：前者该废弃会话从零重来
-    /// （20618），后者说明内容已在、走认领。
+    /// `CompleteMultipartUpload` 带 `If-None-Match: *` 收到 **412**：final key 上已有
+    /// 对象、本次 MPU 未发布。🔴 绝不删除 final key：调用方回读已有对象核验身份
+    /// （privchat-upload-id）——一致则复用（先幂等 abort 当前 MPU 再建行）；不一致
+    /// 则保留已有对象、abort 当前 MPU、报内部冲突（RESUMABLE §8.5）。
     PreconditionFailed,
     /// 其余后端错误：可重试与否由调用方按 HTTP 语义决定。
     Backend(String),
 }
 
-/// 一次进行中 MPU 的**可持久化**引用（RESUMABLE §8.7）：bucket/key/uploadId
-/// 三件套整体存进会话 manifest，进程重启后照常恢复。🔴 `provider_upload_id`
-/// 冻结为 provider 的原始 UploadId——不得把 bucket/key 编进去，也不得靠进程内
-/// 映射反查（重启即失忆，续传就断了）。
+/// 一次进行中 MPU 的**可持久化**引用（RESUMABLE §8.7）：bucket/final_key/uploadId
+/// 三件套与 manifest 的三个平铺字段一一对应（作为整体原子使用），进程重启后
+/// 照常恢复。🔴 `provider_upload_id` 冻结为 provider 的原始 UploadId——不得把
+/// bucket/final_key 编进去，也不得靠进程内映射反查（重启即失忆，续传就断了）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadReference {
     pub bucket: String,
-    pub key: String,
+    /// 最终对象 key（spec 字段名 `final_key`）：建 MPU 前由调用方定死，之后不可改。
+    pub final_key: String,
     pub provider_upload_id: String,
 }
 
@@ -70,14 +74,16 @@ pub struct ListedPart {
     pub checksum_sha256_b64: Option<String>,
 }
 
-/// `CompleteMultipartUpload` 的一片。
+/// `CompleteMultipartUpload` 的一片。🔴 spec 冻结 part_number / ETag /
+/// ChecksumSHA256 **三字段缺一不可**（会话声明了 SHA256，Complete 必须携带每片
+/// checksum，RESUMABLE §8.5）：所以 checksum 是 `String` 而非 `Option`，不变量由
+/// 类型保证——缺摘要的片根本构造不出来，绝无可能被提交给 Complete。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedPart {
     pub part_number: u32,
     pub etag: String,
-    /// 与 part-url 签发时同源的片 checksum（Base64）：checksum 模式下 S3 按它
-    /// 逐片校验，缺了会触发 412（[`NumberedPartError::PreconditionFailed`]）。
-    pub checksum_sha256_b64: Option<String>,
+    /// 与 part-url 签发时同源的片 checksum（RFC 4648 标准 Base64）。
+    pub checksum_sha256_b64: String,
 }
 
 /// 分片号从 1 起、字节直连 S3 的控制接口。实现不绑定具体库（§8.7）。
@@ -86,16 +92,17 @@ pub struct CompletedPart {
 /// 它整体持久化在 manifest，任何实现都不得依赖进程内状态。
 #[async_trait]
 pub trait NumberedPartBackend: Send + Sync {
-    /// 创建 multipart upload，返回完整 [`UploadReference`]（存进 manifest）。
-    /// `bucket`/`key` 由调用方按存储路径规则预先定死——MPU 之后对象坐标不可再改。
+    /// 创建 multipart upload，返回完整 [`UploadReference`]（存入 manifest 的
+    /// bucket/final_key/provider_upload_id 三个平铺字段）。`bucket`/`final_key`
+    /// 由调用方按存储路径规则预先定死——MPU 之后对象坐标不可再改。
     /// 🔴 创建时必须写对象 metadata `privchat-upload-id = {session_id}` 并声明
-    /// `ChecksumAlgorithm=SHA256`（RESUMABLE §2.2）：前者是后续所有删除动作的
-    /// 唯一归属证明，后者让每片 checksum 可查可验。
+    /// `ChecksumAlgorithm=SHA256`（RESUMABLE §2.2）：前者是最终对象归属的唯一
+    /// 证明（HEAD 恢复时核对），后者让每片 checksum 可查可验。
     async fn create(
         &self,
         session_upload_id: &str,
         bucket: &str,
-        key: &str,
+        final_key: &str,
         total_size: u64,
     ) -> Result<UploadReference, NumberedPartError>;
 
@@ -117,9 +124,10 @@ pub trait NumberedPartBackend: Send + Sync {
         reference: &UploadReference,
     ) -> Result<Vec<ListedPart>, NumberedPartError>;
 
-    /// 组装分片。调用方负责带 `If-None-Match: *` 语义的冲突处理（RESUMABLE §8.5）：
-    /// 冲突回 [`NumberedPartError::Conflict`]，片级校验失败回
-    /// [`NumberedPartError::PreconditionFailed`]，二者不得混同。
+    /// 组装分片，🔴 **必须携带 `If-None-Match: *`**（最终 key 的 no-clobber 是存储层
+    /// 职责，RESUMABLE §8.5）：`409` → MPU 作废，回 [`NumberedPartError::Conflict`]；
+    /// `412` → final key 已存在、本次未发布，回 [`NumberedPartError::PreconditionFailed`]，
+    /// 二者不得混同（恢复路径完全相反）。
     async fn complete(
         &self,
         reference: &UploadReference,
@@ -128,6 +136,30 @@ pub trait NumberedPartBackend: Send + Sync {
 
     /// 中止 MPU：🔴 幂等，`NoSuchUpload` 视为成功。
     async fn abort(&self, reference: &UploadReference) -> Result<(), NumberedPartError>;
+}
+
+/// complete 失败后的恢复动作（RESUMABLE §8.5）。
+///
+/// 🔴 这是冻结语义的唯一真源：409 与 412 的恢复路径**完全相反**，第 3 步 complete
+/// 分流必须调本函数拿动作，不得自行按 HTTP 码猜。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteRecovery {
+    /// 409：MPU 作废 → 回 20618 RestartUpload，客户端废弃会话从零重来。
+    RestartUpload,
+    /// 412：final key 上已有对象、本次 MPU 未发布 → 回读已有对象核验身份：
+    /// 一致复用（先幂等 abort 当前 MPU 再建行），不一致保留已有对象、abort
+    /// 当前 MPU、报内部冲突。🔴 绝不删除 final key。
+    VerifyExistingObject,
+}
+
+/// complete 分流对照：后端错误 → 恢复动作。`NoSuchUpload`/`Backend` 不在 complete
+/// 的两个冻结分支里，回 `None` 由调用方按自己的恢复链处理（如 HEAD final_key）。
+pub fn complete_recovery_for(e: &NumberedPartError) -> Option<CompleteRecovery> {
+    match e {
+        NumberedPartError::Conflict => Some(CompleteRecovery::RestartUpload),
+        NumberedPartError::PreconditionFailed => Some(CompleteRecovery::VerifyExistingObject),
+        NumberedPartError::NoSuchUpload | NumberedPartError::Backend(_) => None,
+    }
 }
 
 /// 🔴 checksum 编码冻结（RESUMABLE §8.3）：客户端沿用 `X-Chunk-SHA256` 口径传
@@ -224,5 +256,33 @@ mod tests {
         // 整除：末片就是完整 part_size。
         let (total, size) = (8u64 << 20, 4u64 << 20);
         assert!(check_part_geometry(2, size, 2, size, total).is_ok());
+    }
+
+    /// 🔴 complete 分流对照（RESUMABLE §8.5，第十三轮评审 P0）：
+    /// 409（Conflict）→ MPU 作废 → 20618 重启；412（PreconditionFailed）→
+    /// final key 已存在 → 核验复用。两者恢复路径完全相反，写反即事故。
+    #[test]
+    fn complete_recovery_maps_409_to_restart_and_412_to_verify() {
+        assert_eq!(
+            complete_recovery_for(&NumberedPartError::Conflict),
+            Some(CompleteRecovery::RestartUpload),
+            "409 = MPU 作废：回 20618，客户端从零重来"
+        );
+        assert_eq!(
+            complete_recovery_for(&NumberedPartError::PreconditionFailed),
+            Some(CompleteRecovery::VerifyExistingObject),
+            "412 = final key 已存在：回读核验复用，绝不删除"
+        );
+        // 两条分支不得互串：这正是写反语义的回归守卫。
+        assert_ne!(
+            complete_recovery_for(&NumberedPartError::Conflict),
+            complete_recovery_for(&NumberedPartError::PreconditionFailed)
+        );
+        // NoSuchUpload / Backend 不属于这两个冻结分支。
+        assert_eq!(complete_recovery_for(&NumberedPartError::NoSuchUpload), None);
+        assert_eq!(
+            complete_recovery_for(&NumberedPartError::Backend("x".into())),
+            None
+        );
     }
 }
