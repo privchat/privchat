@@ -117,8 +117,26 @@ pub struct Manifest {
     /// 建会话时就预分配的 `file_id`（只取序列号，不产生 PG 临时行）。
     /// 它是「PG 已提交、墓碑还没写」这个崩溃窗口的恢复锚点。
     pub reserved_file_id: u64,
+    /// 上传数据面（RESUMABLE §8.2）：`proxy_offset_v1` / `s3_multipart_v1`。
+    /// 旧 manifest 没有该字段 → 默认 proxy（升级兼容），status/complete/abort
+    /// 与 `/files/part-url` 都按它分流。
+    #[serde(default = "default_manifest_transport")]
+    pub transport: String,
+    /// 仅 `s3_multipart_v1`：固定分片大小（字节）。
+    #[serde(default)]
+    pub part_size: Option<u64>,
+    /// 仅 `s3_multipart_v1`：总分片数。
+    #[serde(default)]
+    pub total_parts: Option<u32>,
+    /// 仅 `s3_multipart_v1`：provider 的 MPU UploadId（RESUMABLE §8.4 命名区分）。
+    #[serde(default)]
+    pub provider_upload_id: Option<String>,
     #[serde(default)]
     pub created_at: i64,
+}
+
+fn default_manifest_transport() -> String {
+    TRANSPORT_PROXY_OFFSET_V1.to_string()
 }
 
 /// 完成墓碑。
@@ -249,6 +267,8 @@ pub struct NewSession {
     pub mime_type: String,
     pub transform_version: i32,
     pub reserved_file_id: u64,
+    /// 协商选定的数据面（RESUMABLE §8.2），当前恒 `proxy_offset_v1`。
+    pub transport: String,
 }
 
 impl ChunkedSession {
@@ -285,6 +305,11 @@ impl ChunkedSession {
             transform_version: input.transform_version,
             expires_at: now + TOKEN_TTL_SECS,
             reserved_file_id: input.reserved_file_id,
+            transport: input.transport,
+            // S3 分片参数在直传门禁接入（实现顺序第 5 步）建 S3 会话时才写入。
+            part_size: None,
+            total_parts: None,
+            provider_upload_id: None,
             created_at: now,
         };
         write_json_atomic(&dir, "manifest.json", &manifest)?;
@@ -707,6 +732,7 @@ mod tests {
             mime_type: "image/jpeg".into(),
             transform_version: 0,
             reserved_file_id: 4242,
+            transport: TRANSPORT_PROXY_OFFSET_V1.to_string(),
         }
     }
 

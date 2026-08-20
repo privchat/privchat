@@ -50,6 +50,10 @@ pub struct FileServerState {
     /// `None` = 没接验证器（单元测试装配），此时要求登录态的端点一律拒绝，
     /// 而不是放行——缺省必须是拒绝。
     pub auth: Option<Arc<dyn UploadAuthenticator>>,
+    /// S3 直传的分片后端（RESUMABLE §8.7）。`None` = 未接入（直传门禁，
+    /// 实现顺序第 5 步）；接入前所有会话恒 proxy，`/files/part-url` 永远回 20616。
+    pub numbered_part_backend:
+        Option<Arc<dyn crate::service::numbered_parts::NumberedPartBackend>>,
 }
 
 /// 「这个 bearer 是谁」——文件服务需要知道的**全部**。
@@ -122,6 +126,9 @@ impl FileHttpServer {
                 file_service,
                 upload_token_service,
                 auth,
+                // 直传门禁接入（实现顺序第 5 步）时才按存储源 direct_upload
+                // 配置挂具体后端；在那之前保持 None。
+                numbered_part_backend: None,
             },
             port,
         }

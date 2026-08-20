@@ -88,6 +88,9 @@ pub fn create_route() -> Router<FileServerState> {
         .route("/api/app/files/status", get(upload_status))
         .route("/api/app/files/complete", post(complete_upload))
         .route("/api/app/files/abort", post(abort_upload))
+        // S3 直传的分片预签名（RESUMABLE §8.3）：仅 s3_multipart_v1 会话可调，
+        // proxy 会话调它直接回 20616（端点与 transport 强绑定）。
+        .route("/api/app/files/part-url", post(part_urls))
         // 从业务硬顶推导，不再写死一个会跟业务限额分家的数字：body limit 必须高于最大
         // 硬顶，否则 multipart 会在业务校验跑起来之前被拒，用户拿到一个没有业务含义的 413。
         .layer(DefaultBodyLimit::max(
@@ -563,7 +566,7 @@ pub struct CompleteRequest {
     pub encryption_version: i32,
 }
 
-/// 上传专用的类型化错误。见 `ErrorCode` 20610-20617。
+/// 上传专用的类型化错误。见 `ErrorCode` 20610-20618。
 fn coded(code: privchat_protocol::ErrorCode, status: u16, msg: impl Into<String>) -> ServerError {
     ServerError::Coded {
         code,
@@ -662,6 +665,135 @@ async fn put_chunk(
         total_size: session.manifest().total_size,
         complete: missing.is_empty(),
     }))
+}
+
+/// `POST /api/app/files/part-url` 请求体（RESUMABLE §8.3）：批量 ≤ 100。
+#[derive(Debug, Deserialize)]
+struct PartUrlRequest {
+    parts: Vec<PartUrlItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartUrlItem {
+    part_number: u32,
+    content_length: u64,
+    /// 64 位 hex，与 `X-Chunk-SHA256` 同口径；服务端转 RFC 4648 Base64 签进 URL。
+    checksum_sha256_hex: String,
+}
+
+/// 🔴 通用响应结构：客户端不硬编码头名，PUT 时原样发送 `required_headers`。
+#[derive(Debug, Serialize)]
+struct PartUrlResponse {
+    parts: Vec<SignedPart>,
+}
+
+#[derive(Debug, Serialize)]
+struct SignedPart {
+    part_number: u32,
+    url: String,
+    required_headers: std::collections::BTreeMap<String, String>,
+}
+
+/// `POST /api/app/files/part-url` —— 仅 S3 会话可调：批量预签名 UploadPart URL。
+///
+/// 🔴 端点与 transport 强绑定（RESUMABLE §8.3）：proxy 会话调它回 `UploadModeConflict`
+/// （20616，终局失败）；S3 会话绝不落本地 part 文件。checksum 编码冻结：hex →
+/// RFC 4648 标准 Base64（保留 padding，禁 base64url）→ 签入 `x-amz-checksum-sha256`。
+async fn part_urls(
+    State(state): State<FileServerState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<PartUrlRequest>,
+) -> ApiResult<PartUrlResponse> {
+    use crate::service::chunked_upload::TRANSPORT_S3_MULTIPART_V1;
+    use crate::service::numbered_parts::{
+        check_part_geometry, checksum_b64_from_hex, NumberedPartError, MAX_PARTS_PER_REQUEST,
+        PART_URL_TTL_SECS,
+    };
+    use privchat_protocol::ErrorCode as E;
+
+    let session = open_session(&state, &headers)?;
+
+    // 🔴 串用即终局：proxy 会话的分片字节只能走 PUT /files/chunk。
+    if session.manifest().transport != TRANSPORT_S3_MULTIPART_V1 {
+        return Err(coded(
+            E::UploadModeConflict,
+            409,
+            "该会话是 proxy_offset_v1：分片字节只能走 PUT /files/chunk",
+        ));
+    }
+    // 已完成的会话不再签发：迟到的预签名对结果没有意义。
+    if session.completed_file_id()?.is_some() {
+        return Err(coded(E::UploadSessionCompleted, 409, "该上传已完成"));
+    }
+    // flock 保护服务端动作（RESUMABLE §8.4）：签发与 status/complete/abort 互斥；
+    // 客户端直传 S3 的过程不在保护范围，同一 part_number 多张未过期 URL 是接受行为。
+    let _lock = lock_or_busy(&session).await?;
+
+    let manifest = session.manifest();
+    let (part_size, total_parts, provider_upload_id) = match (
+        manifest.part_size,
+        manifest.total_parts,
+        manifest.provider_upload_id.as_deref(),
+    ) {
+        (Some(ps), Some(tp), Some(pid)) => (ps, tp, pid.to_string()),
+        _ => {
+            return Err(ServerError::Internal(
+                "S3 会话缺少 part_size/total_parts/provider_upload_id".to_string(),
+            ))
+        }
+    };
+
+    if body.parts.is_empty() || body.parts.len() > MAX_PARTS_PER_REQUEST {
+        return Err(coded(
+            E::InvalidParams,
+            400,
+            format!("parts 必须非空且单次最多 {MAX_PARTS_PER_REQUEST} 片"),
+        ));
+    }
+
+    let backend = state.numbered_part_backend.as_ref().ok_or_else(|| {
+        ServerError::Internal("直传后端未配置（direct_upload 门禁未接入）".to_string())
+    })?;
+
+    let mut out = Vec::with_capacity(body.parts.len());
+    for item in body.parts {
+        // 几何校验同 chunk 端点口径：part_number ∈ [1, total_parts]、非末片 = part_size、
+        // 末片 = 余数。
+        check_part_geometry(item.part_number, item.content_length, total_parts, part_size, manifest.total_size)
+            .map_err(|m| coded(E::UploadChunkNotAligned, 400, m))?;
+        let checksum_b64 = checksum_b64_from_hex(&item.checksum_sha256_hex)
+            .map_err(|m| coded(E::InvalidParams, 400, m))?;
+        let url = backend
+            .sign_part_url(
+                &provider_upload_id,
+                item.part_number,
+                item.content_length,
+                &checksum_b64,
+                PART_URL_TTL_SECS,
+            )
+            .await
+            .map_err(|e| match e {
+                // MPU 已关闭：会话无法继续，客户端重新申请 token 从零传。
+                // NoSuchUpload 不是归属证明，这里不做任何删除（RESUMABLE §2.2）。
+                NumberedPartError::NoSuchUpload => coded(
+                    E::UploadSessionGone,
+                    410,
+                    "分片上传已被关闭，请重新申请 token 从头上传",
+                ),
+                NumberedPartError::Backend(m) => {
+                    ServerError::Internal(format!("预签名分片失败: {m}"))
+                }
+            })?;
+        // 服务端不持久化每片摘要：checksum 只签进 URL 由 S3 在传输时强制（§8.3）。
+        let mut required_headers = std::collections::BTreeMap::new();
+        required_headers.insert("x-amz-checksum-sha256".to_string(), checksum_b64);
+        out.push(SignedPart {
+            part_number: item.part_number,
+            url,
+            required_headers,
+        });
+    }
+    Ok(ApiEnvelope::ok(PartUrlResponse { parts: out }))
 }
 
 /// `GET /api/app/files/status` —— 进程重启、换网络、隔天回来，都靠它接上。

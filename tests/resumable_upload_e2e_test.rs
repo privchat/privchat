@@ -77,6 +77,7 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, dir: Option<tempfile::Te
             file_service: Arc::new(file_service),
             upload_token_service: Arc::new(UploadTokenService::new()),
             auth: None,
+            numbered_part_backend: None,
         },
         root,
         _dir: dir,
@@ -104,6 +105,7 @@ impl Rig {
                 mime_type: "application/octet-stream".into(),
                 transform_version: 0,
                 reserved_file_id: reserved,
+                transport: "proxy_offset_v1".to_string(),
             },
         )
         .expect("create session");

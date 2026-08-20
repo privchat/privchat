@@ -193,6 +193,9 @@ pub async fn issue_chunked_upload_token(
             },
             transform_version: request.transform_version,
             reserved_file_id,
+            // manifest 记下协商结果：status/complete/abort 与 /files/part-url
+            // 的端点强绑定（RESUMABLE §8.3）都按它分流。
+            transport: transport.clone(),
         },
     )
     .map_err(|e| RpcError::internal(e.to_string()))?;
