@@ -23,7 +23,9 @@
 use serde_json::Value;
 
 use crate::rpc::{RpcContext, RpcError, RpcResult, RpcServiceContext};
-use crate::service::chunked_upload::{ChunkedSession, NewSession, BASE_UNIT};
+use crate::service::chunked_upload::{
+    select_transport, ChunkedSession, NewSession, BASE_UNIT,
+};
 use crate::service::FileType;
 use privchat_protocol::error_code::ErrorCode;
 use privchat_protocol::rpc::{
@@ -113,6 +115,27 @@ pub async fn request_chunked_upload_token(
         }
     }
 
+    // ---- §8.2 协商与模式选择（纯加法）----
+    // 旧客户端不带 supported_upload_transports → 恒 proxy 且响应不新增字段，逐字节不变。
+    // 🔴 集合规则：字段存在则必须包含 proxy_offset_v1（回退保底），否则参数错误；
+    // 服务端不得选择客户端声明集合之外的 transport。
+    if let Some(list) = request.supported_upload_transports.as_deref() {
+        if !list
+            .iter()
+            .any(|t| t == crate::service::chunked_upload::TRANSPORT_PROXY_OFFSET_V1)
+        {
+            return Err(RpcError::validation(
+                "supported_upload_transports 必须包含 proxy_offset_v1".to_string(),
+            ));
+        }
+    }
+    let declared_transports = request.supported_upload_transports.is_some();
+    let transport = select_transport(
+        request.supported_upload_transports.as_deref(),
+        request.file_size as u64,
+    )
+    .to_string();
+
     // ---- 2.2 建会话 ----
     let upload_url = services
         .config
@@ -171,6 +194,11 @@ pub async fn request_chunked_upload_token(
         upload_url: Some(upload_url),
         base_unit: Some(BASE_UNIT),
         expires_at: Some(expires_at),
+        // 只对声明了能力的客户端回协商结果（当前恒 proxy_offset_v1；选为 S3 时
+        // 另带 part_size/total_parts，RESUMABLE §8.2）。旧客户端的响应不新增字段。
+        transport: declared_transports.then_some(transport),
+        part_size: None,
+        total_parts: None,
     };
     serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
 }
