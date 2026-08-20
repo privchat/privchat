@@ -61,26 +61,38 @@ pub const TRANSPORT_PROXY_OFFSET_V1: &str = "proxy_offset_v1";
 /// 上传数据面标识（RESUMABLE_UPLOAD_SPEC §8）：S3 原生 Multipart 直传（待实现）。
 pub const TRANSPORT_S3_MULTIPART_V1: &str = "s3_multipart_v1";
 
+/// 协商失败：声明的能力集合缺少 `proxy_offset_v1`（回退保底，RESUMABLE §8.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportSetMissingProxy;
+
 /// 协商与模式选择（RESUMABLE_UPLOAD_SPEC §8.2，纯加法）。
 ///
-/// 🔴 旧客户端不带 `supported_upload_transports`（`declared == None`）→ 隐式 proxy，
-/// 行为逐字节不变。🔴 集合规则：`declared` 为 `Some` 时**调用方必须先验证包含
-/// `proxy_offset_v1`**（回退保底，见 RPC 层）；服务端不得选择声明集合之外的值。
+/// 🔴 集合规则由本函数自己强制，不靠调用方注释维持：`declared` 为 `Some` 且不含
+/// `proxy_offset_v1` → `Err(TransportSetMissingProxy)`（RPC 层映射为参数错误）。
+/// `declared == None`（旧客户端）→ 隐式 proxy，行为逐字节不变。服务端永远不会
+/// 返回客户端声明集合之外的 transport。
 /// 当前 S3 门禁（`direct_upload` 显式配置 + `s3_direct_threshold` + 集成门禁）尚未
 /// 接入，即使客户端声明了 `s3_multipart_v1` 也回退 proxy；分支结构留在原地，供后续
 /// 步骤接入，不得在别的处另写判定。
-pub fn select_transport(declared: Option<&[String]>, _file_size: u64) -> &'static str {
+pub fn select_transport(
+    declared: Option<&[String]>,
+    _file_size: u64,
+) -> std::result::Result<&'static str, TransportSetMissingProxy> {
     match declared {
         // 字段省略：旧客户端，隐式 proxy；现有自适应分片逻辑完全不变。
-        None => TRANSPORT_PROXY_OFFSET_V1,
-        // 字段存在：未声明 s3_multipart_v1 → proxy（调用方已保证含 proxy_offset_v1）。
+        None => Ok(TRANSPORT_PROXY_OFFSET_V1),
+        // 🔴 集合规则：不含 proxy_offset_v1 → 拒绝，调用方回参数错误。
+        Some(list) if !list.iter().any(|t| t == TRANSPORT_PROXY_OFFSET_V1) => {
+            Err(TransportSetMissingProxy)
+        }
+        // 未声明 s3_multipart_v1 → proxy。
         Some(list) if !list.iter().any(|t| t == TRANSPORT_S3_MULTIPART_V1) => {
-            TRANSPORT_PROXY_OFFSET_V1
+            Ok(TRANSPORT_PROXY_OFFSET_V1)
         }
         // 声明支持 S3 → 还要过门禁：file_size >= s3_direct_threshold + 存储源显式
         // direct_upload 配置 + 集成门禁（RESUMABLE §8.2）；不满足时回退 proxy（合法，
         // 因为集合必含 proxy_offset_v1）。门禁未接入前恒 proxy。
-        Some(_) => TRANSPORT_PROXY_OFFSET_V1,
+        Some(_) => Ok(TRANSPORT_PROXY_OFFSET_V1),
     }
 }
 
@@ -831,16 +843,27 @@ mod tests {
     /// 与新客户端的行为差异只体现在响应字段，不体现在模式选择。
     #[test]
     fn transport_selection_is_proxy_only_until_gates_land() {
-        assert_eq!(select_transport(None, 1), TRANSPORT_PROXY_OFFSET_V1);
-        assert_eq!(select_transport(None, 1 << 30), TRANSPORT_PROXY_OFFSET_V1);
+        assert_eq!(select_transport(None, 1), Ok(TRANSPORT_PROXY_OFFSET_V1));
+        assert_eq!(select_transport(None, 1 << 30), Ok(TRANSPORT_PROXY_OFFSET_V1));
         let only_proxy = vec![TRANSPORT_PROXY_OFFSET_V1.to_string()];
-        assert_eq!(select_transport(Some(&only_proxy), 1 << 30), TRANSPORT_PROXY_OFFSET_V1);
+        assert_eq!(select_transport(Some(&only_proxy), 1 << 30), Ok(TRANSPORT_PROXY_OFFSET_V1));
         let with_s3 = vec![
             TRANSPORT_PROXY_OFFSET_V1.to_string(),
             TRANSPORT_S3_MULTIPART_V1.to_string(),
         ];
-        // 声明了 s3_multipart_v1 也恒 proxy：direct_upload 配置 + 阈值 + 集成门禁
-        // 均未接入（实现顺序第 5 步），接入前不得提前放行。
-        assert_eq!(select_transport(Some(&with_s3), 1 << 30), TRANSPORT_PROXY_OFFSET_V1);
+        // 声明了 s3_multipart_v1 也回退 proxy：direct_upload 配置 + 阈值 + 集成门禁
+        // 均未接入（实现顺序第 5 步），接入前不得提前放行。回退合法：集合含 proxy。
+        assert_eq!(select_transport(Some(&with_s3), 1 << 30), Ok(TRANSPORT_PROXY_OFFSET_V1));
+        // 🔴 集合规则由本函数自身强制：不含 proxy_offset_v1 → Err（含空集合、
+        // 只声明 S3、未知 transport），不依赖调用方先校验。
+        assert_eq!(
+            select_transport(Some(&[TRANSPORT_S3_MULTIPART_V1.to_string()]), 1 << 30),
+            Err(TransportSetMissingProxy)
+        );
+        assert_eq!(select_transport(Some(&[]), 1 << 30), Err(TransportSetMissingProxy));
+        assert_eq!(
+            select_transport(Some(&["weird".to_string()]), 1 << 30),
+            Err(TransportSetMissingProxy)
+        );
     }
 }

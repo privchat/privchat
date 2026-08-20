@@ -26,11 +26,21 @@ use crate::rpc::{RpcContext, RpcError, RpcResult, RpcServiceContext};
 use crate::service::chunked_upload::{
     select_transport, ChunkedSession, NewSession, BASE_UNIT,
 };
+use crate::service::file_service::FileService;
+use crate::service::upload_token_service::UploadTokenService;
 use crate::service::FileType;
 use privchat_protocol::error_code::ErrorCode;
 use privchat_protocol::rpc::{
     FileRequestChunkedUploadTokenRequest, FileRequestChunkedUploadTokenResponse,
 };
+
+/// 签发分片上传 token 所需的窄依赖（把生产接线从 `RpcServiceContext` 里剥出来，
+/// 让测试能直接驱动，见 `tests/chunked_token_negotiation_test.rs`）。
+pub struct ChunkedTokenServices<'a> {
+    pub file_service: &'a FileService,
+    pub upload_token_service: &'a UploadTokenService,
+    pub file_api_base_url: Option<&'a str>,
+}
 
 pub async fn request_chunked_upload_token(
     services: RpcServiceContext,
@@ -41,6 +51,23 @@ pub async fn request_chunked_upload_token(
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
 
+    let narrowed = ChunkedTokenServices {
+        file_service: &services.file_service,
+        upload_token_service: &services.upload_token_service,
+        file_api_base_url: services.config.file_api_base_url.as_deref(),
+    };
+    let response = issue_chunked_upload_token(&narrowed, user_id, request).await?;
+    serde_json::to_value(response)
+        .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+}
+
+/// 签发的真实接线（RESUMABLE_UPLOAD_SPEC §2.2/§8.2）：参数校验 → 🔴 协商集合校验与
+/// 模式选择（**在秒传预检之前**，见下）→ 秒传 → 建会话。RPC 层只做解码与身份提取。
+pub async fn issue_chunked_upload_token(
+    services: &ChunkedTokenServices<'_>,
+    user_id: u64,
+    request: FileRequestChunkedUploadTokenRequest,
+) -> RpcResult<FileRequestChunkedUploadTokenResponse> {
     let file_type = FileType::from_str(&request.file_type)
         .ok_or_else(|| RpcError::validation(format!("无效的文件类型: {}", request.file_type)))?;
     if request.file_size <= 0 {
@@ -71,7 +98,22 @@ pub async fn request_chunked_upload_token(
         }
     }
 
-    // ---- 2.1 秒传预检：命中就回 claim_token，不建任何目录 ----
+    // ---- §8.2 协商与模式选择（纯加法）----
+    // 🔴 「字段存在必须含 proxy_offset_v1」是无条件协议约束：**在秒传预检之前**
+    // 校验，同一非法请求不会因文件是否已存在而一会儿成功一会儿失败。
+    // 集合规则由 select_transport 自身强制（不靠注释）；旧客户端不带字段 → 隐式
+    // proxy，响应不新增字段，逐字节不变。
+    let declared_transports = request.supported_upload_transports.is_some();
+    let transport = select_transport(
+        request.supported_upload_transports.as_deref(),
+        request.file_size as u64,
+    )
+    .map_err(|_| {
+        RpcError::validation("supported_upload_transports 必须包含 proxy_offset_v1".to_string())
+    })?
+    .to_string();
+
+    // ---- 2.1 秒传预检：命中就回 claim_token，不建任何目录（协商校验已在它之前）----
     if !request.force_upload {
         let hit = services
             .file_service
@@ -110,37 +152,13 @@ pub async fn request_chunked_upload_token(
                 claim_token: Some(claim_token),
                 ..Default::default()
             };
-            return serde_json::to_value(response)
-                .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)));
+            return Ok(response);
         }
     }
-
-    // ---- §8.2 协商与模式选择（纯加法）----
-    // 旧客户端不带 supported_upload_transports → 恒 proxy 且响应不新增字段，逐字节不变。
-    // 🔴 集合规则：字段存在则必须包含 proxy_offset_v1（回退保底），否则参数错误；
-    // 服务端不得选择客户端声明集合之外的 transport。
-    if let Some(list) = request.supported_upload_transports.as_deref() {
-        if !list
-            .iter()
-            .any(|t| t == crate::service::chunked_upload::TRANSPORT_PROXY_OFFSET_V1)
-        {
-            return Err(RpcError::validation(
-                "supported_upload_transports 必须包含 proxy_offset_v1".to_string(),
-            ));
-        }
-    }
-    let declared_transports = request.supported_upload_transports.is_some();
-    let transport = select_transport(
-        request.supported_upload_transports.as_deref(),
-        request.file_size as u64,
-    )
-    .to_string();
 
     // ---- 2.2 建会话 ----
     let upload_url = services
-        .config
         .file_api_base_url
-        .as_ref()
         .filter(|base_url| !base_url.trim().is_empty())
         .map(|base_url| format!("{}/files", base_url.trim_end_matches('/')))
         .ok_or_else(|| {
@@ -200,5 +218,5 @@ pub async fn request_chunked_upload_token(
         part_size: None,
         total_parts: None,
     };
-    serde_json::to_value(response).map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
+    Ok(response)
 }
