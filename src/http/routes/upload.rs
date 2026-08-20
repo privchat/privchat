@@ -721,24 +721,25 @@ async fn part_urls(
             "该会话是 proxy_offset_v1：分片字节只能走 PUT /files/chunk",
         ));
     }
-    // 已完成的会话不再签发：迟到的预签名对结果没有意义。
-    if session.completed_file_id()?.is_some() {
-        return Err(coded(E::UploadSessionCompleted, 409, "该上传已完成"));
-    }
     // flock 保护服务端动作（RESUMABLE §8.4）：签发与 status/complete/abort 互斥；
     // 客户端直传 S3 的过程不在保护范围，同一 part_number 多张未过期 URL 是接受行为。
     let _lock = lock_or_busy(&session).await?;
+    // 🔴 完成墓碑必须在**拿到锁之后**查：锁前查、锁后签的话，complete 可以在两者
+    // 之间完成，这里就会给已关闭的 MPU 签出无效 URL（第十二轮评审 P1）。
+    if session.completed_file_id()?.is_some() {
+        return Err(coded(E::UploadSessionCompleted, 409, "该上传已完成"));
+    }
 
     let manifest = session.manifest();
-    let (part_size, total_parts, provider_upload_id) = match (
+    let (part_size, total_parts, reference) = match (
         manifest.part_size,
         manifest.total_parts,
-        manifest.provider_upload_id.as_deref(),
+        manifest.s3_reference.as_ref(),
     ) {
-        (Some(ps), Some(tp), Some(pid)) => (ps, tp, pid.to_string()),
+        (Some(ps), Some(tp), Some(r)) => (ps, tp, r.clone()),
         _ => {
             return Err(ServerError::Internal(
-                "S3 会话缺少 part_size/total_parts/provider_upload_id".to_string(),
+                "S3 会话缺少 part_size/total_parts/s3_reference".to_string(),
             ))
         }
     };
@@ -765,7 +766,7 @@ async fn part_urls(
             .map_err(|m| coded(E::InvalidParams, 400, m))?;
         let url = backend
             .sign_part_url(
-                &provider_upload_id,
+                &reference,
                 item.part_number,
                 item.content_length,
                 &checksum_b64,
@@ -780,6 +781,10 @@ async fn part_urls(
                     410,
                     "分片上传已被关闭，请重新申请 token 从头上传",
                 ),
+                // 签发阶段不该出现的两种 complete 语义错误：不当成可重试。
+                NumberedPartError::Conflict | NumberedPartError::PreconditionFailed => {
+                    ServerError::Internal(format!("预签名分片遇到意外错误: {e:?}"))
+                }
                 NumberedPartError::Backend(m) => {
                     ServerError::Internal(format!("预签名分片失败: {m}"))
                 }

@@ -41,11 +41,24 @@ struct Rig {
 /// TempDir 销毁后物理对象就没了——不清库就会留下「有记录、无对象」的垃圾行，
 /// 后续重跑的秒传对照可能靠陈旧记录假绿，也会污染共享真库的其他测试。
 /// 按 uploader 全量清：测试开头清一次（吃掉上次 panic 留下的残留），结尾再清一次。
-async fn cleanup(pool: &sqlx::PgPool) {
-    let _ = sqlx::query("DELETE FROM privchat_file_uploads WHERE uploader_id = $1")
+/// 🔴 清理失败不得静默：DELETE 出错或清完仍有残留都算清理失败，否则污染会
+/// 在测试绿灯下持续累积（第十二轮评审 P2）。
+async fn cleanup(pool: &sqlx::PgPool) -> Result<(), String> {
+    sqlx::query("DELETE FROM privchat_file_uploads WHERE uploader_id = $1")
         .bind(UPLOADER as i64)
         .execute(pool)
-        .await;
+        .await
+        .map_err(|e| format!("cleanup DELETE 失败: {e}"))?;
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM privchat_file_uploads WHERE uploader_id = $1")
+            .bind(UPLOADER as i64)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("cleanup 复查失败: {e}"))?;
+    if remaining != 0 {
+        return Err(format!("cleanup 后仍残留 {remaining} 行 uploader_id={UPLOADER}"));
+    }
+    Ok(())
 }
 
 async fn rig() -> Rig {
@@ -72,7 +85,9 @@ async fn rig() -> Rig {
     };
     let file_service = FileService::new(vec![source], 0, pool.clone());
     file_service.init().await.expect("init storage");
-    cleanup(&pool).await;
+    cleanup(&pool)
+        .await
+        .expect("测试开始前的清库必须成功，否则陈旧记录会造成假绿");
     Rig {
         pool,
         file_service,
@@ -199,10 +214,17 @@ async fn invalid_transport_set_is_rejected_even_when_dedup_would_hit() {
     let outcome = std::panic::AssertUnwindSafe(ordering_case_core(&rig))
         .catch_unwind()
         .await;
-    cleanup(&rig.pool).await;
     if let Err(payload) = outcome {
+        // 用例已经失败：清理失败只报不盖，不掩盖原始断言失败。
+        if let Err(e) = cleanup(&rig.pool).await {
+            eprintln!("[negotiation] 用例后清库失败（真库可能已被污染）: {e}");
+        }
         std::panic::resume_unwind(payload);
     }
+    // 🔴 正常路径：清库必须成功且残留为 0，否则测试该红（第十二轮评审 P2）。
+    cleanup(&rig.pool)
+        .await
+        .expect("用例后清库必须成功，否则真库污染会在绿灯下持续累积");
 }
 
 async fn ordering_case_core(rig: &Rig) {

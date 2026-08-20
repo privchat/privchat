@@ -23,6 +23,7 @@
 //! 第 5 步）一起接入，接入前本模块只提供接口与纯函数。
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// 预签名 URL 有效期（RESUMABLE §8.3）：15 分钟，过期重拉，不影响已传分片。
 pub const PART_URL_TTL_SECS: u64 = 15 * 60;
@@ -36,8 +37,26 @@ pub enum NumberedPartError {
     /// MPU 已被关闭（abort / complete / 过期）。🔴 它**不是**归属证明
     /// （RESUMABLE §2.2）：调用方按自己的恢复分支处理，不得据此删对象。
     NoSuchUpload,
+    /// complete 的条件冲突（409 语义）：`If-None-Match: *` 守护的条件不满足，
+    /// 目标对象已存在（RESUMABLE §8.5）。
+    Conflict,
+    /// complete 的预条件失败（412 语义）：逐片 checksum / 组装校验不通过。
+    /// 🔴 与 [`NumberedPartError::Conflict`] 分开：前者该废弃会话从零重来
+    /// （20618），后者说明内容已在、走认领。
+    PreconditionFailed,
     /// 其余后端错误：可重试与否由调用方按 HTTP 语义决定。
     Backend(String),
+}
+
+/// 一次进行中 MPU 的**可持久化**引用（RESUMABLE §8.7）：bucket/key/uploadId
+/// 三件套整体存进会话 manifest，进程重启后照常恢复。🔴 `provider_upload_id`
+/// 冻结为 provider 的原始 UploadId——不得把 bucket/key 编进去，也不得靠进程内
+/// 映射反查（重启即失忆，续传就断了）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadReference {
+    pub bucket: String,
+    pub key: String,
+    pub provider_upload_id: String,
 }
 
 /// `ListParts` 换算用的一片（status 分支把它转成现有区间格式）。
@@ -46,6 +65,9 @@ pub struct ListedPart {
     pub part_number: u32,
     pub size: u64,
     pub etag: String,
+    /// 该片在 S3 侧记录的 SHA-256（Base64）。创建时声明了
+    /// `ChecksumAlgorithm=SHA256` 就应该有；`None` = 后端没回，调用方按缺失处理。
+    pub checksum_sha256_b64: Option<String>,
 }
 
 /// `CompleteMultipartUpload` 的一片。
@@ -53,24 +75,36 @@ pub struct ListedPart {
 pub struct CompletedPart {
     pub part_number: u32,
     pub etag: String,
+    /// 与 part-url 签发时同源的片 checksum（Base64）：checksum 模式下 S3 按它
+    /// 逐片校验，缺了会触发 412（[`NumberedPartError::PreconditionFailed`]）。
+    pub checksum_sha256_b64: Option<String>,
 }
 
 /// 分片号从 1 起、字节直连 S3 的控制接口。实现不绑定具体库（§8.7）。
+///
+/// 🔴 所有方法都以 [`UploadReference`] 定位 MPU（bucket/key/uploadId 三件套）：
+/// 它整体持久化在 manifest，任何实现都不得依赖进程内状态。
 #[async_trait]
 pub trait NumberedPartBackend: Send + Sync {
-    /// 创建 multipart upload，返回 provider 的 UploadId（存进 manifest 的
-    /// `provider_upload_id`）。🔴 创建时必须写对象 metadata
-    /// `privchat-upload-id = {session_id}` 并声明 `ChecksumAlgorithm=SHA256`
-    /// （RESUMABLE §2.2）：这是后续所有删除动作的唯一归属证明。
-    async fn create(&self, session_upload_id: &str, total_size: u64)
-        -> Result<String, NumberedPartError>;
+    /// 创建 multipart upload，返回完整 [`UploadReference`]（存进 manifest）。
+    /// `bucket`/`key` 由调用方按存储路径规则预先定死——MPU 之后对象坐标不可再改。
+    /// 🔴 创建时必须写对象 metadata `privchat-upload-id = {session_id}` 并声明
+    /// `ChecksumAlgorithm=SHA256`（RESUMABLE §2.2）：前者是后续所有删除动作的
+    /// 唯一归属证明，后者让每片 checksum 可查可验。
+    async fn create(
+        &self,
+        session_upload_id: &str,
+        bucket: &str,
+        key: &str,
+        total_size: u64,
+    ) -> Result<UploadReference, NumberedPartError>;
 
     /// 预签名单片 UploadPart URL（有效 `ttl_secs` 秒）。🔴 `checksum_sha256_b64`
     /// 已是 RFC 4648 标准 Base64（见 [`checksum_b64_from_hex`]），后端把它签进
     /// `x-amz-checksum-sha256`；`Content-Length` 不签（浏览器不允许手动设置）。
     async fn sign_part_url(
         &self,
-        provider_upload_id: &str,
+        reference: &UploadReference,
         part_number: u32,
         content_length: u64,
         checksum_sha256_b64: &str,
@@ -80,18 +114,20 @@ pub trait NumberedPartBackend: Send + Sync {
     /// 已传分片列表（status 分支换算区间用；调用方逐片校验长度，异常视为缺失）。
     async fn list_parts(
         &self,
-        provider_upload_id: &str,
+        reference: &UploadReference,
     ) -> Result<Vec<ListedPart>, NumberedPartError>;
 
-    /// 组装分片。调用方负责带 `If-None-Match: *` 语义的冲突处理（RESUMABLE §8.5）。
+    /// 组装分片。调用方负责带 `If-None-Match: *` 语义的冲突处理（RESUMABLE §8.5）：
+    /// 冲突回 [`NumberedPartError::Conflict`]，片级校验失败回
+    /// [`NumberedPartError::PreconditionFailed`]，二者不得混同。
     async fn complete(
         &self,
-        provider_upload_id: &str,
+        reference: &UploadReference,
         parts: &[CompletedPart],
     ) -> Result<(), NumberedPartError>;
 
     /// 中止 MPU：🔴 幂等，`NoSuchUpload` 视为成功。
-    async fn abort(&self, provider_upload_id: &str) -> Result<(), NumberedPartError>;
+    async fn abort(&self, reference: &UploadReference) -> Result<(), NumberedPartError>;
 }
 
 /// 🔴 checksum 编码冻结（RESUMABLE §8.3）：客户端沿用 `X-Chunk-SHA256` 口径传
