@@ -501,6 +501,15 @@ pub(crate) struct RecordFields {
     pub cek: Option<String>,
 }
 
+/// [`FileService::record_s3_published`] 的结果。
+pub(crate) enum S3RecordOutcome {
+    /// 已建行，返回正式记录。
+    Recorded(FileMetadata),
+    /// 秒传命中：同摘要已存在，本次发布在 final_key 上的对象冗余。
+    /// 调用方删除它（归属已证明）后带 `allow_duplicate=true` 重调一次。
+    DuplicateObject,
+}
+
 /// 发布结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishOutcome {
@@ -878,6 +887,104 @@ impl FileService {
             fields,
         )
         .await
+    }
+
+    /// S3 直传的建行（RESUMABLE §8.5 第 7 步）：对象已由 MPU 发布在正式路径
+    /// （manifest 的 `final_key`）上，这里只做与整包**同一条**收敛 + 建行，
+    /// 不再发布。收敛/主键幂等与 [`Self::publish_and_record`] 完全同源。
+    ///
+    /// 🔴 秒传命中（同摘要已存在）时本次刚发布的 `final_key` 对象是冗余的：
+    /// 返回 [`S3RecordOutcome::DuplicateObject`] 让调用方删除它（归属由
+    /// CreateMultipartUpload 的 metadata 证明，§8.5 统一删除规则），然后带
+    /// `allow_duplicate=true` 重调一次用既有路径建行——最多两次，无环。
+    pub(crate) async fn record_s3_published(
+        &self,
+        session: &crate::service::chunked_upload::ChunkedSession,
+        stored_sha256: String,
+        fields: RecordFields,
+        allow_duplicate: bool,
+    ) -> Result<S3RecordOutcome> {
+        let m = session.manifest();
+        let final_key = m.final_key.clone().ok_or_else(|| {
+            ServerError::Internal("S3 会话缺少 final_key".to_string())
+        })?;
+        let file_type = FileType::from_str(&m.file_type).unwrap_or(FileType::File);
+        let source = self.resolve_storage_source()?;
+        let source_id = source.id;
+
+        let mut tx = self
+            .file_upload_repo
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ServerError::Database(format!("开启上传收敛事务失败: {e}")))?;
+        let placement = converge_upload(
+            &mut tx,
+            &UploadPlacement {
+                stored_sha256: stored_sha256.clone(),
+                encryption_version: fields.encryption_version,
+                my_path: final_key.clone(),
+                my_source_id: source_id as i32,
+                my_cek: fields.cek.clone(),
+            },
+        )
+        .await?;
+        if placement.duplicate && !allow_duplicate {
+            // 对象还没建行引用，此刻删它是安全的；建行留到删除后的第二次调用。
+            return Ok(S3RecordOutcome::DuplicateObject);
+        }
+
+        let metadata = FileMetadata {
+            file_id: m.reserved_file_id,
+            original_filename: fields.filename.clone(),
+            file_size: m.total_size,
+            original_size: None,
+            file_type: file_type.clone(),
+            mime_type: fields.mime_type.clone(),
+            file_path: placement.file_path.clone(),
+            storage_source_id: placement.storage_source_id as u32,
+            uploader_id: fields.uploader_id,
+            uploader_ip: fields.uploader_ip.clone(),
+            uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
+            width: None,
+            height: None,
+            file_hash: Some(stored_sha256),
+            business_type: Some(fields.business_type.clone()),
+            business_id: fields.business_id.clone(),
+            encryption_version: placement.encryption_version,
+            cek: placement.cek.clone(),
+        };
+        // 幂等同 publish_and_record：预留 id 主键冲突 → 回读既有行核身份。
+        let inserted = self.insert_within(&mut tx, &metadata).await?;
+        let metadata = if inserted {
+            metadata
+        } else {
+            let existing = self
+                .file_upload_repo
+                .get_by_file_id(metadata.file_id)
+                .await?
+                .ok_or_else(|| {
+                    ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
+                })?;
+            let same_identity = existing.uploader_id == metadata.uploader_id
+                && existing.file_hash == metadata.file_hash
+                && existing.file_size == metadata.file_size
+                && existing.file_type.as_str() == metadata.file_type.as_str();
+            if !same_identity {
+                return Err(ServerError::Internal(format!(
+                    "file_id={} 已被另一份内容占用（uploader/摘要/大小/类型不符）",
+                    metadata.file_id
+                )));
+            }
+            tracing::info!("♻️ file_id={} 上次已落库且身份一致，回读既有记录", metadata.file_id);
+            existing
+        };
+        tx.commit()
+            .await
+            .map_err(|e| ServerError::Database(format!("提交上传收敛事务失败: {e}")))?;
+        // 窗口：PG 已提交、墓碑还没写（与整包/分片同一故障注入点）。
+        crash_point("after_commit_before_tombstone");
+        Ok(S3RecordOutcome::Recorded(metadata))
     }
 
     /// 已落盘并校验通过的一份字节 → 收敛、发布、落库。

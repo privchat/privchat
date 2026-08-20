@@ -54,6 +54,11 @@ pub struct FileServerState {
     /// 实现顺序第 5 步）；接入前所有会话恒 proxy，`/files/part-url` 永远回 20616。
     pub numbered_part_backend:
         Option<Arc<dyn crate::service::numbered_parts::NumberedPartBackend>>,
+    /// final key 的对象探测（RESUMABLE §8.5）：HEAD / 流式回读 / 删除三个恢复
+    /// 原语，生产实现委托现有存储层（§8.7：不进 NumberedPartBackend）。与分片
+    /// 后端同门禁：`None` = 未接入，S3 会话的 status/complete/abort 分支不可达。
+    pub final_object_probe:
+        Option<Arc<dyn crate::service::final_object_probe::FinalObjectProbe>>,
 }
 
 /// 「这个 bearer 是谁」——文件服务需要知道的**全部**。
@@ -129,6 +134,7 @@ impl FileHttpServer {
                 // 直传门禁接入（实现顺序第 5 步）时才按存储源 direct_upload
                 // 配置挂具体后端；在那之前保持 None。
                 numbered_part_backend: None,
+                final_object_probe: None,
             },
             port,
         }

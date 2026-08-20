@@ -33,6 +33,7 @@ pub mod metrics;
 pub mod room_tickets;
 pub mod transfer;
 pub mod upload;
+mod upload_s3;
 
 use crate::http::{AdminServerState, FileServerState};
 use axum::{routing::get, Router};

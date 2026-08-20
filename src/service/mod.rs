@@ -51,6 +51,7 @@ pub mod read_state_service;
 pub mod file_service;
 // 新增上传 token 服务
 pub mod chunked_upload;
+pub mod final_object_probe;
 pub mod numbered_parts;
 pub mod upload_session;
 pub mod upload_token_service;

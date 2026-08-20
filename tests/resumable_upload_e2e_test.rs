@@ -78,6 +78,7 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, dir: Option<tempfile::Te
             upload_token_service: Arc::new(UploadTokenService::new()),
             auth: None,
             numbered_part_backend: None,
+            final_object_probe: None,
         },
         root,
         _dir: dir,

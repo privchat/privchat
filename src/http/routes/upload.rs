@@ -52,7 +52,7 @@ pub struct UploadResponse {
 }
 
 /// 从请求头提取客户端 IP（兼容反向代理：X-Forwarded-For 取第一个，否则 X-Real-IP）
-fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+pub(super) fn client_ip_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("X-Forwarded-For") {
         if let Ok(s) = v.to_str() {
             let ip = s.split(',').next().map(|s| s.trim());
@@ -567,7 +567,7 @@ pub struct CompleteRequest {
 }
 
 /// 上传专用的类型化错误。见 `ErrorCode` 20610-20618。
-fn coded(code: privchat_protocol::ErrorCode, status: u16, msg: impl Into<String>) -> ServerError {
+pub(super) fn coded(code: privchat_protocol::ErrorCode, status: u16, msg: impl Into<String>) -> ServerError {
     ServerError::Coded {
         code,
         status,
@@ -596,7 +596,7 @@ fn open_session(state: &FileServerState, headers: &axum::http::HeaderMap) -> Res
     })
 }
 
-async fn lock_or_busy(session: &ChunkedSession) -> Result<crate::service::chunked_upload::SessionLock, ServerError> {
+pub(super) async fn lock_or_busy(session: &ChunkedSession) -> Result<crate::service::chunked_upload::SessionLock, ServerError> {
     session
         .lock(std::time::Duration::from_secs(2))
         .await?
@@ -634,6 +634,15 @@ async fn put_chunk(
 ) -> ApiResult<ChunkResponse> {
     use privchat_protocol::ErrorCode as E;
     let session = open_session(&state, &headers)?;
+    // 🔴 端点与 transport 强绑定（RESUMABLE §8.3）：S3 会话的分片字节只能经
+    // part-url 直连 S3，绝不落本地 part——串用即终局 20616。
+    if session.manifest().transport != crate::service::chunked_upload::TRANSPORT_PROXY_OFFSET_V1 {
+        return Err(coded(
+            E::UploadModeConflict,
+            409,
+            "该会话是 s3_multipart_v1：分片字节只能经 /files/part-url 直传 S3",
+        ));
+    }
     let declared = declared_chunk_digest(&headers)?;
     let _lock = lock_or_busy(&session).await?;
 
@@ -706,7 +715,7 @@ async fn part_urls(
 ) -> ApiResult<PartUrlResponse> {
     use crate::service::chunked_upload::TRANSPORT_S3_MULTIPART_V1;
     use crate::service::numbered_parts::{
-        check_part_geometry, checksum_b64_from_hex, NumberedPartError, UploadReference,
+        check_part_geometry, checksum_b64_from_hex, NumberedPartError,
         MAX_PARTS_PER_REQUEST, PART_URL_TTL_SECS,
     };
     use privchat_protocol::ErrorCode as E;
@@ -731,31 +740,9 @@ async fn part_urls(
     }
 
     let manifest = session.manifest();
-    // spec 冻结的 manifest 平铺字段：bucket/final_key/provider_upload_id 与分片参数
-    // 作为整体原子使用，缺一即会话半建，按内部错误处理。
-    let (part_size, total_parts, reference) = match (
-        manifest.part_size,
-        manifest.total_parts,
-        manifest.bucket.as_deref(),
-        manifest.final_key.as_deref(),
-        manifest.provider_upload_id.as_deref(),
-    ) {
-        (Some(ps), Some(tp), Some(bucket), Some(final_key), Some(pid)) => (
-            ps,
-            tp,
-            UploadReference {
-                bucket: bucket.to_string(),
-                final_key: final_key.to_string(),
-                provider_upload_id: pid.to_string(),
-            },
-        ),
-        _ => {
-            return Err(ServerError::Internal(
-                "S3 会话缺少 part_size/total_parts/bucket/final_key/provider_upload_id"
-                    .to_string(),
-            ))
-        }
-    };
+    // spec 冻结的 manifest 平铺字段：与分片参数作为整体原子使用（提取逻辑与
+    // status/complete/abort 分流共用一处）。
+    let (part_size, total_parts, reference) = super::upload_s3::s3_reference_of(manifest)?;
 
     if body.parts.is_empty() || body.parts.len() > MAX_PARTS_PER_REQUEST {
         return Err(coded(
@@ -820,6 +807,10 @@ async fn upload_status(
     headers: axum::http::HeaderMap,
 ) -> ApiResult<ChunkedStatusResponse> {
     let session = open_session(&state, &headers)?;
+    // 按 manifest.transport 分流（§8.3）：status 协议不变，客户端零改动。
+    if session.manifest().transport == crate::service::chunked_upload::TRANSPORT_S3_MULTIPART_V1 {
+        return super::upload_s3::s3_status(&state, &session).await;
+    }
     let completed = session.completed_file_id()?.is_some();
     let (received, missing, received_bytes) = session.status()?;
     Ok(ApiEnvelope::ok(ChunkedStatusResponse {
@@ -832,7 +823,7 @@ async fn upload_status(
 }
 
 /// 已完成的上传：按 `file_id` 回读、**核对身份**并构造与首次一致的响应。
-async fn chunked_completed_response(
+pub(super) async fn chunked_completed_response(
     state: &FileServerState,
     session: &ChunkedSession,
     file_id: u64,
@@ -851,7 +842,7 @@ async fn chunked_completed_response(
     Ok(ApiEnvelope::ok(upload_response_of(state, meta)))
 }
 
-fn upload_response_of(state: &FileServerState, meta: crate::service::FileMetadata) -> UploadResponse {
+pub(super) fn upload_response_of(state: &FileServerState, meta: crate::service::FileMetadata) -> UploadResponse {
     UploadResponse {
         file_id: meta.file_id,
         file_url: state
@@ -881,7 +872,7 @@ pub(crate) fn manifest_matches(session: &ChunkedSession, meta: &crate::service::
 }
 
 /// 与整包表单同一套 cek 校验规则。
-fn validate_cek(encryption_version: i32, cek: &Option<String>) -> Result<(), ServerError> {
+pub(super) fn validate_cek(encryption_version: i32, cek: &Option<String>) -> Result<(), ServerError> {
     match encryption_version {
         0 => {
             if cek.is_some() {
@@ -928,6 +919,11 @@ async fn complete_upload(
     let session = open_session(&state, &headers)?;
     let extra = body.map(|axum::Json(b)| b).unwrap_or_default();
     let _lock = lock_or_busy(&session).await?;
+
+    // 按 manifest.transport 分流（§8.5）：S3 分支全程持同一把锁。
+    if session.manifest().transport == crate::service::chunked_upload::TRANSPORT_S3_MULTIPART_V1 {
+        return super::upload_s3::s3_complete(&state, &session, extra, &headers).await;
+    }
 
     // 1. 墓碑
     if let Some(existing) = session.completed_file_id()? {
@@ -1044,6 +1040,10 @@ async fn abort_upload(
             409,
             "该上传已完成，不能中止",
         ));
+    }
+    // 按 manifest.transport 分流（§8.3）：先 S3 abort + 确认清空，才删目录。
+    if session.manifest().transport == crate::service::chunked_upload::TRANSPORT_S3_MULTIPART_V1 {
+        return super::upload_s3::s3_abort(&state, &session).await;
     }
     session.discard()?;
     Ok(ApiEnvelope::ok(serde_json::json!({ "aborted": true })))

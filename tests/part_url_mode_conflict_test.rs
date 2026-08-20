@@ -55,6 +55,7 @@ async fn rig() -> Rig {
             upload_token_service: Arc::new(UploadTokenService::new()),
             auth: None,
             numbered_part_backend: None,
+            final_object_probe: None,
         },
         _dir: dir,
     }

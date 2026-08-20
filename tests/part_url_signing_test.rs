@@ -140,6 +140,7 @@ async fn rig() -> Rig {
             upload_token_service: Arc::new(UploadTokenService::new()),
             auth: None,
             numbered_part_backend: Some(fake.clone()),
+            final_object_probe: None,
         },
         fake,
         _dir: dir,
