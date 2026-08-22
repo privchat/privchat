@@ -103,7 +103,8 @@ pub async fn get_file_url(
         .await
         .map_err(|e| RpcError::internal(format!("获取文件 URL 失败: {}", e)))?;
 
-    tracing::info!("🔗 返回文件 URL: {}", url.file_url);
+    // 🔴 第二十六轮评审：日志最小化——访问 URL 不进日志，只记 file_id。
+    tracing::info!("🔗 返回文件 URL: file_id={}", request.file_id);
 
     let response = FileGetUrlResponse {
         file_url: url.file_url,

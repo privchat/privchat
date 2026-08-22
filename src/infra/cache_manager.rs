@@ -273,7 +273,8 @@ impl CacheManager {
 
         // 创建 L2 缓存（如果配置了 Redis）
         let (redis_pool, redis_config) = if let Some(redis_config) = &config.redis {
-            info!("🔧 Initializing Redis L2 cache: {}", redis_config.url);
+            // 🔴 第二十六轮评审：连接串可能带密码，绝不整段入日志；只记去凭证后的地址。
+            info!("🔧 Initializing Redis L2 cache: {}", redact_redis_url(&redis_config.url));
 
             let manager = RedisConnectionManager::new(redis_config.url.clone()).map_err(|e| {
                 ServerError::Internal(format!("Failed to create Redis manager: {}", e))
@@ -1048,4 +1049,38 @@ pub struct CacheStats {
     pub l1_hits: u64,
     pub l2_hits: u64,
     pub misses: u64,
+}
+
+/// 🔴 第二十六轮评审：Redis 连接串可能携带密码（`redis://:pass@host:6379/db`），
+/// 绝不整段写入日志。保留 scheme://host:port/db，去掉 `//` 与 `@` 之间的 userinfo。
+fn redact_redis_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.rsplit_once('@') {
+            Some((_, host_part)) => format!("{scheme}://{host_part}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_redis_url;
+
+    #[test]
+    fn strips_credentials_from_redis_url() {
+        assert_eq!(
+            redact_redis_url("redis://:secret@127.0.0.1:6379/0"),
+            "redis://127.0.0.1:6379/0"
+        );
+        assert_eq!(
+            redact_redis_url("rediss://user:secret@redis.internal:6380"),
+            "rediss://redis.internal:6380"
+        );
+        // 无凭证的地址原样保留。
+        assert_eq!(
+            redact_redis_url("redis://127.0.0.1:6379"),
+            "redis://127.0.0.1:6379"
+        );
+    }
 }
