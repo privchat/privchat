@@ -190,6 +190,7 @@ async fn make_rig(wired: bool) -> Rig {
         path_prefix: None,
         direct_upload: None,
         region: None,
+        addressing_style: None,
     };
     let file_service = Arc::new(FileService::new(vec![source], 0, pool));
     file_service.init().await.expect("init storage");

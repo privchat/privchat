@@ -41,6 +41,8 @@ struct LiveEnv {
     secret_key: String,
     bucket: String,
     region: String,
+    /// 🔴 第二十八轮：寻址方式（`PRIVCHAT_S3_LIVE_ADDRESSING`，腾讯 COS 必须 virtual）。
+    addressing: Option<String>,
 }
 
 fn live_env() -> Option<LiveEnv> {
@@ -60,7 +62,18 @@ fn live_env() -> Option<LiveEnv> {
         secret_key,
         bucket,
         region: get("PRIVCHAT_S3_LIVE_REGION").unwrap_or_else(|| "us-east-1".to_string()),
+        addressing: get("PRIVCHAT_S3_LIVE_ADDRESSING"),
     })
+}
+
+/// 与生产 `object_url` 同口径的测试辅助：按寻址方式拼对象 URL。
+fn live_object_url(env: &LiveEnv, key: &str) -> String {
+    if env.addressing.as_deref() == Some("virtual") {
+        let (scheme, host) = env.endpoint.split_once("://").unwrap_or(("https", &env.endpoint));
+        format!("{scheme}://{}.{host}/{}", env.bucket, key.trim_start_matches('/'))
+    } else {
+        format!("{}/{}/{}", env.endpoint.trim_end_matches('/'), env.bucket, key)
+    }
 }
 
 /// 按冻结入口 `from_source` 构建（fail-fast 配置校验同生产）。
@@ -77,6 +90,7 @@ fn make_backend(env: &LiveEnv, page_size: u32) -> Arc<S3DirectBackend> {
         path_prefix: None,
         direct_upload: Some("s3_multipart_v1".to_string()),
         region: Some(env.region.clone()),
+        addressing_style: env.addressing.clone(),
     };
     Arc::new(
         S3DirectBackend::from_source(&src)
@@ -85,7 +99,10 @@ fn make_backend(env: &LiveEnv, page_size: u32) -> Arc<S3DirectBackend> {
     )
 }
 
-/// 桶不存在则创建（测试自持，不依赖外部预置）。
+/// 确认桶可用（第二十八轮重写）：旧版 PutBucket 建桶在两种真实后端都不适用——
+/// 腾讯 COS 禁止 PutBucket 且桶子域名下 `{endpoint}/{bucket}` 会被当成对象上传（411）；
+/// 桶都是控制台预建的。改为零字节探针：2xx/403 均证明桶可达且凭证有效（403 =
+/// 权限不足，后续操作会自行报错，不在这里兜底）；网络层失败立即终止。
 async fn ensure_bucket(env: &LiveEnv) {
     let signer = reqsign::AwsV4Signer::new("s3", &env.region);
     let cred = reqsign::AwsCredential {
@@ -94,21 +111,22 @@ async fn ensure_bucket(env: &LiveEnv) {
         session_token: None,
         expires_in: None,
     };
-    let url = format!("{}/{}", env.endpoint.trim_end_matches('/'), env.bucket);
+    let url = live_object_url(env, "__privchat_probe__/bucket-check");
     let mut req = reqwest::Client::new()
         .put(&url)
+        .header("content-length", "0")
         .build()
-        .expect("build PutBucket");
-    signer.sign(&mut req, &cred).expect("sign PutBucket");
+        .expect("build 探针 PUT");
+    signer.sign(&mut req, &cred).expect("sign 探针 PUT");
     let resp = reqwest::Client::new()
         .execute(req)
         .await
-        .expect("PutBucket 请求失败");
+        .expect("探针 PUT 请求失败（网络层）");
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     assert!(
-        status.is_success() || body.contains("BucketAlreadyOwnedByYou") || body.contains("BucketAlreadyExists"),
-        "建桶失败: HTTP {} body={body}",
+        status.is_success() || status == reqwest::StatusCode::FORBIDDEN,
+        "桶不可用: HTTP {} body={body}",
         status.as_u16()
     );
 }
@@ -176,7 +194,10 @@ fn part_data(seed: u8, len: usize) -> Vec<u8> {
 // ================= 1. 完整上传 + 断点 + 分页 + checksum 回读 =================
 
 /// 断点续传口径：先传 1、3 片，`ListParts` 只回这两片（页大小 2 → 真实分页）；
-/// 补传第 2 片后 complete；最终对象带归属 metadata、逐片 checksum 全程可验。
+/// 补传第 2 片后 complete；最终对象带归属 metadata。🔴 第二十八轮（腾讯 COS 实测）：
+/// COS 的 ListParts 不回逐片 checksum（即使 CreateMPU 声明了 SHA256）——回读断言改为
+/// 能力感知：回读的 provider 硬断言；不回读的如实记录能力缺口（续传证据缺失，
+/// status 收敛为全量重传，数据正确性不受影响），与本文件条件删除的先例同口径。
 #[tokio::test]
 async fn live_multipart_resume_pagination_checksum_and_metadata() {
     let Some(env) = live_env() else { return };
@@ -200,21 +221,28 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
     let c1 = upload_part(&backend, &reference, 1, &p1).await;
     let c3 = upload_part(&backend, &reference, 3, &p3).await;
 
-    // ListParts 回读 = 断点续传依据：只有 1、3，且逐片 checksum 与大小正确。
+    // ListParts 回读 = 断点续传依据：只有 1、3，且逐片大小正确。
     let listed = backend.list_parts(&reference).await.expect("ListParts");
     let nums: Vec<u32> = listed.iter().map(|p| p.part_number).collect();
     assert_eq!(nums, vec![1, 3], "断点恢复只看已上传分片");
     assert_eq!(listed[0].size, PART_SIZE as u64);
     assert_eq!(listed[1].size, (100 << 10) as u64);
-    assert_eq!(
-        listed[0].checksum_sha256_b64.as_deref(),
-        Some(sha256_b64(&p1).as_str()),
-        "CreateMPU 声明 SHA256 后，ListParts 必须回读片 checksum"
-    );
-    assert_eq!(
-        listed[1].checksum_sha256_b64.as_deref(),
-        Some(sha256_b64(&p3).as_str())
-    );
+    // 🔴 第二十八轮：腾讯 COS 的 ListParts 不回逐片 checksum（实测，即使 CreateMPU
+    // 已声明 SHA256；UploadPart 侧的 checksum 强制仍生效，见预签名拒收用例）。
+    // 能力感知口径同条件删除先例：回读的硬断言；不回读的记缺口，不在这里降级也不兑底。
+    if listed[0].checksum_sha256_b64.is_some() {
+        assert_eq!(
+            listed[0].checksum_sha256_b64.as_deref(),
+            Some(sha256_b64(&p1).as_str()),
+            "CreateMPU 声明 SHA256 后，ListParts 必须回读片 checksum"
+        );
+        assert_eq!(
+            listed[1].checksum_sha256_b64.as_deref(),
+            Some(sha256_b64(&p3).as_str())
+        );
+    } else {
+        println!("live provider 能力缺口：ListParts 不回逐片 checksum（续传证据缺失，status 收敛为全量重传）");
+    }
 
     // 补传第 2 片，三片齐全后 complete。
     let c2 = upload_part(&backend, &reference, 2, &p2).await;
@@ -310,6 +338,7 @@ async fn live_gate_wires_provider_with_missing_capabilities_and_warns() {
         path_prefix: None,
         direct_upload: Some("s3_multipart_v1".to_string()),
         region: Some(env.region.clone()),
+        addressing_style: env.addressing.clone(),
     };
     let url = privchat::require_test_database_url()
         .expect("门禁用例需要 PRIVCHAT_TEST_DATABASE_URL / DATABASE_URL");
@@ -357,6 +386,7 @@ async fn init_returns_promptly_when_s3_endpoint_unreachable() {
         path_prefix: None,
         direct_upload: Some("s3_multipart_v1".to_string()),
         region: Some("us-east-1".to_string()),
+        addressing_style: None,
     };
     let url = privchat::require_test_database_url()
         .expect("该用例需要 PRIVCHAT_TEST_DATABASE_URL / DATABASE_URL");
@@ -414,6 +444,10 @@ async fn live_part_put_with_wrong_checksum_is_rejected() {
 
 /// final key 已有对象时，第二次 complete 必须被 `If-None-Match: *` 拒绝
 /// （409/412 映射为 Conflict/PreconditionFailed），且原对象毫发无损。
+/// 🔴 第二十八轮（腾讯 COS 实测）：COS 的 CompleteMPU 完全忽略 If-None-Match，
+/// 第二次 complete 会真实覆盖已有对象。能力感知口径同第二十一轮条件删除先例：
+/// 先探测，支持的 provider（MinIO/AWS）保留全套硬断言不降级；不支持的跳过硬断言，
+/// 由启动诊断告警 + 运营判断放行，不在用例里把覆盖当通过。
 #[tokio::test]
 async fn live_complete_if_none_match_rejects_overwrite() {
     let Some(env) = live_env() else { return };
@@ -430,6 +464,18 @@ async fn live_complete_if_none_match_rejects_overwrite() {
     let c = upload_part(&backend, &first, 1, &data).await;
     backend.complete(&first, &[c]).await.expect("第一次 complete");
     let etag_before = backend.head(&first).await.unwrap().expect("对象在").etag;
+
+    // 🔴 第二十八轮：探测先行。不支持 no-clobber 的 provider（腾讯 COS）：不造第二次
+    // MPU（避免真实覆盖），记能力缺口后清理收尾；安全语义由启动诊断告警暴露。
+    let no_clobber = backend
+        .probe_complete_no_clobber(&env.bucket)
+        .await
+        .expect("no-clobber 能力探测");
+    if !no_clobber {
+        println!("live provider 能力缺口：CompleteMPU 忽略 If-None-Match（no-clobber 不支持，启动诊断告警）");
+        assert_eq!(backend.delete_if_match(&first, &etag_before).await.unwrap(), true);
+        return;
+    }
 
     // 同一 final key 再建 MPU 传一片，complete 必须被拒。
     let second = backend
@@ -452,16 +498,6 @@ async fn live_complete_if_none_match_rejects_overwrite() {
     // 原对象未被覆盖：内容摘要不变。
     assert_eq!(backend.sha256_of(&first).await.unwrap(), sha256_hex(&data));
     assert_eq!(backend.head(&first).await.unwrap().unwrap().etag, etag_before);
-
-    // 🔴 第十九轮评审 P0：启动探测必须同样能证明这个能力（门禁完整性）：
-    // 本 provider 既然真实拒绝了覆盖，探测也必须判支持。
-    assert!(
-        backend
-            .probe_complete_no_clobber(&env.bucket)
-            .await
-            .expect("no-clobber 能力探测"),
-        "真实拒绝了覆盖的 provider，探测必须判支持"
-    );
 
     // 清理：第二次 MPU 作废 + 删对象。
     backend.abort(&second).await.expect("abort 第二次 MPU");

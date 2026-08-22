@@ -42,6 +42,8 @@ struct LiveEnv {
     secret_key: String,
     bucket: String,
     region: String,
+    /// 🔴 第二十八轮：寻址方式（`PRIVCHAT_S3_LIVE_ADDRESSING`，腾讯 COS 必须 virtual）。
+    addressing: Option<String>,
 }
 
 fn live_env() -> Option<LiveEnv> {
@@ -61,7 +63,18 @@ fn live_env() -> Option<LiveEnv> {
         secret_key,
         bucket,
         region: get("PRIVCHAT_S3_LIVE_REGION").unwrap_or_else(|| "us-east-1".to_string()),
+        addressing: get("PRIVCHAT_S3_LIVE_ADDRESSING"),
     })
+}
+
+/// 与生产 `object_url` 同口径的测试辅助：按寻址方式拼对象 URL。
+fn live_object_url(env: &LiveEnv, key: &str) -> String {
+    if env.addressing.as_deref() == Some("virtual") {
+        let (scheme, host) = env.endpoint.split_once("://").unwrap_or(("https", &env.endpoint));
+        format!("{scheme}://{}.{host}/{}", env.bucket, key.trim_start_matches('/'))
+    } else {
+        format!("{}/{}/{}", env.endpoint.trim_end_matches('/'), env.bucket, key)
+    }
 }
 
 fn source_config(env: &LiveEnv, id: u32, direct_upload: Option<&str>) -> FileStorageSourceConfig {
@@ -77,10 +90,13 @@ fn source_config(env: &LiveEnv, id: u32, direct_upload: Option<&str>) -> FileSto
         path_prefix: None,
         direct_upload: direct_upload.map(|s| s.to_string()),
         region: Some(env.region.clone()),
+        addressing_style: env.addressing.clone(),
     }
 }
 
-/// 桶不存在则创建（与 `s3_backend_live_test.rs` 同口径，测试自持）。
+/// 确认桶可用（第二十八轮，与 `s3_backend_live_test.rs` 同口径）：腾讯 COS 禁止
+/// PutBucket 且强制虚拟主机寻址，旧版建桶不适用；桶都是控制台预建的。改为零字节
+/// 探针：2xx/403 均证明桶可达且凭证有效；网络层失败立即终止。
 async fn ensure_bucket(env: &LiveEnv) {
     let signer = reqsign::AwsV4Signer::new("s3", &env.region);
     let cred = reqsign::AwsCredential {
@@ -89,15 +105,22 @@ async fn ensure_bucket(env: &LiveEnv) {
         session_token: None,
         expires_in: None,
     };
-    let url = format!("{}/{}", env.endpoint.trim_end_matches('/'), env.bucket);
-    let mut req = reqwest::Client::new().put(&url).build().expect("build PutBucket");
-    signer.sign(&mut req, &cred).expect("sign PutBucket");
-    let resp = reqwest::Client::new().execute(req).await.expect("PutBucket 请求失败");
+    let url = live_object_url(env, "__privchat_probe__/bucket-check");
+    let mut req = reqwest::Client::new()
+        .put(&url)
+        .header("content-length", "0")
+        .build()
+        .expect("build 探针 PUT");
+    signer.sign(&mut req, &cred).expect("sign 探针 PUT");
+    let resp = reqwest::Client::new()
+        .execute(req)
+        .await
+        .expect("探针 PUT 请求失败（网络层）");
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     assert!(
-        status.is_success() || body.contains("BucketAlreadyOwnedByYou") || body.contains("BucketAlreadyExists"),
-        "建桶失败: HTTP {} body={body}",
+        status.is_success() || status == reqwest::StatusCode::FORBIDDEN,
+        "桶不可用: HTTP {} body={body}",
         status.as_u16()
     );
 }

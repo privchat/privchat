@@ -26,8 +26,11 @@
 //! 携带 `If-None-Match: *` 与逐片 checksum、`DeleteObject` 携带 `If-Match`
 //! 的条件删除（§8.5 归属核对与删除合成一个原子判定）。
 //!
-//! 🔴 寻址方式：配置了 `endpoint`（MinIO/Garage/OSS/COS 等）一律 path-style
-//! `{endpoint}/{bucket}/{key}`——自建后端普遍不支持虚拟主机寻址。
+//! 🔴 寻址方式（第二十八轮）：默认 path-style `{endpoint}/{bucket}/{key}`（自建
+//! MinIO/Garage 等普遍不支持虚拟主机寻址）；配置 `addressing_style = "virtual"` 时
+//! 改用 `{scheme}://{bucket}.{host}/{key}`——腾讯云 COS 明确禁止 path-style
+//! （PathStyleDomainForbidden），不经桶子域名一律拒收。寻址方式只改 URL 拼装，
+//! 控制位/签名/冻结语义完全不变。
 
 use std::time::Duration;
 
@@ -62,6 +65,9 @@ pub struct S3DirectBackend {
     cred: reqsign::AwsCredential,
     /// 含 scheme 的 endpoint（如 `https://s3.e2e.local`）。
     endpoint: String,
+    /// 🔴 第二十八轮：虚拟主机寻址开关（`addressing_style = "virtual"`）。
+    /// false = path-style（默认，自建后端）；true = `{scheme}://{bucket}.{host}/{key}`（COS）。
+    virtual_hosted: bool,
     /// `ListParts` 页大小：生产固定 1000；真实集成门禁用小值验证分页循环。
     list_page_size: u32,
 }
@@ -100,6 +106,23 @@ impl S3DirectBackend {
             .filter(|s| !s.is_empty())
             .unwrap_or("us-east-1")
             .to_string();
+        // 🔴 第二十八轮：寻址方式显式可配——腾讯 COS 禁止 path-style，必须虚拟主机；
+        // 非法值启动期报错（与 direct_upload 同口径的 fail-fast，不留到第一次上传才炸）。
+        let virtual_hosted = match src
+            .addressing_style
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None | Some("path") => false,
+            Some("virtual") => true,
+            Some(other) => {
+                return Err(ServerError::Internal(format!(
+                    "存储源 id={} addressing_style={other} 非法，只支持 path / virtual",
+                    src.id
+                )))
+            }
+        };
         // 🔴 第二十二轮评审：控制面 HTTP 客户端必须带超时——后端不可达/失联时，
         // 启动诊断与上传期控制请求（建 MPU/分页/complete/abort）都要快速报错，
         // 不能挂到 OS TCP 超时（几十秒）。分片直传不经该客户端（预签名 URL 直连），不受影响。
@@ -120,6 +143,7 @@ impl S3DirectBackend {
                 expires_in: None,
             },
             endpoint,
+            virtual_hosted,
             list_page_size: 1000,
         })
     }
@@ -131,9 +155,16 @@ impl S3DirectBackend {
         self
     }
 
-    /// path-style 对象 URL：`{endpoint}/{bucket}/{key}`（key 逐段百分号编码）。
+    /// 对象 URL（key 逐段百分号编码）。寻址方式由 `addressing_style` 决定（第二十八轮）：
+    /// path-style `{endpoint}/{bucket}/{key}`（默认）或虚拟主机 `{scheme}://{bucket}.{host}/{key}`。
     fn object_url(&self, bucket: &str, key: &str) -> String {
-        format!("{}/{}/{}", self.endpoint, bucket, encode_key(key))
+        if self.virtual_hosted {
+            let (scheme, host) = self.endpoint.split_once("://").unwrap_or(("https", &self.endpoint));
+            let host = host.trim_end_matches('/');
+            format!("{scheme}://{bucket}.{host}/{}", encode_key(key))
+        } else {
+            format!("{}/{}/{}", self.endpoint, bucket, encode_key(key))
+        }
     }
 
     /// 探测对象的清理：裸 DELETE（随机探测 key 归探测独占，无条件删是安全的，
@@ -1048,6 +1079,7 @@ mod tests {
             path_prefix: None,
             direct_upload: Some(DIRECT_UPLOAD_S3_MULTIPART_V1.to_string()),
             region: None,
+            addressing_style: None,
         };
         assert!(S3DirectBackend::from_source(&base).is_err(), "local 源不允许");
         let mut ok = base.clone();
@@ -1059,5 +1091,39 @@ mod tests {
         let mut no_key = ok.clone();
         no_key.secret_access_key = Some("  ".to_string());
         assert!(S3DirectBackend::from_source(&no_key).is_err());
+        // 🔴 第二十八轮：非法寻址方式必须启动期报错（fail-fast）。
+        let mut bad_addr = ok.clone();
+        bad_addr.addressing_style = Some("weird".to_string());
+        assert!(S3DirectBackend::from_source(&bad_addr).is_err());
+    }
+
+    /// 第二十八轮：寻址方式只改 URL 拼装——path-style 与虚拟主机两种口径。
+    #[test]
+    fn object_url_follows_addressing_style() {
+        let mut src = FileStorageSourceConfig {
+            id: 1,
+            storage_type: "s3".to_string(),
+            storage_root: String::new(),
+            base_url: None,
+            endpoint: Some("https://cos.ap-guangzhou.myqcloud.com".to_string()),
+            bucket: Some("weey-1253534920".to_string()),
+            access_key_id: Some("ak".to_string()),
+            secret_access_key: Some("sk".to_string()),
+            path_prefix: None,
+            direct_upload: Some(DIRECT_UPLOAD_S3_MULTIPART_V1.to_string()),
+            region: Some("ap-guangzhou".to_string()),
+            addressing_style: None,
+        };
+        let path_backend = S3DirectBackend::from_source(&src).expect("path 默认");
+        assert_eq!(
+            path_backend.object_url("b", "files/a b.bin"),
+            "https://cos.ap-guangzhou.myqcloud.com/b/files/a%20b.bin"
+        );
+        src.addressing_style = Some("virtual".to_string());
+        let virtual_backend = S3DirectBackend::from_source(&src).expect("virtual 合法");
+        assert_eq!(
+            virtual_backend.object_url("weey-1253534920", "files/a b.bin"),
+            "https://weey-1253534920.cos.ap-guangzhou.myqcloud.com/files/a%20b.bin"
+        );
     }
 }

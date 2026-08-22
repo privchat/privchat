@@ -121,6 +121,7 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, keep: Option<tempfile::T
         path_prefix: None,
         direct_upload: None,
         region: None,
+        addressing_style: None,
     };
     let file_service = FileService::new(vec![source], 0, pool);
     file_service.init().await.expect("init storage");

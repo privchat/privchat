@@ -281,6 +281,7 @@ async fn make_rig() -> Rig {
         path_prefix: None,
         direct_upload: None,
         region: None,
+        addressing_style: None,
     };
     // 🔴 S3 存储源 id=1（第十五轮评审 P0 门禁）：default 仍是 0，建行必须指向
     // manifest 冻结的 id=1 而不是当前默认；桶与测试 manifest 的 bucket 一致。
@@ -296,6 +297,7 @@ async fn make_rig() -> Rig {
         path_prefix: None,
         direct_upload: None,
         region: None,
+        addressing_style: None,
     };
     let file_service = FileService::new(vec![source, s3_source], 0, pool.clone());
     file_service.init().await.expect("init storage");

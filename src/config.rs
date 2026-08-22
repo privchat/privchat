@@ -1307,6 +1307,12 @@ pub struct FileStorageSourceConfig {
     /// 自建 MinIO/Garage 一般任意值可过）。
     #[serde(default)]
     pub region: Option<String>,
+    /// 🔴 第二十八轮：S3 寻址方式。不填或 `"path"` = path-style
+    /// `{endpoint}/{bucket}/{key}`（自建 MinIO/Garage）；`"virtual"` = 虚拟主机寻址
+    /// `{scheme}://{bucket}.{host}/{key}`——腾讯云 COS 明确禁止 path-style
+    /// （PathStyleDomainForbidden），必须显式配 virtual。其他值启动期报错（fail-fast）。
+    #[serde(default)]
+    pub addressing_style: Option<String>,
 }
 
 fn default_storage_type() -> String {
@@ -1346,6 +1352,8 @@ struct TomlFileStorageSource {
     direct_upload: Option<String>,
     #[serde(default)]
     region: Option<String>,
+    #[serde(default)]
+    addressing_style: Option<String>,
 }
 
 /// TOML [logging] 段，用于反序列化
@@ -1552,6 +1560,7 @@ impl From<TomlConfig> for ServerConfig {
                         path_prefix: s.path_prefix,
                         direct_upload: s.direct_upload,
                         region: s.region,
+                        addressing_style: s.addressing_style,
                     })
                     .collect();
             }
