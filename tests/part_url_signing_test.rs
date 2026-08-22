@@ -247,6 +247,18 @@ async fn valid_batch_signs_urls_and_returns_checksum_headers_verbatim() {
     assert_eq!(calls[0].reference.bucket, "privchat-e2e");
     assert_eq!(calls[0].reference.final_key, "files/s3-payload.bin");
     assert_eq!(calls[0].reference.provider_upload_id, "mpu-abc-123");
+
+    // 🔴 第二十九轮：签发成功后声明摘要落盘 manifest `part_digests`（Complete 组装来源）。
+    let root = rig.state.file_service.upload_session_root().expect("session root");
+    let upload_id = token.split('.').next().expect("upload id");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("chunked").join(upload_id).join("manifest.json"))
+            .expect("read manifest"),
+    )
+    .expect("parse manifest");
+    assert_eq!(manifest["part_digests"]["1"], b64_of_hex(&hex1));
+    assert_eq!(manifest["part_digests"]["3"], b64_of_hex(&hex3));
+    assert!(manifest["part_digests"].get("2").is_none(), "未签发的片不得凭空出现");
 }
 
 /// 几何 / 摘要 / 批量校验都发生在 backend 之前：参数非法一次都不触达 backend。

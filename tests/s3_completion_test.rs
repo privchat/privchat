@@ -417,6 +417,16 @@ async fn create_s3_session_full(
     obj.insert("bucket".into(), serde_json::json!(bucket));
     obj.insert("final_key".into(), serde_json::json!("files/s3-payload.bin"));
     obj.insert("provider_upload_id".into(), serde_json::json!("mpu-abc-123"));
+    // 🔴 第二十九轮：模拟 part-url 签发时持久化的逐片摘要声明（与 part(n) 的
+    // checksum 同源）——Complete 体的逐片 checksum 取自这里而不是 ListParts 回读。
+    obj.insert(
+        "part_digests".into(),
+        serde_json::json!({
+            "1": "checksum-1",
+            "2": "checksum-2",
+            "3": "checksum-3",
+        }),
+    );
     if let Some(id) = source_id {
         obj.insert("storage_source_id".into(), serde_json::json!(id));
     }
@@ -517,24 +527,25 @@ async fn s3_status_converts_parts_to_ranges() {
     assert_eq!(data["missing"][0]["length"], PART_SIZE);
 }
 
-/// 🔴 长度异常或缺摘要的片一律视为缺失（不进 received，§8.3），不得产出
-/// 语义不明的区间——否则 status 报完整而 complete 永远过不去。
+/// 🔴 长度异常的片一律视为缺失（不进 received，§8.3），不得产出语义不明的区间——
+/// 否则 status 报完整而 complete 永远过不去。第二十九轮：换算依据只有几何证据，
+/// 不回逐片摘要的片（COS 形态）照样如实报告已收区间。
 #[tokio::test]
-async fn s3_status_treats_bad_or_checksumless_parts_as_missing() {
+async fn s3_status_treats_bad_geometry_as_missing_and_ignores_checksum_absence() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_901).await;
     let mut bad_size = part(2);
     bad_size.size = PART_SIZE - 1; // 非末片长度异常
     let mut no_checksum = part(3);
-    no_checksum.checksum_sha256_b64 = None;
+    no_checksum.checksum_sha256_b64 = None; // COS 形态：ListParts 不回逐片摘要
     rig.backend.set_list(vec![part(1), bad_size, no_checksum]);
     let (status, json) = call(&rig, get_status(&token)).await;
     assert_eq!(status, StatusCode::OK);
     let data = &json["data"];
-    assert_eq!(data["received"].as_array().unwrap().len(), 1, "只有第 1 片合法：{json}");
-    assert_eq!(data["received_bytes"], PART_SIZE);
+    assert_eq!(data["received"].as_array().unwrap().len(), 2, "第 1、3 片几何合法：{json}");
+    assert_eq!(data["received_bytes"], PART_SIZE + size_of(3));
     assert_eq!(data["missing"][0]["offset"], PART_SIZE);
-    assert_eq!(data["missing"][0]["length"], TOTAL_SIZE - PART_SIZE);
+    assert_eq!(data["missing"][0]["length"], PART_SIZE);
 }
 
 /// NoSuchUpload + HEAD 命中本 session 且长度一致 → 报完整，由客户端照常
@@ -611,7 +622,7 @@ async fn happy_path_core(rig: &Rig) {
     // 行必须指向 manifest 冻结的 id=1，而不是当前默认。
     assert_eq!(source_id, 1, "建行必须指向冻结的存储源，而不是当前默认源");
 
-    // Complete 提交的三字段快照来自 ListParts（S3 自己的记录）。
+    // Complete 提交的快照：ETag 来自 ListParts，逐片 checksum 来自 manifest 声明（第二十九轮）。
     let calls = rig.backend.complete_call_parts();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].len(), TOTAL_PARTS as usize);
@@ -636,6 +647,70 @@ async fn s3_complete_missing_parts_returns_409_and_stays_repairable() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(json["code"], 20615);
     assert!(session.completed_file_id().expect("read tombstone").is_none());
+}
+
+/// 🔴 第二十九轮核心回归：COS 形态——ListParts 不回逐片摘要（全部 None）。
+/// status 按几何如实报告已收；complete 用 manifest 声明组装照走通，
+/// Complete 体的逐片 checksum 与声明同源。
+#[tokio::test]
+async fn s3_complete_works_when_list_parts_returns_no_checksums() {
+    const UPLOADER: u64 = 9_974_108;
+    const FILE_ID: u64 = 9_974_108_01;
+    let rig = make_rig().await;
+    cleanup(&rig.pool, UPLOADER).await.expect("用例前清库");
+    run_with_cleanup(&rig.pool, UPLOADER, async {
+        let (_, token) = create_s3_session(&rig, UPLOADER, FILE_ID).await;
+        // COS 形态：逐片摘要全空。
+        let cos_parts: Vec<ListedPart> = all_parts()
+            .into_iter()
+            .map(|mut p| {
+                p.checksum_sha256_b64 = None;
+                p
+            })
+            .collect();
+        rig.backend.set_list(cos_parts);
+        rig.probe.set_sha256(&sealed_of(FILE_ID));
+
+        // status：几何证据照样报完整（判据 12/26 口径不变）。
+        let (status, json) = call(&rig, get_status(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["received_bytes"], TOTAL_SIZE);
+        assert_eq!(json["data"]["missing"].as_array().unwrap().len(), 0);
+
+        // complete：manifest 声明组装 → 回读一致 → 建行。
+        let (status, json) = call(&rig, post_complete(&token)).await;
+        assert_eq!(status, StatusCode::OK, "COS 形态下 complete 必须成功：{json}");
+        assert_eq!(json["data"]["file_id"], FILE_ID);
+        let calls = rig.backend.complete_call_parts();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), TOTAL_PARTS as usize);
+        assert_eq!(calls[0][0].etag, "etag-1", "ETag 仍取自 ListParts");
+        assert_eq!(calls[0][0].checksum_sha256_b64, "checksum-1", "checksum 取自 manifest 声明");
+    })
+    .await;
+}
+
+/// 🔴 第二十九轮：几何齐但 manifest 缺某片声明 → 按缺失处理回 409，
+/// 绝不拿空声明组装 Complete。
+#[tokio::test]
+async fn s3_complete_returns_409_when_manifest_lacks_part_declaration() {
+    let rig = make_rig().await;
+    let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_930).await;
+    // 把第 2 片声明从 manifest 里抠掉（模拟升级前签发的在途会话，§8.4 升级边界）。
+    let root = rig.state.file_service.upload_session_root().expect("session root");
+    let manifest_path = root
+        .join("chunked")
+        .join(upload_id_of(&token))
+        .join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("read")).expect("parse");
+    manifest["part_digests"].as_object_mut().expect("part_digests").remove("2");
+    std::fs::write(&manifest_path, manifest.to_string()).expect("rewrite");
+
+    let (status, json) = call(&rig, post_complete(&token)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "缺声明按缺片处理：{json}");
+    assert_eq!(json["code"], 20615);
+    assert_eq!(rig.backend.complete_call_parts().len(), 0, "不得发起 Complete");
 }
 
 /// §8.5 第 3 步分支二：HEAD 命中本 session + 摘要一致 → 补建行 + 幂等 abort。

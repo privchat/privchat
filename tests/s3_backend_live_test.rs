@@ -3,7 +3,8 @@
 //! 上验证生产后端的全部冻结行为，不能只靠 Fake：
 //!   1. `CreateMultipartUpload` 写入归属 metadata 与 `ChecksumAlgorithm=SHA256`；
 //!   2. 预签名 `UploadPart` 把 `x-amz-checksum-sha256` 签进 URL（错误值必须被拒）；
-//!   3. `ListParts` 分页正确、每片回读 checksum（断点续传的依据）；
+//!   3. `ListParts` 分页正确、每片回读 checksum（第二十九轮起：不回读的按能力感知记录，
+//!      续传换算依据是几何证据，不受影响）；
 //!   4. `CompleteMultipartUpload` 的 `If-None-Match: *`（final key no-clobber）；
 //!   5. ETag 条件删除（归属核对 + 防 TOCTOU）；
 //!   6. `NoSuchUpload` 的 provider 真实错误映射与幂等 abort。
@@ -195,9 +196,9 @@ fn part_data(seed: u8, len: usize) -> Vec<u8> {
 
 /// 断点续传口径：先传 1、3 片，`ListParts` 只回这两片（页大小 2 → 真实分页）；
 /// 补传第 2 片后 complete；最终对象带归属 metadata。🔴 第二十八轮（腾讯 COS 实测）：
-/// COS 的 ListParts 不回逐片 checksum（即使 CreateMPU 声明了 SHA256）——回读断言改为
-/// 能力感知：回读的 provider 硬断言；不回读的如实记录能力缺口（续传证据缺失，
-/// status 收敛为全量重传，数据正确性不受影响），与本文件条件删除的先例同口径。
+/// COS 的 ListParts 不回逐片 checksum（即使 CreateMPU 声明了 SHA256）。第二十九轮起这不再是
+/// 续传缺口：status/complete 换算依据是几何证据（part_number + size），回读断言保持能力感知：
+/// 回读的 provider 硬断言；不回读的如实记录（与本文件条件删除的先例同口径）。
 #[tokio::test]
 async fn live_multipart_resume_pagination_checksum_and_metadata() {
     let Some(env) = live_env() else { return };
@@ -229,7 +230,8 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
     assert_eq!(listed[1].size, (100 << 10) as u64);
     // 🔴 第二十八轮：腾讯 COS 的 ListParts 不回逐片 checksum（实测，即使 CreateMPU
     // 已声明 SHA256；UploadPart 侧的 checksum 强制仍生效，见预签名拒收用例）。
-    // 能力感知口径同条件删除先例：回读的硬断言；不回读的记缺口，不在这里降级也不兑底。
+    // 第二十九轮起不影响续传：status 按几何证据换算（§8.3）。能力感知口径同条件删除先例：
+    // 回读的硬断言；不回读的记缺口，不在这里降级也不兑底。
     if listed[0].checksum_sha256_b64.is_some() {
         assert_eq!(
             listed[0].checksum_sha256_b64.as_deref(),
@@ -241,7 +243,7 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
             Some(sha256_b64(&p3).as_str())
         );
     } else {
-        println!("live provider 能力缺口：ListParts 不回逐片 checksum（续传证据缺失，status 收敛为全量重传）");
+        println!("live provider 能力缺口：ListParts 不回逐片 checksum（第二十九轮起不影响续传：status 按几何换算）");
     }
 
     // 补传第 2 片，三片齐全后 complete。

@@ -70,19 +70,21 @@ pub struct ListedPart {
     pub size: u64,
     pub etag: String,
     /// 该片在 S3 侧记录的 SHA-256（Base64）。创建时声明了
-    /// `ChecksumAlgorithm=SHA256` 就应该有；`None` = 后端没回，调用方按缺失处理。
+    /// `ChecksumAlgorithm=SHA256` 就应该有；`None` = 后端没回。🔴 第二十九轮起调用方不拿它
+    /// 判片的存在或组装 Complete（几何 + manifest 声明为权威），仅支持 flexible
+    /// checksums 的后端诊断/审计参考。
     pub checksum_sha256_b64: Option<String>,
 }
 
 /// `CompleteMultipartUpload` 的一片。🔴 spec 冻结 part_number / ETag /
-/// ChecksumSHA256 **三字段缺一不可**（会话声明了 SHA256，Complete 必须携带每片
-/// checksum，RESUMABLE §8.5）：所以 checksum 是 `String` 而非 `Option`，不变量由
-/// 类型保证——缺摘要的片根本构造不出来，绝无可能被提交给 Complete。
+/// ChecksumSHA256 **三字段缺一不可**（Complete 必须携带每片 checksum，RESUMABLE §8.5）：
+/// 所以 checksum 是 `String` 而非 `Option`，不变量由类型保证——缺摘要的片根本构造不出来，
+/// 绝无可能被提交给 Complete。第二十九轮：checksum 取自 manifest 声明（§8.5 第 4 步）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedPart {
     pub part_number: u32,
     pub etag: String,
-    /// 与 part-url 签发时同源的片 checksum（RFC 4648 标准 Base64）。
+    /// 与 part-url 签发时同源（manifest `part_digests`）的片 checksum（RFC 4648 标准 Base64）。
     pub checksum_sha256_b64: String,
 }
 

@@ -100,8 +100,9 @@ fn list_err(e: &NumberedPartError, ctx: &str) -> ServerError {
 }
 
 /// `ListParts` → received 区间（§8.3）：🔴 换算前逐片校验——几何异常
-/// （part_number 越界 / 长度不符）**或摘要缺失**的片一律视为缺失（不进
-/// received，留给客户端重传），不得产出语义不明的区间。
+/// （part_number 越界 / 长度不符）的片一律视为缺失（不进 received，留给
+/// 客户端重传），不得产出语义不明的区间。🔴 第二十九轮：换算依据只有几何证据，
+/// 不依赖逐片 checksum 回读（COS 的 ListParts 不回逐片摘要）。
 fn ranges_from_parts(
     parts: &[crate::service::numbered_parts::ListedPart],
     part_size: u64,
@@ -111,9 +112,8 @@ fn ranges_from_parts(
     let mut ranges: Vec<Range> = parts
         .iter()
         .filter(|p| {
-            p.checksum_sha256_b64.is_some()
-                && check_part_geometry(p.part_number, p.size, total_parts, part_size, total_size)
-                    .is_ok()
+            check_part_geometry(p.part_number, p.size, total_parts, part_size, total_size)
+                .is_ok()
         })
         .map(|p| Range {
             offset: (p.part_number as u64 - 1) * part_size,
@@ -326,26 +326,29 @@ pub(super) async fn s3_complete(
         Err(e) => return Err(list_err(&e, "ListParts 失败")),
     };
 
-    // 4. 权威快照：三字段从 S3 自己的记录读回组装 Complete（不与客户端声明比较）。
-    // 🔴 几何异常或摘要缺失的片按缺失处理 → 409 回缺失区间，会话保持可补片。
+    // 4. 🔴 第二十九轮（COS 最小兼容）：分片身份证据 = 几何 + 本地声明。
+    // part_number/ETag/size 从 ListParts 回读；每片 checksum 取自 manifest 声明（part-url 签发时
+    // 持久化）——COS 的 ListParts 不回逐片摘要，不再从 S3 回读。
+    // 几何异常或缺 manifest 声明的片按缺失处理 → 409 回缺失区间，会话保持可补片。
+    let manifest = session.manifest();
     let mut completed_parts: Vec<CompletedPart> = Vec::new();
     for p in &snapshot {
         let geometry_ok =
-            check_part_geometry(p.part_number, p.size, total_parts, part_size, session.manifest().total_size)
+            check_part_geometry(p.part_number, p.size, total_parts, part_size, manifest.total_size)
                 .is_ok();
-        if let (true, Some(checksum)) = (geometry_ok, p.checksum_sha256_b64.as_deref()) {
+        if let (true, Some(checksum)) = (geometry_ok, manifest.part_digests.get(&p.part_number)) {
             if !completed_parts.iter().any(|c| c.part_number == p.part_number) {
                 completed_parts.push(CompletedPart {
                     part_number: p.part_number,
                     etag: p.etag.clone(),
-                    checksum_sha256_b64: checksum.to_string(),
+                    checksum_sha256_b64: checksum.clone(),
                 });
             }
         }
     }
     if completed_parts.len() != total_parts as usize {
-        let received = ranges_from_parts(&snapshot, part_size, total_parts, session.manifest().total_size);
-        let missing = missing_complement(&received, session.manifest().total_size);
+        let received = ranges_from_parts(&snapshot, part_size, total_parts, manifest.total_size);
+        let missing = missing_complement(&received, manifest.total_size);
         let received_bytes: u64 = received.iter().map(|r| r.length).sum();
         tracing::info!("S3 complete 缺片预检未过：missing={missing:?}");
         return Err(coded(
@@ -353,13 +356,14 @@ pub(super) async fn s3_complete(
             409,
             format!(
                 "还有区间没传完（已收 {received_bytes} / {} 字节），请 GET status 补齐",
-                session.manifest().total_size
+                manifest.total_size
             ),
         ));
     }
     completed_parts.sort_by_key(|c| c.part_number);
 
-    // 5. CompleteMultipartUpload（🔴 If-None-Match: * 由 backend 强制携带）。
+    // 5. CompleteMultipartUpload（If-None-Match: * 由 backend 强制携带；第二十九轮起它不再是
+    // 必备安全闸门，不可覆盖性由 final_key 唯一性 + HEAD 预检 + 整文件回读保障）。
     if let Err(e) = backend.complete(&reference, &completed_parts).await {
         // 🔴 恢复动作取自 complete_recovery_for（冻结语义唯一真源），不按 HTTP 码猜。
         return match complete_recovery_for(&e) {
@@ -400,8 +404,8 @@ pub(super) async fn s3_complete(
         .await
         .map_err(|e| probe_err(e, "回读 final 对象失败"))?;
     if !stored.eq_ignore_ascii_case(&session.manifest().sealed_sha256) {
-        // 本次 Complete 刚组装的对象天然携带本会话 metadata（If-None-Match 保证
-        // 它此前不存在）→ 满足统一删除规则。删除需先 HEAD 拿 ETag 作条件
+        // 本次 Complete 刚组装的对象天然携带本会话 metadata（第二十九轮起「它此前不存在」
+        // 由 final_key 唯一性 + HEAD 预检保证）→ 满足统一删除规则。删除需先 HEAD 拿 ETag 作条件
         // （防 TOCTOU）；HEAD 读不到 = 对象已被并发清除，等同删除成功。
         return match probe
             .head(&reference)
@@ -590,9 +594,9 @@ async fn record_and_finish(
     {
         S3RecordOutcome::Recorded(meta) => meta,
         S3RecordOutcome::DuplicateObject => {
-            // 秒传命中：本次刚发布的 final 对象冗余。它由本会话 MPU 组装
-            // （If-None-Match 保证此前不存在、metadata 属于本会话）→ 满足统一
-            // 删除规则；删除后用既有路径建行。
+            // 秒传命中：本次刚发布的 final 对象冗余。它由本会话 MPU 组装（metadata 属于
+            // 本会话，final_key 由预留 file_id 生成不会撞别人）→ 满足统一删除规则；删除后
+            // 用既有路径建行。
             match probe
                 .head(reference)
                 .await

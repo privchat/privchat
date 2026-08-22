@@ -738,6 +738,8 @@ async fn part_urls(
     if session.completed_file_id()?.is_some() {
         return Err(coded(E::UploadSessionCompleted, 409, "该上传已完成"));
     }
+    // 🔴 part_digests 增量写入需要可变会话（第二十九轮；其余字段仍只读）。
+    let mut session = session;
 
     let manifest = session.manifest();
     // spec 冻结的 manifest 平铺字段：与分片参数作为整体原子使用（提取逻辑与
@@ -757,6 +759,8 @@ async fn part_urls(
     })?;
 
     let mut out = Vec::with_capacity(body.parts.len());
+    // 第二十九轮：签发成功的逐片声明摘要，统一在签发后写入 manifest。
+    let mut decls: Vec<(u32, String)> = Vec::with_capacity(body.parts.len());
     for item in body.parts {
         // 几何校验同 chunk 端点口径：part_number ∈ [1, total_parts]、非末片 = part_size、
         // 末片 = 余数。
@@ -789,7 +793,9 @@ async fn part_urls(
                     ServerError::Internal(format!("预签名分片失败: {m}"))
                 }
             })?;
-        // 服务端不持久化每片摘要：checksum 只签进 URL 由 S3 在传输时强制（§8.3）。
+        // 第二十九轮：声明摘要记入 manifest（Complete 组装来源，§8.5 第 4 步）；
+        // 支持逐片校验的后端仍由签名头在传输时强制，不支持的（COS）靠整文件回读兜底。
+        decls.push((item.part_number, checksum_b64.clone()));
         let mut required_headers = std::collections::BTreeMap::new();
         required_headers.insert("x-amz-checksum-sha256".to_string(), checksum_b64);
         out.push(SignedPart {
@@ -798,6 +804,11 @@ async fn part_urls(
             required_headers,
         });
     }
+    // 🔴 写失败必须报错：Complete 体依赖这些声明组装，丢下来 complete 永远过不去；
+    // 此刻客户端还没拿到 URL、未传任何字节，重试无损。
+    session.record_part_digests(&decls).map_err(|e| {
+        ServerError::Internal(format!("逐片摘要声明落盘失败，请重试: {e}"))
+    })?;
     Ok(ApiEnvelope::ok(PartUrlResponse { parts: out }))
 }
 

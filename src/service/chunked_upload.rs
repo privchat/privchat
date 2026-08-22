@@ -21,7 +21,8 @@
 //!
 //! ```text
 //! tmp/uploads/chunked/{upload_id}/
-//!   manifest.json        # 冻结事实（申请 token 时一次写成，之后只读）
+//!   manifest.json        # 冻结事实（申请 token 时一次写成，之后只读；
+//!                        #   唯一例外：part-url 签发后增量写入的 part_digests，第二十九轮）
 //!   session.lock         # flock：文件操作互斥，不是状态机
 //!   parts/{offset}-{length}.part
 //!   body.complete.tmp    # complete 拼接的中间文件
@@ -179,6 +180,13 @@ pub struct Manifest {
     pub storage_source_id: Option<u32>,
     #[serde(default)]
     pub created_at: i64,
+    /// 仅 `s3_multipart_v1`（第二十九轮 COS 最小兼容）：`part_number` →
+    /// part-url 签发时客户端声明的片摘要（RFC 4648 标准 Base64）。同一片号最新
+    /// 声明覆盖旧值。它是 Complete 体逐片 checksum 的组装来源（§8.5 第 4 步）：
+    /// COS 的 ListParts 不回逐片摘要，本地声明是唯一来源。🔴 manifest 唯一允许
+    /// 的增量写入（在 flock 内原子重写），其余字段仍一次写成后只读。
+    #[serde(default)]
+    pub part_digests: std::collections::BTreeMap<u32, String>,
 }
 
 fn default_manifest_transport() -> String {
@@ -444,6 +452,7 @@ impl ChunkedSession {
             provider_upload_id: s3.map(|s| s.provider_upload_id.clone()),
             storage_source_id: s3.map(|s| s.storage_source_id),
             created_at: now,
+            part_digests: std::collections::BTreeMap::new(),
         };
         write_json_atomic(&dir, "manifest.json", &manifest)?;
         // 会话目录项本身也要落盘。
@@ -541,6 +550,17 @@ impl ChunkedSession {
     /// 写墓碑（原子 + fsync 目录）。
     pub fn write_completed(&self, file_id: u64) -> Result<()> {
         write_json_atomic(&self.dir, "completed.json", &Completed { file_id })
+    }
+
+    /// 记录逐片摘要声明（第二十九轮）：part-url 签发成功后调用（调用方持锁）。
+    /// 同一片号最新声明覆盖旧值（URL 过期重拉时可能带新声明）。🔴 写失败必须报错：
+    /// Complete 体依赖这些声明组装，丢下来 complete 永远过不去；此刻客户端还没拿到
+    /// URL、未传任何字节，报错重试无损。
+    pub fn record_part_digests(&mut self, decls: &[(u32, String)]) -> Result<()> {
+        for (part_number, b64) in decls {
+            self.manifest.part_digests.insert(*part_number, b64.clone());
+        }
+        write_json_atomic(&self.dir, "manifest.json", &self.manifest)
     }
 
     /// 墓碑之后：删 parts 与拼接中间文件，只留 manifest + completed.json。

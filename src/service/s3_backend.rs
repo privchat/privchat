@@ -1033,7 +1033,7 @@ mod tests {
         assert_eq!(parts[0].size, 8388608);
         assert_eq!(parts[0].etag, "\"e1\"");
         assert_eq!(parts[0].checksum_sha256_b64.as_deref(), Some("c1"));
-        assert_eq!(parts[1].checksum_sha256_b64, None, "缺 checksum = None，调用方按缺失处理");
+        assert_eq!(parts[1].checksum_sha256_b64, None, "缺 checksum = None（COS 等不回逐片摘要的后端；第二十九轮起调用方不拿它判片存在）");
     }
 
     #[test]
