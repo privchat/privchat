@@ -25,18 +25,25 @@
 //! 🔴 删除 final key 的唯一判据（§8.5 第 6 步）：对象 metadata
 //! `privchat-upload-id == 当前 session_id` 才允许删。本接口只出原语，判据由
 //! complete 分流在调用前核对——接口自己不猜归属。
+//!
+//! 🔴 **归属核对与删除必须是一个条件操作**（第十五轮评审 P1）：先 HEAD 验归属、
+//! 再无条件 DELETE 存在 TOCTOU——两步之间 key 被替换时会删到别人的对象。因此
+//! HEAD 结果携带 ETag，删除接口以 ETag 为条件（对应 S3 条件删除 / If-Match），
+//! 不匹配即拒绝；调用方不得分两步完成安全判定。
 
 use async_trait::async_trait;
 
 use crate::service::numbered_parts::UploadReference;
 
-/// HEAD 到的 final 对象：长度 + 归属 metadata。
+/// HEAD 到的 final 对象：长度 + 归属 metadata + ETag。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalObjectHead {
     pub content_length: u64,
     /// 对象 metadata `privchat-upload-id`（CreateMultipartUpload 时写入，§2.2）。
     /// `None` = 对象没有该 metadata（无法证明归属 → 一律不得删除）。
     pub privchat_upload_id: Option<String>,
+    /// 🔴 条件删除的凭据：删除时必须携带，ETag 不匹配即拒绝（防 TOCTOU）。
+    pub etag: String,
 }
 
 /// 探测错误：只有后端错误一种，恢复语义由调用方按 §8.5 分流。
@@ -68,7 +75,14 @@ pub trait FinalObjectProbe: Send + Sync {
     /// §3.5）：文件身份的唯一权威就是这次回读。
     async fn sha256_of(&self, reference: &UploadReference) -> Result<String, ProbeError>;
 
-    /// 删除 final 对象。🔴 调用方必须已核对归属（metadata == 当前 session_id）；
-    /// 幂等：对象已不在视为成功。
-    async fn delete(&self, reference: &UploadReference) -> Result<(), ProbeError>;
+    /// 条件删除 final 对象：🔴 只有当前对象的 ETag 与 `etag`（来自归属核对时
+    /// 的 HEAD）一致才执行删除，把「核对」与「删除」合成一个原子判定，消除两步
+    /// 之间对象被替换的 TOCTOU。调用方必须已核对归属（metadata == 当前
+    /// session_id）。返回：`Ok(true)` 已删除；`Ok(false)` 对象已变化，拒绝删除
+    /// （调用方回可重试错误，重试可自愈）；对象已不在视为 `Ok(true)`（幂等）。
+    async fn delete_if_match(
+        &self,
+        reference: &UploadReference,
+        etag: &str,
+    ) -> Result<bool, ProbeError>;
 }

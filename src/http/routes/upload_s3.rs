@@ -158,12 +158,19 @@ fn missing_complement(received: &[Range], total_size: u64) -> Vec<Range> {
     missing
 }
 
-/// 幂等 abort：`NoSuchUpload` 视为成功；其他失败只告警不阻断——对象侧的结果
-/// 已经确定，parts 残留由桶 lifecycle 兜底（§8.5）。
-async fn idempotent_abort(backend: &Arc<dyn NumberedPartBackend>, reference: &UploadReference) {
+/// 建行/复用前的强制幂等 abort：`NoSuchUpload` 视为成功；🔴 其他失败不得
+/// 吞掉（第十五轮评审 P1）——abort 失败仍建行写墓碑，等于把「清理失败」
+/// 记成「上传完成」，旧 MPU 与预签名 URL 会一直存活。失败回可重试 5xx，
+/// 会话保留（此刻尚未建行/写墓碑，重试无损）。
+async fn must_abort(
+    backend: &Arc<dyn NumberedPartBackend>,
+    reference: &UploadReference,
+) -> Result<(), ServerError> {
     match backend.abort(reference).await {
-        Ok(()) | Err(NumberedPartError::NoSuchUpload) => {}
-        Err(e) => tracing::warn!("幂等 abort MPU 失败（不阻断主流程，parts 由桶 lifecycle 兜底）: {e:?}"),
+        Ok(()) | Err(NumberedPartError::NoSuchUpload) => Ok(()),
+        Err(e) => Err(ServerError::Internal(format!(
+            "幂等 abort MPU 失败，会话保留，请稍后重试: {e:?}"
+        ))),
     }
 }
 
@@ -394,9 +401,21 @@ pub(super) async fn s3_complete(
         .map_err(|e| probe_err(e, "回读 final 对象失败"))?;
     if !stored.eq_ignore_ascii_case(&session.manifest().sealed_sha256) {
         // 本次 Complete 刚组装的对象天然携带本会话 metadata（If-None-Match 保证
-        // 它此前不存在）→ 满足统一删除规则。删成功 → 20618；失败 → 保留会话、
-        // 可重试 5xx（24h 扫描器继续删）。
-        return delete_then_restart_or_retry(probe, &reference, "回读摘要与声明不符").await;
+        // 它此前不存在）→ 满足统一删除规则。删除需先 HEAD 拿 ETag 作条件
+        // （防 TOCTOU）；HEAD 读不到 = 对象已被并发清除，等同删除成功。
+        return match probe
+            .head(&reference)
+            .await
+            .map_err(|e| probe_err(e, "HEAD final key 失败"))?
+        {
+            None => Err(restart_required(
+                "回读摘要与声明不符且对象已不存在，请重新申请 token 从头上传",
+            )),
+            Some(head) => {
+                delete_then_restart_or_retry(probe, &reference, "回读摘要与声明不符", &head.etag)
+                    .await
+            }
+        };
     }
 
     // 7. 建行（对象已在 final 路径）→ 墓碑 → 删本地 parts（本就为空）。
@@ -424,7 +443,7 @@ async fn recover_from_existing_object(
     // 分支一：metadata 不属于当前 session → 保留对象（无权删除）、abort 当前
     // MPU、报内部冲突。🔴 不得回 20618——重申请仍是同一 final_key，会死循环。
     if head.privchat_upload_id.as_deref() != Some(session.upload_id()) {
-        idempotent_abort(backend, reference).await;
+        must_abort(backend, reference).await?;
         tracing::error!(
             "final key 上已有对象但 metadata 不属于会话 {}，保留对象人工排查",
             session.upload_id()
@@ -440,8 +459,9 @@ async fn recover_from_existing_object(
         .map_err(|e| probe_err(e, "回读 final 对象失败"))?;
 
     if stored.eq_ignore_ascii_case(&session.manifest().sealed_sha256) {
-        // 分支二：属于本 session + 摘要一致 → 补建行 + 墓碑（幂等 abort 当前 MPU）。
-        idempotent_abort(backend, reference).await;
+        // 分支二：属于本 session + 摘要一致 → 补建行 + 墓碑（幂等 abort 当前 MPU；
+        // 🔴 abort 失败回可重试 5xx，绝不带着存活的 MPU 建行）。
+        must_abort(backend, reference).await?;
         let metadata =
             record_and_finish(state, session, extra, headers, probe, reference, stored).await?;
         tracing::info!(
@@ -452,8 +472,9 @@ async fn recover_from_existing_object(
     }
 
     // 分支三：属于本 session + 摘要不一致（上一轮回读不符但删除失败的重试）→
-    // 满足统一删除规则，允许删：成功 → 20618；失败 → 保留会话、可重试 5xx。
-    delete_then_restart_or_retry(probe, reference, "final key 上对象摘要与本次上传不符").await
+    // 满足统一删除规则，允许删：成功 → 20618；失败/拒绝 → 保留会话、可重试 5xx。
+    delete_then_restart_or_retry(probe, reference, "final key 上对象摘要与本次上传不符", &head.etag)
+        .await
 }
 
 /// §8.5 第 5 步 412（PreconditionFailed）恢复：final key 已有对象、本次 MPU
@@ -486,9 +507,9 @@ async fn verify_precondition_failed(
                     .await
                     .map_err(|e| probe_err(e, "回读 final 对象失败"))?;
                 if stored.eq_ignore_ascii_case(&session.manifest().sealed_sha256) {
-                    // 身份一致 → 复用继续建行；🔴 建行前先幂等 abort 当前 MPU
-                    // （否则 parts 一直留到桶 lifecycle）。
-                    idempotent_abort(backend, reference).await;
+                    // 身份一致 → 复用继续建行；🔴 建行前先幂等 abort 当前 MPU，
+                    // abort 失败回可重试 5xx，绝不带着存活的 MPU 建行。
+                    must_abort(backend, reference).await?;
                     let metadata = record_and_finish(
                         state, session, extra, headers, probe, reference, stored,
                     )
@@ -501,7 +522,7 @@ async fn verify_precondition_failed(
                 }
             }
             // 身份不一致 → 保留已有对象、abort 当前 MPU、报内部冲突。
-            idempotent_abort(backend, reference).await;
+            must_abort(backend, reference).await?;
             tracing::error!(
                 "412 后 final key 对象与本次上传身份不符（ours={ours}），保留对象人工排查",
             );
@@ -512,17 +533,25 @@ async fn verify_precondition_failed(
     }
 }
 
-/// 归属已证明的删除：成功 → 20618 从零重来；失败 → 保留会话、可重试 5xx
-/// （24h 扫描器继续删，重试可自愈）。
+/// 归属已证明的删除：成功 → 20618 从零重来；失败/拒绝 → 保留会话、可重试
+/// 5xx（24h 扫描器继续删，重试可自愈）。🔴 删除以 HEAD 的 ETag 为条件
+/// （delete_if_match），检查与删除之间对象被替换时拒绝删除而不是删错对象。
 async fn delete_then_restart_or_retry(
     probe: &Arc<dyn FinalObjectProbe>,
     reference: &UploadReference,
     reason: &str,
+    etag: &str,
 ) -> ApiResult<UploadResponse> {
-    match probe.delete(reference).await {
-        Ok(()) => Err(restart_required(format!(
+    match probe.delete_if_match(reference, etag).await {
+        Ok(true) => Err(restart_required(format!(
             "{reason}，已删除该对象，请重新申请 token 从头上传"
         ))),
+        Ok(false) => {
+            tracing::error!("{reason}且删除前对象已变化（ETag 不匹配），拒绝删除，会话保留等待重试");
+            Err(ServerError::Internal(format!(
+                "{reason}且对象在删除前已变化，拒绝删除，请稍后重试"
+            )))
+        }
         Err(e) => {
             tracing::error!("{reason}且删除 final 对象失败（{}），会话保留等待重试", e);
             Err(ServerError::Internal(format!(
@@ -570,10 +599,20 @@ async fn record_and_finish(
                 .map_err(|e| probe_err(e, "HEAD final key 失败"))?
             {
                 Some(head) if head.privchat_upload_id.as_deref() == Some(session.upload_id()) => {
-                    probe
-                        .delete(reference)
+                    // 🔴 条件删除：以 HEAD 的 ETag 为准，对象已变化即拒绝。
+                    match probe
+                        .delete_if_match(reference, &head.etag)
                         .await
-                        .map_err(|e| probe_err(e, "秒传命中但删除冗余 final 对象失败"))?;
+                        .map_err(|e| probe_err(e, "秒传命中但删除冗余 final 对象失败"))?
+                    {
+                        true => {}
+                        false => {
+                            return Err(ServerError::Internal(
+                                "秒传命中但 final 对象在删除前已变化，拒绝删除，请重试"
+                                    .to_string(),
+                            ))
+                        }
+                    }
                 }
                 _ => {
                     return Err(ServerError::Internal(

@@ -1865,6 +1865,26 @@ impl ChatServer {
                     if removed > 0 {
                         info!("🧹 分片上传扫描：清理过期会话 {removed} 个");
                     }
+                    // 🔴 S3 分支（第十五轮评审 P0）：过期 S3 会话必须先完成
+                    // abort / HEAD / 归属核验 / 条件删除才能删目录，绝不先丢恢复信息。
+                    // 直传门禁接入前后端/探测恒 None，此时只保留目录并记日志。
+                    let root = match file_service.upload_session_root() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("⚠️ S3 会话扫描：取不到会话根目录: {e}");
+                            continue;
+                        }
+                    };
+                    let removed_s3 = crate::service::chunked_upload::sweep_expired_s3(
+                        &root,
+                        None,
+                        None,
+                        &file_service,
+                    )
+                    .await;
+                    if removed_s3 > 0 {
+                        info!("🧹 S3 会话扫描：清理过期会话 {removed_s3} 个");
+                    }
                 }
             });
         }

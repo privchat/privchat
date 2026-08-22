@@ -549,6 +549,11 @@ impl FileService {
             })
     }
 
+    /// 按 id 查存储源配置（只读）。S3 建行走 manifest 冻结的 id，不走默认值。
+    pub(crate) fn source_by_id(&self, id: u32) -> Option<&FileStorageSourceConfig> {
+        self.sources_by_id.get(&id)
+    }
+
     /// 初始化：为每个存储源构建 OpenDAL Operator（Fs 或 S3），本地 FS 预创建子目录
     pub async fn init(&self) -> Result<()> {
         let subdirs = [
@@ -909,7 +914,24 @@ impl FileService {
             ServerError::Internal("S3 会话缺少 final_key".to_string())
         })?;
         let file_type = FileType::from_str(&m.file_type).unwrap_or(FileType::File);
-        let source = self.resolve_storage_source()?;
+        // 🔴 存储源按 manifest 冻结值（第十五轮评审 P0）：会话可存活 24 小时，期间
+        // 重启/切换 default_storage_source_id 不得改变这份上传指向的后端；并校验
+        // 冻结源的 bucket 与 manifest 一致，防止配置漂移后 PG 指向错误存储源。
+        let source_id = m.storage_source_id.ok_or_else(|| {
+            ServerError::Internal("S3 会话缺少 storage_source_id（建会话时必须冻结）".to_string())
+        })?;
+        let source = self.source_by_id(source_id).ok_or_else(|| {
+            ServerError::Internal(format!("manifest 冻结的存储源 id={source_id} 不存在"))
+        })?;
+        let manifest_bucket = m.bucket.as_deref().ok_or_else(|| {
+            ServerError::Internal("S3 会话缺少 bucket".to_string())
+        })?;
+        if source.bucket.as_deref() != Some(manifest_bucket) {
+            return Err(ServerError::Internal(format!(
+                "manifest 冻结的存储源 id={source_id} 的 bucket（{:?}）与 manifest bucket（{manifest_bucket}）不符，拒绝建行",
+                source.bucket
+            )));
+        }
         let source_id = source.id;
 
         let mut tx = self

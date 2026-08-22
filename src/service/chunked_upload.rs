@@ -139,6 +139,11 @@ pub struct Manifest {
     /// 进程重启后靠它们恢复控制面操作，不依赖进程内映射。
     #[serde(default)]
     pub provider_upload_id: Option<String>,
+    /// 仅 `s3_multipart_v1`：🔴 建会话时冻结的存储源 id（第十五轮评审 P0）。
+    /// 建行按该值校验 bucket 并落库，绝不重新读取当前默认存储源——会话可存活
+    /// 24 小时，期间配置切换/重启不得改变这份上传最终指向的后端。
+    #[serde(default)]
+    pub storage_source_id: Option<u32>,
     #[serde(default)]
     pub created_at: i64,
 }
@@ -320,6 +325,7 @@ impl ChunkedSession {
             bucket: None,
             final_key: None,
             provider_upload_id: None,
+            storage_source_id: None,
             created_at: now,
         };
         write_json_atomic(&dir, "manifest.json", &manifest)?;
@@ -641,6 +647,11 @@ pub enum AssembleError {
 }
 
 /// 24 小时扫描：删掉所有**已过期**且**能拿到非阻塞锁**的会话目录。返回删了几个。
+///
+/// 🔴 按 transport 分流（第十五轮评审 P0）：S3 会话必须先完成 MPU abort /
+/// final object 归属处置才能删目录，由 [`sweep_expired_s3`] 负责；这里直接跳过，
+/// 否则目录一删，`provider_upload_id`/`final_key`/session_id 永久丢失，删除失败的
+/// 对象连重试入口都没了。
 pub fn sweep_expired(session_root: &Path) -> usize {
     let root = chunked_root(session_root);
     let Ok(rd) = std::fs::read_dir(&root) else { return 0 };
@@ -651,12 +662,16 @@ pub fn sweep_expired(session_root: &Path) -> usize {
         if !dir.is_dir() {
             continue;
         }
-        let expired = match read_json::<Manifest>(&dir.join("manifest.json")) {
+        let manifest = read_json::<Manifest>(&dir.join("manifest.json"));
+        let expired = match &manifest {
             Ok(Some(m)) => now > m.expires_at,
             // manifest 缺失/损坏：这个目录已经没人能用了，也清。
             _ => true,
         };
         if !expired {
+            continue;
+        }
+        if matches!(&manifest, Ok(Some(m)) if m.transport == TRANSPORT_S3_MULTIPART_V1) {
             continue;
         }
         let lock = OpenOptions::new()
@@ -673,6 +688,174 @@ pub fn sweep_expired(session_root: &Path) -> usize {
             continue;
         }
         if std::fs::remove_dir_all(&dir).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 已过期 S3 会话删目录前，对象侧必须先处置干净（RESUMABLE §8.7 判据 20）。
+/// 返回 `Ok(true)` = 可以删目录；`Ok(false)` = 保留目录下一轮再试；`Err(())` =
+/// manifest 半建（从未建过 MPU，无恢复信息），等同可删。
+async fn s3_expired_session_ready(
+    manifest: &Manifest,
+    session_id: &str,
+    backend: &std::sync::Arc<dyn super::numbered_parts::NumberedPartBackend>,
+    probe: &std::sync::Arc<dyn super::final_object_probe::FinalObjectProbe>,
+    file_service: &super::FileService,
+) -> std::result::Result<bool, ()> {
+    use super::numbered_parts::{NumberedPartError, UploadReference};
+
+    let reference = match (
+        manifest.bucket.as_deref(),
+        manifest.final_key.as_deref(),
+        manifest.provider_upload_id.as_deref(),
+    ) {
+        (Some(bucket), Some(final_key), Some(pid)) => UploadReference {
+            bucket: bucket.to_string(),
+            final_key: final_key.to_string(),
+            provider_upload_id: pid.to_string(),
+        },
+        // 半建会话：MPU 从未创建，没有对象侧负担。
+        _ => return Err(()),
+    };
+
+    // 1. abort MPU（NoSuchUpload = 已关闭，视为成功）；失败保留目录下一轮再试。
+    if let Err(e) = backend.abort(&reference).await {
+        if !matches!(e, NumberedPartError::NoSuchUpload) {
+            tracing::warn!("扫描器 abort MPU 失败（目录保留，下一轮重试）: {e:?}");
+            return Ok(false);
+        }
+    }
+
+    // 2. HEAD final_key。
+    let head = match probe.head(&reference).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("扫描器 HEAD final key 失败（目录保留，下一轮重试）: {e}");
+            return Ok(false);
+        }
+    };
+    let Some(head) = head else {
+        // 对象不存在：MPU 已 abort，无残留。
+        return Ok(true);
+    };
+
+    // 3. 归属：metadata 不属于本会话 → 永不删对象；目录保留作人工排查锚点。
+    if head.privchat_upload_id.as_deref() != Some(session_id) {
+        tracing::error!(
+            "扫描器：final key 上对象不属于过期会话 {session_id}，保留对象与目录，人工排查"
+        );
+        return Ok(false);
+    }
+
+    // 4. 属于本会话：先查 PG——「PG 已提交、墓碑没写」的崩溃窗口里对象是
+    // 正式数据，绝不能删；只有无行引用的对象才是冗余，才条件删除。
+    match file_service.get_file_metadata(manifest.reserved_file_id).await {
+        Ok(Some(meta))
+            if meta.uploader_id == manifest.uploader_id
+                && meta.file_size == manifest.total_size
+                && meta
+                    .file_hash
+                    .as_deref()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(&manifest.sealed_sha256)) =>
+        {
+            tracing::info!(
+                "扫描器：过期会话 {session_id} 的 final 对象已有 PG 行（file_id={}），保留对象，只删目录",
+                manifest.reserved_file_id
+            );
+            return Ok(true);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("扫描器：查 reserved_file_id 失败（目录保留，下一轮重试）: {e}");
+            return Ok(false);
+        }
+    }
+
+    // 5. 无行引用 → 归属已证明（统一删除规则），条件删除（ETag 防 TOCTOU）。
+    match probe.delete_if_match(&reference, &head.etag).await {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            tracing::warn!("扫描器：删除前 final 对象已变化（ETag 不匹配），目录保留，下一轮重新核验");
+            Ok(false)
+        }
+        Err(e) => {
+            tracing::warn!("扫描器：删除 final 对象失败（目录保留，下一轮重试）: {e}");
+            Ok(false)
+        }
+    }
+}
+
+/// 24 小时扫描的 S3 分支（RESUMABLE §8.7 判据 20，第十五轮评审 P0）：
+/// 🔴 过期且无墓碑的 S3 会话，必须先持非阻塞锁完成 abort / HEAD / 归属核验 /
+/// 恢复或条件删除，**成功之后才删目录**；任何一步失败都保留目录下一轮再试，
+/// 绝不先丢 `provider_upload_id`/`final_key`/session_id 这些恢复信息。
+/// 桶 lifecycle `AbortIncompleteMultipartUpload` 仅兜底目录整体丢失的场景。
+pub async fn sweep_expired_s3(
+    session_root: &Path,
+    backend: Option<&std::sync::Arc<dyn super::numbered_parts::NumberedPartBackend>>,
+    probe: Option<&std::sync::Arc<dyn super::final_object_probe::FinalObjectProbe>>,
+    file_service: &super::FileService,
+) -> usize {
+    let root = chunked_root(session_root);
+    let Ok(rd) = std::fs::read_dir(&root) else { return 0 };
+    let now = now_secs();
+    let mut removed = 0;
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let manifest = match read_json::<Manifest>(&dir.join("manifest.json")) {
+            Ok(Some(m)) => m,
+            // manifest 缺失/损坏：没有恢复信息可丢，与 proxy 同口径直接清。
+            _ => {
+                if std::fs::remove_dir_all(&dir).is_ok() {
+                    removed += 1;
+                }
+                continue;
+            }
+        };
+        if now <= manifest.expires_at || manifest.transport != TRANSPORT_S3_MULTIPART_V1 {
+            continue;
+        }
+        // 墓碑在：complete 已终态（MPU 已终结、对象已处置），与 proxy 同口径。
+        if dir.join("completed.json").exists() {
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                removed += 1;
+            }
+            continue;
+        }
+        // 非阻塞锁：拿不到说明有 in-flight 请求，本轮跳过。
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("session.lock"))
+            .ok();
+        let held = match lock.as_ref() {
+            Some(f) => matches!(flock_nb(f), Ok(true)),
+            None => true,
+        };
+        if !held {
+            continue;
+        }
+        let session_id = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let (Some(backend), Some(probe)) = (backend, probe) else {
+            tracing::error!(
+                "扫描器：存在过期 S3 会话 {session_id} 但直传门禁未接入（后端/探测缺失），目录保留"
+            );
+            continue;
+        };
+        let ready = match s3_expired_session_ready(&manifest, &session_id, backend, probe, file_service).await {
+            Ok(ready) => ready,
+            // 半建会话（MPU 从未创建）：无对象侧负担，可删。
+            Err(()) => true,
+        };
+        if ready && std::fs::remove_dir_all(&dir).is_ok() {
             removed += 1;
         }
     }
