@@ -1,14 +1,17 @@
-//! 协商门禁（RESUMABLE_UPLOAD_SPEC §8.2，第十轮评审）：直接驱动**生产接线**
-//! `issue_chunked_upload_token`（RPC 处理器剥出来的窄依赖版本，不是复制品）。
+//! 模式选择门禁（RESUMABLE_UPLOAD_SPEC §8.2，第二十轮起为单一数据面）：
+//! 直接驱动**生产接线** `issue_chunked_upload_token`（RPC 处理器剥出来的窄依赖版本，
+//! 不是复制品）。本文件的 rig 未配 S3（唯一数据面 = 内置上传服务）。
 //!
 //! 五个用例：
 //!   1. 不带 supported_upload_transports → 响应保持旧格式（无 transport 等新字段）
 //!   2. `[proxy_offset_v1]` → transport = proxy_offset_v1
-//!   3. `[proxy_offset_v1, s3_multipart_v1]` 且门禁关闭 → 回退 proxy_offset_v1
+//!   3. `[proxy_offset_v1, s3_multipart_v1]` 且服务端未配 S3 → 发 proxy（无 S3 可发，非回退）
 //!   4. `[]` → 参数错误
 //!   5. `[s3_multipart_v1]` → 参数错误
 //! 外加顺序用例：非法集合 + 秒传命中 → 仍然参数错误（🔴 校验在秒传预检之前，
 //! 同一非法请求不因文件是否已存在而改变结局）。
+//! 🔴 S3 单一数据面的拒绝用例（未声明即报「不支持该上传模式」）在
+//! `s3_direct_wiring_test.rs`（需要真实接线）。
 
 use std::sync::Arc;
 
@@ -103,7 +106,6 @@ fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
         file_service: &rig.file_service,
         upload_token_service: &rig.upload_token_service,
         file_api_base_url: Some("http://e2e.local/files"),
-        s3_direct_threshold: 16 << 20,
     }
 }
 
@@ -164,7 +166,7 @@ async fn declaring_only_proxy_returns_proxy() {
 }
 
 #[tokio::test]
-async fn declaring_both_falls_back_to_proxy_while_gates_are_closed() {
+async fn declaring_both_returns_proxy_when_server_is_proxy_mode() {
     let rig = rig().await;
     let resp = issue_chunked_upload_token(
         &services(&rig),
@@ -176,7 +178,7 @@ async fn declaring_both_falls_back_to_proxy_while_gates_are_closed() {
     )
     .await
     .expect("声明两种 transport 应成功");
-    // direct_upload 配置 + 阈值 + 集成门禁均未接入（实现顺序第 5 步），恒回退 proxy。
+    // 🔴 单一数据面：服务端未配 S3 → 唯一数据面是内置服务，发 proxy（与文件大小无关）。
     assert_eq!(resp.transport.as_deref(), Some("proxy_offset_v1"));
 }
 

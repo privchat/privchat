@@ -2,9 +2,10 @@
 //! P0）：不再靠手改 manifest 的夹具证明冻结字段，而是驱动**生产签发入口**
 //! `issue_chunked_upload_token` + `install_s3_direct` 接线 + `FileHttpServer::new`
 //! 装配，断言：
-//!   1. 门禁开启且达阈值 → 真实签发先 `CreateMultipartUpload` 再写 manifest，
+//!   1. 门禁开启 → 真实签发先 `CreateMultipartUpload` 再写 manifest，
 //!      全部冻结字段（含 `storage_source_id`）一次写成；
-//!   2. 低于阈值 / 未接线 → 回退 proxy，绝不建 MPU；
+//!   2. 🔴 单一数据面（第二十轮）：S3 接线在位时未声明/只声明 proxy → 报
+//!      「不支持该上传模式」，绝不回退建 proxy 会话；
 //!   3. `CreateMultipartUpload` 失败 → 签发报错且不落本地会话目录；
 //!   4. `FileHttpServer::new` 与扫描任务拿同一份接线（`Arc::ptr_eq`），不再恒 None；
 //!   5. 用该接线跑一次 `sweep_expired_s3`，过期 S3 会话按生产编排被清理。
@@ -215,7 +216,6 @@ fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
         file_service: &rig.file_service,
         upload_token_service: &rig.upload_token_service,
         file_api_base_url: Some("http://e2e.local/files"),
-        s3_direct_threshold: 16 << 20,
     }
 }
 
@@ -238,7 +238,7 @@ fn req(file_size: i64) -> FileRequestChunkedUploadTokenRequest {
 
 // ================= 1. 真实签发链路 =================
 
-/// 🔴 生产签发入口（非手改 manifest 的夹具）：门禁开 + 达阈值 → 先
+/// 🔴 生产签发入口（非手改 manifest 的夹具）：S3 单一数据面 → 先
 /// `CreateMultipartUpload`（记录会话 id）再写 manifest，全部冻结字段一次写成。
 #[tokio::test]
 async fn real_issuance_creates_mpu_then_freezes_all_fields() {
@@ -288,16 +288,48 @@ async fn real_issuance_creates_mpu_then_freezes_all_fields() {
     assert_eq!(rig.backend.abort_count(), 0, "成功路径不该调 abort");
 }
 
-/// 低于阈值 → 回退 proxy：不建 MPU，manifest 无任何 S3 冻结字段。
+/// 🔴 第二十轮：单一数据面禁止兜底。S3 接线在位时，旧客户端（不带声明）或只声明
+/// proxy 的客户端 → 报「不支持该上传模式」（参数错误），绝不静默改走内置上传服务；
+/// 不建 MPU，不落会话目录。与文件大小无关（没有阈值）。
 #[tokio::test]
-async fn below_threshold_falls_back_to_proxy_without_creating_mpu() {
+async fn s3_data_plane_refuses_clients_without_s3_declaration() {
     let rig = make_rig(true).await;
+    // 旧客户端：不带 supported_upload_transports。
+    let mut legacy = req(1 << 20);
+    legacy.supported_upload_transports = None;
+    let err = issue_chunked_upload_token(&services(&rig), UPLOADER, legacy)
+        .await
+        .expect_err("旧客户端在 S3 数据面必须被拒");
+    assert!(matches!(err, RpcError { code: ErrorCode::InvalidParams, .. }));
+    assert!(format!("{err}").contains("不支持该上传模式"));
+    // 只声明 proxy：同样拒绝（不得回退）。
+    let mut proxy_only = req(1 << 20);
+    proxy_only.supported_upload_transports = Some(vec!["proxy_offset_v1".to_string()]);
+    let err = issue_chunked_upload_token(&services(&rig), UPLOADER, proxy_only)
+        .await
+        .expect_err("只声明 proxy 在 S3 数据面必须被拒");
+    assert!(matches!(err, RpcError { code: ErrorCode::InvalidParams, .. }));
+    assert!(format!("{err}").contains("不支持该上传模式"));
+    // 拒绝路径无副作用：不建 MPU、不落会话目录。
+    assert!(rig.backend.calls().is_empty(), "拒绝路径绝不建 MPU");
+    assert_eq!(rig.backend.abort_count(), 0);
+    let root = rig.file_service.upload_session_root().expect("session root");
+    let chunked = root.join("chunked");
+    let dirs = std::fs::read_dir(&chunked).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(dirs, 0, "拒绝后不得落下会话目录");
+}
+
+/// proxy 数据面（未接线）：声明两种 transport 也只发 proxy（无 S3 可发，非回退）。
+#[tokio::test]
+async fn proxy_data_plane_issues_proxy_when_not_wired() {
+    // 未接线：服务端只配内置上传服务（唯一数据面是 proxy）。
+    let rig = make_rig(false).await;
     let resp = issue_chunked_upload_token(&services(&rig), UPLOADER, req(1 << 20))
         .await
-        .expect("小文件签发应成功");
+        .expect("proxy 数据面签发应成功");
     assert_eq!(resp.transport.as_deref(), Some("proxy_offset_v1"));
     assert!(resp.part_size.is_none() && resp.total_parts.is_none());
-    assert!(rig.backend.calls().is_empty(), "回退路径绝不建 MPU");
+    assert!(rig.backend.calls().is_empty(), "proxy 数据面绝不建 MPU");
 
     let token = resp.upload_token.expect("token");
     let upload_id = token.split('.').next().expect("upload id");

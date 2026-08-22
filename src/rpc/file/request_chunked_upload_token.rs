@@ -42,8 +42,6 @@ pub struct ChunkedTokenServices<'a> {
     pub file_service: &'a FileService,
     pub upload_token_service: &'a UploadTokenService,
     pub file_api_base_url: Option<&'a str>,
-    /// `s3_direct_threshold`（RESUMABLE §8.2）：服务端配置，默认 16 MiB。
-    pub s3_direct_threshold: u64,
 }
 
 pub async fn request_chunked_upload_token(
@@ -59,7 +57,6 @@ pub async fn request_chunked_upload_token(
         file_service: &services.file_service,
         upload_token_service: &services.upload_token_service,
         file_api_base_url: services.config.file_api_base_url.as_deref(),
-        s3_direct_threshold: services.config.file_s3_direct_threshold,
     };
     let response = issue_chunked_upload_token(&narrowed, user_id, request).await?;
     serde_json::to_value(response)
@@ -103,24 +100,26 @@ pub async fn issue_chunked_upload_token(
         }
     }
 
-    // ---- §8.2 协商与模式选择（纯加法）----
-    // 🔴 「字段存在必须含 proxy_offset_v1」是无条件协议约束：**在秒传预检之前**
-    // 校验，同一非法请求不会因文件是否已存在而一会儿成功一会儿失败。
-    // 集合规则与门禁判定都由 select_transport 自身强制（不靠注释）；旧客户端不带
-    // 字段 → 隐式 proxy，响应不新增字段，逐字节不变。门禁 = 默认存储源显式
-    // `direct_upload` + 后端已接线（第十六轮评审 P0：接进真实链路）+ 达阈值。
+    // ---- §8.2 单一数据面模式选择（第二十轮：配置单选，禁回退/兜底）----
+    // 🔴 校验在秒传预检之前：同一非法请求不会因文件是否已存在而一会儿成功一会儿失败。
+    // 规则由 select_transport 自身强制（不靠注释）：配了 S3 则只认 s3_multipart_v1
+    // 声明（未声明直接报「不支持该上传模式」，绝不静默改走内置服务）；没配则隐式/
+    // 声明 proxy，集合存在必含 proxy_offset_v1。没有阈值、没有能力协商、没有切换。
     let declared_transports = request.supported_upload_transports.is_some();
     let s3_wiring = services.file_service.s3_direct();
     let transport = select_transport(
         request.supported_upload_transports.as_deref(),
-        request.file_size as u64,
         &S3DirectGate {
             open: s3_wiring.is_some(),
-            threshold: services.s3_direct_threshold,
         },
     )
-    .map_err(|_| {
-        RpcError::validation("supported_upload_transports 必须包含 proxy_offset_v1".to_string())
+    .map_err(|e| match e {
+        crate::service::chunked_upload::TransportSelectError::ServerS3Only => RpcError::validation(
+            "不支持该上传模式：服务端已配置 S3 直传，客户端必须声明 s3_multipart_v1".to_string(),
+        ),
+        crate::service::chunked_upload::TransportSelectError::SetMissingProxy => {
+            RpcError::validation("supported_upload_transports 必须包含 proxy_offset_v1".to_string())
+        }
     })?
     .to_string();
 

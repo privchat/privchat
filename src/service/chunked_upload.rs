@@ -61,51 +61,54 @@ pub const TRANSPORT_PROXY_OFFSET_V1: &str = "proxy_offset_v1";
 /// 上传数据面标识（RESUMABLE_UPLOAD_SPEC §8）：S3 原生 Multipart 直传（待实现）。
 pub const TRANSPORT_S3_MULTIPART_V1: &str = "s3_multipart_v1";
 
-/// 协商失败：声明的能力集合缺少 `proxy_offset_v1`（回退保底，RESUMABLE §8.2）。
+/// 模式选择失败（单一数据面，第二十轮评审用户规则）：
+/// - `SetMissingProxy`：proxy 数据面下声明集合缺少 `proxy_offset_v1`；
+/// - `ServerS3Only`：服务端配置了 S3 单一数据面，客户端未声明 `s3_multipart_v1`。
+///   🔴 不得回退/兜底——只能报错，客户端升级或管理员改配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransportSetMissingProxy;
+pub enum TransportSelectError {
+    SetMissingProxy,
+    ServerS3Only,
+}
 
-/// S3 直传门禁输入（RESUMABLE_UPLOAD_SPEC §8.2，第十六轮评审 P0）：
-/// `open` = 默认存储源显式 `direct_upload` 配置 + 后端已接线；`threshold` =
-/// `s3_direct_threshold`（服务端配置，默认 16 MiB）。判定全部收敛在
-/// [`select_transport`] 内，不得在别的处另写判定。
+/// S3 直传门禁输入（RESUMABLE_UPLOAD_SPEC §8.2）：`open` = 默认存储源显式
+/// `direct_upload` 配置 + 后端已接线。🔴 单一数据面（第二十轮）：配置单选，
+/// 没有阈值/回退/能力协商——配了 S3 则全部会话走 S3，没配则全部走 proxy。
+/// 判定全部收敛在 [`select_transport`] 内，不得在别的处另写判定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct S3DirectGate {
     pub open: bool,
-    pub threshold: u64,
 }
 
-/// 协商与模式选择（RESUMABLE_UPLOAD_SPEC §8.2，纯加法）。
+/// 单一数据面的模式选择（RESUMABLE_UPLOAD_SPEC §8.2，第二十轮评审）。
 ///
-/// 🔴 集合规则由本函数自己强制，不靠调用方注释维持：`declared` 为 `Some` 且不含
-/// `proxy_offset_v1` → `Err(TransportSetMissingProxy)`（RPC 层映射为参数错误）。
-/// `declared == None`（旧客户端）→ 隐式 proxy，行为逐字节不变。服务端永远不会
-/// 返回客户端声明集合之外的 transport。
-/// S3 门禁（§8.2）：声明了 `s3_multipart_v1` 还要 `gate.open`（默认存储源显式
-/// `direct_upload` + 后端已接线）且 `file_size >= gate.threshold` 才选 S3，
-/// 否则回退 proxy（合法，因为集合必含 proxy_offset_v1）。
+/// 🔴 规则由本函数自己强制，不靠调用方注释维持：
+/// - 服务端配了 S3（`gate.open`）：token 只能绑 `s3_multipart_v1`。客户端声明了它 →
+///   S3；否则（含旧客户端不带字段）→ `Err(ServerS3Only)` → 「不支持该上传模式」，
+///   绝不静默改走内置上传服务。
+/// - 服务端没配（唯一数据面是内置服务）：字段省略 = 旧客户端，隐式 proxy；字段存在则必须包含 `proxy_offset_v1`，否则 `Err(SetMissingProxy)`。
+/// 🔴 不存在「不达阈值回退」「未声明能力自动 proxy」「失败后切换数据面」：
+/// 失败只能报错或重新申请同一模式的 token。
 pub fn select_transport(
     declared: Option<&[String]>,
-    file_size: u64,
     gate: &S3DirectGate,
-) -> std::result::Result<&'static str, TransportSetMissingProxy> {
+) -> std::result::Result<&'static str, TransportSelectError> {
+    if gate.open {
+        return match declared {
+            Some(list) if list.iter().any(|t| t == TRANSPORT_S3_MULTIPART_V1) => {
+                Ok(TRANSPORT_S3_MULTIPART_V1)
+            }
+            _ => Err(TransportSelectError::ServerS3Only),
+        };
+    }
     match declared {
         // 字段省略：旧客户端，隐式 proxy；现有自适应分片逻辑完全不变。
         None => Ok(TRANSPORT_PROXY_OFFSET_V1),
         // 🔴 集合规则：不含 proxy_offset_v1 → 拒绝，调用方回参数错误。
         Some(list) if !list.iter().any(|t| t == TRANSPORT_PROXY_OFFSET_V1) => {
-            Err(TransportSetMissingProxy)
+            Err(TransportSelectError::SetMissingProxy)
         }
-        // 未声明 s3_multipart_v1 → proxy。
-        Some(list) if !list.iter().any(|t| t == TRANSPORT_S3_MULTIPART_V1) => {
-            Ok(TRANSPORT_PROXY_OFFSET_V1)
-        }
-        // 声明支持 S3 → 过门禁才选 S3（RESUMABLE §8.2）；不满足回退 proxy。
-        Some(_) => Ok(if gate.open && file_size >= gate.threshold {
-            TRANSPORT_S3_MULTIPART_V1
-        } else {
-            TRANSPORT_PROXY_OFFSET_V1
-        }),
+        Some(_) => Ok(TRANSPORT_PROXY_OFFSET_V1),
     }
 }
 
@@ -1301,47 +1304,52 @@ mod tests {
         assert_eq!(sweep_expired(root.path()), 1);
     }
 
-    /// §8.2 协商：集合规则 + 门禁（第十六轮评审 P0：门禁接进 select_transport）。
+    /// §8.2 单一数据面（第二十轮）：配置单选、禁回退；配了 S3 只认 S3 声明。
     #[test]
-    fn transport_selection_follows_set_rules_and_gate() {
-        let closed = S3DirectGate { open: false, threshold: 16 << 20 };
-        let open = S3DirectGate { open: true, threshold: 16 << 20 };
-        assert_eq!(select_transport(None, 1, &closed), Ok(TRANSPORT_PROXY_OFFSET_V1));
-        assert_eq!(select_transport(None, 1 << 30, &open), Ok(TRANSPORT_PROXY_OFFSET_V1));
+    fn transport_selection_follows_single_data_plane() {
+        let closed = S3DirectGate { open: false };
+        let open = S3DirectGate { open: true };
+        // proxy 数据面：旧客户端隐式 proxy；声明含 proxy → proxy（文件大小无关）。
+        assert_eq!(select_transport(None, &closed), Ok(TRANSPORT_PROXY_OFFSET_V1));
+        assert_eq!(select_transport(None, &open), Err(TransportSelectError::ServerS3Only));
         let only_proxy = vec![TRANSPORT_PROXY_OFFSET_V1.to_string()];
         assert_eq!(
-            select_transport(Some(&only_proxy), 1 << 30, &open),
+            select_transport(Some(&only_proxy), &closed),
             Ok(TRANSPORT_PROXY_OFFSET_V1)
         );
+        // proxy 数据面下声明了 S3 也不算非法（含 proxy 即可）→ proxy，无 S3 可发。
         let with_s3 = vec![
             TRANSPORT_PROXY_OFFSET_V1.to_string(),
             TRANSPORT_S3_MULTIPART_V1.to_string(),
         ];
-        // 门禁关闭（默认源未配 direct_upload / 后端未接线）→ 回退 proxy。
         assert_eq!(
-            select_transport(Some(&with_s3), 1 << 30, &closed),
+            select_transport(Some(&with_s3), &closed),
             Ok(TRANSPORT_PROXY_OFFSET_V1)
         );
-        // 门禁开但低于阈值 → 回退 proxy（§8.2：弱网小文件直传反而降可靠性）。
+        // 🔴 S3 单一数据面：声明了 S3 → S3（任何文件大小，无阈值）；
+        // 未声明（含旧客户端、只声明 proxy）→ 报错，绝不回退。
         assert_eq!(
-            select_transport(Some(&with_s3), (16 << 20) - 1, &open),
-            Ok(TRANSPORT_PROXY_OFFSET_V1)
-        );
-        // 门禁开 + 达阈值 → s3_multipart_v1。
-        assert_eq!(
-            select_transport(Some(&with_s3), 16 << 20, &open),
+            select_transport(Some(&with_s3), &open),
             Ok(TRANSPORT_S3_MULTIPART_V1)
         );
-        // 🔴 集合规则由本函数自身强制：不含 proxy_offset_v1 → Err（含空集合、
-        // 只声明 S3、未知 transport），不依赖调用方先校验，且与门禁状态无关。
         assert_eq!(
-            select_transport(Some(&[TRANSPORT_S3_MULTIPART_V1.to_string()]), 1 << 30, &open),
-            Err(TransportSetMissingProxy)
+            select_transport(Some(&[TRANSPORT_S3_MULTIPART_V1.to_string()]), &open),
+            Ok(TRANSPORT_S3_MULTIPART_V1)
         );
-        assert_eq!(select_transport(Some(&[]), 1 << 30, &open), Err(TransportSetMissingProxy));
         assert_eq!(
-            select_transport(Some(&["weird".to_string()]), 1 << 30, &open),
-            Err(TransportSetMissingProxy)
+            select_transport(Some(&only_proxy), &open),
+            Err(TransportSelectError::ServerS3Only)
+        );
+        // proxy 数据面的集合规则不变：不含 proxy_offset_v1 → Err（空集合、只声明
+        // S3、未知 transport），与门禁状态无关。
+        assert_eq!(
+            select_transport(Some(&[TRANSPORT_S3_MULTIPART_V1.to_string()]), &closed),
+            Err(TransportSelectError::SetMissingProxy)
+        );
+        assert_eq!(select_transport(Some(&[]), &closed), Err(TransportSelectError::SetMissingProxy));
+        assert_eq!(
+            select_transport(Some(&["weird".to_string()]), &closed),
+            Err(TransportSelectError::SetMissingProxy)
         );
     }
 

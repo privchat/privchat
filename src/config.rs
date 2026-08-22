@@ -66,9 +66,6 @@ pub struct ServerConfig {
     pub file_storage_sources: Vec<FileStorageSourceConfig>,
     /// 默认存储源 ID（上传时使用，须在 file_storage_sources 中存在）
     pub file_default_storage_source_id: u32,
-    /// S3 直传阈值（RESUMABLE §8.2）：file_size 达阈才可选 s3_multipart_v1，
-    /// 默认 16 MiB（单 part MPU 无断点粒度，小文件直传反而降可靠性）。
-    pub file_s3_direct_threshold: u64,
     /// HTTP 文件服务器端口（用于启动服务）
     pub http_file_server_port: u16,
     /// 管理 API 服务器端口（仅内网访问）
@@ -339,7 +336,6 @@ impl Default for ServerConfig {
             gateway_listeners: default_gateway_listeners(),
             file_storage_sources: vec![],
             file_default_storage_source_id: 0,
-            file_s3_direct_threshold: 16 << 20,
             http_file_server_port: 9083,
             admin_api_port: 9090,
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
@@ -420,6 +416,16 @@ impl ServerConfig {
 
         let toml_config: TomlConfig =
             toml::from_str(&content).with_context(|| "配置文件格式错误")?;
+        // 🔴 第二十轮：单一数据面没有阈值/回退。旧配置项出现即报错，
+        // 防止管理员以为它还在生效。
+        if toml_config
+            .file
+            .as_ref()
+            .and_then(|f| f.s3_direct_threshold)
+            .is_some()
+        {
+            anyhow::bail!("[file] s3_direct_threshold 已废止：单一数据面（配置单选）没有阈值/回退，请删除该配置项");
+        }
 
         Ok(toml_config.into())
     }
@@ -1316,7 +1322,8 @@ struct TomlFileConfig {
     server_port: Option<u16>,
     /// 文件服务 API 基础 URL，客户端访问（原 file_server.api_base_url）
     server_api_base_url: Option<String>,
-    /// S3 直传阈值（RESUMABLE §8.2），默认 16 MiB
+    /// 🔴 第二十轮已废止：单一数据面没有阈值/回退。旧配置里出现即报错，
+    /// 防止管理员以为它还在生效。
     s3_direct_threshold: Option<u64>,
 }
 
@@ -1551,9 +1558,7 @@ impl From<TomlConfig> for ServerConfig {
             if let Some(id) = file.default_storage_source_id {
                 config.file_default_storage_source_id = id;
             }
-            if let Some(threshold) = file.s3_direct_threshold {
-                config.file_s3_direct_threshold = threshold;
-            }
+            // s3_direct_threshold 已废止：在 from_toml_file 入口报错，这里不再读取。
         }
 
         if let Some(admin) = toml.admin {
