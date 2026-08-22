@@ -6,6 +6,8 @@
 //! 以及 S3 会话串用 /files/chunk 的 20616 终局。
 //! 第十五轮评审新增：扫描器按 transport 分流的恢复/保留门禁、存储源冻结与
 //! 默认源切换门禁、条件删除（ETag）拒绝门禁。
+//! 第三十轮评审新增：同一会话重复 complete 的回归断言——不重新覆盖已完成
+//! 对象，也不生成重复/错误的文件记录。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -68,6 +70,8 @@ struct FakeBackend {
     abort_calls: AtomicU32,
     list_calls: AtomicU32,
     complete_calls: Mutex<Vec<Vec<CompletedPart>>>,
+    /// Complete 尝试次数（含失败；第三十轮重复 complete 回归用）。
+    complete_attempts: AtomicU32,
 }
 
 impl FakeBackend {
@@ -80,6 +84,7 @@ impl FakeBackend {
             abort_calls: AtomicU32::new(0),
             list_calls: AtomicU32::new(0),
             complete_calls: Mutex::new(Vec::new()),
+            complete_attempts: AtomicU32::new(0),
         }
     }
     fn set_list(&self, parts: Vec<ListedPart>) {
@@ -102,6 +107,9 @@ impl FakeBackend {
     }
     fn complete_call_parts(&self) -> Vec<Vec<CompletedPart>> {
         self.complete_calls.lock().unwrap().clone()
+    }
+    fn complete_attempts(&self) -> u32 {
+        self.complete_attempts.load(Ordering::SeqCst)
     }
 }
 
@@ -142,6 +150,7 @@ impl NumberedPartBackend for FakeBackend {
         parts: &[CompletedPart],
     ) -> Result<(), NumberedPartError> {
         let r = self.complete_result.lock().unwrap().clone();
+        self.complete_attempts.fetch_add(1, Ordering::SeqCst);
         if r.is_ok() {
             self.complete_calls.lock().unwrap().push(parts.to_vec());
         }
@@ -635,6 +644,18 @@ async fn happy_path_core(rig: &Rig) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["data"]["file_id"], FILE_ID);
     assert_eq!(rig.backend.complete_call_parts().len(), before, "墓碑后不得再调 backend");
+
+    // 🔴 第三十轮回归：重复 complete 后 PG 仍只有一行（无重复/错误记录）。
+    assert_eq!(file_row_count(rig, FILE_ID).await, 1);
+}
+
+/// PG 中该 file_id 的行数（第三十轮重复 complete 回归用）。
+async fn file_row_count(rig: &Rig, file_id: u64) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM privchat_file_uploads WHERE file_id = $1")
+        .bind(file_id as i64)
+        .fetch_one(&*rig.pool)
+        .await
+        .expect("count rows")
 }
 
 /// 缺片 complete → 409 回缺失区间，会话保持可补片（不写墓碑）。
@@ -814,6 +835,20 @@ async fn precondition_failed_core(rig: &Rig) {
     assert_eq!(json["data"]["file_id"], FILE_ID);
     assert_eq!(rig.backend.abort_calls(), 1, "建行前必须幂等 abort 当前 MPU");
     assert_eq!(rig.probe.delete_calls(), 0, "412 绝不删除 final key");
+
+    // 🔴 第三十轮回归：同一会话重复 complete（412 恢复路径）不重新覆盖已完成对象、
+    // 不生成重复/错误记录：Complete 只尝试过一次（412 即被后端拒绝，对象未被重写），
+    // 恢复不再重发；PG 只有一行。
+    assert_eq!(rig.backend.complete_attempts(), 1, "恢复不得再发 Complete（不覆盖对象）");
+    assert_eq!(file_row_count(rig, FILE_ID).await, 1);
+
+    // 恢复已写墓碑：第三次 complete 幂等回同一 file_id，仍不动对象、不加行。
+    let (status, json) = call(rig, post_complete(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["file_id"], FILE_ID);
+    assert_eq!(rig.backend.complete_attempts(), 1);
+    assert_eq!(rig.probe.delete_calls(), 0);
+    assert_eq!(file_row_count(rig, FILE_ID).await, 1);
 
     // 身份不一致 → 保留对象、abort、500（不建行）。
     let rig2 = make_rig().await;
