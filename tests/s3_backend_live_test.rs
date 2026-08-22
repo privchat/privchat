@@ -244,7 +244,7 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
     // ETag 条件删除（第十八轮评审 P1：不得把「对象被删」当「条件生效」）：
     // - 支持条件删除的后端：硬断言 错 ETag → Ok(false) 且对象必须在；对 ETag → Ok(true)。
     // - 不支持的后端（如 MinIO）：本用例不降级验收条件删除（直接清理收尾），
-    //   「该 provider 不能通过 direct-upload 门禁」由 live_gate_refuses_* 用例硬拦截。
+    //   能力缺失由启动期诊断告警暴露（第二十一轮起不再拒启动），运营监控决定放行。
     let supported = backend
         .probe_conditional_delete(&env.bucket)
         .await
@@ -276,15 +276,14 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
     assert!(backend.head(&reference).await.unwrap().is_none(), "结束后对象消失");
 }
 
-// ================= 1b. 启动门禁：缺任一安全能力的 provider 拒绝开启 =================
+// ================= 1b. 启动诊断：缺安全能力的 provider 照常接线 + 告警（不拒启动） =================
 
-/// 🔴 第十八轮 P0 / 第十九轮 P0：启动门禁要求两项能力都证明：
-/// ① DELETE `If-Match` 条件删除；② CompleteMPU `If-None-Match: *` no-clobber。
-/// 缺任一项，`FileService::init` 必须拒绝开启 `direct_upload`（fail-fast，不得带病运行）。
-/// 本地 MinIO 实测命中拒绝分支（条件删除不支持）——MinIO 不算通过 direct-upload
-/// 集成门禁。
+/// 🔴 第二十一轮评审（运营策略）：启动期能力探测降级为诊断告警——缺任一项能力，
+/// `FileService::init` 照常接线放行（服务正常启动），上传期失败返回错误码并写日志，
+/// 不回退内置上传（单一数据面）。运行时安全语义不变：删除仍走 If-Match、
+/// complete 仍带 If-None-Match。本地 MinIO 实测命中告警分支（条件删除不支持）。
 #[tokio::test]
-async fn live_gate_refuses_provider_missing_required_capabilities() {
+async fn live_gate_wires_provider_with_missing_capabilities_and_warns() {
     let Some(env) = live_env() else { return };
     ensure_bucket(&env).await;
     let backend = make_backend(&env, 1000);
@@ -297,7 +296,6 @@ async fn live_gate_refuses_provider_missing_required_capabilities() {
         .await
         .expect("no-clobber 能力探测");
     println!("live provider 能力：conditional_delete={cond_delete} complete_no_clobber={no_clobber}");
-    let supported = cond_delete && no_clobber;
 
     let src = FileStorageSourceConfig {
         id: 99,
@@ -316,19 +314,9 @@ async fn live_gate_refuses_provider_missing_required_capabilities() {
         .expect("门禁用例需要 PRIVCHAT_TEST_DATABASE_URL / DATABASE_URL");
     let pool = Arc::new(PgPoolOptions::new().max_connections(1).connect(&url).await.expect("连库"));
     let service = FileService::new(vec![src], 99, pool);
-    let result = service.init().await;
-    if supported {
-        result.expect("两项能力齐备的后端必须放行");
-        assert!(service.s3_direct().is_some(), "接线必须生效");
-    } else {
-        let err = result.expect_err("缺任一安全能力的后端必须拒绝开启 direct_upload");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("条件删除") || msg.contains("If-None-Match"),
-            "启动错误必须说明拒绝原因: {msg}"
-        );
-        assert!(service.s3_direct().is_none(), "拒绝后不得留下接线");
-    }
+    // 🔴 无论能力齐备与否，启动都必须成功且接线生效（能力缺失只告警，不拒启动）。
+    service.init().await.expect("能力探测不再阻塞启动");
+    assert!(service.s3_direct().is_some(), "接线必须生效（单一数据面，上传期失败再报错）");
 }
 
 // ================= 2. 预签名 checksum：错误值必须被拒 =================

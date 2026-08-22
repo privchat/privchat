@@ -168,7 +168,7 @@ impl S3DirectBackend {
             .map_err(|e| ServerError::Internal(format!("探测清理：abort 失败: {e:?}")))
     }
 
-    /// 尽力清理（用于「反正已拒绝启动」的失败路径）：失败只告警，不掩盖原因。
+    /// 尽力清理（探测失败路径 / 第二十一轮起清理不再阻塞启动）：失败只告警，不掩盖原因。
     async fn probe_cleanup_best_effort(&self, bucket: &str, key: &str, upload_id: Option<&str>) {
         if let Some(id) = upload_id {
             if let Err(e) = self.probe_cleanup_upload(bucket, key, id).await {
@@ -183,12 +183,13 @@ impl S3DirectBackend {
     /// 🔴 启动期能力探测（第十八轮评审 P0）：验证后端是否真正支持
     /// `DeleteObject` 的 `If-Match` 条件。真实门禁发现 MinIO 会忽略条件直接删：
     /// 这种后端上「归属核对 + 条件删除」退化为无条件删，扫描器可能删到被替换的
-    /// 对象——因此在启动期证明能力，不支持直接拒绝开启 `direct_upload`。
+    /// 对象——因此启动期探测证明能力并告警（第二十一轮起：缺失不再拒绝启动，
+    /// 上传期失败返回错误码，见 RESUMABLE_UPLOAD_SPEC 判据 33）。
     ///
     /// 探测序列：PUT 探测对象 → 用**过期 ETag** 发条件删除：
     /// - 412 → 条件生效 = 支持（随后无条件清理随机探测对象）；
     /// - 2xx 且对象消失 → 条件被忽略，旧条件删掉了新对象 = **不安全**；
-    /// - 其余（2xx 但对象仍在、传输错误等）→ 行为不可预测，同样拒绝。
+    /// - 其余（2xx 但对象仍在、传输错误等）→ 行为不可预测，同样判不支持。
     pub async fn probe_conditional_delete(&self, bucket: &str) -> Result<bool, ServerError> {
         const CTX: &str = "条件删除能力探测";
         // 🔴 第十九轮评审 P0：每次探测现生成随机 key——不撞业务对象、实例间不互踩、
@@ -239,13 +240,10 @@ impl S3DirectBackend {
         })?;
         match resp.status() {
             StatusCode::PRECONDITION_FAILED => {
-                // 条件生效 = 支持。🔴 第十九轮评审 P1：清理也是门禁的一部分——
-                // 清理失败必须拒绝启动，不得静默放行（留下探测对象）。
-                self.probe_cleanup_object(bucket, &key).await.map_err(|e| {
-                    ServerError::Internal(format!(
-                        "{CTX}：探测成功但清理失败: {e}，探测 key={key}，拒绝启动"
-                    ))
-                })?;
+                // 条件生效 = 支持。清理失败不再阻塞启动（第二十一轮），尽力清理 + 告警。
+                if let Err(e) = self.probe_cleanup_object(bucket, &key).await {
+                    tracing::warn!("{CTX}：探测成功但清理失败: {e}，探测 key={key}");
+                }
                 Ok(true)
             }
             s if s.is_success() => {
@@ -259,10 +257,10 @@ impl S3DirectBackend {
                     // 旧条件直接删掉了新对象：条件删除安全保证失效（对象已被无条件删掉，无残留）。
                     Ok(false)
                 } else {
-                    // 删除返回成功但对象仍在：行为不可预测，拒绝。反正拒绝启动，清理尽力即可。
+                    // 删除返回成功但对象仍在：行为不可预测，判不支持（告警口径同条件被忽略）。
                     self.probe_cleanup_best_effort(bucket, &key, None).await;
                     Err(ServerError::Internal(format!(
-                        "{CTX}：过期 ETag 删除返回成功但对象仍在，后端行为不可预测，拒绝开启 direct_upload"
+                        "{CTX}：过期 ETag 删除返回成功但对象仍在，后端行为不可预测，探测判不支持"
                     )))
                 }
             }
@@ -286,7 +284,7 @@ impl S3DirectBackend {
     /// `If-None-Match: *` 的 Complete：
     /// - 409/412 → 条件生效 = 支持（清理 MPU + 探测对象后放行）；
     /// - 2xx（对象被覆盖）→ 条件被忽略 = **不安全**；
-    /// - 其余行为不可预测同样拒绝。🔴 清理失败同样拒绝启动（第十九轮评审 P1）。
+    /// - 其余行为不可预测同样判不支持。🔴 清理失败尽力清理 + 告警，不再阻塞启动（第二十一轮）。
     pub async fn probe_complete_no_clobber(&self, bucket: &str) -> Result<bool, ServerError> {
         const CTX: &str = "complete no-clobber 能力探测";
         let key = probe_key("complete-no-clobber");
@@ -402,18 +400,13 @@ impl S3DirectBackend {
         let body = resp.text().await.unwrap_or_default();
         match status {
             StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
-                // 条件生效 = 支持。🔴 清理是门禁的一部分（第十九轮评审 P1）：
-                // abort MPU + 删探测对象，失败拒绝启动。
-                self.probe_cleanup_upload(bucket, &key, &upload_id).await.map_err(|e| {
-                    ServerError::Internal(format!(
-                        "{CTX}：探测成功但 MPU 清理失败: {e}，探测 key={key}，拒绝启动"
-                    ))
-                })?;
-                self.probe_cleanup_object(bucket, &key).await.map_err(|e| {
-                    ServerError::Internal(format!(
-                        "{CTX}：探测成功但清理失败: {e}，探测 key={key}，拒绝启动"
-                    ))
-                })?;
+                // 条件生效 = 支持。清理失败不再阻塞启动（第二十一轮）：尽力清理 + 告警。
+                if let Err(e) = self.probe_cleanup_upload(bucket, &key, &upload_id).await {
+                    tracing::warn!("{CTX}：探测成功但 MPU 清理失败: {e}，探测 key={key}");
+                }
+                if let Err(e) = self.probe_cleanup_object(bucket, &key).await {
+                    tracing::warn!("{CTX}：探测成功但清理失败: {e}，探测 key={key}");
+                }
                 Ok(true)
             }
             s if s.is_success() => {
@@ -426,12 +419,10 @@ impl S3DirectBackend {
                     )));
                 }
                 // 对象被覆盖：If-None-Match 被忽略 = 不安全。MPU 已被 complete 消费。
-                // 清理仍是门禁的一部分：删掉被覆盖的探测对象，失败拒绝启动。
-                self.probe_cleanup_object(bucket, &key).await.map_err(|e| {
-                    ServerError::Internal(format!(
-                        "{CTX}：清理失败: {e}，探测 key={key}，拒绝启动"
-                    ))
-                })?;
+                // 尽力清理被覆盖的探测对象，失败只告警。
+                if let Err(e) = self.probe_cleanup_object(bucket, &key).await {
+                    tracing::warn!("{CTX}：清理失败: {e}，探测 key={key}");
+                }
                 Ok(false)
             }
             s => {

@@ -626,36 +626,39 @@ impl FileService {
                     )));
                 }
                 let backend = Arc::new(crate::service::s3_backend::S3DirectBackend::from_source(src)?);
-                // 🔴 第十八轮评审 P0：条件删除能力门禁。真实 MinIO 门禁发现部分兼容服务忽略
-                // DELETE 的 If-Match——这种后端上扫描器的「归属核对 + 条件删除」退化为无条件删，
-                // 可能删到被替换的对象。启动期探测证明能力，不支持直接拒绝开启，不得带病运行。
+                // 🔴 第二十一轮评审（运营策略）：能力探测降级为启动期诊断告警，不再拒绝启动。
+                // 上传过程中失败按单一数据面返回错误码并写日志（不回退内置上传）；
+                // 运行时安全语义不变：删除仍走 If-Match 条件、complete 仍带 If-None-Match。
                 let bucket = src.bucket.clone().unwrap_or_default();
-                match backend.probe_conditional_delete(&bucket).await? {
-                    true => {
+                match backend.probe_conditional_delete(&bucket).await {
+                    Ok(true) => {
                         tracing::info!("🔒 存储源 id={} 已证明支持条件删除（If-Match）", src.id);
                     }
-                    false => {
-                        return Err(ServerError::Internal(format!(
-                            "存储源 id={} 开启了 direct_upload，但后端不支持条件删除（DELETE 的 If-Match 被忽略）：「归属核对 + 条件删除」的安全保证在该后端上失效，拒绝开启。请更换支持条件删除的后端（如 AWS S3），或关闭 direct_upload",
+                    Ok(false) => {
+                        tracing::warn!(
+                            "⚠️ 存储源 id={} 的后端不支持条件删除（DELETE 的 If-Match 被忽略）：扫描器的「归属核对 + 条件删除」在该后端上退化为无条件删，删除请求会被条件拒收的防护失效。已按运营策略照常接线，上传期失败将返回错误码，建议更换支持条件删除的后端",
                             src.id
-                        )));
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("⚠️ 存储源 id={} 条件删除能力探测未能完成（{e}），照常接线", src.id);
                     }
                 }
-                // 🔴 第十九轮评审 P0：complete no-clobber 能力门禁。直传安全同时依赖
-                // CompleteMultipartUpload 的 If-None-Match（§8.5）：后端忽略它时，并发
-                // complete 会覆盖已有正式对象。只验条件删除不足以证明完整安全能力。
-                match backend.probe_complete_no_clobber(&bucket).await? {
-                    true => {
+                match backend.probe_complete_no_clobber(&bucket).await {
+                    Ok(true) => {
                         tracing::info!(
                             "🔒 存储源 id={} 已证明支持 CompleteMPU no-clobber（If-None-Match）",
                             src.id
                         );
                     }
-                    false => {
-                        return Err(ServerError::Internal(format!(
-                            "存储源 id={} 开启了 direct_upload，但后端不支持 CompleteMultipartUpload 的 If-None-Match：并发 complete 可能覆盖已有正式对象，安全保证失效，拒绝开启。请更换支持该能力的后端（如 AWS S3），或关闭 direct_upload",
+                    Ok(false) => {
+                        tracing::warn!(
+                            "⚠️ 存储源 id={} 的后端不支持 CompleteMPU 的 If-None-Match：并发 complete 可能覆盖已有正式对象。已按运营策略照常接线，上传期失败将返回错误码，建议更换支持该能力的后端",
                             src.id
-                        )));
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("⚠️ 存储源 id={} complete no-clobber 能力探测未能完成（{e}），照常接线", src.id);
                     }
                 }
                 let wiring = S3DirectUploadWiring {

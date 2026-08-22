@@ -3,10 +3,10 @@
 //! （If-None-Match + 整文件回读）→ PG 建行」与「abort / 扫描恢复」，
 //! 证明数据面正向实现本身可工作——不只有负向门禁有效。
 //!
-//! 🔴 **本用例不是放行依据**：本地 MinIO 不支持条件删除（DELETE If-Match
-//! 被忽略），生产启动必然拒绝（由 `live_gate_refuses_provider_missing_required_capabilities`
-//! 硬断言）。这里经测试钩子 `install_s3_direct` 接线，仅验证链路实现；
-//! 生产放行必须用同时通过判据 33 两项能力探测的后端（判据 32）。
+//! 🔴 **能力口径（第二十一轮起）**：本地 MinIO 不支持条件删除（DELETE If-Match
+//! 被忽略），启动期探测会告警但不再拒绝启动（运营策略：上传期失败返回错误码）。
+//! 本用例经测试钩子 `install_s3_direct` 接线，验证数据面正向链路实现本身可工作；
+//! 生产能力验收（判据 33）仍是放行建议依据，由运营监控基于告警决定。
 //!
 //! 门禁：`PRIVCHAT_S3_LIVE_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_BUCKET`，
 //! 缺失整体跳过。真库卫生：建行后按 file_id 删行，失败路径同样清（同 §8.7 口径）。
