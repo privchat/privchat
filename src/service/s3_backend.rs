@@ -100,8 +100,18 @@ impl S3DirectBackend {
             .filter(|s| !s.is_empty())
             .unwrap_or("us-east-1")
             .to_string();
+        // 🔴 第二十二轮评审：控制面 HTTP 客户端必须带超时——后端不可达/失联时，
+        // 启动诊断与上传期控制请求（建 MPU/分页/complete/abort）都要快速报错，
+        // 不能挂到 OS TCP 超时（几十秒）。分片直传不经该客户端（预签名 URL 直连），不受影响。
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                ServerError::Internal(format!("存储源 id={} 构建 S3 HTTP 客户端失败: {e}", src.id))
+            })?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             signer: reqsign::AwsV4Signer::new("s3", &region),
             cred: reqsign::AwsCredential {
                 access_key_id: access_key_id.to_string(),

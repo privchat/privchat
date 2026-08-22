@@ -21,6 +21,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use sha2::Digest as _;
@@ -317,6 +318,45 @@ async fn live_gate_wires_provider_with_missing_capabilities_and_warns() {
     // 🔴 无论能力齐备与否，启动都必须成功且接线生效（能力缺失只告警，不拒启动）。
     service.init().await.expect("能力探测不再阻塞启动");
     assert!(service.s3_direct().is_some(), "接线必须生效（单一数据面，上传期失败再报错）");
+    // 🔴 第二十二轮：诊断异步化后，init 应在接线完成后立即返回；
+    // 给它一个宽裕窗口核对（真实后端上两项探测本身很快）。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(service.s3_direct().is_some(), "异步诊断不得影响已落位的接线");
+}
+
+/// 🔴 第二十二轮评审：后端网络不可达时启动不得被阻塞。用不可路由地址：
+/// 若诊断同步跑，探测会挂到客户端/总超时；异步化后 `init` 必须立即返回且接线生效，
+/// 诊断在后台超时后只写告警日志（离线可跑，不需要 live 环境）。
+#[tokio::test]
+async fn init_returns_promptly_when_s3_endpoint_unreachable() {
+    let src = FileStorageSourceConfig {
+        id: 98,
+        storage_type: "s3".to_string(),
+        storage_root: String::new(),
+        base_url: None,
+        endpoint: Some("http://10.255.255.1:19999".to_string()),
+        bucket: Some("privchat-unreachable".to_string()),
+        access_key_id: Some("privchat-test".to_string()),
+        secret_access_key: Some("privchat-test-secret-1".to_string()),
+        path_prefix: None,
+        direct_upload: Some("s3_multipart_v1".to_string()),
+        region: Some("us-east-1".to_string()),
+    };
+    let url = privchat::require_test_database_url()
+        .expect("该用例需要 PRIVCHAT_TEST_DATABASE_URL / DATABASE_URL");
+    let pool = Arc::new(PgPoolOptions::new().max_connections(1).connect(&url).await.expect("连库"));
+    let service = FileService::new(vec![src], 98, pool);
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), service.init())
+        .await
+        .expect("init 不得被不可达后端阻塞（诊断必须异步 + 带超时）")
+        .expect("配置合法，init 本身应成功（诊断失败只告警）");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "init 必须立即返回，实际耗时 {:?}",
+        started.elapsed()
+    );
+    assert!(service.s3_direct().is_some(), "后端不可达不影响接线（上传期失败再报错，单一数据面）");
 }
 
 // ================= 2. 预签名 checksum：错误值必须被拒 =================

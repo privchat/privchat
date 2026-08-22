@@ -26,6 +26,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use opendal::Operator;
@@ -629,41 +630,12 @@ impl FileService {
                 // 🔴 第二十一轮评审（运营策略）：能力探测降级为启动期诊断告警，不再拒绝启动。
                 // 上传过程中失败按单一数据面返回错误码并写日志（不回退内置上传）；
                 // 运行时安全语义不变：删除仍走 If-Match 条件、complete 仍带 If-None-Match。
+                // 🔴 第二十二轮评审：诊断**异步执行且带总超时**——后端网络不可达时
+                // 绝不能阻塞服务启动；接线先落位，诊断在后台只写日志，不影响任何判定。
                 let bucket = src.bucket.clone().unwrap_or_default();
-                match backend.probe_conditional_delete(&bucket).await {
-                    Ok(true) => {
-                        tracing::info!("🔒 存储源 id={} 已证明支持条件删除（If-Match）", src.id);
-                    }
-                    Ok(false) => {
-                        tracing::warn!(
-                            "⚠️ 存储源 id={} 的后端不支持条件删除（DELETE 的 If-Match 被忽略）：扫描器的「归属核对 + 条件删除」在该后端上退化为无条件删，删除请求会被条件拒收的防护失效。已按运营策略照常接线，上传期失败将返回错误码，建议更换支持条件删除的后端",
-                            src.id
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("⚠️ 存储源 id={} 条件删除能力探测未能完成（{e}），照常接线", src.id);
-                    }
-                }
-                match backend.probe_complete_no_clobber(&bucket).await {
-                    Ok(true) => {
-                        tracing::info!(
-                            "🔒 存储源 id={} 已证明支持 CompleteMPU no-clobber（If-None-Match）",
-                            src.id
-                        );
-                    }
-                    Ok(false) => {
-                        tracing::warn!(
-                            "⚠️ 存储源 id={} 的后端不支持 CompleteMPU 的 If-None-Match：并发 complete 可能覆盖已有正式对象。已按运营策略照常接线，上传期失败将返回错误码，建议更换支持该能力的后端",
-                            src.id
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("⚠️ 存储源 id={} complete no-clobber 能力探测未能完成（{e}），照常接线", src.id);
-                    }
-                }
                 let wiring = S3DirectUploadWiring {
                     source_id: src.id,
-                    bucket,
+                    bucket: bucket.clone(),
                     path_prefix: src
                         .path_prefix
                         .as_deref()
@@ -672,10 +644,11 @@ impl FileService {
                         .trim_matches('/')
                         .to_string(),
                     backend: backend.clone(),
-                    probe: backend,
+                    probe: backend.clone(),
                 };
                 *self.s3_direct.write().unwrap() = Some(Arc::new(wiring));
                 tracing::info!("📦 S3 直传门禁已开启：存储源 id={}", src.id);
+                spawn_s3_capability_diagnostics(src.id, bucket, backend);
             }
         }
         Ok(())
@@ -691,7 +664,66 @@ impl FileService {
     pub fn install_s3_direct(&self, wiring: S3DirectUploadWiring) {
         *self.s3_direct.write().unwrap() = Some(Arc::new(wiring));
     }
+}
 
+/// 🔴 启动期能力诊断（第二十一轮降级为告警；第二十二轮：异步 + 单项总超时）。
+/// 在后台任务里跑两项探测，`init` 不等待它：后端网络不可达时服务照常启动，
+/// 诊断结果只写日志，不影响接线与任何判定（单一数据面，判据 34）。
+/// 单项探测外加总超时兜底：即使客户端层超时失效，诊断任务也不会无限挂起。
+fn spawn_s3_capability_diagnostics(
+    source_id: u32,
+    bucket: String,
+    backend: Arc<crate::service::s3_backend::S3DirectBackend>,
+) {
+    const BUDGET: Duration = Duration::from_secs(10);
+    tokio::spawn(async move {
+        match tokio::time::timeout(BUDGET, backend.probe_conditional_delete(&bucket)).await {
+            Ok(Ok(true)) => {
+                tracing::info!("🔒 存储源 id={} 已证明支持条件删除（If-Match）", source_id);
+            }
+            Ok(Ok(false)) => {
+                tracing::warn!(
+                    "⚠️ 存储源 id={} 的后端不支持条件删除（DELETE 的 If-Match 被忽略）：扫描器的「归属核对 + 条件删除」在该后端上退化为无条件删，删除请求会被条件拒收的防护失效。已按运营策略照常接线，上传期失败将返回错误码，建议更换支持条件删除的后端",
+                    source_id
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("⚠️ 存储源 id={} 条件删除能力探测未能完成（{e}），照常接线", source_id);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "⚠️ 存储源 id={} 条件删除能力探测超时（>{BUDGET:?}，后端可能不可达），照常接线",
+                    source_id
+                );
+            }
+        }
+        match tokio::time::timeout(BUDGET, backend.probe_complete_no_clobber(&bucket)).await {
+            Ok(Ok(true)) => {
+                tracing::info!(
+                    "🔒 存储源 id={} 已证明支持 CompleteMPU no-clobber（If-None-Match）",
+                    source_id
+                );
+            }
+            Ok(Ok(false)) => {
+                tracing::warn!(
+                    "⚠️ 存储源 id={} 的后端不支持 CompleteMPU 的 If-None-Match：并发 complete 可能覆盖已有正式对象。已按运营策略照常接线，上传期失败将返回错误码，建议更换支持该能力的后端",
+                    source_id
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("⚠️ 存储源 id={} complete no-clobber 能力探测未能完成（{e}），照常接线", source_id);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "⚠️ 存储源 id={} complete no-clobber 能力探测超时（>{BUDGET:?}，后端可能不可达），照常接线",
+                    source_id
+                );
+            }
+        }
+    });
+}
+
+impl FileService {
     /// 根据配置构建 OpenDAL Operator（兼容标准 Fs / S3 配置）
     async fn build_operator(src: &FileStorageSourceConfig) -> Result<Operator> {
         if src.storage_type == "local" {
