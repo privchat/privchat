@@ -641,6 +641,23 @@ impl FileService {
                         )));
                     }
                 }
+                // 🔴 第十九轮评审 P0：complete no-clobber 能力门禁。直传安全同时依赖
+                // CompleteMultipartUpload 的 If-None-Match（§8.5）：后端忽略它时，并发
+                // complete 会覆盖已有正式对象。只验条件删除不足以证明完整安全能力。
+                match backend.probe_complete_no_clobber(&bucket).await? {
+                    true => {
+                        tracing::info!(
+                            "🔒 存储源 id={} 已证明支持 CompleteMPU no-clobber（If-None-Match）",
+                            src.id
+                        );
+                    }
+                    false => {
+                        return Err(ServerError::Internal(format!(
+                            "存储源 id={} 开启了 direct_upload，但后端不支持 CompleteMultipartUpload 的 If-None-Match：并发 complete 可能覆盖已有正式对象，安全保证失效，拒绝开启。请更换支持该能力的后端（如 AWS S3），或关闭 direct_upload",
+                            src.id
+                        )));
+                    }
+                }
                 let wiring = S3DirectUploadWiring {
                     source_id: src.id,
                     bucket,

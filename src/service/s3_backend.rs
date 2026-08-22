@@ -44,9 +44,16 @@ use crate::service::numbered_parts::{
 /// `direct_upload` 显式开关的唯一合法值（RESUMABLE §8.2）。
 pub const DIRECT_UPLOAD_S3_MULTIPART_V1: &str = "s3_multipart_v1";
 
-/// 启动期能力探测专用 key（第十八轮评审 P0）：只用于条件删除能力验证，
-/// 不承载任何业务数据；内容 1 字节，每次启动覆盖重写。
-const CONDITIONAL_DELETE_PROBE_KEY: &str = "__privchat_probe__/conditional-delete";
+/// 启动期能力探测专用 key 前缀（第十八轮评审）：探测只在该前缀下建临时对象，
+/// 不承载任何业务数据。🔴 第十九轮评审 P0：key 必须带每次启动现生成的随机
+/// nonce（见 `probe_key`）——固定 key 可能与业务对象冲突（启动即被覆盖/删除），
+/// 多实例并发启动还会互相覆盖。
+const PROBE_KEY_PREFIX: &str = "__privchat_probe__/capability";
+
+/// 生成不可与业务 key 冲突的探测 key：专用前缀 + 用途 + 随机 UUID nonce。
+fn probe_key(purpose: &str) -> String {
+    format!("{PROBE_KEY_PREFIX}/{purpose}/{}", uuid::Uuid::new_v4().as_simple())
+}
 
 /// 生产 S3 控制面 + final 对象探测：一份连接配置同时实现两个冻结接口。
 pub struct S3DirectBackend {
@@ -119,19 +126,75 @@ impl S3DirectBackend {
         format!("{}/{}/{}", self.endpoint, bucket, encode_key(key))
     }
 
+    /// 探测对象的清理：裸 DELETE（随机探测 key 归探测独占，无条件删是安全的，
+    /// 也不依赖被探测的条件删除能力本身）。2xx/404 均视为已清。
+    async fn probe_cleanup_object(&self, bucket: &str, key: &str) -> Result<(), ServerError> {
+        let url = self.object_url(bucket, key);
+        let req = self
+            .client
+            .delete(&url)
+            .build()
+            .map_err(|e| ServerError::Internal(format!("探测清理：构建 DELETE 请求失败: {e}")))?;
+        let resp = self
+            .signed_execute(req)
+            .await
+            .map_err(|e| ServerError::Internal(format!("探测清理：DELETE 失败: {e:?}")))?;
+        let s = resp.status();
+        if s.is_success() || s == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(ServerError::Internal(format!(
+            "探测清理失败: HTTP {} body={}",
+            s.as_u16(),
+            truncate(&body, 256)
+        )))
+    }
+
+    /// 探测 MPU 的清理：幂等 abort（`NoSuchUpload` = 已关，视为已清）。
+    async fn probe_cleanup_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ServerError> {
+        let reference = UploadReference {
+            bucket: bucket.to_string(),
+            final_key: key.to_string(),
+            provider_upload_id: upload_id.to_string(),
+        };
+        <Self as NumberedPartBackend>::abort(&self, &reference)
+            .await
+            .map_err(|e| ServerError::Internal(format!("探测清理：abort 失败: {e:?}")))
+    }
+
+    /// 尽力清理（用于「反正已拒绝启动」的失败路径）：失败只告警，不掩盖原因。
+    async fn probe_cleanup_best_effort(&self, bucket: &str, key: &str, upload_id: Option<&str>) {
+        if let Some(id) = upload_id {
+            if let Err(e) = self.probe_cleanup_upload(bucket, key, id).await {
+                tracing::warn!("探测清理（尽力）abort 失败: {e}，探测 key={key}");
+            }
+        }
+        if let Err(e) = self.probe_cleanup_object(bucket, key).await {
+            tracing::warn!("探测清理（尽力）DELETE 失败: {e}，探测 key={key}");
+        }
+    }
+
     /// 🔴 启动期能力探测（第十八轮评审 P0）：验证后端是否真正支持
     /// `DeleteObject` 的 `If-Match` 条件。真实门禁发现 MinIO 会忽略条件直接删：
     /// 这种后端上「归属核对 + 条件删除」退化为无条件删，扫描器可能删到被替换的
     /// 对象——因此在启动期证明能力，不支持直接拒绝开启 `direct_upload`。
     ///
     /// 探测序列：PUT 探测对象 → 用**过期 ETag** 发条件删除：
-    /// - 412 → 条件生效 = 支持（随后用真实 ETag 清理探测对象）；
+    /// - 412 → 条件生效 = 支持（随后无条件清理随机探测对象）；
     /// - 2xx 且对象消失 → 条件被忽略，旧条件删掉了新对象 = **不安全**；
     /// - 其余（2xx 但对象仍在、传输错误等）→ 行为不可预测，同样拒绝。
     pub async fn probe_conditional_delete(&self, bucket: &str) -> Result<bool, ServerError> {
         const CTX: &str = "条件删除能力探测";
-        // 1. PUT 探测对象（覆盖式，幂等；上次探测的残留在这里被接管）。
-        let url = self.object_url(bucket, CONDITIONAL_DELETE_PROBE_KEY);
+        // 🔴 第十九轮评审 P0：每次探测现生成随机 key——不撞业务对象、实例间不互踩、
+        // 不留固定残留。
+        let key = probe_key("conditional-delete");
+        let url = self.object_url(bucket, &key);
         let req = self
             .client
             .put(&url)
@@ -151,10 +214,10 @@ impl S3DirectBackend {
                 truncate(&body, 256)
             )));
         }
-        // 2. HEAD 取真实 ETag。
+        // 2. HEAD 确认对象落盘。
         let reference = UploadReference {
             bucket: bucket.to_string(),
-            final_key: CONDITIONAL_DELETE_PROBE_KEY.to_string(),
+            final_key: key.clone(),
             provider_upload_id: String::new(),
         };
         let head = <Self as FinalObjectProbe>::head(&self, &reference)
@@ -163,6 +226,7 @@ impl S3DirectBackend {
             .ok_or_else(|| {
                 ServerError::Internal(format!("{CTX}：PUT 成功但 HEAD 不到探测对象"))
             })?;
+        let _ = head; // 只需确认对象落盘；清理由探测自管（随机 key 无条件删）。
         // 3. 用过期 ETag 发条件删除，判定条件是否生效。
         let req = self
             .client
@@ -175,10 +239,13 @@ impl S3DirectBackend {
         })?;
         match resp.status() {
             StatusCode::PRECONDITION_FAILED => {
-                // 条件生效 = 支持。清理探测对象（best-effort：失败只留 1 字节残留，
-                // 下次启动 PUT 覆盖接管）。
-                let _ = <Self as FinalObjectProbe>::delete_if_match(&self, &reference, &head.etag)
-                    .await;
+                // 条件生效 = 支持。🔴 第十九轮评审 P1：清理也是门禁的一部分——
+                // 清理失败必须拒绝启动，不得静默放行（留下探测对象）。
+                self.probe_cleanup_object(bucket, &key).await.map_err(|e| {
+                    ServerError::Internal(format!(
+                        "{CTX}：探测成功但清理失败: {e}，探测 key={key}，拒绝启动"
+                    ))
+                })?;
                 Ok(true)
             }
             s if s.is_success() => {
@@ -189,9 +256,11 @@ impl S3DirectBackend {
                     })?
                     .is_none();
                 if gone {
-                    // 旧条件直接删掉了新对象：条件删除安全保证失效。
+                    // 旧条件直接删掉了新对象：条件删除安全保证失效（对象已被无条件删掉，无残留）。
                     Ok(false)
                 } else {
+                    // 删除返回成功但对象仍在：行为不可预测，拒绝。反正拒绝启动，清理尽力即可。
+                    self.probe_cleanup_best_effort(bucket, &key, None).await;
                     Err(ServerError::Internal(format!(
                         "{CTX}：过期 ETag 删除返回成功但对象仍在，后端行为不可预测，拒绝开启 direct_upload"
                     )))
@@ -199,6 +268,174 @@ impl S3DirectBackend {
             }
             s => {
                 let body = resp.text().await.unwrap_or_default();
+                self.probe_cleanup_best_effort(bucket, &key, None).await;
+                Err(ServerError::Internal(format!(
+                    "{CTX}：意外的响应: HTTP {} body={}",
+                    s.as_u16(),
+                    truncate(&body, 256)
+                )))
+            }
+        }
+    }
+
+    /// 🔴 启动期能力探测（第十九轮评审 P0）：验证后端是否真正支持
+    /// `CompleteMultipartUpload` 的 `If-None-Match: *`（final key no-clobber，§8.5）。
+    /// 直传安全同时依赖它：后端忽略该条件时，并发 complete 会覆盖已有正式对象。
+    ///
+    /// 探测序列：PUT 一个「已有正式对象」→ 同 key 建 MPU → 传一片 → 带
+    /// `If-None-Match: *` 的 Complete：
+    /// - 409/412 → 条件生效 = 支持（清理 MPU + 探测对象后放行）；
+    /// - 2xx（对象被覆盖）→ 条件被忽略 = **不安全**；
+    /// - 其余行为不可预测同样拒绝。🔴 清理失败同样拒绝启动（第十九轮评审 P1）。
+    pub async fn probe_complete_no_clobber(&self, bucket: &str) -> Result<bool, ServerError> {
+        const CTX: &str = "complete no-clobber 能力探测";
+        let key = probe_key("complete-no-clobber");
+        let url = self.object_url(bucket, &key);
+        // 1. PUT 一个「已有正式对象」（探测要保护的对象）。
+        let req = self
+            .client
+            .put(&url)
+            .header("content-length", "1")
+            .body(vec![0u8])
+            .build()
+            .map_err(|e| ServerError::Internal(format!("{CTX}：构建 PUT 请求失败: {e}")))?;
+        let resp = self
+            .signed_execute(req)
+            .await
+            .map_err(|e| ServerError::Internal(format!("{CTX}：PUT 探测对象失败: {e:?}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ServerError::Internal(format!(
+                "{CTX}：PUT 探测对象失败: HTTP {} body={}",
+                status.as_u16(),
+                truncate(&body, 256)
+            )));
+        }
+        // 2. 同一 key 建 MPU（不声明 checksum 算法：探测不牵涉业务 checksum 链路）。
+        let req = self
+            .client
+            .post(format!("{url}?uploads="))
+            .header("content-type", "application/octet-stream")
+            .build()
+            .map_err(|e| ServerError::Internal(format!("{CTX}：构建 CreateMPU 请求失败: {e}")))?;
+        let resp = self
+            .signed_execute(req)
+            .await
+            .map_err(|e| ServerError::Internal(format!("{CTX}：CreateMPU 失败: {e:?}")))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            self.probe_cleanup_best_effort(bucket, &key, None).await;
+            return Err(ServerError::Internal(format!(
+                "{CTX}：CreateMPU 失败: HTTP {} body={}",
+                status.as_u16(),
+                truncate(&body, 256)
+            )));
+        }
+        let upload_id = match xml_text(&body, "UploadId").filter(|s| !s.is_empty()) {
+            Some(id) => id,
+            None => {
+                self.probe_cleanup_best_effort(bucket, &key, None).await;
+                return Err(ServerError::Internal(format!(
+                    "{CTX}：CreateMPU 响应缺少 UploadId"
+                )));
+            }
+        };
+        // 3. 传一片（部分后端对空分片列表的 complete 先报参数错，走不到条件判定）。
+        let req = self
+            .client
+            .put(format!("{url}?partNumber=1&uploadId={upload_id}"))
+            .header("content-length", "1")
+            .body(vec![0u8])
+            .build()
+            .map_err(|e| ServerError::Internal(format!("{CTX}：构建 UploadPart 请求失败: {e}")))?;
+        let resp = match self.signed_execute(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.probe_cleanup_best_effort(bucket, &key, Some(&upload_id)).await;
+                return Err(ServerError::Internal(format!("{CTX}：UploadPart 失败: {e:?}")));
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            self.probe_cleanup_best_effort(bucket, &key, Some(&upload_id)).await;
+            return Err(ServerError::Internal(format!(
+                "{CTX}：UploadPart 失败: HTTP {} body={}",
+                status.as_u16(),
+                truncate(&body, 256)
+            )));
+        }
+        let part_etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if part_etag.is_empty() {
+            self.probe_cleanup_best_effort(bucket, &key, Some(&upload_id)).await;
+            return Err(ServerError::Internal(format!(
+                "{CTX}：UploadPart 响应缺少 ETag"
+            )));
+        }
+        // 4. 带 If-None-Match: * 的 Complete：已有对象在，必须被拒。
+        let complete_xml = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{part_etag}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let req = self
+            .client
+            .post(format!("{url}?uploadId={upload_id}"))
+            .header("if-none-match", "*")
+            .header("content-type", "application/xml")
+            .body(complete_xml)
+            .build()
+            .map_err(|e| ServerError::Internal(format!("{CTX}：构建 CompleteMPU 请求失败: {e}")))?;
+        let resp = match self.signed_execute(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.probe_cleanup_best_effort(bucket, &key, Some(&upload_id)).await;
+                return Err(ServerError::Internal(format!("{CTX}：CompleteMPU 请求失败: {e:?}")));
+            }
+        };
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        match status {
+            StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
+                // 条件生效 = 支持。🔴 清理是门禁的一部分（第十九轮评审 P1）：
+                // abort MPU + 删探测对象，失败拒绝启动。
+                self.probe_cleanup_upload(bucket, &key, &upload_id).await.map_err(|e| {
+                    ServerError::Internal(format!(
+                        "{CTX}：探测成功但 MPU 清理失败: {e}，探测 key={key}，拒绝启动"
+                    ))
+                })?;
+                self.probe_cleanup_object(bucket, &key).await.map_err(|e| {
+                    ServerError::Internal(format!(
+                        "{CTX}：探测成功但清理失败: {e}，探测 key={key}，拒绝启动"
+                    ))
+                })?;
+                Ok(true)
+            }
+            s if s.is_success() => {
+                if let Some(code) = xml_text(&body, "Code") {
+                    // 200 里包错误：不是探测预期的行为，拒绝。
+                    self.probe_cleanup_best_effort(bucket, &key, Some(&upload_id)).await;
+                    return Err(ServerError::Internal(format!(
+                        "{CTX}：CompleteMPU 返回 200 但含错误 code={code} body={}",
+                        truncate(&body, 256)
+                    )));
+                }
+                // 对象被覆盖：If-None-Match 被忽略 = 不安全。MPU 已被 complete 消费。
+                // 清理仍是门禁的一部分：删掉被覆盖的探测对象，失败拒绝启动。
+                self.probe_cleanup_object(bucket, &key).await.map_err(|e| {
+                    ServerError::Internal(format!(
+                        "{CTX}：清理失败: {e}，探测 key={key}，拒绝启动"
+                    ))
+                })?;
+                Ok(false)
+            }
+            s => {
+                self.probe_cleanup_best_effort(bucket, &key, Some(&upload_id)).await;
                 Err(ServerError::Internal(format!(
                     "{CTX}：意外的响应: HTTP {} body={}",
                     s.as_u16(),
@@ -715,6 +952,26 @@ mod tests {
         assert_eq!(encode_key("files/123.bin"), "files/123.bin");
         assert_eq!(encode_key("a b/c+d"), "a%20b/c%2Bd");
         assert_eq!(encode_key("中文/文件"), "%E4%B8%AD%E6%96%87/%E6%96%87%E4%BB%B6");
+    }
+
+    /// 🔴 第十九轮评审 P0：探测 key 必须随机且互斥——不能用固定生产 key，
+    /// 否则启动探测会覆盖/删除真实业务对象，多实例启动还会互踩。
+    #[test]
+    fn probe_keys_are_random_and_isolated() {
+        let a = probe_key("conditional-delete");
+        let b = probe_key("conditional-delete");
+        assert_ne!(a, b, "每次探测必须现生成随机 key");
+        for k in [&a, &b] {
+            assert!(
+                k.starts_with("__privchat_probe__/capability/"),
+                "探测 key 必须落在专用前缀下: {k}"
+            );
+        }
+        assert_ne!(
+            probe_key("complete-no-clobber"),
+            probe_key("conditional-delete"),
+            "不同用途的探测 key 互斥"
+        );
     }
 
     #[test]

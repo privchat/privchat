@@ -276,22 +276,28 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
     assert!(backend.head(&reference).await.unwrap().is_none(), "结束后对象消失");
 }
 
-// ================= 1b. 启动门禁：不支持条件删除的 provider 拒绝开启 =================
+// ================= 1b. 启动门禁：缺任一安全能力的 provider 拒绝开启 =================
 
-/// 🔴 第十八轮评审 P0：探测证明后端忽略 DELETE 的 If-Match（条件删除安全保证失效）
-/// 时，`FileService::init` 必须拒绝开启 `direct_upload`（fail-fast，不得带病运行）；
-/// 探测支持的后端则必须放行。本地 MinIO 实测命中拒绝分支——MinIO 不算通过
-/// direct-upload 集成门禁。
+/// 🔴 第十八轮 P0 / 第十九轮 P0：启动门禁要求两项能力都证明：
+/// ① DELETE `If-Match` 条件删除；② CompleteMPU `If-None-Match: *` no-clobber。
+/// 缺任一项，`FileService::init` 必须拒绝开启 `direct_upload`（fail-fast，不得带病运行）。
+/// 本地 MinIO 实测命中拒绝分支（条件删除不支持）——MinIO 不算通过 direct-upload
+/// 集成门禁。
 #[tokio::test]
-async fn live_gate_refuses_provider_without_conditional_delete() {
+async fn live_gate_refuses_provider_missing_required_capabilities() {
     let Some(env) = live_env() else { return };
     ensure_bucket(&env).await;
     let backend = make_backend(&env, 1000);
-    let supported = backend
+    let cond_delete = backend
         .probe_conditional_delete(&env.bucket)
         .await
-        .expect("能力探测");
-    println!("live provider 条件删除能力: supported={supported}");
+        .expect("条件删除能力探测");
+    let no_clobber = backend
+        .probe_complete_no_clobber(&env.bucket)
+        .await
+        .expect("no-clobber 能力探测");
+    println!("live provider 能力：conditional_delete={cond_delete} complete_no_clobber={no_clobber}");
+    let supported = cond_delete && no_clobber;
 
     let src = FileStorageSourceConfig {
         id: 99,
@@ -312,12 +318,15 @@ async fn live_gate_refuses_provider_without_conditional_delete() {
     let service = FileService::new(vec![src], 99, pool);
     let result = service.init().await;
     if supported {
-        result.expect("支持条件删除的后端必须放行");
+        result.expect("两项能力齐备的后端必须放行");
         assert!(service.s3_direct().is_some(), "接线必须生效");
     } else {
-        let err = result.expect_err("不支持条件删除的后端必须拒绝开启 direct_upload");
+        let err = result.expect_err("缺任一安全能力的后端必须拒绝开启 direct_upload");
         let msg = format!("{err}");
-        assert!(msg.contains("条件删除"), "启动错误必须说明拒绝原因: {msg}");
+        assert!(
+            msg.contains("条件删除") || msg.contains("If-None-Match"),
+            "启动错误必须说明拒绝原因: {msg}"
+        );
         assert!(service.s3_direct().is_none(), "拒绝后不得留下接线");
     }
 }
@@ -399,6 +408,16 @@ async fn live_complete_if_none_match_rejects_overwrite() {
     // 原对象未被覆盖：内容摘要不变。
     assert_eq!(backend.sha256_of(&first).await.unwrap(), sha256_hex(&data));
     assert_eq!(backend.head(&first).await.unwrap().unwrap().etag, etag_before);
+
+    // 🔴 第十九轮评审 P0：启动探测必须同样能证明这个能力（门禁完整性）：
+    // 本 provider 既然真实拒绝了覆盖，探测也必须判支持。
+    assert!(
+        backend
+            .probe_complete_no_clobber(&env.bucket)
+            .await
+            .expect("no-clobber 能力探测"),
+        "真实拒绝了覆盖的 provider，探测必须判支持"
+    );
 
     // 清理：第二次 MPU 作废 + 删对象。
     backend.abort(&second).await.expect("abort 第二次 MPU");
