@@ -392,6 +392,52 @@ async fn issuance_manifest_fail_abort_fail_keeps_anchor_for_scanner_retry() {
     std::fs::remove_file(root.join("chunked")).expect("unblock");
 }
 
+/// 🔴 第十八轮评审 P1：锚点补偿路径的真实扫描回归——签发失败留下的「无 manifest 锚点」，
+/// 首轮扫描 abort 仍失败 → 锚点保留；下一轮 abort 恢复 → ListParts 确认（NoSuchUpload）
+/// → HEAD 空 → 锚点被收。补偿闭环不靠局部单测背书。
+#[tokio::test]
+async fn scanner_recovers_anchor_left_by_failed_issuance() {
+    let rig = make_rig(true).await;
+    rig.backend.set_fail_abort(true);
+    let root = rig.file_service.upload_session_root().expect("session root");
+    std::fs::create_dir_all(&root).expect("ensure root");
+    // chunked 占位文件：manifest 从未写成。
+    std::fs::write(root.join("chunked"), b"blocker").expect("block chunked dir");
+
+    let err = issue_chunked_upload_token(&services(&rig), UPLOADER, req(32 << 20))
+        .await
+        .expect_err("manifest 写不了 + abort 失败必须报错");
+    assert!(err.message.contains("恢复信息"));
+    std::fs::remove_file(root.join("chunked")).expect("unblock");
+    let anchor_root = root.join("s3-anchors");
+    let anchors = || std::fs::read_dir(&anchor_root).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(anchors(), 1, "锚点必须保留供扫描器重试");
+
+    let wiring = rig.file_service.s3_direct().expect("接线必须存在");
+    // 第一轮扫描：abort 仍失败 → 锚点保留。
+    chunked_upload::sweep_expired_s3(
+        &root,
+        Some(&wiring.backend),
+        Some(&wiring.probe),
+        &rig.file_service,
+    )
+    .await;
+    assert_eq!(anchors(), 1, "abort 失败的扫描轮次不得丢锚点");
+    assert_eq!(rig.backend.abort_count(), 2, "签发 1 次 + 扫描 1 次都尝试过 abort");
+
+    // 第二轮：S3 恢复 → abort 成功 + ListParts 确认（NoSuchUpload）+ HEAD 空 → 收锚点。
+    rig.backend.set_fail_abort(false);
+    chunked_upload::sweep_expired_s3(
+        &root,
+        Some(&wiring.backend),
+        Some(&wiring.probe),
+        &rig.file_service,
+    )
+    .await;
+    assert_eq!(anchors(), 0, "恢复确认后锚点必须被收掉");
+    assert_eq!(rig.backend.abort_count(), 3, "恢复轮次再 abort 一次");
+}
+
 // ================= 2. 启动装配：HTTP 服务器与扫描共用一份接线 =================
 
 /// 🔴 `FileHttpServer::new` 从 `s3_direct()` 拿真实接线（第十六轮评审 P0：

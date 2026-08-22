@@ -626,9 +626,24 @@ impl FileService {
                     )));
                 }
                 let backend = Arc::new(crate::service::s3_backend::S3DirectBackend::from_source(src)?);
+                // 🔴 第十八轮评审 P0：条件删除能力门禁。真实 MinIO 门禁发现部分兼容服务忽略
+                // DELETE 的 If-Match——这种后端上扫描器的「归属核对 + 条件删除」退化为无条件删，
+                // 可能删到被替换的对象。启动期探测证明能力，不支持直接拒绝开启，不得带病运行。
+                let bucket = src.bucket.clone().unwrap_or_default();
+                match backend.probe_conditional_delete(&bucket).await? {
+                    true => {
+                        tracing::info!("🔒 存储源 id={} 已证明支持条件删除（If-Match）", src.id);
+                    }
+                    false => {
+                        return Err(ServerError::Internal(format!(
+                            "存储源 id={} 开启了 direct_upload，但后端不支持条件删除（DELETE 的 If-Match 被忽略）：「归属核对 + 条件删除」的安全保证在该后端上失效，拒绝开启。请更换支持条件删除的后端（如 AWS S3），或关闭 direct_upload",
+                            src.id
+                        )));
+                    }
+                }
                 let wiring = S3DirectUploadWiring {
                     source_id: src.id,
-                    bucket: src.bucket.clone().unwrap_or_default(),
+                    bucket,
                     path_prefix: src
                         .path_prefix
                         .as_deref()

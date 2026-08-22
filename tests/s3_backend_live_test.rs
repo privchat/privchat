@@ -26,11 +26,13 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use privchat::config::FileStorageSourceConfig;
+use privchat::service::file_service::FileService;
 use privchat::service::final_object_probe::FinalObjectProbe;
 use privchat::service::numbered_parts::{
     CompletedPart, NumberedPartBackend, NumberedPartError, UploadReference,
 };
 use privchat::service::s3_backend::S3DirectBackend;
+use sqlx::postgres::PgPoolOptions;
 
 struct LiveEnv {
     endpoint: String,
@@ -239,17 +241,27 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
         "回读摘要 = 整文件摘要（文件身份唯一权威）"
     );
 
-    // ETag 条件删除：错条件不得在「对象被替换而不自知」的情况下报成功。
-    // 支持 If-Match 的服务 → 412 → Ok(false)；忽略条件的（如 MinIO）直接删 →
-    // 实现靠删后 HEAD 核验兑现同一承诺；两种形态都收敛为「不误报」。
-    let rejected = backend
-        .delete_if_match(&reference, "\"etag-does-not-match\"")
+    // ETag 条件删除（第十八轮评审 P1：不得把「对象被删」当「条件生效」）：
+    // - 支持条件删除的后端：硬断言 错 ETag → Ok(false) 且对象必须在；对 ETag → Ok(true)。
+    // - 不支持的后端（如 MinIO）：本用例不降级验收条件删除（直接清理收尾），
+    //   「该 provider 不能通过 direct-upload 门禁」由 live_gate_refuses_* 用例硬拦截。
+    let supported = backend
+        .probe_conditional_delete(&env.bucket)
         .await
-        .expect("条件删除(错条件)");
-    if rejected {
-        // 服务忽略 If-Match：对象已被删，删后 HEAD 核验链路同样保证了不误报。
-    } else {
-        assert!(backend.head(&reference).await.unwrap().is_some(), "拒绝后对象仍在");
+        .expect("能力探测");
+    if supported {
+        assert_eq!(
+            backend
+                .delete_if_match(&reference, "\"etag-does-not-match\"")
+                .await
+                .expect("条件删除(错条件)"),
+            false,
+            "ETag 不符必须拒绝删除"
+        );
+        assert!(
+            backend.head(&reference).await.unwrap().is_some(),
+            "错 ETag 删除后对象必须仍在（条件真正生效的唯一证据）"
+        );
         assert_eq!(
             backend
                 .delete_if_match(&reference, &head.etag)
@@ -257,8 +269,57 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
                 .expect("条件删除(对条件)"),
             true
         );
+    } else {
+        // 能力缺失不在这里兜底：直接清掉测试对象，门禁结论见门禁用例。
+        let _ = backend.delete_if_match(&reference, &head.etag).await;
     }
     assert!(backend.head(&reference).await.unwrap().is_none(), "结束后对象消失");
+}
+
+// ================= 1b. 启动门禁：不支持条件删除的 provider 拒绝开启 =================
+
+/// 🔴 第十八轮评审 P0：探测证明后端忽略 DELETE 的 If-Match（条件删除安全保证失效）
+/// 时，`FileService::init` 必须拒绝开启 `direct_upload`（fail-fast，不得带病运行）；
+/// 探测支持的后端则必须放行。本地 MinIO 实测命中拒绝分支——MinIO 不算通过
+/// direct-upload 集成门禁。
+#[tokio::test]
+async fn live_gate_refuses_provider_without_conditional_delete() {
+    let Some(env) = live_env() else { return };
+    ensure_bucket(&env).await;
+    let backend = make_backend(&env, 1000);
+    let supported = backend
+        .probe_conditional_delete(&env.bucket)
+        .await
+        .expect("能力探测");
+    println!("live provider 条件删除能力: supported={supported}");
+
+    let src = FileStorageSourceConfig {
+        id: 99,
+        storage_type: "s3".to_string(),
+        storage_root: String::new(),
+        base_url: None,
+        endpoint: Some(env.endpoint.clone()),
+        bucket: Some(env.bucket.clone()),
+        access_key_id: Some(env.access_key.clone()),
+        secret_access_key: Some(env.secret_key.clone()),
+        path_prefix: None,
+        direct_upload: Some("s3_multipart_v1".to_string()),
+        region: Some(env.region.clone()),
+    };
+    let url = privchat::require_test_database_url()
+        .expect("门禁用例需要 PRIVCHAT_TEST_DATABASE_URL / DATABASE_URL");
+    let pool = Arc::new(PgPoolOptions::new().max_connections(1).connect(&url).await.expect("连库"));
+    let service = FileService::new(vec![src], 99, pool);
+    let result = service.init().await;
+    if supported {
+        result.expect("支持条件删除的后端必须放行");
+        assert!(service.s3_direct().is_some(), "接线必须生效");
+    } else {
+        let err = result.expect_err("不支持条件删除的后端必须拒绝开启 direct_upload");
+        let msg = format!("{err}");
+        assert!(msg.contains("条件删除"), "启动错误必须说明拒绝原因: {msg}");
+        assert!(service.s3_direct().is_none(), "拒绝后不得留下接线");
+    }
 }
 
 // ================= 2. 预签名 checksum：错误值必须被拒 =================

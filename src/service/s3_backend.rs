@@ -44,6 +44,10 @@ use crate::service::numbered_parts::{
 /// `direct_upload` 显式开关的唯一合法值（RESUMABLE §8.2）。
 pub const DIRECT_UPLOAD_S3_MULTIPART_V1: &str = "s3_multipart_v1";
 
+/// 启动期能力探测专用 key（第十八轮评审 P0）：只用于条件删除能力验证，
+/// 不承载任何业务数据；内容 1 字节，每次启动覆盖重写。
+const CONDITIONAL_DELETE_PROBE_KEY: &str = "__privchat_probe__/conditional-delete";
+
 /// 生产 S3 控制面 + final 对象探测：一份连接配置同时实现两个冻结接口。
 pub struct S3DirectBackend {
     client: reqwest::Client,
@@ -113,6 +117,95 @@ impl S3DirectBackend {
     /// path-style 对象 URL：`{endpoint}/{bucket}/{key}`（key 逐段百分号编码）。
     fn object_url(&self, bucket: &str, key: &str) -> String {
         format!("{}/{}/{}", self.endpoint, bucket, encode_key(key))
+    }
+
+    /// 🔴 启动期能力探测（第十八轮评审 P0）：验证后端是否真正支持
+    /// `DeleteObject` 的 `If-Match` 条件。真实门禁发现 MinIO 会忽略条件直接删：
+    /// 这种后端上「归属核对 + 条件删除」退化为无条件删，扫描器可能删到被替换的
+    /// 对象——因此在启动期证明能力，不支持直接拒绝开启 `direct_upload`。
+    ///
+    /// 探测序列：PUT 探测对象 → 用**过期 ETag** 发条件删除：
+    /// - 412 → 条件生效 = 支持（随后用真实 ETag 清理探测对象）；
+    /// - 2xx 且对象消失 → 条件被忽略，旧条件删掉了新对象 = **不安全**；
+    /// - 其余（2xx 但对象仍在、传输错误等）→ 行为不可预测，同样拒绝。
+    pub async fn probe_conditional_delete(&self, bucket: &str) -> Result<bool, ServerError> {
+        const CTX: &str = "条件删除能力探测";
+        // 1. PUT 探测对象（覆盖式，幂等；上次探测的残留在这里被接管）。
+        let url = self.object_url(bucket, CONDITIONAL_DELETE_PROBE_KEY);
+        let req = self
+            .client
+            .put(&url)
+            .header("content-length", "1")
+            .body(vec![0u8])
+            .build()
+            .map_err(|e| ServerError::Internal(format!("{CTX}：构建 PUT 请求失败: {e}")))?;
+        let resp = self.signed_execute(req).await.map_err(|e| {
+            ServerError::Internal(format!("{CTX}：PUT 探测对象失败: {e:?}"))
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ServerError::Internal(format!(
+                "{CTX}：PUT 探测对象失败: HTTP {} body={}",
+                status.as_u16(),
+                truncate(&body, 256)
+            )));
+        }
+        // 2. HEAD 取真实 ETag。
+        let reference = UploadReference {
+            bucket: bucket.to_string(),
+            final_key: CONDITIONAL_DELETE_PROBE_KEY.to_string(),
+            provider_upload_id: String::new(),
+        };
+        let head = <Self as FinalObjectProbe>::head(&self, &reference)
+            .await
+            .map_err(|e| ServerError::Internal(format!("{CTX}：HEAD 探测对象失败: {e}")))?
+            .ok_or_else(|| {
+                ServerError::Internal(format!("{CTX}：PUT 成功但 HEAD 不到探测对象"))
+            })?;
+        // 3. 用过期 ETag 发条件删除，判定条件是否生效。
+        let req = self
+            .client
+            .delete(&url)
+            .header("if-match", "\"privchat-probe-stale-etag\"")
+            .build()
+            .map_err(|e| ServerError::Internal(format!("{CTX}：构建 DELETE 请求失败: {e}")))?;
+        let resp = self.signed_execute(req).await.map_err(|e| {
+            ServerError::Internal(format!("{CTX}：DELETE 探测请求失败: {e:?}"))
+        })?;
+        match resp.status() {
+            StatusCode::PRECONDITION_FAILED => {
+                // 条件生效 = 支持。清理探测对象（best-effort：失败只留 1 字节残留，
+                // 下次启动 PUT 覆盖接管）。
+                let _ = <Self as FinalObjectProbe>::delete_if_match(&self, &reference, &head.etag)
+                    .await;
+                Ok(true)
+            }
+            s if s.is_success() => {
+                let gone = <Self as FinalObjectProbe>::head(&self, &reference)
+                    .await
+                    .map_err(|e| {
+                        ServerError::Internal(format!("{CTX}：删后核验 HEAD 失败: {e}"))
+                    })?
+                    .is_none();
+                if gone {
+                    // 旧条件直接删掉了新对象：条件删除安全保证失效。
+                    Ok(false)
+                } else {
+                    Err(ServerError::Internal(format!(
+                        "{CTX}：过期 ETag 删除返回成功但对象仍在，后端行为不可预测，拒绝开启 direct_upload"
+                    )))
+                }
+            }
+            s => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(ServerError::Internal(format!(
+                    "{CTX}：意外的响应: HTTP {} body={}",
+                    s.as_u16(),
+                    truncate(&body, 256)
+                )))
+            }
+        }
     }
 
     /// 签名并执行：签名必须在设置完全部参与签名的头之后。
