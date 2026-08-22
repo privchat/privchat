@@ -324,17 +324,33 @@ async fn live_gate_wires_provider_with_missing_capabilities_and_warns() {
     assert!(service.s3_direct().is_some(), "异步诊断不得影响已落位的接线");
 }
 
-/// 🔴 第二十二轮评审：后端网络不可达时启动不得被阻塞。用不可路由地址：
-/// 若诊断同步跑，探测会挂到客户端/总超时；异步化后 `init` 必须立即返回且接线生效，
-/// 诊断在后台超时后只写告警日志（离线可跑，不需要 live 环境）。
+/// 🔴 第二十二轮评审：后端网络不可达/挂起时启动不得被阻塞。诊断异步化后 `init`
+/// 必须立即返回且接线生效，诊断在后台超时后只写告警日志（离线可跑，不需要 live 环境）。
+/// 🔴 第二十三轮：不用外部不可路由地址（不同网络环境下行为不稳定：可能被代理/门户
+/// 拦截返回响应），改用本地黑洞监听器：接受连接但永不响应，确定性地模拟后端挂起。
 #[tokio::test]
 async fn init_returns_promptly_when_s3_endpoint_unreachable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定本地黑洞监听器");
+    let endpoint = format!("http://{}", listener.local_addr().expect("监听地址"));
+    // 接受连接但永不响应：模拟「连接成功但请求永远等不到回复」的后端挂起形态。
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else { break };
+            tokio::spawn(async move {
+                // 挂住连接直到测试结束（运行时销毁时一并终止）。
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                drop(sock);
+            });
+        }
+    });
     let src = FileStorageSourceConfig {
         id: 98,
         storage_type: "s3".to_string(),
         storage_root: String::new(),
         base_url: None,
-        endpoint: Some("http://10.255.255.1:19999".to_string()),
+        endpoint: Some(endpoint),
         bucket: Some("privchat-unreachable".to_string()),
         access_key_id: Some("privchat-test".to_string()),
         secret_access_key: Some("privchat-test-secret-1".to_string()),
