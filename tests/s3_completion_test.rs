@@ -21,7 +21,7 @@ use tower::ServiceExt;
 
 use privchat::config::FileStorageSourceConfig;
 use privchat::http::FileServerState;
-use privchat::service::chunked_upload::{self, ChunkedSession, NewSession};
+use privchat::service::chunked_upload::{self, ChunkedSession, NewSession, S3Anchor};
 use privchat::service::file_service::FileService;
 use privchat::service::final_object_probe::{FinalObjectHead, FinalObjectProbe, ProbeError};
 use privchat::service::numbered_parts::{
@@ -1057,6 +1057,121 @@ async fn sweep_s3_retains_dir_when_parts_never_clear() {
     assert!(dir.exists(), "残留不清：目录保留等下一轮");
     assert_eq!(rig.backend.abort_calls(), 3, "上限内尽力 abort");
     assert_eq!(rig.probe.delete_calls(), 0, "未确认清空不得进入删除分支");
+}
+
+/// manifest 损坏但锚点在（第十七轮评审 P2）：不盲删。锚点 GC 完成 abort 确认后
+/// 对象不在 → 删锚点，随后主循环见无锚点才删目录；全程不丢恢复信息。
+#[tokio::test]
+async fn sweep_s3_recovers_corrupt_manifest_dir_via_anchor() {
+    let rig = make_rig().await;
+    let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_925).await;
+    let upload_id = upload_id_of(&token).to_string();
+    let root = rig.state.file_service.upload_session_root().expect("session root");
+    let dir = root.join("chunked").join(&upload_id);
+    // 断电写坏 manifest。
+    std::fs::write(dir.join("manifest.json"), "{\"expires_at\": 1, \"torn").expect("corrupt");
+    chunked_upload::write_s3_anchor(
+        &root,
+        &upload_id,
+        &S3Anchor {
+            bucket: "privchat-e2e".into(),
+            final_key: "files/s3-payload.bin".into(),
+            provider_upload_id: "mpu-abc-123".into(),
+            created_at: 1,
+        },
+    )
+    .expect("写锚点");
+    rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
+    // FakeProbe 默认 HEAD 空 = 无残留对象。
+
+    // 锚点 GC 确认清空后直接收掉目录（不进主循环计数）。
+    assert_eq!(sweep_s3(&rig).await, 0);
+    assert!(!dir.exists(), "锚点恢复完成后目录才允许删");
+    assert!(rig.backend.abort_calls() >= 1, "凭锚点找回并 abort 了 MPU");
+    assert!(
+        !chunked_upload::s3_anchor_root(&root).join(format!("{upload_id}.json")).exists(),
+        "锚点必须随之收掉"
+    );
+}
+
+/// manifest 损坏 + 锚点在 + final 对象仍在（无论归属）：无 manifest 不能证明可删，
+/// 锚点与目录都保留，人工排查；对象消失后的下一轮才放行。
+#[tokio::test]
+async fn sweep_s3_keeps_corrupt_manifest_dir_while_final_object_exists() {
+    let rig = make_rig().await;
+    let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_926).await;
+    let upload_id = upload_id_of(&token).to_string();
+    let root = rig.state.file_service.upload_session_root().expect("session root");
+    let dir = root.join("chunked").join(&upload_id);
+    std::fs::write(dir.join("manifest.json"), "garbage").expect("corrupt");
+    chunked_upload::write_s3_anchor(
+        &root,
+        &upload_id,
+        &S3Anchor {
+            bucket: "privchat-e2e".into(),
+            final_key: "files/s3-payload.bin".into(),
+            provider_upload_id: "mpu-abc-123".into(),
+            created_at: 1,
+        },
+    )
+    .expect("写锚点");
+    rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
+    rig.probe.set_head(Some(&upload_id), TOTAL_SIZE);
+
+    assert_eq!(sweep_s3(&rig).await, 0);
+    assert!(dir.exists(), "对象仍在：目录保留作人工排查锚点");
+    assert!(
+        chunked_upload::s3_anchor_root(&root).join(format!("{upload_id}.json")).exists(),
+        "锚点保留：下一轮/人工处置的入口"
+    );
+    assert_eq!(rig.probe.delete_calls(), 0, "无 manifest 绝不删对象");
+}
+
+/// manifest 损坏且无锚点 → 可证 MPU 从未创建（不变式：create 成功必先写锚），
+/// 与 proxy 同口径直接清。
+#[tokio::test]
+async fn sweep_s3_removes_corrupt_manifest_dir_without_anchor() {
+    let rig = make_rig().await;
+    let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_927).await;
+    let upload_id = upload_id_of(&token).to_string();
+    let root = rig.state.file_service.upload_session_root().expect("session root");
+    let dir = root.join("chunked").join(&upload_id);
+    std::fs::write(dir.join("manifest.json"), "").expect("corrupt");
+
+    assert_eq!(sweep_s3(&rig).await, 1);
+    assert!(!dir.exists());
+    assert_eq!(rig.backend.abort_calls(), 0, "无锚点 = 无 MPU，不动对象侧");
+}
+
+/// 签发成功后的残留锚点（删锚失败留下的）：manifest 健在 → 锚点 GC 直接收，
+/// 不碰会话目录。
+#[tokio::test]
+async fn sweep_s3_collects_stale_anchor_of_live_session() {
+    let rig = make_rig().await;
+    let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_928).await;
+    let upload_id = upload_id_of(&token).to_string();
+    let root = rig.state.file_service.upload_session_root().expect("session root");
+    let dir = root.join("chunked").join(&upload_id);
+    chunked_upload::write_s3_anchor(
+        &root,
+        &upload_id,
+        &S3Anchor {
+            bucket: "privchat-e2e".into(),
+            final_key: "files/s3-payload.bin".into(),
+            provider_upload_id: "mpu-abc-123".into(),
+            created_at: 1,
+        },
+    )
+    .expect("写锚点");
+    rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
+
+    assert_eq!(sweep_s3(&rig).await, 0, "未过期会话不删");
+    assert!(dir.exists());
+    assert!(
+        !chunked_upload::s3_anchor_root(&root).join(format!("{upload_id}.json")).exists(),
+        "manifest 健在：残留锚点直接收掉"
+    );
+    assert_eq!(rig.backend.abort_calls(), 0, "健在会话的锚点不得触发 abort");
 }
 
 /// 未过期与 proxy 会话 → S3 扫描器不碰。

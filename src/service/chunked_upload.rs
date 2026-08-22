@@ -344,6 +344,48 @@ pub fn new_session_ids() -> SessionIds {
     }
 }
 
+/// S3 恢复锚点（第十七轮评审 P1/P2）：`CreateMultipartUpload` 成功后**立即**落盘，
+/// 在写 manifest 之前。不变式：**MPU 存在 ⇒ 锚点文件在或 manifest 可读**——
+/// 据此扫描器对 manifest 损坏/缺失的目录能区分「可恢复的 S3 会话」与「可证 MPU
+/// 从未创建的半建目录」。锁在 `chunked/` 之外的 `s3-anchors/`，避免被目录扫描误删。
+/// 签发成功后删除（manifest 接管）；删不掉的残留由扫描器锚点 GC 收。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Anchor {
+    pub bucket: String,
+    pub final_key: String,
+    pub provider_upload_id: String,
+    pub created_at: i64,
+}
+
+/// 锚点目录：`{session_root}/s3-anchors/`（与 `chunked/` 平级，不在其内）。
+pub fn s3_anchor_root(session_root: &Path) -> PathBuf {
+    session_root.join("s3-anchors")
+}
+
+fn s3_anchor_path(session_root: &Path, upload_id: &str) -> PathBuf {
+    s3_anchor_root(session_root).join(format!("{upload_id}.json"))
+}
+
+/// 原子写锚点（目录不存在先建）。
+pub fn write_s3_anchor(session_root: &Path, upload_id: &str, anchor: &S3Anchor) -> Result<()> {
+    let root = s3_anchor_root(session_root);
+    std::fs::create_dir_all(&root)
+        .map_err(|e| ServerError::Internal(format!("创建锚点目录 {root:?} 失败: {e}")))?;
+    write_json_atomic(&root, &format!("{upload_id}.json"), anchor)
+}
+
+pub fn read_s3_anchor(session_root: &Path, upload_id: &str) -> Result<Option<S3Anchor>> {
+    read_json::<S3Anchor>(&s3_anchor_path(session_root, upload_id))
+}
+
+pub fn remove_s3_anchor(session_root: &Path, upload_id: &str) -> Result<()> {
+    match std::fs::remove_file(s3_anchor_path(session_root, upload_id)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ServerError::Internal(format!("删除锚点失败: {e}"))),
+    }
+}
+
 impl ChunkedSession {
     /// 建目录 + 写 manifest，**成功之后才**返回 token。
     ///
@@ -766,6 +808,110 @@ pub fn sweep_expired(session_root: &Path) -> usize {
     removed
 }
 
+/// abort MPU 并用 `ListParts` 确认清空（RESUMABLE §8.7 判据 20，第十六轮评审 P1）：
+/// abort 后确认，残留继续 abort，上限 3 轮。返回 `true` = 已确认清空。
+async fn abort_until_confirmed(
+    backend: &std::sync::Arc<dyn super::numbered_parts::NumberedPartBackend>,
+    reference: &super::numbered_parts::UploadReference,
+) -> bool {
+    use super::numbered_parts::NumberedPartError;
+    for _ in 0..3 {
+        if let Err(e) = backend.abort(reference).await {
+            if !matches!(e, NumberedPartError::NoSuchUpload) {
+                tracing::warn!("扫描器 abort MPU 失败（保留，下一轮重试）: {e:?}");
+                return false;
+            }
+        }
+        match backend.list_parts(reference).await {
+            // NoSuchUpload = MPU 已彻底关闭；空列表 = parts 已清。二者都算确认。
+            Err(NumberedPartError::NoSuchUpload) => return true,
+            Ok(parts) if parts.is_empty() => return true,
+            Ok(parts) => {
+                tracing::warn!("扫描器：abort 后 MPU 仍残留 {} 片，继续 abort", parts.len());
+            }
+            Err(e) => {
+                tracing::warn!("扫描器：ListParts 确认失败（保留，下一轮重试）: {e:?}");
+                return false;
+            }
+        }
+    }
+    tracing::warn!("扫描器：反复 abort 后 MPU 仍有残留分片，保留，下一轮重试");
+    false
+}
+
+/// 锚点 GC（第十七轮评审 P1）：锚点是「MPU 已建但 manifest 不可读」的恢复记录。
+/// - 对应会话目录健在（manifest 可读）→ 签发成功后的残留锚点，直接删；
+/// - 否则孤儿：abort + ListParts 确认 → HEAD：无对象 → 删锚点并收掉对应目录（必须在这里收：锚点删后
+///   主循环无法区分「刚恢复完」与「从未建过」）；对象在（无论归属）或任何一步失败 → 保留锚点（下一轮重试/人工）。🔴 manifest 不可读 ⇒ 无法查
+///   `reserved_file_id` ⇒ 即使对象属于本会话也不能证明「无 PG 行」，绝不删对象。
+async fn sweep_s3_anchors(
+    session_root: &Path,
+    backend: Option<&std::sync::Arc<dyn super::numbered_parts::NumberedPartBackend>>,
+    probe: Option<&std::sync::Arc<dyn super::final_object_probe::FinalObjectProbe>>,
+) {
+    use super::numbered_parts::UploadReference;
+    let anchor_root = s3_anchor_root(session_root);
+    let Ok(rd) = std::fs::read_dir(&anchor_root) else { return };
+    let chunked = chunked_root(session_root);
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Some(upload_id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let anchor = match read_json::<S3Anchor>(&path) {
+            Ok(Some(a)) => a,
+            // 锚点文件损坏：没有可恢复的引用，同「无锚点」口径删掉。
+            _ => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        // manifest 可读 → 签发成功后的残留（删锚失败留下的）：manifest 已接管。
+        if matches!(
+            read_json::<Manifest>(&chunked.join(&upload_id).join("manifest.json")),
+            Ok(Some(_))
+        ) {
+            let _ = remove_s3_anchor(session_root, &upload_id);
+            continue;
+        }
+        let (Some(backend), Some(probe)) = (backend, probe) else {
+            tracing::error!(
+                "扫描器：存在孤儿锚 {upload_id} 但直传门禁未接入（后端/探测缺失），保留"
+            );
+            continue;
+        };
+        let reference = UploadReference {
+            bucket: anchor.bucket,
+            final_key: anchor.final_key,
+            provider_upload_id: anchor.provider_upload_id,
+        };
+        if !abort_until_confirmed(backend, &reference).await {
+            continue;
+        }
+        match probe.head(&reference).await {
+            Ok(None) => {
+                // MPU 已关、对象不在：孤儿已清干净。收锚点与对应目录（此刻能证明的
+                // 仅此而已；不先收目录，锚点删后主循环无法区分「刚恢复完」与「从未建过」）。
+                let _ = remove_s3_anchor(session_root, &upload_id);
+                let _ = std::fs::remove_dir_all(chunked.join(&upload_id));
+            }
+            Ok(Some(head)) => {
+                let own = head.privchat_upload_id.as_deref() == Some(upload_id.as_str());
+                tracing::error!(
+                    "扫描器：孤儿锚 {upload_id} 的 final 对象仍在（属于本会话: {own}），无 manifest 不能证明可删，锚点与目录保留，人工排查"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("扫描器：孤儿锚 {upload_id} HEAD 失败（保留，下一轮重试）: {e}");
+            }
+        }
+    }
+}
+
 /// 已过期 S3 会话删目录前，对象侧必须先处置干净（RESUMABLE §8.7 判据 20）。
 /// 返回 `Ok(true)` = 可以删目录；`Ok(false)` = 保留目录下一轮再试；`Err(())` =
 /// manifest 半建（从未建过 MPU，无恢复信息），等同可删。
@@ -776,7 +922,7 @@ async fn s3_expired_session_ready(
     probe: &std::sync::Arc<dyn super::final_object_probe::FinalObjectProbe>,
     file_service: &super::FileService,
 ) -> std::result::Result<bool, ()> {
-    use super::numbered_parts::{NumberedPartError, UploadReference};
+    use super::numbered_parts::UploadReference;
 
     let reference = match (
         manifest.bucket.as_deref(),
@@ -792,41 +938,8 @@ async fn s3_expired_session_ready(
         _ => return Err(()),
     };
 
-    // 1. abort MPU 并确认清空（RESUMABLE §8.7 判据 20，第十六轮评审 P1）：
-    // abort 后用 ListParts 确认已空或 NoSuchUpload；仍有 part 残留则继续 abort，
-    // 反复不清则保留目录下一轮再试——绝不在 parts 残留时删本地会话目录。
-    let mut parts_cleared = false;
-    for _ in 0..3 {
-        if let Err(e) = backend.abort(&reference).await {
-            if !matches!(e, NumberedPartError::NoSuchUpload) {
-                tracing::warn!("扫描器 abort MPU 失败（目录保留，下一轮重试）: {e:?}");
-                return Ok(false);
-            }
-        }
-        match backend.list_parts(&reference).await {
-            // NoSuchUpload = MPU 已彻底关闭；空列表 = parts 已清。二者都算确认。
-            Err(NumberedPartError::NoSuchUpload) => {
-                parts_cleared = true;
-                break;
-            }
-            Ok(parts) if parts.is_empty() => {
-                parts_cleared = true;
-                break;
-            }
-            Ok(parts) => {
-                tracing::warn!(
-                    "扫描器：abort 后 MPU 仍残留 {} 片，继续 abort",
-                    parts.len()
-                );
-            }
-            Err(e) => {
-                tracing::warn!("扫描器：ListParts 确认失败（目录保留，下一轮重试）: {e:?}");
-                return Ok(false);
-            }
-        }
-    }
-    if !parts_cleared {
-        tracing::warn!("扫描器：反复 abort 后 MPU 仍有残留分片，目录保留，下一轮重试");
+    // 1. abort MPU 并确认清空（公共口径，见 [`abort_until_confirmed`]）。
+    if !abort_until_confirmed(backend, &reference).await {
         return Ok(false);
     }
 
@@ -900,6 +1013,10 @@ pub async fn sweep_expired_s3(
     probe: Option<&std::sync::Arc<dyn super::final_object_probe::FinalObjectProbe>>,
     file_service: &super::FileService,
 ) -> usize {
+    // 锚点 GC 先行（第十七轮评审 P1）：清掉「MPU 已建但 manifest 不可读」的孤儿，
+    // 同时把签发成功后的残留锚点收掉；主循环的损坏分支据此判断可否删目录。
+    sweep_s3_anchors(session_root, backend, probe).await;
+
     let root = chunked_root(session_root);
     let Ok(rd) = std::fs::read_dir(&root) else { return 0 };
     let now = now_secs();
@@ -911,8 +1028,20 @@ pub async fn sweep_expired_s3(
         }
         let manifest = match read_json::<Manifest>(&dir.join("manifest.json")) {
             Ok(Some(m)) => m,
-            // manifest 缺失/损坏：没有恢复信息可丢，与 proxy 同口径直接清。
+            // manifest 缺失/损坏（第十七轮评审 P2）：不盲删。有锚点 → MPU 已建，
+            // 目录保留（对象侧已由锚点 GC 处置）；无锚点 → 可证 MPU 从未创建
+            // （不变式：create 成功必先写锚），与 proxy 同口径直接清。
             _ => {
+                let upload_id = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if matches!(read_s3_anchor(session_root, &upload_id), Ok(Some(_))) {
+                    tracing::warn!(
+                        "扫描器：会话 {upload_id} manifest 不可读但存在 S3 锚点，目录保留，等锚点 GC 恢复"
+                    );
+                    continue;
+                }
                 if std::fs::remove_dir_all(&dir).is_ok() {
                     removed += 1;
                 }
@@ -941,6 +1070,8 @@ pub async fn sweep_expired_s3(
         if dir.join("completed.json").exists() {
             if std::fs::remove_dir_all(&dir).is_ok() {
                 removed += 1;
+                // 锚点随目录生命周期终结（正常早已删，这里兜底）。
+                let _ = remove_s3_anchor(session_root, &session_id_at(&dir));
             }
             continue;
         }
@@ -961,9 +1092,16 @@ pub async fn sweep_expired_s3(
         };
         if ready && std::fs::remove_dir_all(&dir).is_ok() {
             removed += 1;
+            let _ = remove_s3_anchor(session_root, &session_id);
         }
     }
     removed
+}
+
+fn session_id_at(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 fn sha256_of_file(path: &Path) -> Result<String> {

@@ -51,6 +51,8 @@ struct CreateCall {
 struct IssuanceBackend {
     create_calls: Mutex<Vec<CreateCall>>,
     create_result: Mutex<Result<String, NumberedPartError>>,
+    abort_calls: Mutex<usize>,
+    fail_abort: Mutex<bool>,
 }
 
 impl IssuanceBackend {
@@ -58,6 +60,8 @@ impl IssuanceBackend {
         Self {
             create_calls: Mutex::new(Vec::new()),
             create_result: Mutex::new(Ok(PROVIDER_UPLOAD_ID.to_string())),
+            abort_calls: Mutex::new(0),
+            fail_abort: Mutex::new(false),
         }
     }
     fn calls(&self) -> Vec<CreateCall> {
@@ -66,6 +70,12 @@ impl IssuanceBackend {
     fn fail_create(&self) {
         *self.create_result.lock().unwrap() =
             Err(NumberedPartError::Backend("s3 down".into()));
+    }
+    fn set_fail_abort(&self, fail: bool) {
+        *self.fail_abort.lock().unwrap() = fail;
+    }
+    fn abort_count(&self) -> usize {
+        *self.abort_calls.lock().unwrap()
     }
 }
 
@@ -116,6 +126,10 @@ impl NumberedPartBackend for IssuanceBackend {
         Err(NumberedPartError::Backend("complete 不在本测试路径上".into()))
     }
     async fn abort(&self, _reference: &UploadReference) -> Result<(), NumberedPartError> {
+        *self.abort_calls.lock().unwrap() += 1;
+        if *self.fail_abort.lock().unwrap() {
+            return Err(NumberedPartError::Backend("abort refused".into()));
+        }
         Ok(())
     }
 }
@@ -266,6 +280,12 @@ async fn real_issuance_creates_mpu_then_freezes_all_fields() {
     assert_eq!(manifest["provider_upload_id"], serde_json::json!(PROVIDER_UPLOAD_ID));
     assert_eq!(manifest["part_size"], serde_json::json!(part_size));
     assert_eq!(manifest["total_parts"], serde_json::json!(total_parts));
+
+    // 第十七轮评审 P1：签发成功后锚点必须删掉（manifest 接管），不得残留。
+    let anchor_root = root.join("s3-anchors");
+    let left = std::fs::read_dir(&anchor_root).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(left, 0, "签发成功后锚点必须删除，不得残留");
+    assert_eq!(rig.backend.abort_count(), 0, "成功路径不该调 abort");
 }
 
 /// 低于阈值 → 回退 proxy：不建 MPU，manifest 无任何 S3 冻结字段。
@@ -312,6 +332,64 @@ async fn issuance_fails_without_leaving_a_session_when_create_mpu_fails() {
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert_eq!(count, 0, "签发失败不得留下半建会话目录");
+    // MPU 创建失败：锚点写发生在 create 之后，失败路径也没来得及建锚。
+    let anchor_root = root.join("s3-anchors");
+    let left = std::fs::read_dir(&anchor_root).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(left, 0, "create 失败不得留下锚点");
+}
+
+/// 🔴 第十七轮评审 P1：锚点写入失败且 abort 也失败时，错误不得吞掉——
+/// 必须携带可恢复引用（bucket / key / uploadId），且不落本地会话目录。
+#[tokio::test]
+async fn issuance_anchor_write_and_abort_fail_error_carries_recovery_reference() {
+    let rig = make_rig(true).await;
+    rig.backend.set_fail_abort(true);
+    // 把 session_root 下的 s3-anchors 占成普通文件，write_s3_anchor 的
+    // create_dir_all 必然失败。
+    let root = rig.file_service.upload_session_root().expect("session root");
+    std::fs::create_dir_all(&root).expect("ensure root");
+    std::fs::write(root.join("s3-anchors"), b"blocker").expect("block anchor dir");
+
+    let err = issue_chunked_upload_token(&services(&rig), UPLOADER, req(32 << 20))
+        .await
+        .expect_err("锚点写不了 + abort 失败必须报错");
+    assert!(err.message.contains("恢复信息"), "错误必须说明留有恢复信息");
+    assert!(err.message.contains(BUCKET), "错误必须带 bucket");
+    assert!(err.message.contains("uploadId="), "错误必须带 provider upload id");
+    assert_eq!(rig.backend.abort_count(), 1, "必须尝试过 abort");
+
+    // 会话目录与锚点都不落（锚点目录是占位文件，不是目录）。
+    let chunked = root.join("chunked");
+    let count = std::fs::read_dir(&chunked).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(count, 0, "清理失败也不得留下半建会话目录");
+    std::fs::remove_file(root.join("s3-anchors")).expect("unblock");
+}
+
+/// 🔴 第十七轮评审 P1：manifest 写入失败、abort 也失败时，锚点必须保留（扫描器
+/// 凭锚点重试清理），且错误携带可恢复引用。
+#[tokio::test]
+async fn issuance_manifest_fail_abort_fail_keeps_anchor_for_scanner_retry() {
+    let rig = make_rig(true).await;
+    rig.backend.set_fail_abort(true);
+    let root = rig.file_service.upload_session_root().expect("session root");
+    // 把 chunked 占成普通文件，create_with_ids 的 create_dir_all 必然失败，
+    // 且失败发生在锚点已经落盘之后。
+    std::fs::create_dir_all(&root).expect("ensure root");
+    std::fs::write(root.join("chunked"), b"blocker").expect("block chunked dir");
+
+    let err = issue_chunked_upload_token(&services(&rig), UPLOADER, req(32 << 20))
+        .await
+        .expect_err("manifest 写不了 + abort 失败必须报错");
+    assert!(err.message.contains("恢复信息"), "错误必须说明留有恢复信息");
+    assert!(err.message.contains(BUCKET));
+    assert!(err.message.contains("uploadId="));
+    assert_eq!(rig.backend.abort_count(), 1, "必须尝试过 abort");
+
+    // 锚点保留：扫描器下一轮凭它重试清理（不变式：MPU 存在 ⇒ 锚点在）。
+    let anchor_root = root.join("s3-anchors");
+    let left = std::fs::read_dir(&anchor_root).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(left, 1, "abort 失败时锚点必须保留供扫描器重试");
+    std::fs::remove_file(root.join("chunked")).expect("unblock");
 }
 
 // ================= 2. 启动装配：HTTP 服务器与扫描共用一份接线 =================

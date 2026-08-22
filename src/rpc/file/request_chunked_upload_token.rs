@@ -24,8 +24,9 @@ use serde_json::Value;
 
 use crate::rpc::{RpcContext, RpcError, RpcResult, RpcServiceContext};
 use crate::service::chunked_upload::{
-    new_session_ids, s3_part_geometry, select_transport, ChunkedSession, NewSession,
-    S3DirectGate, S3SessionSetup, BASE_UNIT, TRANSPORT_S3_MULTIPART_V1,
+    new_session_ids, remove_s3_anchor, s3_part_geometry, select_transport, write_s3_anchor,
+    ChunkedSession, NewSession, S3Anchor, S3DirectGate, S3SessionSetup, BASE_UNIT,
+    TRANSPORT_S3_MULTIPART_V1,
 };
 use crate::service::file_service::FileService;
 use crate::service::upload_token_service::UploadTokenService;
@@ -195,10 +196,11 @@ pub async fn issue_chunked_upload_token(
     };
 
     // ---- 2.2 建会话 ----
-    // S3 直传的真实签发链路（RESUMABLE §2.2，第十六轮评审 P0）：
+    // S3 直传的真实签发链路（RESUMABLE §2.2，第十六/十七轮评审）：
     // 选源/门禁在 select_transport 里已过 → 先 `CreateMultipartUpload`（对象
-    // metadata 写会话 id、声明逐片 SHA256）→ 再写 manifest（含全部冻结字段，
-    // 含 `storage_source_id`）；manifest 写失败 → 先 abort MPU 再报错。
+    // metadata 写会话 id、声明逐片 SHA256）→ 🔴 立即落盘恢复锚点 → 再写 manifest
+    // （含全部冻结字段，含 `storage_source_id`）。不变式：MPU 存在 ⇒ 锚点在或
+    // manifest 可读；任何一步失败都不吞掉清理失败，错误带可恢复引用。
     let (session, token, expires_at) = if transport == TRANSPORT_S3_MULTIPART_V1 {
         let wiring = s3_wiring.ok_or_else(|| {
             RpcError::internal("S3 直传门禁状态不一致：选中了 transport 但接线缺失".to_string())
@@ -209,6 +211,7 @@ pub async fn issue_chunked_upload_token(
             .generate_file_path(reserved_file_id, &file_type, &filename);
         let final_key = wiring.object_key(&file_path);
         let ids = new_session_ids();
+        let upload_id = ids.upload_id.clone();
         let reference = wiring
             .backend
             .create(&ids.upload_id, &wiring.bucket, &final_key, request.file_size as u64)
@@ -216,6 +219,37 @@ pub async fn issue_chunked_upload_token(
             .map_err(|e| {
                 RpcError::internal(format!("创建 S3 分片上传失败，请稍后重试: {e:?}"))
             })?;
+        // 🔴 MPU 已建：恢复锚点立即落盘（第十七轮评审 P1）。之后无论 manifest 成败、
+        // 进程是否崩溃，扫描器都能凭锚点找回并处置这个 MPU。
+        let anchor = S3Anchor {
+            bucket: wiring.bucket.clone(),
+            final_key: final_key.clone(),
+            provider_upload_id: reference.provider_upload_id.clone(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0) as i64,
+        };
+        if let Err(e) = write_s3_anchor(&session_root, &upload_id, &anchor) {
+            // 锚都落不了盘：立即 abort；abort 也失败则错误必须带上可恢复引用。
+            return Err(match wiring.backend.abort(&reference).await {
+                Ok(()) => RpcError::internal(format!(
+                    "创建 S3 分片上传会话失败（本地锚点写入失败: {e}），已清理，请重试"
+                )),
+                Err(ae) => {
+                    tracing::error!(
+                        "S3 签发：锚点写入失败且 abort 失败，桶内遗留 MPU：bucket={} key={} uploadId={}：{e} / {ae:?}",
+                        wiring.bucket,
+                        final_key,
+                        reference.provider_upload_id
+                    );
+                    RpcError::internal(format!(
+                        "创建 S3 分片上传会话失败且清理失败，请联系管理员（恢复信息: bucket={} key={} uploadId={}）",
+                        wiring.bucket, final_key, reference.provider_upload_id
+                    ))
+                }
+            });
+        }
         let created = ChunkedSession::create_with_ids(
             &session_root,
             ids,
@@ -241,17 +275,38 @@ pub async fn issue_chunked_upload_token(
             },
         );
         match created {
-            Ok(triple) => triple,
-            Err(e) => {
-                // 🔴 §2.2：S3 调用成功但 manifest 写失败 → 先 AbortMultipartUpload
-                // 再报错；abort 失败只记日志，过期扫描器会再清一次（目录还没建出来，
-                // 没有本地恢复锚点，只能靠后端幂等）。
-                if let Err(ae) = wiring.backend.abort(&reference).await {
-                    tracing::warn!(
-                        "S3 会话 manifest 写入失败后清理：abort MPU 失败（桶 lifecycle 兜底）: {ae:?}"
-                    );
+            Ok(triple) => {
+                // manifest 可读 ⇒ 锚点使命结束；删失败只告警，锚点 GC 会收（看到
+                // manifest 健在即删）。
+                if let Err(e) = remove_s3_anchor(&session_root, &upload_id) {
+                    tracing::warn!("S3 签发成功但删除恢复锚点失败（扫描器会收掉）: {e}");
                 }
-                return Err(RpcError::internal(e.to_string()));
+                triple
+            }
+            Err(e) => {
+                // 🔴 §2.2：S3 调用成功但 manifest 写失败 → 先 AbortMultipartUpload。
+                // 🔴 第十七轮评审 P1：abort 失败不再吞——保留锚点让扫描器重试，
+                // 并把可恢复引用写进错误与日志。
+                match wiring.backend.abort(&reference).await {
+                    Ok(()) => {
+                        let _ = remove_s3_anchor(&session_root, &upload_id);
+                        return Err(RpcError::internal(format!(
+                            "创建 S3 分片上传会话失败，已清理，请重试: {e}"
+                        )));
+                    }
+                    Err(ae) => {
+                        tracing::error!(
+                            "S3 签发：manifest 写入失败且 abort 失败，扫描器将凭锚点重试：bucket={} key={} uploadId={}：{e} / {ae:?}",
+                            wiring.bucket,
+                            reference.final_key,
+                            reference.provider_upload_id
+                        );
+                        return Err(RpcError::internal(format!(
+                            "创建 S3 分片上传会话失败且清理失败，服务端将自动重试清理（恢复信息: bucket={} key={} uploadId={}）",
+                            wiring.bucket, reference.final_key, reference.provider_upload_id
+                        )));
+                    }
+                }
             }
         }
     } else {

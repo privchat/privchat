@@ -51,6 +51,8 @@ pub struct S3DirectBackend {
     cred: reqsign::AwsCredential,
     /// 含 scheme 的 endpoint（如 `https://s3.e2e.local`）。
     endpoint: String,
+    /// `ListParts` 页大小：生产固定 1000；真实集成门禁用小值验证分页循环。
+    list_page_size: u32,
 }
 
 impl S3DirectBackend {
@@ -97,7 +99,15 @@ impl S3DirectBackend {
                 expires_in: None,
             },
             endpoint,
+            list_page_size: 1000,
         })
+    }
+
+    /// 仅测试用：改小 `ListParts` 页大小，用少量分片即可验证分页循环。
+    /// 生产代码从不调整，启动装配固定 1000。
+    pub fn with_list_page_size(mut self, size: u32) -> Self {
+        self.list_page_size = size.max(1);
+        self
     }
 
     /// path-style 对象 URL：`{endpoint}/{bucket}/{key}`（key 逐段百分号编码）。
@@ -353,9 +363,10 @@ impl NumberedPartBackend for S3DirectBackend {
         // 1000 片一页；冻结几何保证 ≤ 10000 片，最多 10 页。
         for _ in 0..10 {
             let mut url = format!(
-                "{}?uploadId={}&max-parts=1000",
+                "{}?uploadId={}&max-parts={}",
                 self.object_url(&reference.bucket, &reference.final_key),
-                reference.provider_upload_id
+                reference.provider_upload_id,
+                self.list_page_size
             );
             if let Some(m) = &marker {
                 url.push_str(&format!("&part-number-marker={m}"));
@@ -577,8 +588,18 @@ impl FinalObjectProbe for S3DirectBackend {
             .await
             .map_err(|e| ProbeError::Backend(format!("DELETE 请求失败: {e}")))?;
         match resp.status() {
-            s if s.is_success() => Ok(true),
-            StatusCode::NOT_FOUND => Ok(true), // 对象已不在：幂等成功。
+            // 🔴 第十七轮评审 P1（真实 MinIO 门禁发现）：不是所有兼容服务都支持
+            // DELETE 的 If-Match（MinIO 会忽略条件直接删）。因此 2xx 后必须再 HEAD：
+            // 对象消失 = 删除成立；对象仍在 = 条件被忽略且对象已被替换，返回拒绝。
+            s if s.is_success() => match self.head(reference).await {
+                Ok(None) => Ok(true),
+                Ok(Some(_)) => Ok(false),
+                Err(e) => Err(ProbeError::Backend(format!(
+                    "删除后核验 HEAD 失败，不能确认删除结果: {e}"
+                ))),
+            },
+            // 对象已不在：本轮目标就是「对象消失」，幂等达成。
+            StatusCode::NOT_FOUND => Ok(true),
             StatusCode::PRECONDITION_FAILED => Ok(false), // ETag 不符：拒绝删除。
             s => {
                 let body = resp.text().await.unwrap_or_default();
