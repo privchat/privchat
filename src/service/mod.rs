@@ -53,6 +53,7 @@ pub mod file_service;
 pub mod chunked_upload;
 pub mod final_object_probe;
 pub mod numbered_parts;
+pub mod s3_backend;
 pub mod upload_session;
 pub mod upload_token_service;
 // 新增表情包服务

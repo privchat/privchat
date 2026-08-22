@@ -1867,7 +1867,8 @@ impl ChatServer {
                     }
                     // 🔴 S3 分支（第十五轮评审 P0）：过期 S3 会话必须先完成
                     // abort / HEAD / 归属核验 / 条件删除才能删目录，绝不先丢恢复信息。
-                    // 直传门禁接入前后端/探测恒 None，此时只保留目录并记日志。
+                    // 后端/探测取自 FileService 的真实接线（第十六轮评审 P0：默认源
+                    // 开启 direct_upload 时是生产实现；未开启时为 None，保留目录记日志）。
                     let root = match file_service.upload_session_root() {
                         Ok(r) => r,
                         Err(e) => {
@@ -1875,10 +1876,11 @@ impl ChatServer {
                             continue;
                         }
                     };
+                    let wiring = file_service.s3_direct();
                     let removed_s3 = crate::service::chunked_upload::sweep_expired_s3(
                         &root,
-                        None,
-                        None,
+                        wiring.as_ref().map(|w| &w.backend),
+                        wiring.as_ref().map(|w| &w.probe),
                         &file_service,
                     )
                     .await;

@@ -65,18 +65,29 @@ pub const TRANSPORT_S3_MULTIPART_V1: &str = "s3_multipart_v1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportSetMissingProxy;
 
+/// S3 直传门禁输入（RESUMABLE_UPLOAD_SPEC §8.2，第十六轮评审 P0）：
+/// `open` = 默认存储源显式 `direct_upload` 配置 + 后端已接线；`threshold` =
+/// `s3_direct_threshold`（服务端配置，默认 16 MiB）。判定全部收敛在
+/// [`select_transport`] 内，不得在别的处另写判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S3DirectGate {
+    pub open: bool,
+    pub threshold: u64,
+}
+
 /// 协商与模式选择（RESUMABLE_UPLOAD_SPEC §8.2，纯加法）。
 ///
 /// 🔴 集合规则由本函数自己强制，不靠调用方注释维持：`declared` 为 `Some` 且不含
 /// `proxy_offset_v1` → `Err(TransportSetMissingProxy)`（RPC 层映射为参数错误）。
 /// `declared == None`（旧客户端）→ 隐式 proxy，行为逐字节不变。服务端永远不会
 /// 返回客户端声明集合之外的 transport。
-/// 当前 S3 门禁（`direct_upload` 显式配置 + `s3_direct_threshold` + 集成门禁）尚未
-/// 接入，即使客户端声明了 `s3_multipart_v1` 也回退 proxy；分支结构留在原地，供后续
-/// 步骤接入，不得在别的处另写判定。
+/// S3 门禁（§8.2）：声明了 `s3_multipart_v1` 还要 `gate.open`（默认存储源显式
+/// `direct_upload` + 后端已接线）且 `file_size >= gate.threshold` 才选 S3，
+/// 否则回退 proxy（合法，因为集合必含 proxy_offset_v1）。
 pub fn select_transport(
     declared: Option<&[String]>,
-    _file_size: u64,
+    file_size: u64,
+    gate: &S3DirectGate,
 ) -> std::result::Result<&'static str, TransportSetMissingProxy> {
     match declared {
         // 字段省略：旧客户端，隐式 proxy；现有自适应分片逻辑完全不变。
@@ -89,11 +100,30 @@ pub fn select_transport(
         Some(list) if !list.iter().any(|t| t == TRANSPORT_S3_MULTIPART_V1) => {
             Ok(TRANSPORT_PROXY_OFFSET_V1)
         }
-        // 声明支持 S3 → 还要过门禁：file_size >= s3_direct_threshold + 存储源显式
-        // direct_upload 配置 + 集成门禁（RESUMABLE §8.2）；不满足时回退 proxy（合法，
-        // 因为集合必含 proxy_offset_v1）。门禁未接入前恒 proxy。
-        Some(_) => Ok(TRANSPORT_PROXY_OFFSET_V1),
+        // 声明支持 S3 → 过门禁才选 S3（RESUMABLE §8.2）；不满足回退 proxy。
+        Some(_) => Ok(if gate.open && file_size >= gate.threshold {
+            TRANSPORT_S3_MULTIPART_V1
+        } else {
+            TRANSPORT_PROXY_OFFSET_V1
+        }),
     }
+}
+
+/// S3 固定分片几何（RESUMABLE §8.1 冻结公式）：
+/// `part_size = align_up(max(8 MiB, ceil(size / 10000)), 1 MiB)`，限域 `[5 MiB, 5 GiB]`。
+/// 返回 `(part_size, total_parts)`；末片长度由 `check_part_geometry` 按余数口径校验。
+pub fn s3_part_geometry(total_size: u64) -> (u64, u32) {
+    const MIN_PART: u64 = 5 << 20;
+    const DEFAULT_PART: u64 = 8 << 20;
+    const MAX_PART: u64 = 5 << 30;
+    const MAX_PARTS: u64 = 10_000;
+    const ALIGN: u64 = 1 << 20;
+    let by_count = total_size.div_ceil(MAX_PARTS);
+    let mut part_size = DEFAULT_PART.max(by_count);
+    part_size = part_size.div_ceil(ALIGN) * ALIGN;
+    part_size = part_size.clamp(MIN_PART, MAX_PART);
+    let total_parts = total_size.div_ceil(part_size) as u32;
+    (part_size, total_parts)
 }
 
 /// 冻结事实。申请 token 时一次写成；complete 建行所需的一切都从这里读。
@@ -280,8 +310,38 @@ pub struct NewSession {
     pub mime_type: String,
     pub transform_version: i32,
     pub reserved_file_id: u64,
-    /// 协商选定的数据面（RESUMABLE §8.2），当前恒 `proxy_offset_v1`。
+    /// 协商选定的数据面（RESUMABLE §8.2）。
     pub transport: String,
+    /// 仅 `s3_multipart_v1`：建会话时一次写齐的冻结字段（含 `storage_source_id`，
+    /// RESUMABLE §3.2）。proxy 会话恒 `None`。
+    pub s3: Option<S3SessionSetup>,
+}
+
+/// S3 会话的冻结字段（RESUMABLE §3.2）：建会话时一次写成，complete 建行按它校验，
+/// 🔴 绝不重新读取当前默认存储源。`provider_upload_id` 来自建会话前的
+/// `CreateMultipartUpload`（§2.2：先建 MPU 再写 manifest）。
+pub struct S3SessionSetup {
+    pub part_size: u64,
+    pub total_parts: u32,
+    pub bucket: String,
+    pub final_key: String,
+    pub provider_upload_id: String,
+    pub storage_source_id: u32,
+}
+
+/// 预生成的会话身份（第十六轮评审 P0）：S3 签发链路必须在写 manifest **之前**
+/// 拿 `CreateMultipartUpload`（对象 metadata 要写 `privchat-upload-id = session_id`，
+/// RESUMABLE §2.2），所以 id/secret 的生成从建目录里剖出来。
+pub struct SessionIds {
+    pub upload_id: String,
+    pub secret: String,
+}
+
+pub fn new_session_ids() -> SessionIds {
+    SessionIds {
+        upload_id: hex::encode(rand::random::<[u8; 16]>()),
+        secret: hex::encode(rand::random::<[u8; 32]>()),
+    }
 }
 
 impl ChunkedSession {
@@ -289,12 +349,22 @@ impl ChunkedSession {
     ///
     /// 返回 `(session, token, expires_at)`。
     pub fn create(session_root: &Path, input: NewSession) -> Result<(Self, String, i64)> {
+        Self::create_with_ids(session_root, new_session_ids(), input)
+    }
+
+    /// 同 [`Self::create`]，但用调用方预生成的 [`SessionIds`]（S3 签发链路专用，
+    /// 见其注释）。
+    pub fn create_with_ids(
+        session_root: &Path,
+        ids: SessionIds,
+        input: NewSession,
+    ) -> Result<(Self, String, i64)> {
         let root = chunked_root(session_root);
         std::fs::create_dir_all(&root)
             .map_err(|e| ServerError::Internal(format!("创建 {root:?} 失败: {e}")))?;
 
-        let upload_id = hex::encode(rand::random::<[u8; 16]>());
-        let secret = hex::encode(rand::random::<[u8; 32]>());
+        let upload_id = ids.upload_id;
+        let secret = ids.secret;
         let dir = root.join(&upload_id);
         // 128-bit 随机值撞名的概率可以忽略；真撞了就是有人在造，拒绝而不是覆盖。
         std::fs::create_dir(&dir)
@@ -306,6 +376,9 @@ impl ChunkedSession {
             .map_err(|e| ServerError::Internal(format!("创建会话锁失败: {e}")))?;
 
         let now = now_secs();
+        // S3 冻结字段：建会话时一次写成（第十六轮评审 P0：真实签发链路写入，
+        // 不再是测试夹具手改）；proxy 会话全 `None`。
+        let s3 = input.s3.as_ref();
         let manifest = Manifest {
             secret_sha256: sha256_hex(secret.as_bytes()),
             uploader_id: input.uploader_id,
@@ -319,13 +392,12 @@ impl ChunkedSession {
             expires_at: now + TOKEN_TTL_SECS,
             reserved_file_id: input.reserved_file_id,
             transport: input.transport,
-            // S3 分片参数在直传门禁接入（实现顺序第 5 步）建 S3 会话时才写入。
-            part_size: None,
-            total_parts: None,
-            bucket: None,
-            final_key: None,
-            provider_upload_id: None,
-            storage_source_id: None,
+            part_size: s3.map(|s| s.part_size),
+            total_parts: s3.map(|s| s.total_parts),
+            bucket: s3.map(|s| s.bucket.clone()),
+            final_key: s3.map(|s| s.final_key.clone()),
+            provider_upload_id: s3.map(|s| s.provider_upload_id.clone()),
+            storage_source_id: s3.map(|s| s.storage_source_id),
             created_at: now,
         };
         write_json_atomic(&dir, "manifest.json", &manifest)?;
@@ -720,12 +792,42 @@ async fn s3_expired_session_ready(
         _ => return Err(()),
     };
 
-    // 1. abort MPU（NoSuchUpload = 已关闭，视为成功）；失败保留目录下一轮再试。
-    if let Err(e) = backend.abort(&reference).await {
-        if !matches!(e, NumberedPartError::NoSuchUpload) {
-            tracing::warn!("扫描器 abort MPU 失败（目录保留，下一轮重试）: {e:?}");
-            return Ok(false);
+    // 1. abort MPU 并确认清空（RESUMABLE §8.7 判据 20，第十六轮评审 P1）：
+    // abort 后用 ListParts 确认已空或 NoSuchUpload；仍有 part 残留则继续 abort，
+    // 反复不清则保留目录下一轮再试——绝不在 parts 残留时删本地会话目录。
+    let mut parts_cleared = false;
+    for _ in 0..3 {
+        if let Err(e) = backend.abort(&reference).await {
+            if !matches!(e, NumberedPartError::NoSuchUpload) {
+                tracing::warn!("扫描器 abort MPU 失败（目录保留，下一轮重试）: {e:?}");
+                return Ok(false);
+            }
         }
+        match backend.list_parts(&reference).await {
+            // NoSuchUpload = MPU 已彻底关闭；空列表 = parts 已清。二者都算确认。
+            Err(NumberedPartError::NoSuchUpload) => {
+                parts_cleared = true;
+                break;
+            }
+            Ok(parts) if parts.is_empty() => {
+                parts_cleared = true;
+                break;
+            }
+            Ok(parts) => {
+                tracing::warn!(
+                    "扫描器：abort 后 MPU 仍残留 {} 片，继续 abort",
+                    parts.len()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("扫描器：ListParts 确认失败（目录保留，下一轮重试）: {e:?}");
+                return Ok(false);
+            }
+        }
+    }
+    if !parts_cleared {
+        tracing::warn!("扫描器：反复 abort 后 MPU 仍有残留分片，目录保留，下一轮重试");
+        return Ok(false);
     }
 
     // 2. HEAD final_key。
@@ -820,14 +922,9 @@ pub async fn sweep_expired_s3(
         if now <= manifest.expires_at || manifest.transport != TRANSPORT_S3_MULTIPART_V1 {
             continue;
         }
-        // 墓碑在：complete 已终态（MPU 已终结、对象已处置），与 proxy 同口径。
-        if dir.join("completed.json").exists() {
-            if std::fs::remove_dir_all(&dir).is_ok() {
-                removed += 1;
-            }
-            continue;
-        }
-        // 非阻塞锁：拿不到说明有 in-flight 请求，本轮跳过。
+        // 非阻塞锁：拿不到说明有 in-flight 请求，本轮跳过。🔴 墓碑分支同样在锁后：
+        // complete 写完墓碑可能仍持锁未返回，锁前删目录会删掉进行中的完成流程
+        // （第十六轮评审 P0）。
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -838,6 +935,13 @@ pub async fn sweep_expired_s3(
             None => true,
         };
         if !held {
+            continue;
+        }
+        // 墓碑在：complete 已终态（MPU 已终结、对象已处置），与 proxy 同口径。
+        if dir.join("completed.json").exists() {
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                removed += 1;
+            }
             continue;
         }
         let session_id = dir
@@ -926,6 +1030,7 @@ mod tests {
             transform_version: 0,
             reserved_file_id: 4242,
             transport: TRANSPORT_PROXY_OFFSET_V1.to_string(),
+            s3: None,
         }
     }
 
@@ -1058,31 +1163,71 @@ mod tests {
         assert_eq!(sweep_expired(root.path()), 1);
     }
 
-    /// §8.2 协商：门禁未接入前所有分支恒 proxy_offset_v1；旧客户端（None）
-    /// 与新客户端的行为差异只体现在响应字段，不体现在模式选择。
+    /// §8.2 协商：集合规则 + 门禁（第十六轮评审 P0：门禁接进 select_transport）。
     #[test]
-    fn transport_selection_is_proxy_only_until_gates_land() {
-        assert_eq!(select_transport(None, 1), Ok(TRANSPORT_PROXY_OFFSET_V1));
-        assert_eq!(select_transport(None, 1 << 30), Ok(TRANSPORT_PROXY_OFFSET_V1));
+    fn transport_selection_follows_set_rules_and_gate() {
+        let closed = S3DirectGate { open: false, threshold: 16 << 20 };
+        let open = S3DirectGate { open: true, threshold: 16 << 20 };
+        assert_eq!(select_transport(None, 1, &closed), Ok(TRANSPORT_PROXY_OFFSET_V1));
+        assert_eq!(select_transport(None, 1 << 30, &open), Ok(TRANSPORT_PROXY_OFFSET_V1));
         let only_proxy = vec![TRANSPORT_PROXY_OFFSET_V1.to_string()];
-        assert_eq!(select_transport(Some(&only_proxy), 1 << 30), Ok(TRANSPORT_PROXY_OFFSET_V1));
+        assert_eq!(
+            select_transport(Some(&only_proxy), 1 << 30, &open),
+            Ok(TRANSPORT_PROXY_OFFSET_V1)
+        );
         let with_s3 = vec![
             TRANSPORT_PROXY_OFFSET_V1.to_string(),
             TRANSPORT_S3_MULTIPART_V1.to_string(),
         ];
-        // 声明了 s3_multipart_v1 也回退 proxy：direct_upload 配置 + 阈值 + 集成门禁
-        // 均未接入（实现顺序第 5 步），接入前不得提前放行。回退合法：集合含 proxy。
-        assert_eq!(select_transport(Some(&with_s3), 1 << 30), Ok(TRANSPORT_PROXY_OFFSET_V1));
+        // 门禁关闭（默认源未配 direct_upload / 后端未接线）→ 回退 proxy。
+        assert_eq!(
+            select_transport(Some(&with_s3), 1 << 30, &closed),
+            Ok(TRANSPORT_PROXY_OFFSET_V1)
+        );
+        // 门禁开但低于阈值 → 回退 proxy（§8.2：弱网小文件直传反而降可靠性）。
+        assert_eq!(
+            select_transport(Some(&with_s3), (16 << 20) - 1, &open),
+            Ok(TRANSPORT_PROXY_OFFSET_V1)
+        );
+        // 门禁开 + 达阈值 → s3_multipart_v1。
+        assert_eq!(
+            select_transport(Some(&with_s3), 16 << 20, &open),
+            Ok(TRANSPORT_S3_MULTIPART_V1)
+        );
         // 🔴 集合规则由本函数自身强制：不含 proxy_offset_v1 → Err（含空集合、
-        // 只声明 S3、未知 transport），不依赖调用方先校验。
+        // 只声明 S3、未知 transport），不依赖调用方先校验，且与门禁状态无关。
         assert_eq!(
-            select_transport(Some(&[TRANSPORT_S3_MULTIPART_V1.to_string()]), 1 << 30),
+            select_transport(Some(&[TRANSPORT_S3_MULTIPART_V1.to_string()]), 1 << 30, &open),
             Err(TransportSetMissingProxy)
         );
-        assert_eq!(select_transport(Some(&[]), 1 << 30), Err(TransportSetMissingProxy));
+        assert_eq!(select_transport(Some(&[]), 1 << 30, &open), Err(TransportSetMissingProxy));
         assert_eq!(
-            select_transport(Some(&["weird".to_string()]), 1 << 30),
+            select_transport(Some(&["weird".to_string()]), 1 << 30, &open),
             Err(TransportSetMissingProxy)
         );
+    }
+
+    /// §8.1 冻结分片几何：默认 8 MiB、按 10000 片上限抬升、1 MiB 对齐、
+    /// 限域 [5 MiB, 5 GiB]。
+    #[test]
+    fn s3_part_geometry_follows_the_frozen_formula() {
+        // 小文件：默认 8 MiB，单片。
+        assert_eq!(s3_part_geometry(16 << 20), (8 << 20, 2));
+        assert_eq!(s3_part_geometry(1 << 20), (8 << 20, 1));
+        // 非整片：末片余数由 check_part_geometry 管，这里只出片数。
+        assert_eq!(s3_part_geometry((10 << 20) + 1), (8 << 20, 2));
+        // 100 GiB：ceil(100GiB/10000)=10.48576 MiB → 对齐 11 MiB。
+        let (ps, n) = s3_part_geometry(100 << 30);
+        assert_eq!(ps, 11 << 20);
+        assert_eq!(n as u64, (100u64 << 30).div_ceil(11 << 20));
+        // 极大文件：片大小抬到上限 5 GiB。
+        let (ps, n) = s3_part_geometry(50_000u64 << 30);
+        assert_eq!(ps, 5 << 30);
+        assert_eq!(n, 10_000);
+        // 总片数永远 ≤ 10000。
+        for size in [1u64, 1 << 30, 80 << 30, 5 << 40] {
+            let (_, n) = s3_part_geometry(size);
+            assert!(n <= 10_000, "size={size} 片数 {n} 超限");
+        }
     }
 }

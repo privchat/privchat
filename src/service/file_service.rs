@@ -103,6 +103,32 @@ pub struct FileService {
     operators: Arc<RwLock<HashMap<u32, Operator>>>,
     default_storage_source_id: u32,
     file_upload_repo: Arc<FileUploadRepository>,
+    /// S3 直传接线（第十六轮评审 P0）：init 时按默认源 `direct_upload` 显式配置构建，
+    /// 签发 / `/files/part-url` / 扫描任务共用同一份，不再各持 None。
+    s3_direct: Arc<std::sync::RwLock<Option<Arc<S3DirectUploadWiring>>>>,
+}
+
+/// S3 直传的一份接线（RESUMABLE §8.7）：控制面后端与对象探测同源同配置，
+/// 建会话时冻结的 `storage_source_id`/`bucket` 都从这里取。
+pub struct S3DirectUploadWiring {
+    pub source_id: u32,
+    pub bucket: String,
+    /// 桶内目录前缀（已去掉首尾 `/`；空串 = 桶根）。
+    pub path_prefix: String,
+    pub backend: Arc<dyn crate::service::numbered_parts::NumberedPartBackend>,
+    pub probe: Arc<dyn crate::service::final_object_probe::FinalObjectProbe>,
+}
+
+impl S3DirectUploadWiring {
+    /// final 对象 key = `path_prefix/file_path`（与 OpenDAL `root` 口径同源：
+    /// 回读/建行后通过 OpenDAL 访问同一对象时坐标一致）。
+    pub fn object_key(&self, file_path: &str) -> String {
+        if self.path_prefix.is_empty() {
+            file_path.to_string()
+        } else {
+            format!("{}/{}", self.path_prefix, file_path)
+        }
+    }
 }
 
 /// 把校验通过的临时对象发布到正式路径。
@@ -531,6 +557,7 @@ impl FileService {
             operators: Arc::new(RwLock::new(HashMap::new())),
             default_storage_source_id,
             file_upload_repo: Arc::new(FileUploadRepository::new(pool)),
+            s3_direct: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -586,7 +613,48 @@ impl FileService {
             }
             self.operators.write().await.insert(src.id, op);
         }
+        // S3 直传门禁接线（第十六轮评审 P0）：默认存储源显式开启 `direct_upload`
+        // 时启动期就构建生产后端与探测（fail-fast：配置缺字段直接拒启动，
+        // 不是第一次上传才炸）。判定只看默认源：上传落默认源，直传也必须落默认源。
+        if let Some(src) = self.sources_by_id.get(&self.default_storage_source_id) {
+            if let Some(mode) = src.direct_upload.as_deref() {
+                if mode != crate::service::s3_backend::DIRECT_UPLOAD_S3_MULTIPART_V1 {
+                    return Err(ServerError::Internal(format!(
+                        "存储源 id={} 的 direct_upload 值非法（{mode}），目前只支持 {}",
+                        src.id,
+                        crate::service::s3_backend::DIRECT_UPLOAD_S3_MULTIPART_V1
+                    )));
+                }
+                let backend = Arc::new(crate::service::s3_backend::S3DirectBackend::from_source(src)?);
+                let wiring = S3DirectUploadWiring {
+                    source_id: src.id,
+                    bucket: src.bucket.clone().unwrap_or_default(),
+                    path_prefix: src
+                        .path_prefix
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_matches('/')
+                        .to_string(),
+                    backend: backend.clone(),
+                    probe: backend,
+                };
+                *self.s3_direct.write().unwrap() = Some(Arc::new(wiring));
+                tracing::info!("📦 S3 直传门禁已开启：存储源 id={}", src.id);
+            }
+        }
         Ok(())
+    }
+
+    /// S3 直传接线（未开启 `direct_upload` 时为 `None`）：签发 / part-url / 扫描共用。
+    pub fn s3_direct(&self) -> Option<Arc<S3DirectUploadWiring>> {
+        self.s3_direct.read().unwrap().clone()
+    }
+
+    /// 测试钩子：替换接线里的后端/探测为 fake（生产接线的构建逻辑仍走 `init`，
+    /// 测试只替换执行体，不改判定路径）。
+    pub fn install_s3_direct(&self, wiring: S3DirectUploadWiring) {
+        *self.s3_direct.write().unwrap() = Some(Arc::new(wiring));
     }
 
     /// 根据配置构建 OpenDAL Operator（兼容标准 Fs / S3 配置）
@@ -1469,7 +1537,7 @@ impl FileService {
         verify_object(&op, final_path, expect_size, expect_sha256).await
     }
 
-    fn generate_file_path(&self, file_id: u64, file_type: &FileType, filename: &str) -> String {
+    pub(crate) fn generate_file_path(&self, file_id: u64, file_type: &FileType, filename: &str) -> String {
         let extension = filename.split('.').last().unwrap_or("bin");
         let subdir = match file_type {
             FileType::Image => "images",

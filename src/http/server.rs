@@ -126,18 +126,25 @@ impl FileHttpServer {
         auth: Option<Arc<dyn UploadAuthenticator>>,
         port: u16,
     ) -> Self {
+        // 直传门禁接线（第十六轮评审 P0）：默认存储源显式 `direct_upload` 时，
+        // FileService::init 已在启动期构建生产后端与探测；这里拿同一份接线，
+        // 不再恒 None。未开启时两者为 None，各端点回「门禁未接入」错误。
+        let wiring = file_service.s3_direct();
         Self {
             state: FileServerState {
+                numbered_part_backend: wiring.as_ref().map(|w| w.backend.clone()),
+                final_object_probe: wiring.as_ref().map(|w| w.probe.clone()),
                 file_service,
                 upload_token_service,
                 auth,
-                // 直传门禁接入（实现顺序第 5 步）时才按存储源 direct_upload
-                // 配置挂具体后端；在那之前保持 None。
-                numbered_part_backend: None,
-                final_object_probe: None,
             },
             port,
         }
+    }
+
+    /// 对外只读暴露装配结果（第十六轮评审：真实启动链路可测）。
+    pub fn state(&self) -> &FileServerState {
+        &self.state
     }
 
     /// P1-11：bind 与 serve 分离。bind 在启动路径同步执行——端口占用/权限问题

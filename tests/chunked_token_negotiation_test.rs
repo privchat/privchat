@@ -82,6 +82,8 @@ async fn rig() -> Rig {
         access_key_id: None,
         secret_access_key: None,
         path_prefix: None,
+        direct_upload: None,
+        region: None,
     };
     let file_service = FileService::new(vec![source], 0, pool.clone());
     file_service.init().await.expect("init storage");
@@ -101,6 +103,7 @@ fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
         file_service: &rig.file_service,
         upload_token_service: &rig.upload_token_service,
         file_api_base_url: Some("http://e2e.local/files"),
+        s3_direct_threshold: 16 << 20,
     }
 }
 

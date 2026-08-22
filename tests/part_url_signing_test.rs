@@ -130,6 +130,8 @@ async fn rig() -> Rig {
         access_key_id: None,
         secret_access_key: None,
         path_prefix: None,
+        direct_upload: None,
+        region: None,
     };
     let file_service = FileService::new(vec![source], 0, pool);
     file_service.init().await.expect("init storage");
@@ -165,6 +167,7 @@ async fn create_s3_session(rig: &Rig) -> (ChunkedSession, String) {
             transform_version: 0,
             reserved_file_id: 9_973_901,
             transport: "s3_multipart_v1".to_string(),
+            s3: None,
         },
     )
     .expect("create session");

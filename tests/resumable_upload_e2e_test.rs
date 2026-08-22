@@ -69,6 +69,8 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, dir: Option<tempfile::Te
         access_key_id: None,
         secret_access_key: None,
         path_prefix: None,
+        direct_upload: None,
+        region: None,
     };
     let file_service = FileService::new(vec![source], 0, pool);
     file_service.init().await.expect("init storage");
@@ -107,6 +109,7 @@ impl Rig {
                 transform_version: 0,
                 reserved_file_id: reserved,
                 transport: "proxy_offset_v1".to_string(),
+                s3: None,
             },
         )
         .expect("create session");

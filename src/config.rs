@@ -66,6 +66,9 @@ pub struct ServerConfig {
     pub file_storage_sources: Vec<FileStorageSourceConfig>,
     /// 默认存储源 ID（上传时使用，须在 file_storage_sources 中存在）
     pub file_default_storage_source_id: u32,
+    /// S3 直传阈值（RESUMABLE §8.2）：file_size 达阈才可选 s3_multipart_v1，
+    /// 默认 16 MiB（单 part MPU 无断点粒度，小文件直传反而降可靠性）。
+    pub file_s3_direct_threshold: u64,
     /// HTTP 文件服务器端口（用于启动服务）
     pub http_file_server_port: u16,
     /// 管理 API 服务器端口（仅内网访问）
@@ -336,6 +339,7 @@ impl Default for ServerConfig {
             gateway_listeners: default_gateway_listeners(),
             file_storage_sources: vec![],
             file_default_storage_source_id: 0,
+            file_s3_direct_threshold: 16 << 20,
             http_file_server_port: 9083,
             admin_api_port: 9090,
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
@@ -1288,6 +1292,15 @@ pub struct FileStorageSourceConfig {
     /// 桶内存储目录前缀，不填或空则使用桶根目录；填则 object key = path_prefix/file_path
     #[serde(default)]
     pub path_prefix: Option<String>,
+    /// S3 直传显式开关（RESUMABLE §8.2）：目前唯一合法值 `"s3_multipart_v1"`，
+    /// 默认不开。🔴 不能以 `storage_type = "s3"` 直接判定可直传：各 S3 兼容后端在
+    /// 预签名/checksum/条件写行为上不完全一致，必须显式开启并过集成门禁。
+    #[serde(default)]
+    pub direct_upload: Option<String>,
+    /// SigV4 签名用的 region（仅 direct_upload 开启时需要；未填默认 us-east-1，
+    /// 自建 MinIO/Garage 一般任意值可过）。
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 fn default_storage_type() -> String {
@@ -1303,6 +1316,8 @@ struct TomlFileConfig {
     server_port: Option<u16>,
     /// 文件服务 API 基础 URL，客户端访问（原 file_server.api_base_url）
     server_api_base_url: Option<String>,
+    /// S3 直传阈值（RESUMABLE §8.2），默认 16 MiB
+    s3_direct_threshold: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1320,6 +1335,10 @@ struct TomlFileStorageSource {
     secret_access_key: Option<String>,
     #[serde(default)]
     path_prefix: Option<String>,
+    #[serde(default)]
+    direct_upload: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
 }
 
 /// TOML [logging] 段，用于反序列化
@@ -1524,11 +1543,16 @@ impl From<TomlConfig> for ServerConfig {
                         access_key_id: s.access_key_id,
                         secret_access_key: s.secret_access_key,
                         path_prefix: s.path_prefix,
+                        direct_upload: s.direct_upload,
+                        region: s.region,
                     })
                     .collect();
             }
             if let Some(id) = file.default_storage_source_id {
                 config.file_default_storage_source_id = id;
+            }
+            if let Some(threshold) = file.s3_direct_threshold {
+                config.file_s3_direct_threshold = threshold;
             }
         }
 

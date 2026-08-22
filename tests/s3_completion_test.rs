@@ -279,6 +279,8 @@ async fn make_rig() -> Rig {
         access_key_id: None,
         secret_access_key: None,
         path_prefix: None,
+        direct_upload: None,
+        region: None,
     };
     // 🔴 S3 存储源 id=1（第十五轮评审 P0 门禁）：default 仍是 0，建行必须指向
     // manifest 冻结的 id=1 而不是当前默认；桶与测试 manifest 的 bucket 一致。
@@ -292,6 +294,8 @@ async fn make_rig() -> Rig {
         access_key_id: Some("dummy-ak".to_string()),
         secret_access_key: Some("dummy-sk".to_string()),
         path_prefix: None,
+        direct_upload: None,
+        region: None,
     };
     let file_service = FileService::new(vec![source, s3_source], 0, pool.clone());
     file_service.init().await.expect("init storage");
@@ -396,6 +400,7 @@ async fn create_s3_session_full(
             transform_version: 0,
             reserved_file_id,
             transport: "s3_multipart_v1".to_string(),
+            s3: None,
         },
     )
     .expect("create session");
@@ -894,6 +899,7 @@ async fn sweep_s3_removes_dir_when_object_absent() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_913).await;
     let dir = expire_session(&rig, &token);
+    rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
 
     assert_eq!(sweep_s3(&rig).await, 1);
     assert!(!dir.exists());
@@ -906,6 +912,7 @@ async fn sweep_s3_retains_dir_for_foreign_object() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_914).await;
     let dir = expire_session(&rig, &token);
+    rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
     rig.probe.set_head(Some("another-session"), TOTAL_SIZE);
 
     assert_eq!(sweep_s3(&rig).await, 0);
@@ -924,6 +931,7 @@ async fn sweep_s3_keeps_object_when_pg_row_matches_identity() {
     run_with_cleanup(&rig.pool, UPLOADER, async {
         let (_, token) = create_s3_session(&rig, UPLOADER, FILE_ID).await;
         let dir = expire_session(&rig, &token);
+    rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
         // 模拟崩溃窗口：PG 行已提交、墓碑没写。
         sqlx::query(
             "INSERT INTO privchat_file_uploads (file_id, original_filename, file_size, file_type, \
@@ -961,6 +969,7 @@ async fn sweep_s3_deletes_orphan_object_via_conditional_delete() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_915).await;
     let dir = expire_session(&rig, &token);
+    rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
     rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
 
     assert_eq!(sweep_s3(&rig).await, 1);
@@ -974,6 +983,7 @@ async fn sweep_s3_retains_dir_when_conditional_delete_rejected() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_916).await;
     let dir = expire_session(&rig, &token);
+    rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
     rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
     rig.probe.mutate_etag("etag-replaced"); // HEAD 之后对象被替换
 
@@ -993,6 +1003,60 @@ async fn sweep_s3_removes_tombstoned_dir_without_backend_calls() {
     assert_eq!(sweep_s3(&rig).await, 1);
     assert!(!dir.exists());
     assert_eq!(rig.backend.abort_calls(), 0, "终态会话：不再动对象侧");
+}
+
+/// 🔴 墓碑在但锁被持有（第十六轮评审 P0）：complete 写完墓碑后可能仍持锁未返回，
+/// 扫描器必须先拿非阻塞锁，拿不到就跳过——不得删掉进行中的完成流程。
+#[tokio::test]
+async fn sweep_s3_retains_tombstoned_dir_while_lock_is_held() {
+    let rig = make_rig().await;
+    let (session, token) = create_s3_session(&rig, 9_974_200, 9_974_922).await;
+    session.write_completed(9_974_922_01).expect("写墓碑");
+    let dir = expire_session(&rig, &token);
+    // 模拟 complete 写完墓碑后仍持锁未返回。
+    let held = session.try_lock().expect("lock io").expect("锁必须能拿到");
+
+    assert_eq!(sweep_s3(&rig).await, 0);
+    assert!(dir.exists(), "持锁中的完成流程：目录绝不删");
+    assert!(dir.join("manifest.json").exists(), "锁后删不得碰会话文件");
+    assert_eq!(rig.backend.abort_calls(), 0);
+
+    // 锁释放后（complete 已返回）下一轮才允许删。
+    drop(held);
+    assert_eq!(sweep_s3(&rig).await, 1);
+    assert!(!dir.exists());
+}
+
+/// 🔴 abort 后 ListParts 确认（第十六轮评审 P1）：仍有残留 → 继续 abort，
+/// 直到确认为空才放行删目录。
+#[tokio::test]
+async fn sweep_s3_keeps_aborting_until_list_parts_confirms_empty() {
+    let rig = make_rig().await;
+    let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_923).await;
+    let dir = expire_session(&rig, &token);
+    // 前两轮确认后仍残留，第三轮才清空。
+    rig.backend.queue_list(Ok(all_parts()));
+    rig.backend.queue_list(Ok(all_parts()));
+    rig.backend.set_list(vec![]);
+
+    assert_eq!(sweep_s3(&rig).await, 1);
+    assert!(!dir.exists(), "确认清空后放行删目录");
+    assert_eq!(rig.backend.abort_calls(), 3, "残留不清就继续 abort");
+}
+
+/// 反复 abort 后仍残留 → 保留目录下一轮重试，绝不在 parts 残留时删本地会话。
+#[tokio::test]
+async fn sweep_s3_retains_dir_when_parts_never_clear() {
+    let rig = make_rig().await;
+    let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_924).await;
+    let dir = expire_session(&rig, &token);
+    rig.backend.set_list(all_parts()); // 确认后永远残留
+    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
+
+    assert_eq!(sweep_s3(&rig).await, 0);
+    assert!(dir.exists(), "残留不清：目录保留等下一轮");
+    assert_eq!(rig.backend.abort_calls(), 3, "上限内尽力 abort");
+    assert_eq!(rig.probe.delete_calls(), 0, "未确认清空不得进入删除分支");
 }
 
 /// 未过期与 proxy 会话 → S3 扫描器不碰。
@@ -1019,6 +1083,7 @@ async fn sweep_s3_skips_live_and_proxy_sessions() {
             transform_version: 0,
             reserved_file_id: 9_974_919,
             transport: "proxy_offset_v1".into(),
+            s3: None,
         },
     )
     .expect("建 proxy 会话");
