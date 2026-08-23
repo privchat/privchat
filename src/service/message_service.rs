@@ -283,7 +283,7 @@ impl MessageService {
                 .await;
         }
 
-        if !receivers.is_empty() {
+        if !receivers.is_empty() && req.message_type != ContentMessageType::System {
             for &uid in &receivers {
                 if let Err(e) = self
                     .unread_count_service
@@ -377,6 +377,36 @@ impl MessageService {
             .await
             .map(|_| ())
             .map_err(|e| ServerError::Internal(format!("发送群系统消息失败: {}", e)))
+    }
+
+    /// 单聊（DM）事件系统消息：与 [`send_group_system_message`] 同链路，
+    /// 但 `channel_type=1`，接收者由调用方传入（DM 双方）。
+    ///
+    /// 用于"已成为好友"等单聊生命周期事件（SYSTEM_MESSAGE_SPEC §5）。
+    /// 失败仅记 warn，不向上传播——业务主流程不应被系统消息失败打断。
+    pub async fn send_direct_system_message(
+        &self,
+        channel_id: u64,
+        recipient_user_ids: Vec<u64>,
+        content: String,
+        metadata: Value,
+    ) -> std::result::Result<(), ServerError> {
+        let req = ServerSendMessageRequest {
+            channel_id,
+            sender_id: crate::config::SYSTEM_USER_ID,
+            content,
+            message_type: ContentMessageType::System,
+            metadata,
+            channel_type: 1, // Direct
+            recipient_user_ids,
+            dedup_key: None,
+            attachment_refs_override: None,
+        };
+
+        self.send_message(req)
+            .await
+            .map(|_| ())
+            .map_err(|e| ServerError::Internal(format!("发送单聊系统消息失败: {}", e)))
     }
 
     /// RPC 入口——带权限与时限校验的撤回（`rpc/message/revoke.rs` 使用）。

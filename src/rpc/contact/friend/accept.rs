@@ -25,6 +25,18 @@ use privchat_protocol::EntityMutationHint;
 use privchat_protocol::ErrorCode;
 use serde_json::{json, Value};
 
+/// 查 user 的显示名（display_name → username → fallback uid 字符串），作系统消息 refs 兜底快照。
+async fn resolve_display_name(services: &RpcServiceContext, user_id: u64) -> String {
+    services
+        .user_service
+        .find_by_id(user_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|u| u.display_name.or(u.username))
+        .unwrap_or_else(|| user_id.to_string())
+}
+
 /// 处理 接受好友申请 请求
 pub async fn handle(
     body: Value,
@@ -115,6 +127,45 @@ pub async fn handle(
             user_id,
         )
         .await;
+
+        // 成为好友系统消息——按 SYSTEM_MESSAGE_SPEC §5：
+        //   template = "system.friend_request_accepted"
+        //   refs = [{user, 同意者}, {user, 申请者}]
+        // 文案本地化由各端 i18n 负责，refs[i].text 是兜底显示名快照。
+        let accepter_name = resolve_display_name(&services, user_id).await;
+        let requester_name = resolve_display_name(&services, from_user_id).await;
+        let sys_payload = json!({
+            "message_type": "system",
+            "template": "system.friend_request_accepted",
+            "refs": [
+                {
+                    "type": "user",
+                    "target_id": user_id.to_string(),
+                    "text": accepter_name,
+                },
+                {
+                    "type": "user",
+                    "target_id": from_user_id.to_string(),
+                    "text": requester_name,
+                },
+            ],
+        });
+        if let Err(e) = services
+            .message_service
+            .send_direct_system_message(
+                channel_id,
+                vec![user_id, from_user_id],
+                sys_payload.to_string(),
+                json!({
+                    "event": "friend.request.accepted",
+                    "actor_id": user_id,
+                    "target_ids": [from_user_id],
+                }),
+            )
+            .await
+        {
+            tracing::warn!("⚠️ 写入成为好友系统消息失败 channel_id={}: {}", channel_id, e);
+        }
     }
     let publisher = EntityInvalidationPublisher::new(services.connection_manager.clone());
     if let Err(error) = publisher
