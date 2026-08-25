@@ -55,6 +55,20 @@ pub async fn request_upload_token(
         business_type
     );
 
+    // ---- §8.2 单一数据面：整包端点属于内置面（第三十轮修订，判据 35）----
+    // 🔴 最先校验，与分片 token 同口径：S3 面下整包一律拒绝，不接收字节、不建会话。
+    // 判定复用 select_transport 的数据面判据（whole_file_allowed），不在这里另写一份。
+    crate::service::chunked_upload::whole_file_allowed(
+        &crate::service::chunked_upload::S3DirectGate {
+            open: services.file_service.s3_direct().is_some(),
+        },
+    )
+    .map_err(|_| {
+        RpcError::validation(
+            "不支持该上传模式：服务端已配置 S3 直传，客户端必须声明 s3_multipart_v1".to_string(),
+        )
+    })?;
+
     // 业务检查
     // TODO: 检查用户权限、存储配额、频率限制等
 

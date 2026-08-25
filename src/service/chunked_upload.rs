@@ -113,6 +113,22 @@ pub fn select_transport(
     }
 }
 
+/// 整包端点的数据面闸门（RESUMABLE §8.2 第三十轮修订 / 判据 35）。
+///
+/// 🔴 整包 `POST /files/upload` 与 `file/request_upload_token` 属于**内置面**，S3 面
+/// 没有对应物。旧版把整包写成「恒走 proxy」，在 S3 面留下一条未设防旁路：闸门只加在
+/// 分片 token 上，于是小文件仍从整包端点流进内置上传服务并落进桶里——正是判据 34
+/// 禁止的静默改走内置上传（Weey 实测 ≤1 MiB 成功、>1 MiB 被拒）。
+///
+/// 判定复用 [`select_transport`] 的同一个数据面口径（`gate.open`），整包路径不另写
+/// 一份，否则两处必然再次漂移。
+pub fn whole_file_allowed(gate: &S3DirectGate) -> std::result::Result<(), TransportSelectError> {
+    if gate.open {
+        return Err(TransportSelectError::ServerS3Only);
+    }
+    Ok(())
+}
+
 /// S3 固定分片几何（RESUMABLE §8.1 冻结公式）：
 /// `part_size = align_up(max(8 MiB, ceil(size / 10000)), 1 MiB)`，限域 `[5 MiB, 5 GiB]`。
 /// 返回 `(part_size, total_parts)`；末片长度由 `check_part_geometry` 按余数口径校验。
@@ -1371,6 +1387,26 @@ mod tests {
             select_transport(Some(&["weird".to_string()]), &closed),
             Err(TransportSelectError::SetMissingProxy)
         );
+    }
+
+    /// §8.2 第三十轮 / 判据 35：整包端点也在单一数据面闸门内。
+    ///
+    /// 回归的是线上真实缺口——闸门只加在分片 token 时，S3 面的小文件仍能从整包端点
+    /// 流进内置上传服务并落进桶，等于按文件大小选了数据面。
+    #[test]
+    fn whole_file_endpoints_are_rejected_on_the_s3_plane() {
+        let open = S3DirectGate { open: true };
+        let closed = S3DirectGate { open: false };
+
+        // S3 面：整包一律拒绝，且与分片 token 未声明时同一个错误。
+        assert_eq!(
+            whole_file_allowed(&open),
+            Err(TransportSelectError::ServerS3Only)
+        );
+        assert_eq!(select_transport(None, &open), Err(TransportSelectError::ServerS3Only));
+
+        // 内置面：整包放行，行为与本轮之前一致。
+        assert_eq!(whole_file_allowed(&closed), Ok(()));
     }
 
     /// §8.1 冻结分片几何：默认 8 MiB、按 10000 片上限抬升、1 MiB 对齐、

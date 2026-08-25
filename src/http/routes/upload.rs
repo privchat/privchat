@@ -357,6 +357,20 @@ async fn upload_file(
     headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult<UploadResponse> {
+    // ---- §8.2 单一数据面：整包端点属于内置面（第三十轮修订，判据 35）----
+    // 🔴 在读取任何 multipart 字节之前拒绝：S3 面下这条路径不存在，绝不代收后写进桶。
+    // 与 file/request_upload_token 同口径、同一份数据面判据（whole_file_allowed）。
+    crate::service::chunked_upload::whole_file_allowed(
+        &crate::service::chunked_upload::S3DirectGate {
+            open: state.file_service.s3_direct().is_some(),
+        },
+    )
+    .map_err(|_| {
+        ServerError::Validation(
+            "不支持该上传模式：服务端已配置 S3 直传，客户端必须声明 s3_multipart_v1".to_string(),
+        )
+    })?;
+
     // 提取 X-Upload-Token header
     let upload_token = headers
         .get("X-Upload-Token")
