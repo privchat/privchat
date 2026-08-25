@@ -1668,6 +1668,28 @@ impl FileService {
                 // base_url 已包含完整路径，直接拼接 file_path
                 return format!("{}/{}", base, file_path);
             }
+            // 🔴 s3 源漏配 base_url 时按寻址方式推导，别回相对路径。
+            //
+            // 实测过一次：Weey 的 s3 源没配 base_url，这里回了 `/images/1.webp`，
+            // 客户端拿到这串**当然拉不动**——消息发得出去、桶里也有对象，收件人只看到
+            // 一个「[图片]」占位，而且链路上任何一处都没有报错。配置漏项不该表现成
+            // 一条静默坏掉的下载链路。
+            if src.storage_type == "s3" {
+                if let (Some(endpoint), Some(bucket)) = (&src.endpoint, &src.bucket) {
+                    let endpoint = endpoint.trim_end_matches('/');
+                    let (scheme, host) = match endpoint.split_once("://") {
+                        Some((s, h)) => (s, h),
+                        None => ("https", endpoint),
+                    };
+                    // 与上传侧同一套寻址口径（配置注释：virtual = 虚拟主机寻址，
+                    // 腾讯云 COS 禁 path-style）。
+                    return if src.addressing_style.as_deref() == Some("virtual") {
+                        format!("{scheme}://{bucket}.{host}/{file_path}")
+                    } else {
+                        format!("{scheme}://{host}/{bucket}/{file_path}")
+                    };
+                }
+            }
             return format!("/{}", file_path);
         }
         format!("{{unsupported:storage_source_id={}}}", storage_source_id)
