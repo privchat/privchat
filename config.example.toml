@@ -1,5 +1,7 @@
 # PrivChat Server 配置文件
-# 此文件由 privchat-server --generate-config 生成
+# 模板：`privchat-server --generate-config` 的唯一来源。
+# 🔴 这里不放任何真实密钥；所有 CHANGE_ME 必须在部署前替换。
+# 本仓库的 config.toml 是开发用配置，不作为生成源（会带入本地地址与开发密钥）。
 # 网关：[gateway] 与 gateway.listeners；文件：[file] 含 server_port / server_api_base_url
 
 [database]
@@ -28,7 +30,8 @@ mode = "BUILTIN"
 # （GATEWAY_TRANSPORT_SPEC §1.1）。放网关级而非 listener 级，是为了从结构上杜绝
 # 「两个 listener 配出不同身份」——那会让客户端按传输方式拿到不同 SPKI，pinning 失效。
 # 缺失/读不到/空文件/非 PEM/私钥权限过宽，都会拒绝启动，绝不退回临时自签证书。
-# 生成：./scripts/gen-server-tls.sh 127.0.0.1 ./certs
+# `--generate-config` 会在配置文件同级的 certs/ 下一并生成；
+# 也可手工生成：./scripts/gen-server-tls.sh <host-or-ip> <outdir>
 [gateway.tls]
 cert = "./certs/server.crt"
 key = "./certs/server.key"
@@ -68,7 +71,7 @@ cleanup_interval_seconds = 60
 
 [admin]
 port = 9090
-# master_key = "your-secret-key"  # 也可通过环境变量 SERVICE_MASTER_KEY 设置
+# master_key = "CHANGE_ME"  # 也可通过环境变量 SERVICE_MASTER_KEY 设置
 
 # 统一 token 配置（HTTP API + IM RPC 同一签发/验证路径）。
 # algorithm: "RS256" 或 "HS256"
@@ -189,14 +192,14 @@ endpoint = "https://server-api-push.meizu.com"
 # v1 复用同一把 application master key（与 application 端 privchat.conf 的 service_master_key 一致）
 [server_event]
 application_url = "http://localhost:8080"
-application_master_key = "your_service_master_key_here"
+application_master_key = "CHANGE_ME_service_master_key"
 timeout_ms = 3000
 
 # Room subscribe ticket（spec 02-server/ROOM_CHANNEL_SPEC §4）
 # secret 是 HMAC-SHA256 key。生产环境通过 env 覆盖。
 # default_kid: 签发用的 key id；和 keys 多 key 一起用做轮换。
 [room_ticket]
-secret = "dev-room-ticket-secret-please-rotate-in-prod"
+secret = "CHANGE_ME_room_ticket_hmac_secret"
 default_kid = "v1"
 leeway_secs = 30
 

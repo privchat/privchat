@@ -21,3 +21,6 @@ config.toml
 !/keys/README.md
 *.pem
 *.key
+
+# 服务端长期 TLS 证书与私钥（gen-server-tls.sh 生成，绝不进 Git）
+/certs/

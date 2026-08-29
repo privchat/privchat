@@ -1765,6 +1765,21 @@ impl ChatServer {
         );
     }
 
+    /// 读取长期服务端 TLS 证书与私钥（PEM）。
+    ///
+    /// 配置来源：网关级 `[gateway.tls]` 的 `cert` / `key`
+    /// （见 `config.rs` 里把它们带进 `tls_cert_path` / `tls_key_path` 的那段）。
+    /// listener 级的 tls_cert/tls_key 已废止，出现即拒绝启动。
+    ///
+    /// 任何一项缺失或读取失败都返回错误 → 启动失败。理由见调用处注释。
+    fn load_server_tls_material(&self) -> Result<(String, String), ServerError> {
+        load_tls_material(
+            self.config.tls_cert_path.as_deref(),
+            self.config.tls_key_path.as_deref(),
+        )
+    }
+
+
     /// 创建传输层服务器
     async fn create_transport_server(
         &self,
@@ -1784,8 +1799,19 @@ impl ChatServer {
                 .map_err(|e| ServerError::Internal(format!("WebSocket配置失败: {}", e)))?
                 .path("/gate");
 
+        // 长期服务端证书：QUIC 与 TLS/TCP 共用同一套密钥和同一组 SPKI pins
+        // （GATEWAY_TRANSPORT_SPEC §1.1）。
+        //
+        // 🔴 缺配置 / 读不到 / 格式错都必须**拒绝启动**，绝不退回临时自签证书：
+        // msgtrans 的 `configure_server_insecure_with_config` 会在每次进程启动现生成
+        // 自签证书且只存在内存里，SPKI 每次重启都变——客户端 pin 一个会变的值，
+        // 等于一重启就全员断线。宁可起不来，也不能静默退化成不可 pin 的状态。
+        let (cert_pem, key_pem) = self.load_server_tls_material()?;
+
         let quic_config = QuicServerConfig::new(&self.config.quic_bind_address.to_string())
-            .map_err(|e| ServerError::Internal(format!("QUIC配置失败: {}", e)))?;
+            .map_err(|e| ServerError::Internal(format!("QUIC配置失败: {}", e)))?
+            .cert_pem(cert_pem)
+            .key_pem(key_pem);
 
         // 构建传输服务器
         // max_connections 自 msgtrans 2.0 起真实生效：超限的新连接在 accept
@@ -2665,5 +2691,216 @@ impl msgtrans::SessionHandler for PrivchatSessionHandler {
 
     async fn on_error(&self, session_id: msgtrans::SessionId, error: msgtrans::TransportError) {
         warn!("⚠️ 传输错误: {:?} (会话: {})", error, session_id);
+    }
+}
+
+
+/// [`PrivchatServer::load_server_tls_material`] 的实现，抽成自由函数以便单测。
+fn load_tls_material(
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+) -> Result<(String, String), ServerError> {
+    let cert_path = cert_path.ok_or_else(|| {
+        ServerError::Internal(
+            "未配置 [gateway.tls].cert：服务端必须使用落盘的长期证书，\
+             否则 SPKI 每次重启都变、客户端无法 pinning。生成方式见 \
+             scripts/gen-server-tls.sh"
+                .to_string(),
+        )
+    })?;
+    let key_path = key_path.ok_or_else(|| {
+        ServerError::Internal(
+            "未配置 [gateway.tls].key：证书与私钥必须成对配置".to_string(),
+        )
+    })?;
+
+    let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
+        ServerError::Internal(format!("读取 TLS 证书失败 ({cert_path}): {e}"))
+    })?;
+    let key_pem = std::fs::read_to_string(key_path)
+        .map_err(|e| ServerError::Internal(format!("读取 TLS 私钥失败 ({key_path}): {e}")))?;
+
+    // 空文件在 msgtrans 里是 "用自签证书" 的历史写法（server_config.rs:363 把空串
+    // 过滤成 None），会静默退化成每次重启都变的临时证书——必须挡在这里。
+    if cert_pem.trim().is_empty() {
+        return Err(ServerError::Internal(format!(
+            "TLS 证书文件为空: {cert_path}"
+        )));
+    }
+    if key_pem.trim().is_empty() {
+        return Err(ServerError::Internal(format!(
+            "TLS 私钥文件为空: {key_path}"
+        )));
+    }
+    // 真解析 + 真配对：字符串里有没有 "BEGIN CERTIFICATE" 证明不了证书能解析、
+    // 更证明不了私钥与证书是一对。msgtrans 内部用 rustls 的 with_single_cert 做校验，
+    // 私钥不匹配会在这里就报错，而不是等到 listener 绑定时才炸。
+    msgtrans::validate_server_tls_material(&cert_pem, &key_pem).map_err(|e| {
+        ServerError::Internal(format!(
+            "TLS 证书/私钥无效 (cert={cert_path}, key={key_path}): {e}"
+        ))
+    })?;
+
+    // 私钥权限必须闭环：`chmod 600` 只是脚本里的一次性动作，部署时用 sudo 生成、
+    // 或 scp 过去、或改过属主，都可能变成 group/world 可读。同机其他账号能读到
+    // 私钥，SPKI pinning 就失去意义——拒绝启动，不要只打 warning。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(key_path)
+            .map_err(|e| ServerError::Internal(format!("读取私钥属性失败 ({key_path}): {e}")))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(ServerError::Internal(format!(
+                "TLS 私钥权限过宽 ({key_path}: {mode:04o})，group/world 可读。\
+                 执行: chown privchat:privchat {key_path} && chmod 600 {key_path}"
+            )));
+        }
+    }
+
+    info!("🔐 服务端 TLS 证书: {}", cert_path);
+    Ok((cert_pem, key_pem))
+}
+
+#[cfg(test)]
+mod tls_material_tests {
+    use super::load_tls_material;
+
+    /// 生成一对**真实**的自签证书与私钥。伪 PEM 只能验证字符串检查，
+    /// 证明不了能解析、更证明不了私钥与证书配对。
+    fn real_pair(cn: &str) -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("keypair");
+        let cert = rcgen::CertificateParams::new(vec![cn.to_string()])
+            .expect("params")
+            .self_signed(&key)
+            .expect("self-signed");
+        (cert.pem(), key.serialize_pem())
+    }
+
+    fn fixture(cert: &str, key: &str, key_mode: u32) -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cp = dir.path().join("server.crt");
+        let kp = dir.path().join("server.key");
+        std::fs::write(&cp, cert).unwrap();
+        std::fs::write(&kp, key).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(key_mode)).unwrap();
+        }
+        let _ = key_mode;
+        (
+            dir,
+            cp.to_string_lossy().into_owned(),
+            kp.to_string_lossy().into_owned(),
+        )
+    }
+
+    #[test]
+    fn real_pair_loads() {
+        let (c_pem, k_pem) = real_pair("127.0.0.1");
+        let (_d, c, k) = fixture(&c_pem, &k_pem, 0o600);
+        let (cert, key) = load_tls_material(Some(&c), Some(&k)).expect("valid pair must load");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(key.contains("PRIVATE KEY"));
+    }
+
+    /// 私钥与证书不配对：字符串检查完全看不出来，必须靠真校验挡住。
+    #[test]
+    fn mismatched_key_is_rejected() {
+        let (c_pem, _) = real_pair("127.0.0.1");
+        let (_, other_key) = real_pair("127.0.0.1");
+        let (_d, c, k) = fixture(&c_pem, &other_key, 0o600);
+        let err = load_tls_material(Some(&c), Some(&k)).expect_err("mismatched key must fail");
+        assert!(format!("{err:?}").contains("TLS 证书/私钥无效"));
+    }
+
+    #[test]
+    fn garbage_cert_is_rejected() {
+        let (_, k_pem) = real_pair("127.0.0.1");
+        let (_d, c, k) = fixture("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n", &k_pem, 0o600);
+        assert!(load_tls_material(Some(&c), Some(&k)).is_err());
+    }
+
+    #[test]
+    fn garbage_key_is_rejected() {
+        let (c_pem, _) = real_pair("127.0.0.1");
+        let (_d, c, k) = fixture(&c_pem, "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n", 0o600);
+        assert!(load_tls_material(Some(&c), Some(&k)).is_err());
+    }
+
+    #[test]
+    fn missing_cert_config_is_rejected() {
+        let (c_pem, k_pem) = real_pair("127.0.0.1");
+        let (_d, _c, k) = fixture(&c_pem, &k_pem, 0o600);
+        assert!(load_tls_material(None, Some(&k)).is_err());
+    }
+
+    #[test]
+    fn missing_key_config_is_rejected() {
+        let (c_pem, k_pem) = real_pair("127.0.0.1");
+        let (_d, c, _k) = fixture(&c_pem, &k_pem, 0o600);
+        assert!(load_tls_material(Some(&c), None).is_err());
+    }
+
+    #[test]
+    fn nonexistent_file_is_rejected() {
+        let (c_pem, k_pem) = real_pair("127.0.0.1");
+        let (_d, _c, k) = fixture(&c_pem, &k_pem, 0o600);
+        assert!(load_tls_material(Some("/nonexistent/server.crt"), Some(&k)).is_err());
+    }
+
+    /// 空文件在 msgtrans 里是「用自签证书」的历史写法，会静默退化成每次重启都变的
+    /// 临时证书——必须挡住，否则 pinning 形同虚设。
+    #[test]
+    fn empty_cert_is_rejected() {
+        let (_, k_pem) = real_pair("127.0.0.1");
+        let (_d, c, k) = fixture("   \n", &k_pem, 0o600);
+        assert!(load_tls_material(Some(&c), Some(&k)).is_err());
+    }
+
+    #[test]
+    fn empty_key_is_rejected() {
+        let (c_pem, _) = real_pair("127.0.0.1");
+        let (_d, c, k) = fixture(&c_pem, "", 0o600);
+        assert!(load_tls_material(Some(&c), Some(&k)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_or_world_readable_key_is_rejected() {
+        let (c_pem, k_pem) = real_pair("127.0.0.1");
+        for mode in [0o640, 0o644, 0o604, 0o660] {
+            let (_d, c, k) = fixture(&c_pem, &k_pem, mode);
+            let err = load_tls_material(Some(&c), Some(&k))
+                .expect_err(&format!("mode {mode:o} must be rejected"));
+            assert!(format!("{err:?}").contains("权限过宽"));
+        }
+    }
+
+    /// 私钥内容绝不能出现在错误信息里（错误会进日志）。
+    #[cfg(unix)]
+    #[test]
+    fn error_message_never_leaks_key_material() {
+        let (c_pem, k_pem) = real_pair("127.0.0.1");
+        let secret_line = k_pem.lines().nth(1).unwrap().to_string();
+        let (_d, c, k) = fixture(&c_pem, &k_pem, 0o644);
+        let rendered = format!("{:?}", load_tls_material(Some(&c), Some(&k)).unwrap_err());
+        assert!(!rendered.contains(&secret_line));
+        assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+    }
+
+    /// 同一份落盘证书重复加载必须得到完全相同的内容——这正是 SPKI 跨重启稳定、
+    /// 客户端可以 pin 的前提。（对照：msgtrans 的临时自签路径每次都不同。）
+    #[test]
+    fn material_is_stable_across_reloads() {
+        let (c_pem, k_pem) = real_pair("127.0.0.1");
+        let (_d, c, k) = fixture(&c_pem, &k_pem, 0o600);
+        let first = load_tls_material(Some(&c), Some(&k)).expect("load 1");
+        let second = load_tls_material(Some(&c), Some(&k)).expect("load 2");
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.1, second.1);
     }
 }

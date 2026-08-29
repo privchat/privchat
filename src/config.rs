@@ -427,6 +427,26 @@ impl ServerConfig {
             anyhow::bail!("[file] s3_direct_threshold 已废止：单一数据面（配置单选）没有阈值/回退，请删除该配置项");
         }
 
+        // 🔴 listener 级 tls_cert/tls_key 已废止，迁到网关级 [gateway.tls]。
+        // 出现即报错，绝不"接受但忽略"——那正是这次要修的死配置 bug：字段解析了
+        // 却从不生效，运维以为配了证书，服务端实际每次启动现生成临时自签证书，
+        // SPKI 每次重启都变，客户端 pinning 全废。
+        if let Some(listeners) = toml_config.gateway.as_ref().and_then(|g| g.listeners.as_ref()) {
+            if let Some(l) = listeners
+                .iter()
+                .find(|l| l.tls_cert.is_some() || l.tls_key.is_some())
+            {
+                anyhow::bail!(
+                    "[[gateway.listeners]] 的 tls_cert/tls_key 已废止（protocol=\"{}\"）：\
+                     QUIC 与 TLS/TCP 必须共用同一套服务端身份，否则客户端按传输方式\
+                     拿到不同 SPKI、pinning 失效。请改配网关级：\n\
+                     \n[gateway.tls]\ncert = \"/etc/privchat/tls/server.crt\"\n\
+                     key = \"/etc/privchat/tls/server.key\"",
+                    l.protocol
+                );
+            }
+        }
+
         Ok(toml_config.into())
     }
 
@@ -1125,12 +1145,6 @@ pub struct GatewayListenerConfig {
     /// 绑定地址（host:port），便于直接传给 msgtrans
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_address: Option<String>,
-    /// QUIC/TLS：证书路径
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tls_cert: Option<String>,
-    /// QUIC/TLS：私钥路径
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tls_key: Option<String>,
     /// WebSocket：path，如 "/gate"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -1151,6 +1165,13 @@ impl GatewayListenerConfig {
     }
 }
 
+/// TOML `[gateway.tls]` 段：网关级 TLS 身份。
+#[derive(Debug, Deserialize)]
+struct TomlGatewayTlsConfig {
+    cert: String,
+    key: String,
+}
+
 /// TOML 单条 listener 反序列化
 #[derive(Debug, Deserialize)]
 struct TomlListenerConfig {
@@ -1158,7 +1179,9 @@ struct TomlListenerConfig {
     #[serde(default = "default_listener_host")]
     host: String,
     port: u16,
+    /// 已废止：保留仅为在 from_toml_file 里检测到旧配置时明确报错，见那里的注释。
     tls_cert: Option<String>,
+    /// 已废止，同上。
     tls_key: Option<String>,
     path: Option<String>,
     compression: Option<bool>,
@@ -1177,8 +1200,6 @@ fn default_gateway_listeners() -> Vec<GatewayListenerConfig> {
             host: "0.0.0.0".to_string(),
             port: 9001,
             bind_address: None,
-            tls_cert: None,
-            tls_key: None,
             path: None,
             compression: None,
             internal: None,
@@ -1188,8 +1209,6 @@ fn default_gateway_listeners() -> Vec<GatewayListenerConfig> {
             host: "0.0.0.0".to_string(),
             port: 9001,
             bind_address: None,
-            tls_cert: None,
-            tls_key: None,
             path: None,
             compression: None,
             internal: None,
@@ -1199,8 +1218,6 @@ fn default_gateway_listeners() -> Vec<GatewayListenerConfig> {
             host: "0.0.0.0".to_string(),
             port: 9080,
             bind_address: None,
-            tls_cert: None,
-            tls_key: None,
             path: None,
             compression: None,
             internal: None,
@@ -1211,6 +1228,11 @@ fn default_gateway_listeners() -> Vec<GatewayListenerConfig> {
 /// 网关配置（TCP/WebSocket/QUIC）；gateway.listeners 为多监听入口
 #[derive(Debug, Deserialize)]
 struct TomlGatewayConfig {
+    /// 网关级 TLS 身份：QUIC 与 TLS/TCP **共用同一套长期密钥和同一组 SPKI pins**
+    /// （GATEWAY_TRANSPORT_SPEC §1.1）。放在网关级而不是 listener 级，是为了从结构上
+    /// 杜绝「两个 listener 配出不同身份」——那会让客户端按传输方式拿到不同 SPKI，
+    /// pinning 直接失效。
+    tls: Option<TomlGatewayTlsConfig>,
     /// 多监听入口：每项 protocol + host + port
     listeners: Option<Vec<TomlListenerConfig>>,
     max_connections: Option<u32>,
@@ -1413,6 +1435,13 @@ impl From<TomlConfig> for ServerConfig {
 
         // 网关：gateway.listeners
         if let Some(gw) = toml.gateway {
+            // 网关级 TLS 身份，QUIC 与 TLS/TCP 共用。此前 listener 上的
+            // tls_cert/tls_key 解析了却从不传递，顶层 tls_cert_path 是死字段，
+            // 服务端于是每次启动现生成自签证书、SPKI 每次都变，客户端无法 pin。
+            if let Some(tls) = gw.tls {
+                config.tls_cert_path = Some(tls.cert);
+                config.tls_key_path = Some(tls.key);
+            }
             if let Some(max_conn) = gw.max_connections {
                 config.max_connections = max_conn;
             }
@@ -1434,8 +1463,6 @@ impl From<TomlConfig> for ServerConfig {
                             host: l.host.clone(),
                             port: l.port,
                             bind_address: None,
-                            tls_cert: l.tls_cert.clone(),
-                            tls_key: l.tls_key.clone(),
                             path: l.path.clone(),
                             compression: l.compression,
                             internal: l.internal,
@@ -2576,5 +2603,111 @@ impl From<SecurityProtectionConfig> for crate::security::SecurityConfig {
             enable_ip_ban: config.enable_ip_ban,
             rate_limit: config.rate_limit.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod legacy_listener_tls_tests {
+    use super::ServerConfig;
+    use std::io::Write;
+
+    fn write_cfg(body: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().expect("tmp");
+        f.write_all(body.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    /// 旧的 listener 级证书配置必须**拒绝启动**，不能"接受但忽略"——
+    /// 那正是这次修的死配置 bug：运维以为配了证书，实际服务端每次启动
+    /// 现生成临时自签证书，SPKI 每次重启都变，客户端 pinning 全废。
+    #[test]
+    fn legacy_listener_tls_cert_is_rejected() {
+        let f = write_cfg(
+            r#"
+[[gateway.listeners]]
+protocol = "quic"
+host = "0.0.0.0"
+port = 9001
+tls_cert = "/etc/privchat/tls/server.crt"
+"#,
+        );
+        let err = ServerConfig::from_toml_file(f.path()).expect_err("legacy field must be rejected");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("已废止"), "{msg}");
+        assert!(msg.contains("[gateway.tls]"), "{msg}");
+    }
+
+    #[test]
+    fn legacy_listener_tls_key_is_rejected() {
+        let f = write_cfg(
+            r#"
+[[gateway.listeners]]
+protocol = "tcp"
+host = "0.0.0.0"
+port = 9001
+tls_key = "/etc/privchat/tls/server.key"
+"#,
+        );
+        assert!(ServerConfig::from_toml_file(f.path()).is_err());
+    }
+
+    /// 网关级配置是正路，必须能正常读到。
+    #[test]
+    fn gateway_level_tls_is_accepted() {
+        let f = write_cfg(
+            r#"
+[gateway.tls]
+cert = "/etc/privchat/tls/server.crt"
+key = "/etc/privchat/tls/server.key"
+
+[[gateway.listeners]]
+protocol = "quic"
+host = "0.0.0.0"
+port = 9001
+"#,
+        );
+        let cfg = ServerConfig::from_toml_file(f.path()).expect("should parse");
+        assert_eq!(
+            cfg.tls_cert_path.as_deref(),
+            Some("/etc/privchat/tls/server.crt")
+        );
+        assert_eq!(
+            cfg.tls_key_path.as_deref(),
+            Some("/etc/privchat/tls/server.key")
+        );
+    }
+}
+
+#[cfg(test)]
+mod generated_config_tests {
+    use super::ServerConfig;
+
+    /// `--generate-config` 的产物与仓库模板同源，且**必须能启动**。
+    /// 服务端现在无条件 fail-closed：模板漏了 [gateway.tls]，按官方命令
+    /// 生成的配置就会启动失败。这条测试把生成器和 TLS 要求钉在一起。
+    const GENERATED: &str = include_str!("../config.toml");
+
+    #[test]
+    fn generated_config_declares_gateway_tls() {
+        assert!(
+            GENERATED.contains("[gateway.tls]"),
+            "生成的配置缺少 [gateway.tls]，服务端会拒绝启动"
+        );
+        assert!(GENERATED.contains("cert ="));
+        assert!(GENERATED.contains("key ="));
+    }
+
+    /// 模板本身不得使用已废止的 listener 级证书字段。
+    #[test]
+    fn generated_config_parses_and_carries_tls_paths() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, GENERATED).expect("write");
+        let cfg = ServerConfig::from_toml_file(&p).expect("生成的配置必须能解析");
+        assert!(
+            cfg.tls_cert_path.is_some() && cfg.tls_key_path.is_some(),
+            "生成的配置必须带出 TLS 路径"
+        );
     }
 }

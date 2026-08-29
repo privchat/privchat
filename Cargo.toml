@@ -127,3 +127,5 @@ privchat-protocol = { path = "../privchat-protocol" }
 
 [dev-dependencies]
 tempfile = "3"
+# 测试用真实证书：伪 PEM 字符串证明不了解析与配对
+rcgen = "0.14"
