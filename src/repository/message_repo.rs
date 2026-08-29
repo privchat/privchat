@@ -2197,6 +2197,11 @@ impl PgMessageRepository {
             FROM privchat_messages m
             WHERE privchat_search_tokens(m.content) @@ to_tsquery('simple', $1)
               AND m.content ILIKE $2 ESCAPE '\'
+              -- 只搜文本消息：系统/媒体消息的 content 是结构化 JSON（模板引用、
+              -- file_id 等），把它们放进全文命中就是把协议内部结构当聊天记录端
+              -- 给用户看（生产实拍：搜 "Test" 命中一条 system.friend_request 的
+              -- 原始 JSON）。
+              AND m.message_type = 0
               AND m.revoked = false
               AND m.deleted = false
             "#,
