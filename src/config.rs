@@ -2617,7 +2617,15 @@ impl From<SecurityProtectionConfig> for crate::security::SecurityConfig {
 /// Redis），不能作为生成源。
 pub fn generate_config_with_tls(path: &str) -> Result<()> {
     let template = include_str!("../config.example.toml");
-    fs::write(path, template).with_context(|| format!("无法写入配置文件: {}", path))?;
+
+    // 🔴 每个占位密钥都换成**本次生成的随机值**。
+    // 模板里发一个固定的 CHANGE_ME 出去，等于所有按官方命令部署的实例共用
+    // 同一把密钥——那不是"可启动的最小环境"，是把签名密钥公开在仓库里。
+    let rendered = template
+        .replace("CHANGE_ME_jwt_hs256_secret", &random_secret())
+        .replace("CHANGE_ME_room_ticket_hmac_secret", &random_secret())
+        .replace("CHANGE_ME_service_master_key", &random_secret());
+    fs::write(path, rendered).with_context(|| format!("无法写入配置文件: {}", path))?;
     println!("✅ 配置文件已生成: {}", path);
 
     // 证书路径相对配置文件所在目录，与模板里的 `./certs/...` 对应。
@@ -2656,6 +2664,14 @@ pub fn generate_config_with_tls(path: &str) -> Result<()> {
     println!("   对外部署请改用真实地址重新生成：");
     println!("   ./scripts/gen-server-tls.sh <host-or-ip> <outdir>");
     Ok(())
+}
+
+/// 32 字节 CSPRNG 随机数的十六进制串，用作生成配置里的对称密钥。
+fn random_secret() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    hex::encode(buf)
 }
 
 /// 生成一张 10 年期自签证书，返回 (cert_pem, key_pem)。
@@ -2812,6 +2828,30 @@ mod generate_config_tests {
         let body = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(!body.contains("dev-room-ticket-secret"), "带入了开发 room ticket secret");
         assert!(!body.contains("your_service_master_key_here"));
-        assert!(body.contains("CHANGE_ME"), "占位密钥必须显式标注待替换");
+    }
+
+    /// 🔴 密钥必须逐次随机。发一个固定占位值出去，等于所有按官方命令部署的
+    /// 实例共用同一把签名密钥。
+    #[test]
+    fn generated_secrets_are_random_per_invocation() {
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap();
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let p1 = d1.path().join("config.toml");
+        let p2 = d2.path().join("config.toml");
+        generate_config_with_tls(p1.to_str().unwrap()).unwrap();
+        generate_config_with_tls(p2.to_str().unwrap()).unwrap();
+        let (a, b) = (read(&p1), read(&p2));
+
+        assert!(!a.contains("CHANGE_ME"), "生成产物不得留下固定占位密钥");
+        for key in ["secret", "application_master_key"] {
+            let line_a = a.lines().find(|l| l.trim_start().starts_with(key)).unwrap();
+            let line_b = b.lines().find(|l| l.trim_start().starts_with(key)).unwrap();
+            assert_ne!(line_a, line_b, "{key} 在两次生成之间必须不同");
+        }
+        // 64 个十六进制字符 = 32 字节熵
+        assert!(a.contains(&"0".repeat(0)) && a.lines().any(|l| {
+            l.contains("secret") && l.split('"').nth(1).map(|v| v.len() == 64).unwrap_or(false)
+        }));
     }
 }

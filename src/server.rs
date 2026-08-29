@@ -1787,18 +1787,6 @@ impl ChatServer {
     ) -> Result<Arc<msgtrans::TransportServer>, ServerError> {
         info!("🔧 创建传输层服务器...");
 
-        // 创建协议配置
-        let tcp_config = TcpServerConfig::new(&self.config.tcp_bind_address.to_string())
-            .map_err(|e| ServerError::Internal(format!("TCP配置失败: {}", e)))?;
-
-        // WS 握手路径必须为 /gate：nginx（h5.fflunp.cn / web.fflunp.cn 的 location /gate）
-        // 都把请求转发到后端 :9080/gate。msgtrans 2.0 起严格校验 WS path（默认 "/"），
-        // 不设则 /gate 握手 404、web/native 的 WSS 全连不上（1.x 不校验路径故此前无需设）。
-        let websocket_config =
-            WebSocketServerConfig::new(&self.config.websocket_bind_address.to_string())
-                .map_err(|e| ServerError::Internal(format!("WebSocket配置失败: {}", e)))?
-                .path("/gate");
-
         // 长期服务端证书：QUIC 与 TLS/TCP 共用同一套密钥和同一组 SPKI pins
         // （GATEWAY_TRANSPORT_SPEC §1.1）。
         //
@@ -1807,6 +1795,25 @@ impl ChatServer {
         // 自签证书且只存在内存里，SPKI 每次重启都变——客户端 pin 一个会变的值，
         // 等于一重启就全员断线。宁可起不来，也不能静默退化成不可 pin 的状态。
         let (cert_pem, key_pem) = self.load_server_tls_material()?;
+
+        // 创建协议配置。
+        //
+        // 🔴 tcp:// 在 PrivChat 语义下是 "PrivChat over TLS/TCP"，不是裸 TCP：
+        // 连接建立后立即握手，不做 STARTTLS，握手失败直接断开。否则攻击者只要
+        // 丢弃 UDP 迫使客户端回落 TCP，就能把连接压回明文，QUIC 侧的 pinning
+        // 被完全绕过。
+        let tcp_config = TcpServerConfig::new(&self.config.tcp_bind_address.to_string())
+            .map_err(|e| ServerError::Internal(format!("TCP配置失败: {}", e)))?
+            .cert_pem(cert_pem.clone())
+            .key_pem(key_pem.clone());
+
+        // WS 握手路径必须为 /gate：nginx（h5.fflunp.cn / web.fflunp.cn 的 location /gate）
+        // 都把请求转发到后端 :9080/gate。msgtrans 2.0 起严格校验 WS path（默认 "/"），
+        // 不设则 /gate 握手 404、web/native 的 WSS 全连不上（1.x 不校验路径故此前无需设）。
+        let websocket_config =
+            WebSocketServerConfig::new(&self.config.websocket_bind_address.to_string())
+                .map_err(|e| ServerError::Internal(format!("WebSocket配置失败: {}", e)))?
+                .path("/gate");
 
         let quic_config = QuicServerConfig::new(&self.config.quic_bind_address.to_string())
             .map_err(|e| ServerError::Internal(format!("QUIC配置失败: {}", e)))?
@@ -1830,7 +1837,10 @@ impl ChatServer {
             .map_err(|e| ServerError::Internal(format!("传输服务器创建失败: {}", e)))?;
 
         info!("✅ 传输层服务器创建成功");
-        info!("🔗 TCP 监听地址: {}", self.config.tcp_bind_address);
+        info!(
+            "🔗 TCP 监听地址: {} (TLS, 无明文降级)",
+            self.config.tcp_bind_address
+        );
         info!(
             "🔗 WebSocket 监听地址: {}",
             self.config.websocket_bind_address

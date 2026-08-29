@@ -1,6 +1,7 @@
 # PrivChat Server 配置文件
 # 模板：`privchat-server --generate-config` 的唯一来源。
-# 🔴 这里不放任何真实密钥；所有 CHANGE_ME 必须在部署前替换。
+# 🔴 这里不放任何真实密钥。所有对称密钥在 `--generate-config` 时逐次随机生成，
+#    模板中的占位值永远不会出现在产物里。
 # 本仓库的 config.toml 是开发用配置，不作为生成源（会带入本地地址与开发密钥）。
 # 网关：[gateway] 与 gateway.listeners；文件：[file] 含 server_port / server_api_base_url
 
@@ -71,7 +72,7 @@ cleanup_interval_seconds = 60
 
 [admin]
 port = 9090
-# master_key = "CHANGE_ME"  # 也可通过环境变量 SERVICE_MASTER_KEY 设置
+# master_key = "<32 字节随机十六进制>"  # 也可通过环境变量 SERVICE_MASTER_KEY 设置
 
 # 统一 token 配置（HTTP API + IM RPC 同一签发/验证路径）。
 # algorithm: "RS256" 或 "HS256"
@@ -81,10 +82,14 @@ port = 9090
 # 也可通过 env 覆盖：PRIVCHAT_JWT_ALGORITHM / PRIVCHAT_JWT_SECRET /
 #   PRIVCHAT_JWT_PRIVATE_KEY_PATH / PRIVCHAT_JWT_PUBLIC_KEY_PATH / PRIVCHAT_JWT_KID /
 #   PRIVCHAT_JWT_ACCESS_TTL_SECS / PRIVCHAT_JWT_REFRESH_TTL_SECS
+# 模板默认 HS256：不依赖任何密钥文件，`--generate-config` 的产物开箱即可启动。
+# 生产请切 RS256 并提供 PEM（JWKS 端点才会暴露公钥）：
+#   algorithm        = "RS256"
+#   private_key_path = "/etc/privchat/keys/jwt/v1.pem"
+#   public_key_path  = "/etc/privchat/keys/jwt/v1.pub.pem"
 [auth.jwt]
-algorithm        = "RS256"
-private_key_path = "./.local/keys/jwt/v1.pem"
-public_key_path  = "./.local/keys/jwt/v1.pub.pem"
+algorithm        = "HS256"
+secret           = "CHANGE_ME_jwt_hs256_secret"
 kid              = "v1"
 access_ttl_secs  = 3600
 refresh_ttl_secs = 2592000
