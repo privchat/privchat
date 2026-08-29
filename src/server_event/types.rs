@@ -308,7 +308,7 @@ pub struct TransferResponsePayload {
     /// 与请求里的 `channel_id` 一致。
     pub channel_id: u64,
     /// Transfer 业务结果 code（`0` = OK；其它见 `CHANNEL_TRANSFER_DISPATCH_SPEC` §12
-    /// 的 20900-20909 段位）。**与 envelope 顶层的 `ServerEventAck.code` 不同语义**：
+    /// 的 21500-21519 段位）。**与 envelope 顶层的 `ServerEventAck.code` 不同语义**：
     /// 顶层 code 是 server↔app 投递/调度结果；这里是 transfer 业务结果。
     pub code: i32,
     pub message: String,

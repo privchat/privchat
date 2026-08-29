@@ -78,9 +78,14 @@ pub const CODE_INVALID_PARAMS: i32 = 10100;
 pub const CODE_PAYLOAD_TOO_LARGE: i32 = 10106;
 /// 20500 — `ChannelNotFound`. `channel_id` did not resolve to a known room.
 pub const CODE_CHANNEL_NOT_FOUND: i32 = 20500;
-/// 20900 — `ChannelNotSubscribed` (Channel Transfer segment). Reserved for
+/// `ChannelNotSubscribed` (Channel Transfer segment, 21500). Reserved for
 /// service-handler-level use; wire ingress generally does not return it.
-pub const CODE_CHANNEL_NOT_SUBSCRIBED: i32 = 20900;
+///
+/// Sourced from `privchat_protocol::ErrorCode` rather than a local literal:
+/// the previous value 20900 collides with `SyncChannelResyncRequired`, which
+/// the SDK resume state machine branches on. See ERROR_CODE_SPEC §3.4.12.
+pub const CODE_CHANNEL_NOT_SUBSCRIBED: i32 =
+    privchat_protocol::ErrorCode::ChannelNotSubscribed as i32;
 
 // =====================================================================
 // Lookups — abstracted so tests can mock without standing up

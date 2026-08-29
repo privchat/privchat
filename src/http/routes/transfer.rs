@@ -69,7 +69,10 @@ const CODE_PERMISSION_DENIED: u32 = 10004;
 const CODE_PAYLOAD_TOO_LARGE: u32 = 10106;
 const CODE_INTERNAL_ERROR: u32 = 4;
 const CODE_CHANNEL_NOT_FOUND: u32 = 20500;
-const CODE_CHANNEL_NOT_SUBSCRIBED: u32 = 20900;
+/// Sourced from `privchat_protocol::ErrorCode` rather than a local literal:
+/// this value was previously 20900, which collides with Sync Recovery.
+/// See spec 01-global/ERROR_CODE_SPEC §3.4.12.
+const CODE_CHANNEL_NOT_SUBSCRIBED: u32 = privchat_protocol::ErrorCode::ChannelNotSubscribed as u32;
 
 // =====================================================================
 // Request / response DTOs (HTTP layer only — never reach the wire)
@@ -154,7 +157,7 @@ pub trait TransferSendBackend: Send + Sync {
 
     /// Whether `user_id` has *any* authenticated online session right now.
     /// Used to distinguish "offline → success(0)" from
-    /// "online but unsubscribed → 20900".
+    /// "online but unsubscribed → 21500".
     async fn is_user_online(&self, user_id: u64) -> bool;
 
     /// Whether `user_id` has at least one authenticated session subscribed
@@ -340,7 +343,7 @@ pub async fn process_app_transfer_send<B: TransferSendBackend + ?Sized>(
 
     // 3. Subscription / online split.
     //    - subscribed       → proceed
-    //    - online unsubscribed → 20900 (target online but not in this channel)
+    //    - online unsubscribed → 21500 (target online but not in this channel)
     //    - offline           → success with delivered_sessions = 0 (best-effort)
     let subscribed = backend
         .is_user_subscribed(req.target_user_id, req.channel_id)

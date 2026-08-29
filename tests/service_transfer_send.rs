@@ -174,7 +174,7 @@ async fn rejects_unsubscribed_target_when_online() {
     backend.is_user_subscribed = false;
     backend.is_user_online = true;
     let outcome = process_app_transfer_send(req(b"x"), &backend).await;
-    assert_err(&outcome, 20900);
+    assert_err(&outcome, 21500);
 }
 
 #[tokio::test]
@@ -288,12 +288,12 @@ async fn error_response_uses_api_envelope_with_data_null() {
         } => (code, message, http_status),
         other => panic!("expected Err, got {other:?}"),
     };
-    assert_eq!(code, 20900);
+    assert_eq!(code, 21500);
     assert_eq!(http_status, StatusCode::FORBIDDEN);
 
     let envelope = ApiEnvelope::err_raw(code, message);
     let json = serde_json::to_value(&envelope).expect("envelope serializes to JSON");
-    assert_eq!(json["code"], 20900);
+    assert_eq!(json["code"], 21500);
     assert!(json["message"].is_string());
     assert!(json["data"].is_null(), "errors must have data: null");
 }
