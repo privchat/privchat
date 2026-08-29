@@ -21,7 +21,6 @@ use privchat::{
     config::{self, ServerConfig},
     logging, ChatServer,
 };
-use std::fs;
 use std::process;
 
 #[tokio::main]
@@ -135,20 +134,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// 生成默认配置文件
+/// 生成默认配置文件及其 TLS 证书（实现在 lib 侧，便于单测真实产物）。
 fn generate_config(path: &str) -> Result<()> {
-    // 🔴 与仓库模板 config.toml **同源**，杜绝漂移。
-    // 曾经这里是一份手写的内联副本，已经和 config.toml 各写各的
-    // （一个用 `# database_url =`，一个用 `[database]` 段）。更要命的是
-    // 新增 [gateway.tls] 后，生成器若不同步，`--generate-config` 产出的配置
-    // 会缺证书，而服务端现在无条件 fail-closed —— 按官方命令生成的配置
-    // 必然启动失败。
-    let default_config = include_str!("../config.toml");
-
-    fs::write(path, default_config).with_context(|| format!("无法写入配置文件: {}", path))?;
-
-    println!("✅ 配置文件已生成: {}", path);
-    Ok(())
+    config::generate_config_with_tls(path)
 }
 
 /// 验证配置文件

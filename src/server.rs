@@ -2696,7 +2696,7 @@ impl msgtrans::SessionHandler for PrivchatSessionHandler {
 
 
 /// [`PrivchatServer::load_server_tls_material`] 的实现，抽成自由函数以便单测。
-fn load_tls_material(
+pub(crate) fn load_tls_material(
     cert_path: Option<&str>,
     key_path: Option<&str>,
 ) -> Result<(String, String), ServerError> {

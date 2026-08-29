@@ -2606,6 +2606,69 @@ impl From<SecurityProtectionConfig> for crate::security::SecurityConfig {
     }
 }
 
+/// 生成默认配置文件**及其 TLS 证书**。
+///
+/// 官方生成命令必须产出一个能真正跑起来的最小环境。只写配置是不够的：
+/// 服务端对 TLS 材料无条件 fail-closed，配置里写了 `[gateway.tls]` 而证书
+/// 不存在，`--generate-config` 的产物就是启动即失败。
+///
+/// 模板源是清理过的 `config.example.toml`，不是仓库里的 `config.toml`——
+/// 后者带着本地地址与开发密钥（room ticket secret、JWT 路径、localhost
+/// Redis），不能作为生成源。
+pub fn generate_config_with_tls(path: &str) -> Result<()> {
+    let template = include_str!("../config.example.toml");
+    fs::write(path, template).with_context(|| format!("无法写入配置文件: {}", path))?;
+    println!("✅ 配置文件已生成: {}", path);
+
+    // 证书路径相对配置文件所在目录，与模板里的 `./certs/...` 对应。
+    let base = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    let cert_dir = base.join("certs");
+    let cert_path = cert_dir.join("server.crt");
+    let key_path = cert_dir.join("server.key");
+
+    if cert_path.exists() || key_path.exists() {
+        println!("ℹ️  已存在证书，保留不覆盖: {}", cert_dir.display());
+        println!("   覆盖会让所有已发布客户端的 SPKI pin 失效。");
+        return Ok(());
+    }
+
+    fs::create_dir_all(&cert_dir)
+        .with_context(|| format!("无法创建证书目录: {}", cert_dir.display()))?;
+
+    let (cert_pem, key_pem) = generate_long_lived_self_signed("localhost")?;
+    fs::write(&cert_path, &cert_pem)
+        .with_context(|| format!("无法写入证书: {}", cert_path.display()))?;
+    fs::write(&key_path, &key_pem)
+        .with_context(|| format!("无法写入私钥: {}", key_path.display()))?;
+
+    // 私钥必须 0600：服务端启动时会拒绝 group/world 可读的私钥。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("无法设置私钥权限: {}", key_path.display()))?;
+    }
+
+    println!("🔐 已生成长期自签证书 (10 年):");
+    println!("   {}", cert_path.display());
+    println!("   {} (0600)", key_path.display());
+    println!("⚠️  证书 CN/SAN 为 localhost，仅供本地起服务。");
+    println!("   对外部署请改用真实地址重新生成：");
+    println!("   ./scripts/gen-server-tls.sh <host-or-ip> <outdir>");
+    Ok(())
+}
+
+/// 生成一张 10 年期自签证书，返回 (cert_pem, key_pem)。
+fn generate_long_lived_self_signed(cn: &str) -> Result<(String, String)> {
+    let key = rcgen::KeyPair::generate().context("生成密钥对失败")?;
+    let mut params = rcgen::CertificateParams::new(vec![cn.to_string()])
+        .with_context(|| format!("证书参数无效: {cn}"))?;
+    params.not_after = rcgen::date_time_ymd(2036, 1, 1);
+    let cert = params.self_signed(&key).context("签发自签证书失败")?;
+    Ok((cert.pem(), key.serialize_pem()))
+}
+
+
 #[cfg(test)]
 mod legacy_listener_tls_tests {
     use super::ServerConfig;
@@ -2680,34 +2743,75 @@ port = 9001
 }
 
 #[cfg(test)]
-mod generated_config_tests {
-    use super::ServerConfig;
+mod generate_config_tests {
+    use super::{generate_config_with_tls, ServerConfig};
 
-    /// `--generate-config` 的产物与仓库模板同源，且**必须能启动**。
-    /// 服务端现在无条件 fail-closed：模板漏了 [gateway.tls]，按官方命令
-    /// 生成的配置就会启动失败。这条测试把生成器和 TLS 要求钉在一起。
-    const GENERATED: &str = include_str!("../config.toml");
-
+    /// `--generate-config` 必须产出一个**能真正启动**的最小环境。
+    /// 只写配置是不够的：服务端对 TLS 材料无条件 fail-closed，配置里写了
+    /// [gateway.tls] 而证书不存在，产物就是启动即失败。这条测试一路验到
+    /// 证书能被 server 侧的加载器接受为止。
     #[test]
-    fn generated_config_declares_gateway_tls() {
-        assert!(
-            GENERATED.contains("[gateway.tls]"),
-            "生成的配置缺少 [gateway.tls]，服务端会拒绝启动"
+    fn generated_environment_is_actually_startable() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cfg_path = dir.path().join("config.toml");
+        generate_config_with_tls(cfg_path.to_str().unwrap()).expect("generate");
+
+        let cfg = ServerConfig::from_toml_file(&cfg_path).expect("生成的配置必须能解析");
+        let (cert_path, key_path) = (
+            cfg.tls_cert_path.expect("必须带出证书路径"),
+            cfg.tls_key_path.expect("必须带出私钥路径"),
         );
-        assert!(GENERATED.contains("cert ="));
-        assert!(GENERATED.contains("key ="));
+
+        // 模板里的路径是相对配置文件所在目录的
+        let cert_abs = dir.path().join(cert_path.trim_start_matches("./"));
+        let key_abs = dir.path().join(key_path.trim_start_matches("./"));
+        assert!(cert_abs.exists(), "证书未生成: {}", cert_abs.display());
+        assert!(key_abs.exists(), "私钥未生成: {}", key_abs.display());
+
+        // 关键一步：服务端启动时用的就是这个加载器（真解析 + 真配对 + 权限检查）
+        crate::server::load_tls_material(
+            Some(cert_abs.to_str().unwrap()),
+            Some(key_abs.to_str().unwrap()),
+        )
+        .expect("生成的证书必须能通过服务端启动校验");
     }
 
-    /// 模板本身不得使用已废止的 listener 级证书字段。
+    #[cfg(unix)]
     #[test]
-    fn generated_config_parses_and_carries_tls_paths() {
+    fn generated_private_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tmp");
-        let p = dir.path().join("config.toml");
-        std::fs::write(&p, GENERATED).expect("write");
-        let cfg = ServerConfig::from_toml_file(&p).expect("生成的配置必须能解析");
-        assert!(
-            cfg.tls_cert_path.is_some() && cfg.tls_key_path.is_some(),
-            "生成的配置必须带出 TLS 路径"
-        );
+        let cfg_path = dir.path().join("config.toml");
+        generate_config_with_tls(cfg_path.to_str().unwrap()).expect("generate");
+        let mode = std::fs::metadata(dir.path().join("certs/server.key"))
+            .expect("key")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "私钥权限必须是 0600，实际 {mode:04o}");
+    }
+
+    /// 重复执行不得覆盖已有证书——覆盖会让所有已发布客户端的 SPKI pin 失效。
+    #[test]
+    fn regenerating_keeps_existing_certificate() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cfg_path = dir.path().join("config.toml");
+        generate_config_with_tls(cfg_path.to_str().unwrap()).expect("generate 1");
+        let first = std::fs::read_to_string(dir.path().join("certs/server.crt")).unwrap();
+        generate_config_with_tls(cfg_path.to_str().unwrap()).expect("generate 2");
+        let second = std::fs::read_to_string(dir.path().join("certs/server.crt")).unwrap();
+        assert_eq!(first, second, "重复生成不得覆盖证书");
+    }
+
+    /// 模板源必须是清理过的 config.example.toml，不能把开发密钥带进产物。
+    #[test]
+    fn generated_config_carries_no_development_secrets() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cfg_path = dir.path().join("config.toml");
+        generate_config_with_tls(cfg_path.to_str().unwrap()).expect("generate");
+        let body = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(!body.contains("dev-room-ticket-secret"), "带入了开发 room ticket secret");
+        assert!(!body.contains("your_service_master_key_here"));
+        assert!(body.contains("CHANGE_ME"), "占位密钥必须显式标注待替换");
     }
 }

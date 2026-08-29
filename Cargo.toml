@@ -24,6 +24,8 @@ name = "media_ref_prod_sweep"
 path = "examples/media_ref_prod_sweep.rs"
 
 [dependencies]
+# generate-config 要产出可直接启动的最小环境，需真实签发自签证书
+rcgen = "0.14"
 # 传输层
 msgtrans = { version = "2.0.0-alpha.5", path = "../msgtrans" }
 
@@ -127,5 +129,3 @@ privchat-protocol = { path = "../privchat-protocol" }
 
 [dev-dependencies]
 tempfile = "3"
-# 测试用真实证书：伪 PEM 字符串证明不了解析与配对
-rcgen = "0.14"
