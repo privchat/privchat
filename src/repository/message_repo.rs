@@ -3245,6 +3245,8 @@ mod client_search_tests {
     /// 否则该 Direct 会话的消息对本人不可见（误拒）。
     #[tokio::test]
     async fn search_visible_direct_without_participants() {
+        // These tests share fixed database fixtures with the outbox suite.
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(repo) = open_repo().await else {
             eprintln!(
                 "skip search_visible_direct_without_participants: DATABASE_URL not configured"
@@ -3410,6 +3412,8 @@ mod client_search_tests {
     /// spec §4：GLOBAL 只见成员频道；撤回/他频道不可见；keyset 稳定翻页。
     #[tokio::test]
     async fn search_visible_scopes_and_paginates() {
+        // These tests share fixed database fixtures with the outbox suite.
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(repo) = open_repo().await else {
             eprintln!("skip search_visible_scopes_and_paginates: DATABASE_URL not configured");
             return;
@@ -3542,6 +3546,8 @@ mod client_search_tests {
     /// spec §5：around 两侧元组 keyset；软删过滤由 SQL 保证（撤回占位在响应层）。
     #[tokio::test]
     async fn around_context_windows() {
+        // These tests share fixed database fixtures with the outbox suite.
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
         let Some(repo) = open_repo().await else {
             eprintln!("skip around_context_windows: DATABASE_URL not configured");
             return;
