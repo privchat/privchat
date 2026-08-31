@@ -2721,3 +2721,23 @@ mod object_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod storage_layout_tests {
+    use crate::model::file_upload::FileType;
+    use crate::service::file_service::FileService;
+
+    const H: &str = "73bf505e1efcddffe25fd73cfc4e48bed6cfbd989e801577b7482c508298d434";
+
+    /// 内置存储与对象存储**共用同一条 `file_path`**：本地源把它挂在 `storage_root`
+    /// 下、S3 源把它挂在桶前缀下，所以哈希目录形式对两者同时生效。磁盘上落成
+    /// `storage_root/images/73/bf/<hash>.png`——既不可枚举，也不会让单个目录堆
+    /// 几十万个文件。
+    #[test]
+    fn the_path_is_relative_so_both_backends_can_mount_it() {
+        let p = FileService::path_for_test(H, &FileType::Image, "a.png");
+        assert!(!p.starts_with('/'), "必须是相对路径，否则挂不到存储根下: {p}");
+        assert!(!p.contains(".."), "不得含上跳段: {p}");
+        assert_eq!(p, format!("images/73/bf/{H}.png"));
+    }
+}
