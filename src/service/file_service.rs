@@ -867,7 +867,10 @@ impl FileService {
             Some(id) => id,
             None => self.file_upload_repo.next_file_id().await?,
         };
-        let file_path = self.generate_file_path(file_id, &file_type, filename);
+        // 🔴 正式路径要等内容摘要算出来才能定（按内容寻址），而流式上传开始时
+        // 字节还没读完。这里先留空，`finish_streaming_upload` 拿到 stored_sha256
+        // 后再算——反正字节本来就先写会话临时对象、校验通过才发布。
+        let file_path = String::new();
 
         // 🔴 **字节先写会话临时对象，校验通过后才发布到正式路径。**
         //
@@ -965,10 +968,14 @@ impl FileService {
             }
         }
 
+        // 正式路径按内容摘要算——开始上传时还不知道字节内容，只能等到这里。
+        let final_path =
+            self.generate_file_path(&stored_sha256, &upload.file_type, &filename);
+
         self.publish_and_record(
             StagedObject {
                 file_id: upload.file_id,
-                file_path: upload.file_path.clone(),
+                file_path: final_path,
                 staging_path: upload.staging_path.clone(),
                 source_id: upload.source_id,
                 file_type: upload.file_type.clone(),
@@ -1006,7 +1013,7 @@ impl FileService {
         let file_type = FileType::from_str(&m.file_type).unwrap_or(FileType::File);
         let source = self.resolve_storage_source()?;
         let source_id = source.id;
-        let file_path = self.generate_file_path(m.reserved_file_id, &file_type, &fields.filename);
+        let file_path = self.generate_file_path(&stored_sha256, &file_type, &fields.filename);
         let staging_path = format!(
             "tmp/uploads/chunked/{}/{}",
             session.upload_id(),
@@ -1607,7 +1614,25 @@ impl FileService {
         verify_object(&op, final_path, expect_size, expect_sha256).await
     }
 
-    pub(crate) fn generate_file_path(&self, file_id: u64, file_type: &FileType, filename: &str) -> String {
+    /// 对象存储里的正式路径：`<类型>/<hash 前 2>/<hash 3-4>/<hash>.<ext>`。
+    ///
+    /// 🔴 用内容摘要而不是 file_id 命名。此前是 `images/<file_id>.<ext>`，file_id
+    /// 连续递增、桶又是公共读，任何人顺着数下去就能把全部附件拉走——服务端下发的
+    /// URL 签不签名都拦不住，因为攻击者根本不需要那条 URL。摘要猜不出来。
+    ///
+    /// 两级前缀分片是对象存储的常规做法：同一前缀下键太多会成为热点分区。
+    ///
+    /// ⚠️ 这里的 hash 是**密文**摘要，而每次上传用随机 CEK/nonce，所以同一份明文
+    /// 由不同人发会得到不同路径、各存一份。想真正只存一份得按明文寻址，那要改成
+    /// 收敛加密——代价是任何人猜中明文就能验证"系统里有没有这份文件"，对私密通信
+    /// 不划算。跨用户去重不在本次范围内（2026-08-31 拍板）。
+    /// 测试入口：`generate_file_path` 不读 `self` 的任何字段。
+    #[cfg(test)]
+    pub(crate) fn path_for_test(
+        content_sha256: &str,
+        file_type: &FileType,
+        filename: &str,
+    ) -> String {
         let extension = filename.split('.').last().unwrap_or("bin");
         let subdir = match file_type {
             FileType::Image => "images",
@@ -1616,7 +1641,35 @@ impl FileService {
             FileType::File => "files",
             FileType::Other => "others",
         };
-        format!("{}/{}.{}", subdir, file_id, extension)
+        let hash = content_sha256.to_ascii_lowercase();
+        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return format!("{}/{}.{}", subdir, hash, extension);
+        }
+        format!("{}/{}/{}/{}.{}", subdir, &hash[0..2], &hash[2..4], hash, extension)
+    }
+
+    pub(crate) fn generate_file_path(
+        &self,
+        content_sha256: &str,
+        file_type: &FileType,
+        filename: &str,
+    ) -> String {
+        let extension = filename.split('.').last().unwrap_or("bin");
+        let subdir = match file_type {
+            FileType::Image => "images",
+            FileType::Video => "videos",
+            FileType::Voice => "voices",
+            FileType::File => "files",
+            FileType::Other => "others",
+        };
+        let hash = content_sha256.to_ascii_lowercase();
+        // 摘要不合法就退回按类型平铺：宁可少一层分片，也不要拼出 `images//.jpg`
+        // 这种路径——那会让不同文件互相覆盖。
+        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            tracing::warn!("内容摘要不合法，正式路径退回不分片形态");
+            return format!("{}/{}.{}", subdir, hash, extension);
+        }
+        format!("{}/{}/{}/{}.{}", subdir, &hash[0..2], &hash[2..4], hash, extension)
     }
 
     pub async fn get_file_url(&self, file_id: u64, _user_id: u64) -> Result<FileUrlResponse> {
@@ -2610,6 +2663,61 @@ mod signed_url_tests {
         assert!(
             SIGNED_URL_TTL >= std::time::Duration::from_secs(60),
             "太短会让大文件下到一半失效"
+        );
+    }
+}
+
+#[cfg(test)]
+mod object_path_tests {
+    use crate::service::file_service::FileService;
+    use crate::model::file_upload::FileType;
+
+    fn path(hash: &str, t: FileType, name: &str) -> String {
+        // generate_file_path 不读 self 的任何字段，用未初始化的服务壳即可。
+        FileService::path_for_test(hash, &t, name)
+    }
+
+    const H: &str = "0bca076d514246b741d08a99b6a2d2ba6d62ae5848dbfa389ce86291c7cc0139";
+
+    /// 路径按内容摘要分两级前缀。file_id 连续可枚举，摘要不能。
+    #[test]
+    fn objects_are_addressed_by_content_digest() {
+        assert_eq!(
+            path(H, FileType::Image, "a.jpg"),
+            format!("images/0b/ca/{H}.jpg")
+        );
+    }
+
+    #[test]
+    fn each_file_type_gets_its_own_prefix() {
+        for (t, dir) in [
+            (FileType::Image, "images"),
+            (FileType::Video, "videos"),
+            (FileType::Voice, "voices"),
+            (FileType::File, "files"),
+            (FileType::Other, "others"),
+        ] {
+            assert!(path(H, t, "a.bin").starts_with(&format!("{dir}/0b/ca/")));
+        }
+    }
+
+    /// 摘要非法时必须退回可用形态，而不是拼出 `images//.jpg`——
+    /// 那种路径会让不同文件互相覆盖。
+    #[test]
+    fn a_malformed_digest_never_produces_a_colliding_path() {
+        for bad in ["", "xy", "not-a-hash", "0b"] {
+            let p = path(bad, FileType::Image, "a.jpg");
+            assert!(!p.contains("//"), "路径不得出现空段: {p}");
+            assert!(p.starts_with("images/"), "{p}");
+        }
+    }
+
+    /// 摘要大小写不敏感，但落盘一律小写：同一份内容不能因为大小写产生两个对象。
+    #[test]
+    fn digest_case_does_not_split_the_object() {
+        assert_eq!(
+            path(&H.to_uppercase(), FileType::Image, "a.jpg"),
+            path(H, FileType::Image, "a.jpg")
         );
     }
 }

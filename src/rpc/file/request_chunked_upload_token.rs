@@ -207,7 +207,7 @@ pub async fn issue_chunked_upload_token(
         let (part_size, total_parts) = s3_part_geometry(request.file_size as u64);
         let file_path = services
             .file_service
-            .generate_file_path(reserved_file_id, &file_type, &filename);
+            .generate_file_path(&sha256, &file_type, &filename);
         let final_key = wiring.object_key(&file_path);
         let ids = new_session_ids();
         let upload_id = ids.upload_id.clone();
