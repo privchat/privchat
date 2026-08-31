@@ -268,6 +268,8 @@ async fn ordering_case_core(rig: &Rig) {
             None,
             0,
             None,
+            // 本用例不验 v2 加密，不带 key_id。
+            None,
             0,
             Some(sha.clone()),
             Some(bytes.len() as i64),

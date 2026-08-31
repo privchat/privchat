@@ -153,6 +153,7 @@ fn file_meta(
         business_id: business_id.map(|id| id.to_string()),
         encryption_version,
         cek: cek.map(|s| s.to_string()),
+        encryption_key_id: None,
     }
 }
 

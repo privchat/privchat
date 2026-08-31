@@ -23,6 +23,33 @@ use std::path::Path;
 use std::time::Duration;
 use tracing::info;
 
+/// 附件加密密钥表。`Debug` 只报数量与 id，绝不渲染密钥本身。
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct AttachmentKeys(pub Vec<(u8, String)>);
+
+impl std::fmt::Debug for AttachmentKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AttachmentKeys({} keys, ids={:?}, material=[REDACTED])",
+            self.0.len(),
+            self.0.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        )
+    }
+}
+
+impl AttachmentKeys {
+    pub fn first(&self) -> Option<&(u8, String)> {
+        self.0.first()
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, (u8, String)> {
+        self.0.iter()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// 服务器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -73,7 +100,12 @@ pub struct ServerConfig {
     /// 🔴 密钥只经由**已鉴权**的接口下发给客户端，明文与密钥都不进对象存储——
     /// 威胁模型是存储服务商本身（ATTACHMENT_ENCRYPTION_SPEC §0.1）。
     /// 空 = 未启用 v2，客户端沿用 v1 的 per-file 随机 CEK。
-    pub attachment_keys: Vec<(u8, String)>,
+    ///
+    /// 🔴 用 [`AttachmentKeys`] 而不是裸 `Vec<(u8, String)>`：`ServerConfig` 派生了
+    /// `Debug`，一次 `{:?}` 就能把全部密钥打进日志。包一层手写 Debug 的类型，
+    /// 让脱敏成为类型自带的性质，而不是「记得别打印」。
+    #[serde(skip_serializing)]
+    pub attachment_keys: AttachmentKeys,
     /// 文件 HTTP 服务的监听地址。TLS 由 nginx 终结时必须是 127.0.0.1，
     /// 否则后端端口对外可达、绕开 nginx 就是明文上传接口。
     pub http_file_server_host: String,
@@ -346,7 +378,7 @@ impl Default for ServerConfig {
             file_storage_sources: vec![],
             file_default_storage_source_id: 0,
             http_file_server_port: 9083,
-            attachment_keys: Vec::new(),
+            attachment_keys: AttachmentKeys::default(),
             http_file_server_host: "0.0.0.0".to_string(),
             admin_api_port: 9090,
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
@@ -436,6 +468,47 @@ impl ServerConfig {
             .is_some()
         {
             anyhow::bail!("[file] s3_direct_threshold 已废止：单一数据面（配置单选）没有阈值/回退，请删除该配置项");
+        }
+
+        // 🔴 附件密钥配错必须**拒绝启动**。长度不对的话服务照常起来，但每个客户端
+        // 的加密都会在运行期失败；key_id 重复会让密文头部的自描述失效——两代密钥
+        // 指向同一个 id，老对象再也解不开。
+        if let Some(keys) = toml_config
+            .attachment
+            .as_ref()
+            .and_then(|a| a.keys.as_ref())
+        {
+            use base64::Engine as _;
+            let mut seen: Vec<u8> = Vec::new();
+            for k in keys {
+                if seen.contains(&k.id) {
+                    anyhow::bail!("[[attachment.keys]] key_id 重复: {}", k.id);
+                }
+                seen.push(k.id);
+                let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(k.key.as_bytes())
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "[[attachment.keys]] id={} 的 key 不是合法 base64url(no-pad)",
+                            k.id
+                        )
+                    })?;
+                if decoded.len() != 32 {
+                    anyhow::bail!(
+                        "[[attachment.keys]] id={} 的 key 解码后必须是 32 字节，实际 {}",
+                        k.id,
+                        decoded.len()
+                    );
+                }
+            }
+            // 同一把密钥挂两个 id 等于假轮换：换了 id 却没换密钥。
+            let mut material: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+            material.sort_unstable();
+            let unique = material.len();
+            material.dedup();
+            if material.len() != unique {
+                anyhow::bail!("[[attachment.keys]] 存在重复的密钥内容，轮换无效");
+            }
         }
 
         // 🔴 listener 级 tls_cert/tls_key 已废止，迁到网关级 [gateway.tls]。
@@ -1464,7 +1537,7 @@ impl From<TomlConfig> for ServerConfig {
         // 网关：gateway.listeners
         if let Some(att) = toml.attachment {
             if let Some(keys) = att.keys {
-                config.attachment_keys = keys.into_iter().map(|k| (k.id, k.key)).collect();
+                config.attachment_keys = AttachmentKeys(keys.into_iter().map(|k| (k.id, k.key)).collect());
             }
         }
 

@@ -435,8 +435,8 @@ impl FileUploadRepository {
             INSERT INTO privchat_file_uploads (
                 file_id, original_filename, file_size, file_type, mime_type,
                 file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at, width, height, file_hash,
-                business_type, business_id, encryption_version, cek
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                business_type, business_id, encryption_version, cek, encryption_key_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             "#
         )
         .bind(meta.file_id as i64)
@@ -456,6 +456,7 @@ impl FileUploadRepository {
         .bind(&meta.business_id)
         .bind(meta.encryption_version)
         .bind(&meta.cek)
+        .bind(meta.encryption_key_id.map(i16::from))
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("插入上传记录失败: {}", e)))?;
@@ -482,13 +483,14 @@ impl FileUploadRepository {
             business_type: Option<String>,
             business_id: Option<String>,
             encryption_version: i32,
+            encryption_key_id: Option<i16>,
             cek: Option<String>,
         }
         let row = sqlx::query_as::<_, Row>(
             r#"
             SELECT file_id, original_filename, file_size, file_type, mime_type,
                    file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at, width, height, file_hash,
-                   business_type, business_id, encryption_version, cek
+                   business_type, business_id, encryption_version, cek, encryption_key_id
             FROM privchat_file_uploads WHERE file_id = $1
             "#
         )
@@ -516,6 +518,7 @@ impl FileUploadRepository {
             business_id: r.business_id,
             encryption_version: r.encryption_version,
             cek: r.cek,
+            encryption_key_id: r.encryption_key_id.and_then(|v| u8::try_from(v).ok()),
         }))
     }
 

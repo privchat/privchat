@@ -135,6 +135,12 @@ pub struct FileMetadata {
     /// 内容密钥 CEK：base64url(no-pad) 的 32 字节；nonce 在密文 blob 头部，不入库。
     /// 仅在鉴权后的 get_url 响应返回，绝不进日志/URL。version=0 时为 None。
     pub cek: Option<String>,
+    /// v2：本文件用的是哪一把全站密钥（对应 config `[[attachment.keys]].id`
+    /// 与密文 blob 头部的 key_id）。`None` = 非 v2。
+    ///
+    /// 记在行上，密钥轮换才不影响存量对象：`get_url` 按它取出**这一把**返回，
+    /// 既不必重新加密，也不必把全部历史密钥一起下发。
+    pub encryption_key_id: Option<u8>,
 }
 
 #[cfg(test)]

@@ -98,65 +98,116 @@ pub async fn register_routes(services: RpcServiceContext) {
 ///
 /// 🔴 只在**已鉴权**的响应里出现，绝不进 URL、不进日志——威胁模型是对象存储
 /// 服务商，密钥必须只走我们自己的接口（ATTACHMENT_ENCRYPTION_SPEC §0.1）。
-pub(crate) fn attachment_keys(
+pub(crate) fn attachment_key_for(
     config: &crate::config::ServerConfig,
-) -> Vec<privchat_protocol::rpc::file::upload::AttachmentKey> {
+    key_id: Option<u8>,
+) -> Option<privchat_protocol::rpc::file::upload::AttachmentKey> {
+    let key_id = key_id?;
     config
         .attachment_keys
         .iter()
+        .find(|(id, _)| *id == key_id)
         .map(|(id, key)| privchat_protocol::rpc::file::upload::AttachmentKey {
             key_id: *id,
             key: key.clone(),
         })
-        .collect()
 }
 
 /// 本次上传该用的密钥 = 列表第一项。其余是保留给老对象解密的。
 pub(crate) fn current_attachment_key(
     config: &crate::config::ServerConfig,
 ) -> Option<privchat_protocol::rpc::file::upload::AttachmentKey> {
-    attachment_keys(config).into_iter().next()
+    config
+        .attachment_keys
+        .first()
+        .map(|(id, key)| privchat_protocol::rpc::file::upload::AttachmentKey {
+            key_id: *id,
+            key: key.clone(),
+        })
 }
 
 #[cfg(test)]
 mod attachment_key_tests {
-    use super::{attachment_keys, current_attachment_key};
-    use crate::config::ServerConfig;
+    use super::{attachment_key_for, current_attachment_key};
+    use crate::config::{AttachmentKeys, ServerConfig};
 
-    fn cfg(keys: Vec<(u8, String)>) -> ServerConfig {
+    fn cfg(keys: Vec<(u8, &str)>) -> ServerConfig {
         ServerConfig {
-            attachment_keys: keys,
+            attachment_keys: AttachmentKeys(
+                keys.into_iter().map(|(i, k)| (i, k.to_string())).collect(),
+            ),
             ..ServerConfig::default()
         }
     }
 
-    /// 未配置时返回空，客户端据此沿用 v1 的 per-file CEK——
-    /// 不能凭空造一把密钥，那会让新旧对象都解不开。
+    /// 未配置 = v2 关闭，客户端沿用 v1。服务端绝不凭空造一把——
+    /// 那会让新旧对象都解不开。
     #[test]
     fn no_configured_key_means_v2_is_off() {
-        assert!(attachment_keys(&cfg(vec![])).is_empty());
         assert!(current_attachment_key(&cfg(vec![])).is_none());
+        assert!(attachment_key_for(&cfg(vec![]), Some(1)).is_none());
     }
 
-    /// 上传永远用**第一把**；其余是保留给老对象解密的。
+    /// 上传永远用第一把；其余是保留给存量对象解密的。
     #[test]
     fn uploads_always_use_the_first_key() {
-        let c = cfg(vec![
-            (2, "current".into()),
-            (1, "retired".into()),
-        ]);
-        let current = current_attachment_key(&c).expect("有当前密钥");
-        assert_eq!(current.key_id, 2);
-        assert_eq!(current.key, "current");
+        let c = cfg(vec![(2, "current"), (1, "retired")]);
+        let k = current_attachment_key(&c).expect("有当前密钥");
+        assert_eq!((k.key_id, k.key.as_str()), (2, "current"));
     }
 
-    /// 下载给的是**集合**：轮换期两代对象并存，客户端按密文头里的 key_id 自己挑。
-    /// 只给当前密钥的话，老对象会在轮换后立刻变成不可读。
+    /// 🔴 下载只给**这一个文件**用的那把。
+    ///
+    /// 下发全量密钥表意味着任何拿到一个附件的人就获得了全部历史对象的解密能力——
+    /// 鉴权挡住的是「这个文件」，密钥的暴露面就该止步于此。
     #[test]
-    fn downloads_receive_every_retained_key() {
-        let c = cfg(vec![(2, "current".into()), (1, "retired".into())]);
-        let keys = attachment_keys(&c);
-        assert_eq!(keys.len(), 2);
-        assert_eq!(keys.iter().map(|k| k.key_id).collect::<Vec<_>>(), vec![2, 1]);
+    fn a_download_only_receives_the_key_for_that_object() {
+        let c = cfg(vec![(2, "current"), (1, "retired")]);
+
+        let k = attachment_key_for(&c, Some(1)).expect("按 id 取到");
+        assert_eq!((k.key_id, k.key.as_str()), (1, "retired"));
+
+        let k = attachment_key_for(&c, Some(2)).expect("按 id 取到");
+        assert_eq!(k.key_id, 2);
+    }
+
+    /// 非 v2 的行（明文 / per-file CEK）不带 key_id，不该拿到任何全站密钥。
+    #[test]
+    fn non_v2_objects_get_no_site_key() {
+        let c = cfg(vec![(1, "k")]);
+        assert!(attachment_key_for(&c, None).is_none());
+    }
+
+    /// 已退役、配置里已删掉的 key_id 必须返回 None 而不是回落到当前密钥——
+    /// 拿错密钥解密会失败，但那时错误已经离现场很远了。
+    #[test]
+    fn a_retired_key_id_is_not_silently_replaced() {
+        let c = cfg(vec![(2, "current")]);
+        assert!(attachment_key_for(&c, Some(1)).is_none());
+    }
+
+    /// 🔴 密钥不得出现在 Debug 输出里。ServerConfig 派生了 Debug，
+    /// 一次 `{:?}` 就能把它打进日志。
+    #[test]
+    fn keys_never_render_in_debug_output() {
+        let c = cfg(vec![(1, "super-secret-material")]);
+        let rendered = format!("{:?}", c.attachment_keys);
+        assert!(!rendered.contains("super-secret-material"), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+
+        let whole = format!("{:?}", c);
+        assert!(!whole.contains("super-secret-material"), "整个配置也不得泄露");
+
+        let k = current_attachment_key(&c).unwrap();
+        let rendered = format!("{k:?}");
+        assert!(!rendered.contains("super-secret-material"), "{rendered}");
+    }
+
+    /// 密钥不得被序列化进配置 dump。
+    #[test]
+    fn keys_are_excluded_from_serialization() {
+        let c = cfg(vec![(1, "super-secret-material")]);
+        let json = serde_json::to_string(&c).expect("serialize");
+        assert!(!json.contains("super-secret-material"), "密钥进了序列化输出");
     }
 }

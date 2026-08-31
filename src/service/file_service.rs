@@ -529,6 +529,8 @@ pub(crate) struct RecordFields {
     pub business_id: Option<String>,
     pub encryption_version: i32,
     pub cek: Option<String>,
+    /// v2：本文件用的是哪一把全站密钥。`None` = 非 v2。
+    pub encryption_key_id: Option<u8>,
 }
 
 /// [`FileService::record_s3_published`] 的结果。
@@ -910,6 +912,8 @@ impl FileService {
         business_id: Option<String>,
         encryption_version: i32,
         cek: Option<String>,
+        // v2：客户端加密时用的那把密钥 id（服务端签发 token 时给的）。
+        encryption_key_id: Option<u8>,
         // 产出这份字节的客户端处理版本；0 = 原始未处理。
         transform_version: i32,
         // 客户端在 prepare 声明并签进 token 的**最终上传 blob** 摘要。
@@ -991,6 +995,7 @@ impl FileService {
                 business_id,
                 encryption_version,
                 cek,
+                encryption_key_id,
             },
         )
         .await
@@ -1120,6 +1125,7 @@ impl FileService {
             business_id: fields.business_id.clone(),
             encryption_version: placement.encryption_version,
             cek: placement.cek.clone(),
+            encryption_key_id: fields.encryption_key_id,
         };
         // 幂等同 publish_and_record：预留 id 主键冲突 → 回读既有行核身份。
         let inserted = self.insert_within(&mut tx, &metadata).await?;
@@ -1182,6 +1188,7 @@ impl FileService {
             business_id,
             encryption_version,
             cek,
+            encryption_key_id,
         } = fields;
 
         // 窗口一：字节收完并校验通过，但还没发布。
@@ -1290,6 +1297,7 @@ impl FileService {
             business_id,
             encryption_version: enc_version,
             cek: stored_cek,
+            encryption_key_id: fields.encryption_key_id,
         };
         // 🔴 幂等完全靠**已有的主键**。`file_id` 在收 body 之前就分配好并记进会话
         // （`state.json` 的 `reserved_file_id`），重试复用同一个 id；于是「上一次其实

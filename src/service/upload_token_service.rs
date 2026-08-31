@@ -865,6 +865,7 @@ mod tests {
             business_id: None,
             encryption_version: 0,
             cek: None,
+            encryption_key_id: None,
         };
         assert!(token.matches_file(&meta), "大小写不同的同一个摘要必须视为相同");
 

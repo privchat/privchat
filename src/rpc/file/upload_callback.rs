@@ -468,6 +468,7 @@ mod tests {
             business_id: None,
             encryption_version: 0,
             cek: None,
+            encryption_key_id: None,
         }
     }
 

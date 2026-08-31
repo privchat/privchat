@@ -87,6 +87,7 @@ async fn seed_original(repo: &FileUploadRepository) -> FileMetadata {
         business_id: Some("7777".to_string()),
         encryption_version: 0,
         cek: None,
+        encryption_key_id: None,
     };
     repo.insert(&meta).await.expect("insert original");
     meta

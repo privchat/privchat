@@ -585,6 +585,7 @@ async fn record_and_finish(
         business_id: extra.business_id.clone(),
         encryption_version: extra.encryption_version,
         cek: extra.cek.clone(),
+        encryption_key_id: extra.encryption_key_id,
     };
     use crate::service::file_service::S3RecordOutcome;
     let metadata = match state

@@ -101,7 +101,7 @@ pub fn create_route() -> Router<FileServerState> {
 /// 流式接收 multipart：file 字段按 chunk 直写存储（大小硬顶即时校验），
 /// 其余字段照常收集；收完后做加密结构校验。任何失败都会清理已写入的半文件。
 ///
-/// 返回 (upload, filename, mime_type, business_id, encryption_version, cek, transform_version)。
+/// 返回 (upload, filename, mime_type, business_id, encryption_version, cek, transform_version, encryption_key_id)。
 async fn receive_streaming(
     state: &FileServerState,
     token_info: &crate::service::upload_token_service::ValidatedUploadToken,
@@ -116,6 +116,8 @@ async fn receive_streaming(
         i32,
         Option<String>,
         i32,
+        // v2 加密所用密钥 id；None = 非 v2
+        Option<u8>,
     ),
     ServerError,
 > {
@@ -128,6 +130,7 @@ async fn receive_streaming(
     let mut cek: Option<String> = None;
     // 客户端处理版本：参与秒传身份。压缩算法一变就是另一份字节，不能命中旧对象。
     let mut transform_version: i32 = 0;
+    let mut encryption_key_id: Option<u8> = None;
 
     // 失败路径统一清理半文件后返回错误。
     macro_rules! fail {
@@ -237,6 +240,13 @@ async fn receive_streaming(
                     }
                 }
             }
+            // v2：客户端加密用的那把密钥 id（服务端签发 token 时给的）。
+            // 记在文件行上，下载时按它取回对应密钥——轮换后存量对象照样解得开。
+            "encryption_key_id" => {
+                if let Ok(s) = field.text().await {
+                    encryption_key_id = s.trim().parse::<u8>().ok();
+                }
+            }
             _ => {}
         }
     }
@@ -294,6 +304,27 @@ async fn receive_streaming(
                 );
             }
         }
+        // v2：全站密钥。密钥不在请求里（服务端签发 token 时已给客户端），
+        // 这里只结构校验：cek 必须缺席，blob 至少 4 头 + 12 nonce + 16 tag。
+        2 => {
+            if cek.is_some() {
+                fail!(
+                    upload,
+                    ServerError::Validation(
+                        "encryption_version=2 使用全站密钥，不得再带 cek".to_string()
+                    )
+                );
+            }
+            let written = upload.as_ref().map(|u| u.written()).unwrap_or(0);
+            if written < 32 {
+                fail!(
+                    upload,
+                    ServerError::Validation(format!(
+                        "v2 加密 blob 至少 32 字节（4 头 + 12 nonce + 16 tag），实际 {written}"
+                    ))
+                );
+            }
+        }
         v => {
             fail!(
                 upload,
@@ -311,6 +342,7 @@ async fn receive_streaming(
         encryption_version,
         cek,
         transform_version,
+        encryption_key_id,
     ))
 }
 
@@ -472,7 +504,7 @@ async fn upload_file(
     );
 
     // P0-10：流式接收——数据边收边写存储，任何失败清理半文件，不再全量进内存。
-    let (upload, filename, mime_type, business_id, encryption_version, cek, transform_version) =
+    let (upload, filename, mime_type, business_id, encryption_version, cek, transform_version, encryption_key_id) =
         receive_streaming(&state, &token_info, reserved, &mut multipart).await?;
 
     let uploader_id = token_info.user_id;
@@ -500,6 +532,7 @@ async fn upload_file(
             business_id,
             encryption_version,
             cek,
+            encryption_key_id,
             // 处理版本只是元数据，不参与秒传身份（身份只看内容摘要）。
             transform_version,
             // 🔴 内容摘要取自 **token**，不取表单。表单里的值是这一次请求带来的，
@@ -578,6 +611,9 @@ pub struct CompleteRequest {
     pub cek: Option<String>,
     pub business_id: Option<String>,
     pub encryption_version: i32,
+    /// v2：客户端加密时用的那把密钥的 id（服务端签发 token 时给的）。
+    /// 记在文件行上，下载时按它取出对应密钥——轮换后存量对象照样解得开。
+    pub encryption_key_id: Option<u8>,
 }
 
 /// 上传专用的类型化错误。见 `ErrorCode` 20610-20618。
@@ -899,6 +935,14 @@ pub(crate) fn manifest_matches(session: &ChunkedSession, meta: &crate::service::
 /// 与整包表单同一套 cek 校验规则。
 pub(super) fn validate_cek(encryption_version: i32, cek: &Option<String>) -> Result<(), ServerError> {
     match encryption_version {
+        // v2 用全站密钥，cek 必须缺席（密钥由 token/get_url 下发，不随上传走）。
+        2 => {
+            if cek.is_some() {
+                return Err(ServerError::Validation(
+                    "encryption_version=2 使用全站密钥，不得再带 cek".to_string(),
+                ));
+            }
+        }
         0 => {
             if cek.is_some() {
                 return Err(ServerError::Validation(
@@ -1017,6 +1061,7 @@ async fn complete_upload(
                 business_id: extra.business_id,
                 encryption_version: extra.encryption_version,
                 cek: extra.cek,
+                encryption_key_id: extra.encryption_key_id,
             },
         )
         .await?;
