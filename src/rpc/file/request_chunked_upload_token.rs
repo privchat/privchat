@@ -42,6 +42,8 @@ pub struct ChunkedTokenServices<'a> {
     pub file_service: &'a FileService,
     pub upload_token_service: &'a UploadTokenService,
     pub file_api_base_url: Option<&'a str>,
+    /// 本次上传该用的全站加密密钥（v2）。`None` = 未启用，客户端沿用 v1。
+    pub attachment_key: Option<privchat_protocol::rpc::file::upload::AttachmentKey>,
 }
 
 pub async fn request_chunked_upload_token(
@@ -54,6 +56,7 @@ pub async fn request_chunked_upload_token(
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
 
     let narrowed = ChunkedTokenServices {
+        attachment_key: super::current_attachment_key(&services.config),
         file_service: &services.file_service,
         upload_token_service: &services.upload_token_service,
         file_api_base_url: services.config.file_api_base_url.as_deref(),
@@ -158,6 +161,7 @@ pub async fn issue_chunked_upload_token(
                 .await
                 .map_err(|e| RpcError::internal(e.to_string()))?;
             let response = FileRequestChunkedUploadTokenResponse {
+        attachment_key: services.attachment_key.clone(),
                 already_exists: true,
                 claim_token: Some(claim_token),
                 ..Default::default()
@@ -347,6 +351,7 @@ pub async fn issue_chunked_upload_token(
         (0, 0)
     };
     let response = FileRequestChunkedUploadTokenResponse {
+        attachment_key: services.attachment_key.clone(),
         already_exists: false,
         claim_token: None,
         upload_token: Some(token),

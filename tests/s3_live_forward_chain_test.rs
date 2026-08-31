@@ -177,6 +177,8 @@ async fn make_rig(env: &LiveEnv) -> Rig {
 
 fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
     ChunkedTokenServices {
+        // 这些用例验的是分片协商，不涉及加密密钥下发。
+        attachment_key: None,
         file_service: &rig.state.file_service,
         upload_token_service: &rig.state.upload_token_service,
         file_api_base_url: Some("http://e2e.local/files"),

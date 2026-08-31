@@ -104,6 +104,8 @@ async fn rig() -> Rig {
 
 fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
     ChunkedTokenServices {
+        // 这些用例验的是分片协商，不涉及加密密钥下发。
+        attachment_key: None,
         file_service: &rig.file_service,
         upload_token_service: &rig.upload_token_service,
         file_api_base_url: Some("http://e2e.local/files"),

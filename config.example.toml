@@ -211,6 +211,22 @@ secret = "CHANGE_ME_room_ticket_hmac_secret"
 default_kid = "v1"
 leeway_secs = 30
 
+# 附件加密密钥（ATTACHMENT_ENCRYPTION_SPEC §0.1，v2 全站统一密钥）。
+#
+# 🔴 威胁模型是**对象存储服务商**——不少厂商会拿用户图片视频去训练。所以明文和
+#    密钥都不能进服务端存储或桶里；服务端只做下发，加解密只在客户端。
+# 🔴 密钥只经由已鉴权的接口下发（request_upload_token / file/get_url），
+#    绝不进 URL、不进日志。
+#
+# 第一项 = 当前上传使用；其余保留给老对象解密（轮换时把新密钥插到最前面，
+# 老的留着，客户端按密文头里的 key_id 自己挑，不需要重新加密存量对象）。
+# 留空 = 不启用 v2，客户端沿用 v1 的 per-file 随机 CEK。
+#
+# 生成：openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+# [[attachment.keys]]
+# id  = 1
+# key = "<openssl rand -base64 32 的输出，转 base64url>"
+
 [logging]
 level = "info"
 format = "compact"

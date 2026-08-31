@@ -214,6 +214,8 @@ async fn make_rig(wired: bool) -> Rig {
 
 fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
     ChunkedTokenServices {
+        // 本用例验的是直传接线，不涉及加密密钥下发。
+        attachment_key: None,
         file_service: &rig.file_service,
         upload_token_service: &rig.upload_token_service,
         file_api_base_url: Some("http://e2e.local/files"),

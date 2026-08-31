@@ -178,6 +178,9 @@ pub async fn request_upload_token(
         })?;
 
     let response = FileRequestUploadTokenResponse {
+        // 本次上传该用的全站密钥（v2）。客户端加密后再传，服务端与对象存储
+        // 自始至终只见到密文。
+        attachment_key: super::current_attachment_key(&services.config),
         token: token_str,
         upload_url,
         // 命中只是**告知**：字节已经在服务端，不必再传。要拿到自己的 file_id

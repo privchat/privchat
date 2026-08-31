@@ -93,3 +93,70 @@ pub async fn register_routes(services: RpcServiceContext) {
 
     tracing::debug!("📁 File 系统路由注册完成");
 }
+
+/// 下发给客户端的附件密钥（v2）。
+///
+/// 🔴 只在**已鉴权**的响应里出现，绝不进 URL、不进日志——威胁模型是对象存储
+/// 服务商，密钥必须只走我们自己的接口（ATTACHMENT_ENCRYPTION_SPEC §0.1）。
+pub(crate) fn attachment_keys(
+    config: &crate::config::ServerConfig,
+) -> Vec<privchat_protocol::rpc::file::upload::AttachmentKey> {
+    config
+        .attachment_keys
+        .iter()
+        .map(|(id, key)| privchat_protocol::rpc::file::upload::AttachmentKey {
+            key_id: *id,
+            key: key.clone(),
+        })
+        .collect()
+}
+
+/// 本次上传该用的密钥 = 列表第一项。其余是保留给老对象解密的。
+pub(crate) fn current_attachment_key(
+    config: &crate::config::ServerConfig,
+) -> Option<privchat_protocol::rpc::file::upload::AttachmentKey> {
+    attachment_keys(config).into_iter().next()
+}
+
+#[cfg(test)]
+mod attachment_key_tests {
+    use super::{attachment_keys, current_attachment_key};
+    use crate::config::ServerConfig;
+
+    fn cfg(keys: Vec<(u8, String)>) -> ServerConfig {
+        ServerConfig {
+            attachment_keys: keys,
+            ..ServerConfig::default()
+        }
+    }
+
+    /// 未配置时返回空，客户端据此沿用 v1 的 per-file CEK——
+    /// 不能凭空造一把密钥，那会让新旧对象都解不开。
+    #[test]
+    fn no_configured_key_means_v2_is_off() {
+        assert!(attachment_keys(&cfg(vec![])).is_empty());
+        assert!(current_attachment_key(&cfg(vec![])).is_none());
+    }
+
+    /// 上传永远用**第一把**；其余是保留给老对象解密的。
+    #[test]
+    fn uploads_always_use_the_first_key() {
+        let c = cfg(vec![
+            (2, "current".into()),
+            (1, "retired".into()),
+        ]);
+        let current = current_attachment_key(&c).expect("有当前密钥");
+        assert_eq!(current.key_id, 2);
+        assert_eq!(current.key, "current");
+    }
+
+    /// 下载给的是**集合**：轮换期两代对象并存，客户端按密文头里的 key_id 自己挑。
+    /// 只给当前密钥的话，老对象会在轮换后立刻变成不可读。
+    #[test]
+    fn downloads_receive_every_retained_key() {
+        let c = cfg(vec![(2, "current".into()), (1, "retired".into())]);
+        let keys = attachment_keys(&c);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.iter().map(|k| k.key_id).collect::<Vec<_>>(), vec![2, 1]);
+    }
+}

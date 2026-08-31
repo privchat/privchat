@@ -115,6 +115,9 @@ pub async fn get_file_url(
         original_filename: file_meta.original_filename,
         encryption_version: url.encryption_version,
         cek: url.cek,
+        // v2 给的是密钥**集合**：轮换期两代对象并存，客户端读密文 blob 头部的
+        // key_id 自己挑，服务端不必为每个文件记住用的是哪一代。
+        attachment_keys: super::attachment_keys(&services.config),
         // 转发同一份附件时，客户端拿它直接走 prepare + claim。
         sha256: file_meta.file_hash.clone(),
         // 真实类型由服务端下发，客户端不该按 mime 猜——猜出来的表还会在每个

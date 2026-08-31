@@ -68,6 +68,12 @@ pub struct ServerConfig {
     pub file_default_storage_source_id: u32,
     /// HTTP 文件服务器端口（用于启动服务）
     pub http_file_server_port: u16,
+    /// 附件加密密钥（v2）。第一项是当前使用的，其余是保留下来给老对象解密用的。
+    ///
+    /// 🔴 密钥只经由**已鉴权**的接口下发给客户端，明文与密钥都不进对象存储——
+    /// 威胁模型是存储服务商本身（ATTACHMENT_ENCRYPTION_SPEC §0.1）。
+    /// 空 = 未启用 v2，客户端沿用 v1 的 per-file 随机 CEK。
+    pub attachment_keys: Vec<(u8, String)>,
     /// 文件 HTTP 服务的监听地址。TLS 由 nginx 终结时必须是 127.0.0.1，
     /// 否则后端端口对外可达、绕开 nginx 就是明文上传接口。
     pub http_file_server_host: String,
@@ -340,6 +346,7 @@ impl Default for ServerConfig {
             file_storage_sources: vec![],
             file_default_storage_source_id: 0,
             http_file_server_port: 9083,
+            attachment_keys: Vec::new(),
             http_file_server_host: "0.0.0.0".to_string(),
             admin_api_port: 9090,
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
@@ -940,6 +947,7 @@ struct TomlConfig {
     cache: Option<TomlCacheConfig>,
     room: Option<TomlRoomConfig>,
     file: Option<TomlFileConfig>,
+    attachment: Option<TomlAttachmentConfig>,
     admin: Option<TomlAdminConfig>,
     auth: Option<TomlAuthConfig>,
     account: Option<TomlAccountConfig>,
@@ -1167,6 +1175,20 @@ impl GatewayListenerConfig {
             .clone()
             .unwrap_or_else(|| format!("{}:{}", self.host, self.port))
     }
+}
+
+/// TOML `[attachment]` 段：附件加密密钥。
+#[derive(Debug, Deserialize)]
+struct TomlAttachmentConfig {
+    /// `[[attachment.keys]]`，第一项为当前使用的密钥。
+    keys: Option<Vec<TomlAttachmentKey>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlAttachmentKey {
+    id: u8,
+    /// base64url(no-pad) 的 32 字节密钥。
+    key: String,
 }
 
 /// TOML `[gateway.tls]` 段：网关级 TLS 身份。
@@ -1440,6 +1462,12 @@ impl From<TomlConfig> for ServerConfig {
         let mut config = Self::default();
 
         // 网关：gateway.listeners
+        if let Some(att) = toml.attachment {
+            if let Some(keys) = att.keys {
+                config.attachment_keys = keys.into_iter().map(|k| (k.id, k.key)).collect();
+            }
+        }
+
         if let Some(gw) = toml.gateway {
             // 网关级 TLS 身份，QUIC 与 TLS/TCP 共用。此前 listener 上的
             // tls_cert/tls_key 解析了却从不传递，顶层 tls_cert_path 是死字段，
