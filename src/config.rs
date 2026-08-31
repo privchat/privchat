@@ -68,6 +68,9 @@ pub struct ServerConfig {
     pub file_default_storage_source_id: u32,
     /// HTTP 文件服务器端口（用于启动服务）
     pub http_file_server_port: u16,
+    /// 文件 HTTP 服务的监听地址。TLS 由 nginx 终结时必须是 127.0.0.1，
+    /// 否则后端端口对外可达、绕开 nginx 就是明文上传接口。
+    pub http_file_server_host: String,
     /// 管理 API 服务器端口（仅内网访问）
     pub admin_api_port: u16,
     /// 文件服务 API 基础 URL（用于客户端访问，不包含端口号）
@@ -337,6 +340,7 @@ impl Default for ServerConfig {
             file_storage_sources: vec![],
             file_default_storage_source_id: 0,
             http_file_server_port: 9083,
+            http_file_server_host: "0.0.0.0".to_string(),
             admin_api_port: 9090,
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
             account: AccountConfig::default(), // 默认 BUILTIN（独立部署 / 测试）
@@ -1348,6 +1352,8 @@ struct TomlFileConfig {
     default_storage_source_id: Option<u32>,
     /// HTTP 文件服务监听端口（原 file_server.port）
     server_port: Option<u16>,
+    /// 监听地址；nginx 终结 TLS 时填 "127.0.0.1"。
+    server_host: Option<String>,
     /// 文件服务 API 基础 URL，客户端访问（原 file_server.api_base_url）
     server_api_base_url: Option<String>,
     /// 🔴 第二十轮已废止：单一数据面没有阈值/回退。旧配置里出现即报错，
@@ -1566,6 +1572,9 @@ impl From<TomlConfig> for ServerConfig {
         }
 
         if let Some(file) = toml.file {
+            if let Some(host) = file.server_host.clone() {
+                config.http_file_server_host = host;
+            }
             if let Some(port) = file.server_port {
                 config.http_file_server_port = port;
             }

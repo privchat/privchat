@@ -483,6 +483,7 @@ async fn file_http_server_wires_backend_and_probe_from_s3_direct() {
         Arc::new(UploadTokenService::new()),
         None,
         0,
+        "127.0.0.1".to_string(),
     );
     let state = server.state();
     let wiring = rig.file_service.s3_direct().expect("接线必须存在");
@@ -500,6 +501,7 @@ async fn file_http_server_wires_backend_and_probe_from_s3_direct() {
         Arc::new(UploadTokenService::new()),
         None,
         0,
+        "127.0.0.1".to_string(),
     );
     assert!(server.state().numbered_part_backend.is_none());
     assert!(server.state().final_object_probe.is_none());

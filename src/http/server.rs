@@ -117,6 +117,13 @@ pub struct AdminServerState {
 pub struct FileHttpServer {
     state: FileServerState,
     port: u16,
+    /// 监听地址。
+    ///
+    /// 🔴 TLS 由 nginx 终结时这里必须是 `127.0.0.1`：否则后端端口仍然对外可达，
+    /// 绕开 nginx 就能拿到明文的上传接口。此前写死 `0.0.0.0`，部署文档却写着
+    /// loopback——真正拦住外部访问的只有云安全组，一次误开放就全暴露。
+    /// 安全组是运维约定，不是代码保证。
+    bind_host: String,
 }
 
 impl FileHttpServer {
@@ -125,6 +132,7 @@ impl FileHttpServer {
         upload_token_service: Arc<UploadTokenService>,
         auth: Option<Arc<dyn UploadAuthenticator>>,
         port: u16,
+        bind_host: String,
     ) -> Self {
         // 直传门禁接线（第十六轮评审 P0）：默认存储源显式 `direct_upload` 时，
         // FileService::init 已在启动期构建生产后端与探测；这里拿同一份接线，
@@ -139,6 +147,7 @@ impl FileHttpServer {
                 auth,
             },
             port,
+            bind_host,
         }
     }
 
@@ -152,7 +161,7 @@ impl FileHttpServer {
     pub async fn bind(
         &self,
     ) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error + Send + Sync>> {
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("{}:{}", self.bind_host, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         info!("🌐 HTTP 文件服务器已绑定 {}", addr);
         Ok(listener)

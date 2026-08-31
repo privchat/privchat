@@ -29,13 +29,15 @@ The pin goes into the client brand profile, which is a separate decision.
 ## Ports
 
 nginx takes the public port and the application processes move to private
-backend ports. Do not open the backend ports in the cloud security group or the
-host firewall.
+backend ports. Set `server_host = "127.0.0.1"` so the backend is unreachable
+from outside by construction — a security-group rule is an operational
+convention, not a guarantee, and one wrong entry exposes a plaintext upload
+endpoint.
 
 | Plane | Public (nginx, TLS) | Backend (loopback) | Config |
 |---|---|---|---|
 | Platform API | 8080 | 8081 | `privchat-application/config/application.conf`: `port = 8081`
-| File control | 9083 | 9084 | `privchat-server` `config.toml`: `server_port = 9084`, `server_api_base_url = "https://<ip>:9083/api/app"`
+| File control | 9083 | 9084 | `privchat-server` `config.toml`: `server_port = 9084`, `server_host = "127.0.0.1"`, `server_api_base_url = "https://<ip>:9083/api/app"`
 
 Copy the matching file from `deploy/nginx/` into `/etc/nginx/conf.d/`, then
 `nginx -t && systemctl reload nginx`.

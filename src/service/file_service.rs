@@ -31,6 +31,9 @@ use tokio::sync::RwLock;
 
 use opendal::Operator;
 
+/// 签名读地址的有效期。够客户端下载完，短到枚举拿不到长期直链。
+const SIGNED_URL_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 use crate::config::FileStorageSourceConfig;
 use crate::error::{Result, ServerError};
 use crate::repository::FileUploadRepository;
@@ -1621,8 +1624,17 @@ impl FileService {
             .get_file_metadata(file_id)
             .await?
             .ok_or_else(|| ServerError::NotFound("文件不存在".to_string()))?;
-        let file_url = self.build_access_url(&metadata.file_path, metadata.storage_source_id);
-        let expires_at = Utc::now().timestamp() + 3600 * 24 * 365;
+        // 对象存储的地址要短期签名，不能给一个长期可用的直链。
+        //
+        // 🔴 调用方（`rpc/file/get_url`）已经做了授权，无权的拿不到这里的 CEK；
+        // 但那只挡住了 RPC 这条路。对象路径是 `images/<file_id>.<ext>` 这种连续值，
+        // 桶又是公共读，任何人都能绕开 RPC 顺序枚举、把全部附件密文拉走。
+        // 泄的是密文不是明文，可元数据（大小、类型、上传时序）是明的，
+        // 密文语料也能留着等将来密钥或算法出问题时再解。
+        let (file_url, expires_at) = self
+            .presigned_read_url(&metadata.file_path, metadata.storage_source_id)
+            .await;
+
         Ok(FileUrlResponse {
             file_url,
             thumbnail_url: None,
@@ -1630,9 +1642,6 @@ impl FileService {
             file_size: metadata.file_size,
             mime_type: metadata.mime_type,
             storage_source_id: metadata.storage_source_id,
-            // ⚠️ P0 安全：此处随 detail 返回 CEK，但调用方 get_file_url 目前 **未做** 访问授权
-            // （user_id 未使用）。返回 cek 前必须校验当前用户有权访问该附件（file→message→channel
-            // 成员）。授权补齐前，加密形同虚设。见 ATTACHMENT_ENCRYPTION_SPEC §授权。
             encryption_version: metadata.encryption_version,
             cek: metadata.cek,
         })
@@ -1659,6 +1668,55 @@ impl FileService {
             .await
             .map_err(|e| ServerError::Internal(format!("存储读取失败: {}", e)))?;
         Ok(buf.to_vec())
+    }
+
+    /// 对象存储的短期签名读地址。
+    ///
+    /// 本地文件源没有签名概念（由我们自己的 HTTP 服务出，走同一套鉴权），
+    /// 保持原来的直链。S3/COS 源签一条短期 URL：过期后直链自然失效，
+    /// 顺序枚举也就拿不到东西。
+    ///
+    /// 签名失败时回落到未签名直链并告警，不让取 URL 这条路直接挂掉——
+    /// 但那意味着可枚举窗口重新打开，所以是 warn 级别，要能在日志里看见。
+    async fn presigned_read_url(&self, file_path: &str, storage_source_id: u32) -> (String, i64) {
+        let unsigned = || {
+            (
+                self.build_access_url(file_path, storage_source_id),
+                Utc::now().timestamp() + SIGNED_URL_TTL.as_secs() as i64,
+            )
+        };
+
+        let is_object_store = self
+            .sources_by_id
+            .get(&storage_source_id)
+            .map(|s| s.storage_type != "local")
+            .unwrap_or(false);
+        if !is_object_store {
+            return unsigned();
+        }
+
+        let op = match self.operator_for_source(storage_source_id).await {
+            Ok(op) => op,
+            Err(e) => {
+                tracing::warn!(
+                    "对象存储签名不可用，回落未签名直链 source_id={storage_source_id}: {e}"
+                );
+                return unsigned();
+            }
+        };
+        match op.presign_read(file_path, SIGNED_URL_TTL).await {
+            Ok(signed) => (
+                signed.uri().to_string(),
+                Utc::now().timestamp() + SIGNED_URL_TTL.as_secs() as i64,
+            ),
+            Err(e) => {
+                // 地址本身不进日志（含签名串），只记来源。
+                tracing::warn!(
+                    "签名读地址失败，回落未签名直链 source_id={storage_source_id}: {e}"
+                );
+                unsigned()
+            }
+        }
     }
 
     pub fn build_access_url(&self, file_path: &str, storage_source_id: u32) -> String {
@@ -1978,6 +2036,9 @@ pub fn size_check_target(declared_digest: Option<&str>, declared_size: Option<i6
 mod publish_tests {
     use super::{publish_object, verify_object, PublishOutcome};
     use opendal::Operator;
+
+/// 签名读地址的有效期。够客户端下载完，短到枚举拿不到长期直链。
+const SIGNED_URL_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
     fn op_at(root: &std::path::Path) -> Operator {
         let builder = opendal::services::Fs::default().root(&root.to_string_lossy());
@@ -2533,3 +2594,22 @@ mod publish_tests {
     }
 }
 
+
+#[cfg(test)]
+mod signed_url_tests {
+    use super::SIGNED_URL_TTL;
+
+    /// 过期时间必须短。这条 URL 一旦签出去就无法撤回，长有效期等于把
+    /// 「对象可枚举」换成了「直链可转发」，问题没解决只是换了形状。
+    #[test]
+    fn signed_urls_expire_quickly() {
+        assert!(
+            SIGNED_URL_TTL <= std::time::Duration::from_secs(60 * 60),
+            "签名有效期不得超过一小时"
+        );
+        assert!(
+            SIGNED_URL_TTL >= std::time::Duration::from_secs(60),
+            "太短会让大文件下到一半失效"
+        );
+    }
+}

@@ -105,7 +105,10 @@ max_channel_subscribers_online = 20000
 
 [file]
 default_storage_source_id = 0
+# 🔴 nginx 终结 TLS 时改成 9084 + host = "127.0.0.1"，
+# 否则后端端口对外可达，绕开 nginx 就是明文上传接口（deploy/README.md）。
 server_port = 9083
+server_host = "0.0.0.0"
 server_api_base_url = "http://127.0.0.1:9083/api/app"
 
 [[file.storage_sources]]
