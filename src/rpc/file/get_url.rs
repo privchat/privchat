@@ -128,8 +128,6 @@ pub async fn get_file_url(
         mime_type: url.mime_type,
         // 文件名取自 file 表（已在上方鉴权时拉取的 file_meta），统一由 get_url 下发。
         original_filename: file_meta.original_filename,
-        encryption_version: url.encryption_version,
-        cek: url.cek,
         // 只给解开这一个附件所需的那把。授权已在上面做过，密钥的暴露面
         // 就该止步于这个文件——下发全量等于让任何拿到一个附件的人解开全部。
         attachment_key,

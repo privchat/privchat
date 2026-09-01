@@ -38,6 +38,48 @@ impl std::fmt::Debug for AttachmentKeys {
     }
 }
 
+/// 秒传索引用的长期密钥。`Debug` 只报「有没有配」，绝不渲染密钥本身。
+///
+/// 🔴 **必须独立于 [`AttachmentKeys`]，不得由它派生。** 加密密钥是可轮换的；
+/// 一旦 dedup 密钥跟着轮换，同一份明文换算出的 `dedup_id` 就变了，**全部历史对象的
+/// 跨代秒传直接失效**。它需要独立备份与灾难恢复，真要轮换只能走双索引迁移。
+///
+/// 🔴 **绝不下发给客户端。** 客户端算不出 `dedup_id`，服务端才有能力在首传校验时
+/// 独立判定「你声明的身份和你传的字节是不是同一份内容」。
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct DedupMasterKey(pub Option<Vec<u8>>);
+
+impl std::fmt::Debug for DedupMasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(_) => write!(f, "DedupMasterKey(configured, material=[REDACTED])"),
+            None => write!(f, "DedupMasterKey(absent)"),
+        }
+    }
+}
+
+impl DedupMasterKey {
+    /// `dedup_id = HMAC-SHA256(dedup_master_key, "privchat-attachment-dedup-v1" || plaintext_sha256)`
+    ///
+    /// 输入是明文摘要的**原始字节**，不是它的十六进制串——换成十六进制并不会更安全，
+    /// 但两端只要有一处写法不同，全站秒传就静默失效且没有任何报错。
+    pub fn dedup_id(&self, plaintext_sha256: &[u8; 32]) -> Option<String> {
+        use hmac::{Hmac, Mac};
+        let key = self.0.as_ref()?;
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key)
+            .expect("HMAC accepts keys of any length");
+        mac.update(DEDUP_INFO);
+        mac.update(plaintext_sha256);
+        Some(hex::encode(mac.finalize().into_bytes()))
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+const DEDUP_INFO: &[u8] = b"privchat-attachment-dedup-v1";
+
 impl AttachmentKeys {
     pub fn first(&self) -> Option<&(u8, String)> {
         self.0.first()
@@ -106,6 +148,9 @@ pub struct ServerConfig {
     /// 让脱敏成为类型自带的性质，而不是「记得别打印」。
     #[serde(skip_serializing)]
     pub attachment_keys: AttachmentKeys,
+    /// 跨用户秒传索引的长期密钥（见 [`DedupMasterKey`]）。空 = 不做跨用户秒传。
+    #[serde(skip_serializing)]
+    pub dedup_master_key: DedupMasterKey,
     /// 文件 HTTP 服务的监听地址。TLS 由 nginx 终结时必须是 127.0.0.1，
     /// 否则后端端口对外可达、绕开 nginx 就是明文上传接口。
     pub http_file_server_host: String,
@@ -379,6 +424,7 @@ impl Default for ServerConfig {
             file_default_storage_source_id: 0,
             http_file_server_port: 9083,
             attachment_keys: AttachmentKeys::default(),
+            dedup_master_key: DedupMasterKey::default(),
             http_file_server_host: "0.0.0.0".to_string(),
             admin_api_port: 9090,
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
@@ -508,6 +554,37 @@ impl ServerConfig {
             material.dedup();
             if material.len() != unique {
                 anyhow::bail!("[[attachment.keys]] 存在重复的密钥内容，轮换无效");
+            }
+        }
+
+        // 🔴 dedup 密钥同样是配错就拒绝启动。它错了不会有任何运行期报错——
+        // 秒传只是"再也不命中"，用户看到的是每次都在上传，没人会把这归因到配置。
+        if let Some(raw) = toml_config
+            .attachment
+            .as_ref()
+            .and_then(|a| a.dedup_master_key.as_deref())
+        {
+            use base64::Engine as _;
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(raw.trim().as_bytes())
+                .map_err(|_| {
+                    anyhow::anyhow!("[attachment] dedup_master_key 不是合法 base64url(no-pad)")
+                })?;
+            if decoded.len() != 32 {
+                anyhow::bail!(
+                    "[attachment] dedup_master_key 解码后必须是 32 字节，实际 {}",
+                    decoded.len()
+                );
+            }
+            // 🔴 和任何一把加密密钥相同就等于"从加密密钥派生"：加密密钥一轮换，
+            // 运维很可能顺手把这里也换掉，全站秒传索引当场作废。
+            if let Some(keys) = toml_config.attachment.as_ref().and_then(|a| a.keys.as_ref()) {
+                if keys.iter().any(|k| k.key.trim() == raw.trim()) {
+                    anyhow::bail!(
+                        "[attachment] dedup_master_key 不能与 [[attachment.keys]] 中任何一把相同：\
+                         它必须独立于可轮换的加密密钥，否则轮换会让历史对象再也无法秒传命中"
+                    );
+                }
             }
         }
 
@@ -1255,6 +1332,8 @@ impl GatewayListenerConfig {
 struct TomlAttachmentConfig {
     /// `[[attachment.keys]]`，第一项为当前使用的密钥。
     keys: Option<Vec<TomlAttachmentKey>>,
+    /// `[attachment] dedup_master_key`：base64url(no-pad) 的 32 字节。
+    dedup_master_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1538,6 +1617,15 @@ impl From<TomlConfig> for ServerConfig {
         if let Some(att) = toml.attachment {
             if let Some(keys) = att.keys {
                 config.attachment_keys = AttachmentKeys(keys.into_iter().map(|k| (k.id, k.key)).collect());
+            }
+            // 合法性已在 from_toml_file 里校验过，这里只解码。
+            if let Some(raw) = att.dedup_master_key.as_deref() {
+                use base64::Engine as _;
+                config.dedup_master_key = DedupMasterKey(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(raw.trim().as_bytes())
+                        .ok(),
+                );
             }
         }
 
@@ -2963,5 +3051,59 @@ mod generate_config_tests {
         assert!(a.contains(&"0".repeat(0)) && a.lines().any(|l| {
             l.contains("secret") && l.split('"').nth(1).map(|v| v.len() == 64).unwrap_or(false)
         }));
+    }
+}
+
+#[cfg(test)]
+mod dedup_master_key_tests {
+    use super::DedupMasterKey;
+
+    fn key() -> DedupMasterKey {
+        DedupMasterKey(Some(vec![7u8; 32]))
+    }
+
+    /// 秒传的全部前提：同一份明文永远算出同一个 dedup_id。
+    /// 这里钉死一个 fixture——换了 info 串、换了输入编码（比如误把明文摘要转成
+    /// 十六进制再喂进去）都不会报错，只会让全站秒传静默失效。
+    #[test]
+    fn the_dedup_id_is_a_frozen_function_of_the_plaintext_digest() {
+        let digest = [0xabu8; 32];
+        assert_eq!(
+            key().dedup_id(&digest).expect("configured"),
+            // 独立算过的值（python: hmac.new(b"\x07"*32, b"privchat-attachment-dedup-v1"+b"\xab"*32, sha256)），
+            // 不是把实现的输出抄回来——抄回来的 fixture 只能证明实现没变，证明不了它算对了。
+            "922b6965c25bf988696dcf7858fae43c62141cb6f1d62fca3eb7252f89bb4b26"
+        );
+    }
+
+    #[test]
+    fn different_content_yields_a_different_dedup_id() {
+        let k = key();
+        assert_ne!(k.dedup_id(&[1u8; 32]), k.dedup_id(&[2u8; 32]));
+    }
+
+    /// 🔴 换一把 dedup 密钥，同一份明文就换一个 dedup_id——这正是它绝不能跟着
+    /// 加密密钥一起轮换的原因：轮换一次，全部历史对象的秒传索引作废。
+    #[test]
+    fn rotating_the_key_invalidates_every_existing_dedup_id() {
+        let digest = [0xabu8; 32];
+        let other = DedupMasterKey(Some(vec![8u8; 32]));
+        assert_ne!(key().dedup_id(&digest), other.dedup_id(&digest));
+    }
+
+    /// 没配就没有跨用户秒传，而不是退回某个默认密钥。
+    #[test]
+    fn an_absent_key_produces_no_dedup_id() {
+        assert!(DedupMasterKey(None).dedup_id(&[0u8; 32]).is_none());
+        assert!(!DedupMasterKey(None).is_configured());
+    }
+
+    /// 密钥绝不进日志。
+    #[test]
+    fn the_key_never_renders_in_debug_output() {
+        let rendered = format!("{:?}", key());
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        assert!(!rendered.contains('7'), "{rendered}");
+        assert_eq!(format!("{:?}", DedupMasterKey(None)), "DedupMasterKey(absent)");
     }
 }
