@@ -2495,6 +2495,23 @@ mod atomic_dispatch_tests {
             .bind(CH)
             .execute(repo.pool())
             .await;
+        let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
+            .bind(CH)
+            .execute(repo.pool())
+            .await;
+        // 🔴 群频道的 group_id 有外键。此前这里只建 channel，在**全新库**上必然违约；
+        // 它一直是绿的，只是因为跑测试的那些库里恰好残留着同 id 的 group。
+        // 测试必须自带前置数据，不能靠环境里剩下的东西。owner_id 上还有一层外键，
+        // 所以 user → group → channel 三层都要自己建。
+        ensure_user(&repo, CH).await;
+        sqlx::query(
+            "INSERT INTO privchat_groups (group_id, name, owner_id, qr_key) \
+             VALUES ($1, 'head-fixture', $1, 'headfix')",
+        )
+        .bind(CH)
+        .execute(repo.pool())
+        .await
+        .expect("insert group");
         sqlx::query(
             "INSERT INTO privchat_channels (channel_id, channel_type, group_id) VALUES ($1, 1, $1)",
         )
@@ -2536,6 +2553,16 @@ mod atomic_dispatch_tests {
         );
 
         let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+            .bind(CH)
+            .execute(repo.pool())
+            .await;
+        // 删除顺序与建立顺序相反：反过来会被外键挡住，留下脏行，
+        // 而下一轮的 INSERT 又会撞主键。
+        let _ = sqlx::query("DELETE FROM privchat_groups WHERE group_id = $1")
+            .bind(CH)
+            .execute(repo.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM privchat_users WHERE user_id = $1")
             .bind(CH)
             .execute(repo.pool())
             .await;

@@ -516,11 +516,6 @@ impl ServerConfig {
             anyhow::bail!("[file] s3_direct_threshold 已废止：单一数据面（配置单选）没有阈值/回退，请删除该配置项");
         }
 
-        // 附件密钥的全部校验与解码集中在一处（见 `attachment_material_from_toml`）：
-        // 校验规则散落在"文件加载"和"结构体转换"两条路径上过，结果是一边返回 Result、
-        // 一边 panic，而且两边的规则并不一样。
-        crate::config::attachment_material_from_toml(toml_config.attachment.as_ref())?;
-
         // 🔴 listener 级 tls_cert/tls_key 已废止，迁到网关级 [gateway.tls]。
         // 出现即报错，绝不"接受但忽略"——那正是这次要修的死配置 bug：字段解析了
         // 却从不生效，运维以为配了证书，服务端实际每次启动现生成临时自签证书，
