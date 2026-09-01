@@ -557,6 +557,33 @@ impl ServerConfig {
             }
         }
 
+        // 🔴 配了附件加密就**必须**配 dedup 密钥。
+        //
+        // 缺了它服务照常启动，只是跨用户秒传永远不命中——用户看到的是每次发同一张图
+        // 都在重新上传，没人会把这归因到一行缺失的配置。跨用户秒传是明确的产品要求，
+        // 不是可选增强，所以这里是启动失败，不是静默降级。
+        {
+            let att = toml_config.attachment.as_ref();
+            let has_keys = att
+                .and_then(|a| a.keys.as_ref())
+                .is_some_and(|k| !k.is_empty());
+            let has_dedup = att
+                .and_then(|a| a.dedup_master_key.as_deref())
+                .is_some_and(|k| !k.trim().is_empty());
+            if has_keys && !has_dedup {
+                anyhow::bail!(
+                    "[attachment] 配置了 [[attachment.keys]] 就必须同时配 dedup_master_key：\
+                     缺了它跨用户秒传永远不命中，而运行期不会有任何报错"
+                );
+            }
+            if has_dedup && !has_keys {
+                anyhow::bail!(
+                    "[attachment] 配了 dedup_master_key 却没有 [[attachment.keys]]：\
+                     没有加密就没有附件对象要去重，这多半是配置写漏了一半"
+                );
+            }
+        }
+
         // 🔴 dedup 密钥同样是配错就拒绝启动。它错了不会有任何运行期报错——
         // 秒传只是"再也不命中"，用户看到的是每次都在上传，没人会把这归因到配置。
         if let Some(raw) = toml_config
@@ -578,8 +605,17 @@ impl ServerConfig {
             }
             // 🔴 和任何一把加密密钥相同就等于"从加密密钥派生"：加密密钥一轮换，
             // 运维很可能顺手把这里也换掉，全站秒传索引当场作废。
+            //
+            // 比的是**解码后的 32 字节**，不是 base64 串：编码写法上的一点差异
+            // （多一个空格、换一种 padding 习惯）就能让字符串比较判为不同，
+            // 而底下是同一把密钥——那正是这条检查要拦的情况。
             if let Some(keys) = toml_config.attachment.as_ref().and_then(|a| a.keys.as_ref()) {
-                if keys.iter().any(|k| k.key.trim() == raw.trim()) {
+                let same = keys.iter().any(|k| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(k.key.trim().as_bytes())
+                        .is_ok_and(|other| other == decoded)
+                });
+                if same {
                     anyhow::bail!(
                         "[attachment] dedup_master_key 不能与 [[attachment.keys]] 中任何一把相同：\
                          它必须独立于可轮换的加密密钥，否则轮换会让历史对象再也无法秒传命中"
@@ -1618,14 +1654,20 @@ impl From<TomlConfig> for ServerConfig {
             if let Some(keys) = att.keys {
                 config.attachment_keys = AttachmentKeys(keys.into_iter().map(|k| (k.id, k.key)).collect());
             }
-            // 合法性已在 from_toml_file 里校验过，这里只解码。
+            // 🔴 解不出来就**留空**是不行的：那会把一个配置错误变成"跨用户秒传
+            // 悄悄关掉"，而这条路径不经过 from_toml_file 的校验（ServerConfig 也能
+            // 从别处构造）。这里 panic 是刻意的——启动期发现总比运行期无声失效好。
             if let Some(raw) = att.dedup_master_key.as_deref() {
                 use base64::Engine as _;
-                config.dedup_master_key = DedupMasterKey(
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(raw.trim().as_bytes())
-                        .ok(),
+                let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(raw.trim().as_bytes())
+                    .expect("[attachment] dedup_master_key 不是合法 base64url(no-pad)");
+                assert_eq!(
+                    decoded.len(),
+                    32,
+                    "[attachment] dedup_master_key 解码后必须是 32 字节"
                 );
+                config.dedup_master_key = DedupMasterKey(Some(decoded));
             }
         }
 
@@ -3105,5 +3147,93 @@ mod dedup_master_key_tests {
         assert!(rendered.contains("REDACTED"), "{rendered}");
         assert!(!rendered.contains('7'), "{rendered}");
         assert_eq!(format!("{:?}", DedupMasterKey(None)), "DedupMasterKey(absent)");
+    }
+}
+
+#[cfg(test)]
+mod attachment_config_tests {
+    use super::ServerConfig;
+
+    const KEY_A: &str = "oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE";
+    const KEY_B: &str = "srKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrI";
+
+    /// 以仓库里的 `config.example.toml` 为基底：这样每条用例同时也在验证
+    /// **模板本身仍然加载得起来**。模板腐化过一次就再也没人照它配了。
+    fn load_with_attachment(section: &str) -> anyhow::Result<ServerConfig> {
+        let base = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config.example.toml"
+        ))
+        .expect("模板必须存在");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{base}\n{section}\n")).expect("write");
+        ServerConfig::from_toml_file(&path)
+    }
+
+    #[test]
+    fn the_shipped_example_still_loads() {
+        load_with_attachment("").expect("config.example.toml 必须能被自己的加载器读起来");
+    }
+
+    #[test]
+    fn a_matching_pair_is_accepted() {
+        let config = load_with_attachment(&format!(
+            "[attachment]\ndedup_master_key = \"{KEY_A}\"\n\n[[attachment.keys]]\nid = 1\nkey = \"{KEY_B}\""
+        ))
+        .expect("成对配置应当被接受");
+        assert!(config.dedup_master_key.is_configured());
+        assert_eq!(config.attachment_keys.first().map(|(id, _)| *id), Some(1));
+    }
+
+    /// 🔴 只配加密密钥必须**拒绝启动**，不是静默关掉跨用户秒传。
+    /// 缺了它运行期毫无迹象：用户只会看到每次发同一张图都在重新上传。
+    #[test]
+    fn encryption_without_a_dedup_key_refuses_to_start() {
+        let err = load_with_attachment(&format!(
+            "[[attachment.keys]]\nid = 1\nkey = \"{KEY_B}\""
+        ))
+        .expect_err("必须拒绝");
+        assert!(format!("{err:#}").contains("dedup_master_key"), "{err:#}");
+    }
+
+    #[test]
+    fn a_dedup_key_without_encryption_refuses_to_start() {
+        let err = load_with_attachment(&format!(
+            "[attachment]\ndedup_master_key = \"{KEY_A}\""
+        ))
+        .expect_err("必须拒绝");
+        assert!(format!("{err:#}").contains("attachment.keys"), "{err:#}");
+    }
+
+    /// 🔴 两把相同等于"dedup 密钥从加密密钥派生"：加密密钥一轮换，运维很可能顺手
+    /// 把这里也换掉，全站秒传索引当场作废。
+    #[test]
+    fn the_two_keys_must_not_be_the_same_material() {
+        let err = load_with_attachment(&format!(
+            "[attachment]\ndedup_master_key = \"{KEY_A}\"\n\n[[attachment.keys]]\nid = 1\nkey = \"{KEY_A}\""
+        ))
+        .expect_err("必须拒绝");
+        assert!(format!("{err:#}").contains("不能与"), "{err:#}");
+    }
+
+    /// 相同密钥换一种写法（前后空格）仍然是同一把——所以比的是解码后的字节，
+    /// 不是 base64 字符串。字符串比较会判为不同，而底下是同一把密钥。
+    #[test]
+    fn the_sameness_check_compares_decoded_bytes_not_the_encoding() {
+        let err = load_with_attachment(&format!(
+            "[attachment]\ndedup_master_key = \" {KEY_A} \"\n\n[[attachment.keys]]\nid = 1\nkey = \"{KEY_A}\""
+        ))
+        .expect_err("必须拒绝");
+        assert!(format!("{err:#}").contains("不能与"), "{err:#}");
+    }
+
+    #[test]
+    fn a_dedup_key_of_the_wrong_length_refuses_to_start() {
+        let err = load_with_attachment(&format!(
+            "[attachment]\ndedup_master_key = \"AAAA\"\n\n[[attachment.keys]]\nid = 1\nkey = \"{KEY_B}\""
+        ))
+        .expect_err("必须拒绝");
+        assert!(format!("{err:#}").contains("32 字节"), "{err:#}");
     }
 }
