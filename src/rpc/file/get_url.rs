@@ -97,6 +97,21 @@ pub async fn get_file_url(
         return Err(RpcError::forbidden("无权访问该附件".to_string()));
     }
 
+    // 🔴 v2 对象取不到密钥是**服务端配置损坏**（历史密钥被从配置里删了），
+    // 不是客户端能兜底的缺省值。照常返回 URL 只会让客户端下到一堆解不开的密文，
+    // 故障表现成「图片坏了」，与真实成因隔了十万八千里。
+    let attachment_key = super::attachment_key_for(&services.config, file_meta.encryption_key_id);
+    if file_meta.encryption_version == 2 && attachment_key.is_none() {
+        tracing::error!(
+            "附件密钥缺失: file_id={} encryption_key_id={:?}——配置里已无此 key id",
+            request.file_id,
+            file_meta.encryption_key_id
+        );
+        return Err(RpcError::internal(
+            "ATTACHMENT_KEY_UNAVAILABLE".to_string(),
+        ));
+    }
+
     let url = services
         .file_service
         .get_file_url(request.file_id, user_id)
@@ -117,7 +132,7 @@ pub async fn get_file_url(
         cek: url.cek,
         // 只给解开这一个附件所需的那把。授权已在上面做过，密钥的暴露面
         // 就该止步于这个文件——下发全量等于让任何拿到一个附件的人解开全部。
-        attachment_key: super::attachment_key_for(&services.config, file_meta.encryption_key_id),
+        attachment_key,
         // 转发同一份附件时，客户端拿它直接走 prepare + claim。
         sha256: file_meta.file_hash.clone(),
         // 真实类型由服务端下发，客户端不该按 mime 猜——猜出来的表还会在每个

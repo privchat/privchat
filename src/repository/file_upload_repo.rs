@@ -356,8 +356,8 @@ impl FileUploadRepository {
                 file_id, original_filename, file_size, file_type, mime_type,
                 file_path, storage_source_id, uploader_id, uploaded_at,
                 width, height, file_hash, business_type, encryption_version, cek,
-                claim_key_hash
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now_millis(), $9, $10, $11, $12, $13, $14, $15)
+                claim_key_hash, encryption_key_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now_millis(), $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (uploader_id, claim_key_hash) WHERE claim_key_hash IS NOT NULL
             DO NOTHING
             "#,
@@ -377,6 +377,10 @@ impl FileUploadRepository {
         .bind(source.encryption_version)
         .bind(&source.cek)
         .bind(claim_key_hash)
+        // 🔴 必须继承**源记录**的 key id：秒传复制的是同一个物理对象，
+        // 密文头里写的就是源那把。丢掉这一列，新记录 version=2 却没有 key id，
+        // 下载时 get_url 给得出 URL 给不出密钥。
+        .bind(source.encryption_key_id.map(i16::from))
         .execute(&mut *tx)
         .await
         .map_err(|e| ServerError::Database(format!("创建秒传记录失败: {}", e)))?;

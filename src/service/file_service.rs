@@ -1098,6 +1098,7 @@ impl FileService {
                 my_path: final_key.clone(),
                 my_source_id: source_id as i32,
                 my_cek: fields.cek.clone(),
+                my_encryption_key_id: fields.encryption_key_id,
             },
         )
         .await?;
@@ -1125,7 +1126,8 @@ impl FileService {
             business_id: fields.business_id.clone(),
             encryption_version: placement.encryption_version,
             cek: placement.cek.clone(),
-            encryption_key_id: fields.encryption_key_id,
+            // 命中去重时跟已有对象走，否则用本次声明的。
+            encryption_key_id: placement.encryption_key_id,
         };
         // 幂等同 publish_and_record：预留 id 主键冲突 → 回读既有行核身份。
         let inserted = self.insert_within(&mut tx, &metadata).await?;
@@ -1209,6 +1211,7 @@ impl FileService {
                 my_path: my_path.clone(),
                 my_source_id: my_source_id as i32,
                 my_cek: cek,
+                my_encryption_key_id: encryption_key_id,
             },
         )
         .await?;
@@ -1297,7 +1300,8 @@ impl FileService {
             business_id,
             encryption_version: enc_version,
             cek: stored_cek,
-            encryption_key_id: fields.encryption_key_id,
+            // 命中去重时跟已有对象走，否则用本次声明的。
+            encryption_key_id: placement.encryption_key_id,
         };
         // 🔴 幂等完全靠**已有的主键**。`file_id` 在收 body 之前就分配好并记进会话
         // （`state.json` 的 `reserved_file_id`），重试复用同一个 id；于是「上一次其实
@@ -1987,6 +1991,8 @@ pub struct UploadPlacement {
     pub my_path: String,
     pub my_source_id: i32,
     pub my_cek: Option<String>,
+    /// 本次上传声明用的 key id（v2）；命中已有对象时会被对方的值覆盖。
+    pub my_encryption_key_id: Option<u8>,
 }
 
 /// 收敛结果：这条记录最终指向哪个物理文件。
@@ -1996,6 +2002,9 @@ pub struct ResolvedPlacement {
     pub storage_source_id: i32,
     pub encryption_version: i32,
     pub cek: Option<String>,
+    /// 🔴 命中已有对象时必须跟着**那份对象**走：密文头里写的是它的 key id，
+    /// 记成本次声明的那把，下载就会拿错密钥去解，而错误离现场已经很远。
+    pub encryption_key_id: Option<u8>,
     /// true = 命中了别人先落的那份，自己刚写的对象可以删。
     pub duplicate: bool,
 }
@@ -2026,8 +2035,8 @@ pub async fn converge_upload(
 
     // 判重只看 hash：摘要相同即字节相同，大小自然相同，也不存在
     // 「明文和密文互相复用」——字节都一样了，就是同一份东西。
-    let existing: Option<(String, i32, i32, Option<String>)> = sqlx::query_as(
-        "SELECT file_path, storage_source_id, encryption_version, cek \
+    let existing: Option<(String, i32, i32, Option<String>, Option<i16>)> = sqlx::query_as(
+        "SELECT file_path, storage_source_id, encryption_version, cek, encryption_key_id \
          FROM privchat_file_uploads \
          WHERE file_hash = $1 ORDER BY file_id LIMIT 1",
     )
@@ -2036,7 +2045,7 @@ pub async fn converge_upload(
     .await
     .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {e}")))?;
 
-    if let Some((path, src, enc, existing_cek)) = existing {
+    if let Some((path, src, enc, existing_cek, existing_key_id)) = existing {
         // 🔴 选中了别人那份物理文件之后，还要取**同一把 `file_path` 锁**再确认它没被删。
         //
         // 只有内容锁挡不住这条：上传选中旧路径 → 删除把最后一行连同物理对象删掉 →
@@ -2064,6 +2073,7 @@ pub async fn converge_upload(
                 storage_source_id: src,
                 encryption_version: enc,
                 cek: existing_cek,
+                encryption_key_id: existing_key_id.and_then(|v| u8::try_from(v).ok()),
             });
         }
         // 等锁期间它被删了：退回用自己刚上传的那份，物理文件不丢。
@@ -2074,6 +2084,7 @@ pub async fn converge_upload(
         storage_source_id: input.my_source_id,
         encryption_version: input.encryption_version,
         cek: input.my_cek.clone(),
+        encryption_key_id: input.my_encryption_key_id,
         duplicate: false,
     })
 }

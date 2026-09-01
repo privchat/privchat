@@ -10,3 +10,17 @@ ALTER TABLE public.privchat_file_uploads
 
 COMMENT ON COLUMN public.privchat_file_uploads.encryption_key_id IS
     'v2 附件加密所用密钥的 id（对应 config [[attachment.keys]].id 与密文 blob 头部）；NULL = 非 v2';
+
+-- version 与 key id 必须一致，错误状态不许落库。
+--
+-- 没有这条约束时，`version=2 且 key_id 为空` 会被写进去：上传成功、建行成功，
+-- 但下载时给得出 URL 给不出密钥，故障点离成因已经很远。
+ALTER TABLE public.privchat_file_uploads
+    DROP CONSTRAINT IF EXISTS privchat_file_uploads_encryption_key_id_matches_version;
+ALTER TABLE public.privchat_file_uploads
+    ADD CONSTRAINT privchat_file_uploads_encryption_key_id_matches_version
+    CHECK (
+        (encryption_version = 2 AND encryption_key_id IS NOT NULL
+         AND encryption_key_id BETWEEN 0 AND 255)
+     OR (encryption_version <> 2 AND encryption_key_id IS NULL)
+    );

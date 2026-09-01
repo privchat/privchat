@@ -236,6 +236,7 @@ async fn converge(pool: &sqlx::PgPool, uploader: i64, my_path: &str) -> String {
             my_path: my_path.to_string(),
             my_source_id: 0,
             my_cek: None,
+            my_encryption_key_id: None,
         },
     )
     .await
@@ -442,6 +443,7 @@ async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
                 my_path: "/tmp/privchat-dedup-test/mine.bin".to_string(),
                 my_source_id: 0,
                 my_cek: None,
+            my_encryption_key_id: None,
             },
         )
         .await
