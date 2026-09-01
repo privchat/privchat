@@ -18,7 +18,9 @@
 //! 文件上传记录仓库 - 持久化上传元数据到数据库（有据可查，清理不依赖缓存）
 
 use crate::error::{Result, ServerError};
-use crate::model::file_upload::{FileMetadata, FileType};
+use crate::model::file_upload::{
+    AttachmentObject, FileMetadata, FileType,
+};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -40,14 +42,20 @@ impl FileUploadRepository {
 
     /// 同一份内容的所有逻辑记录（有上限）。
     ///
-    /// 一串字节可能已经被好几个用户各自记过一笔——物理文件一份，记录多条。
+    /// 一串字节可能已经被好几个用户各自记过一笔——物理对象一份，引用记录多条。
     /// 判「这个人能不能取用」时必须逐条看：他有权读的可能不是最老那条。
-    pub async fn find_all_by_content(&self, sha256: &str) -> Result<Vec<FileMetadata>> {
+    ///
+    /// 🔴 判重键是 `dedup_id`（明文摘要的 HMAC），不是密文摘要。每个对象有自己的
+    /// 随机 salt，同一份明文由不同人封装会产出不同密文——按密文判重等于秒传只对
+    /// 「自己重发自己」生效。
+    pub async fn find_all_by_dedup_id(&self, dedup_id: &str) -> Result<Vec<FileMetadata>> {
         let ids: Vec<(i64,)> = sqlx::query_as(
-            "SELECT file_id FROM privchat_file_uploads \
-             WHERE file_hash = $1 ORDER BY file_id LIMIT 16",
+            "SELECT u.file_id FROM privchat_file_uploads u \
+             JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
+             WHERE o.dedup_id = $1 AND o.status = 'published' \
+             ORDER BY u.file_id LIMIT 16",
         )
-        .bind(sha256)
+        .bind(dedup_id)
         .fetch_all(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("按内容查所有记录失败: {}", e)))?;
@@ -64,15 +72,16 @@ impl FileUploadRepository {
 
     /// 秒传探测：这份内容在不在。**不写任何东西。**
     ///
-    /// 判重只看**落盘字节**的 SHA-256：摘要相同即字节相同，大小自然相同，
-    /// 也不存在「明文和密文互相复用」——字节都一样了，就是同一份东西。
-    /// 摘要由服务端对实际收到那串字节计算；客户端 prepare 报的同名值只用于预检。
-    pub async fn find_by_content(&self, sha256: &str) -> Result<Option<FileMetadata>> {
+    /// 🔴 只认 `status = 'published'` 的对象。`pending` 的还没通过首传校验——
+    /// 让它被命中就等于「先发布再校验」：一份没验过的对象进了索引，后来者会拿到它。
+    pub async fn find_by_dedup_id(&self, dedup_id: &str) -> Result<Option<FileMetadata>> {
         let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT file_id FROM privchat_file_uploads \
-             WHERE file_hash = $1 ORDER BY file_id LIMIT 1",
+            "SELECT u.file_id FROM privchat_file_uploads u \
+             JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
+             WHERE o.dedup_id = $1 AND o.status = 'published' \
+             ORDER BY u.file_id LIMIT 1",
         )
-        .bind(sha256)
+        .bind(dedup_id)
         .fetch_optional(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {}", e)))?;
@@ -127,17 +136,19 @@ impl FileUploadRepository {
         // 与「记下取用过」是同一件事，不存在中间态。
         claim_key_hash: Option<&str>,
     ) -> Result<u64> {
-        // 🔴 秒传取用的身份就是这串摘要，缺了或不合法就不该往下走。
-        // 用空串顶上会让下面按 hash 的匹配落到「所有没有摘要的记录」上，
-        // pending 判定也跟着错——那是拿授权去赌一个空值。
-        let content_hash = match source.file_hash.as_deref() {
-            Some(h) if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) => h.to_string(),
-            _ => {
-                return Err(ServerError::NotFound(
-                    "服务端没有这份内容，请正常上传".to_string(),
-                ))
-            }
-        };
+        // 🔴 秒传取用的身份是**对象**，不是摘要字符串。
+        //
+        // 以前按 `file_hash` 匹配，缺了摘要就得用空串顶上，于是匹配会落到
+        // "所有没有摘要的记录"上——那是拿授权去赌一个空值。现在直接拿 object_id：
+        // 它是外键，不存在"匹配到一堆"的可能。
+        let object_id = source.object.object_id as i64;
+
+        // 只有通过首传校验的对象可以被取用。pending 还没验过，legacy 是废止格式。
+        if !source.object.status.is_usable() {
+            return Err(ServerError::NotFound(
+                "服务端没有这份内容，请正常上传".to_string(),
+            ));
+        }
 
         let file_id = self.next_file_id().await?;
         let mut tx = self
@@ -156,8 +167,10 @@ impl FileUploadRepository {
             .await
             .map_err(|e| ServerError::Database(format!("设置锁等待上限失败: {}", e)))?;
 
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(&source.file_path)
+        // 锁的粒度是物理对象。用 object_id 而不是路径字符串：同一个对象只有一个 id，
+        // 而路径是它的属性，将来搬运存储源会变。
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(object_id)
             .execute(&mut *tx)
             .await
             .map_err(|e| Self::map_lock_error("获取物理文件锁失败", e))?;
@@ -335,52 +348,50 @@ impl FileUploadRepository {
             ));
         }
 
-        // 拿到锁之后复查源行还在不在：等锁期间它可能已经被删掉了。
-        let still_there: Option<(i64,)> = sqlx::query_as(
-            "SELECT file_id FROM privchat_file_uploads WHERE file_path = $1 LIMIT 1",
+        // 拿到锁之后复查源**对象**还在不在、还是不是可用状态：等锁期间它可能已经被
+        // GC 掉了。查对象行而不是"还有没有别人引用它"——引用为零的对象照样可以被
+        // 取用，只要它还在；反过来，对象没了的话有多少引用都不算数。
+        let still_there: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM privchat_attachment_objects WHERE object_id = $1",
         )
-        .bind(&source.file_path)
+        .bind(object_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ServerError::Database(format!("复查源文件失败: {}", e)))?;
-        if still_there.is_none() {
+        if still_there.as_ref().map(|(s,)| s.as_str()) != Some("published") {
             tx.rollback().await.ok();
             return Err(ServerError::NotFound(
                 "该文件已被删除，请正常上传".to_string(),
             ));
         }
 
+        // 🔴 秒传取用只是**多一条引用**，物理对象一个字节都不动。
+        //
+        // 以前这里要逐列复制 file_path / 存储源 / 加密版本 / CEK / key id，任何一列漏掉
+        // 都会造出一条"指向同一份字节却描述不一致"的记录——曾经漏掉 key id，新记录
+        // version=2 却没有密钥 id，下载时给得出 URL 给不出密钥。现在那些列根本不在
+        // 这张表上，漏不掉。
         sqlx::query(
             r#"
             INSERT INTO privchat_file_uploads (
-                file_id, original_filename, file_size, file_type, mime_type,
-                file_path, storage_source_id, uploader_id, uploaded_at,
-                width, height, file_hash, business_type, encryption_version, cek,
-                claim_key_hash, encryption_key_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now_millis(), $9, $10, $11, $12, $13, $14, $15, $16)
+                file_id, original_filename, file_type, mime_type,
+                object_id, uploader_id, uploaded_at,
+                width, height, business_type, claim_key_hash
+            ) VALUES ($1, $2, $3, $4, $5, $6, now_millis(), $7, $8, $9, $10)
             ON CONFLICT (uploader_id, claim_key_hash) WHERE claim_key_hash IS NOT NULL
             DO NOTHING
             "#,
         )
         .bind(file_id as i64)
         .bind(&source.original_filename)
-        .bind(source.file_size as i64)
         .bind(source.file_type.as_str())
         .bind(&source.mime_type)
-        .bind(&source.file_path)
-        .bind(source.storage_source_id as i32)
+        .bind(object_id)
         .bind(uploader_id as i64)
         .bind(source.width.map(|v| v as i32))
         .bind(source.height.map(|v| v as i32))
-        .bind(&source.file_hash)
         .bind(business_type)
-        .bind(source.encryption_version)
-        .bind(&source.cek)
         .bind(claim_key_hash)
-        // 🔴 必须继承**源记录**的 key id：秒传复制的是同一个物理对象，
-        // 密文头里写的就是源那把。丢掉这一列，新记录 version=2 却没有 key id，
-        // 下载时 get_url 给得出 URL 给不出密钥。
-        .bind(source.encryption_key_id.map(i16::from))
         .execute(&mut *tx)
         .await
         .map_err(|e| ServerError::Database(format!("创建秒传记录失败: {}", e)))?;
@@ -408,18 +419,22 @@ impl FileUploadRepository {
         Ok(file_id)
     }
 
-    /// 除了这一行，还有没有别人指着同一个物理文件。
+    /// 除了这一行，还有没有别人指着同一个物理对象。
     ///
-    /// 删除时用：还有人指着就只删数据库行，物理文件留着。
-    pub async fn other_rows_share_path(&self, file_id: u64, file_path: &str) -> Result<bool> {
+    /// 删除时用：还有人指着就只删引用行，物理对象留着。
+    ///
+    /// 🔴 现查现算，**不维护 `reference_count` 列**：那种计数在异常重试与事务回滚下
+    /// 会漂移，而漂移的方向恰好是"以为还有人用"（泄漏）或"以为没人用了"（删掉别人
+    /// 还在用的文件）。外键在，`count(*)` 就是准的。
+    pub async fn other_rows_share_object(&self, file_id: u64, object_id: u64) -> Result<bool> {
         let (count,): (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM privchat_file_uploads WHERE file_path = $1 AND file_id <> $2",
+            "SELECT count(*) FROM privchat_file_uploads WHERE object_id = $1 AND file_id <> $2",
         )
-        .bind(file_path)
+        .bind(object_id as i64)
         .bind(file_id as i64)
         .fetch_one(self.pool.as_ref())
         .await
-        .map_err(|e| ServerError::Database(format!("统计共享同一物理文件的记录失败: {}", e)))?;
+        .map_err(|e| ServerError::Database(format!("统计共享同一物理对象的记录失败: {}", e)))?;
         Ok(count > 0)
     }
 
@@ -432,35 +447,29 @@ impl FileUploadRepository {
         Ok(row.0 as u64)
     }
 
-    /// 插入一条上传记录（file_id 已由 next_file_id 取得并用于生成 file_path）
+    /// 插入一条**引用**记录。物理对象必须已经存在（`meta.object.object_id`）。
     pub async fn insert(&self, meta: &FileMetadata) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO privchat_file_uploads (
-                file_id, original_filename, file_size, file_type, mime_type,
-                file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at, width, height, file_hash,
-                business_type, business_id, encryption_version, cek, encryption_key_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                file_id, original_filename, file_type, mime_type,
+                object_id, uploader_id, uploader_ip, uploaded_at, width, height,
+                business_type, business_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#
         )
         .bind(meta.file_id as i64)
         .bind(&meta.original_filename)
-        .bind(meta.file_size as i64)
         .bind(meta.file_type.as_str())
         .bind(&meta.mime_type)
-        .bind(&meta.file_path)
-        .bind(meta.storage_source_id as i32)
+        .bind(meta.object.object_id as i64)
         .bind(meta.uploader_id as i64)
         .bind(&meta.uploader_ip)
         .bind(meta.uploaded_at as i64)
         .bind(meta.width.map(|w| w as i32))
         .bind(meta.height.map(|h| h as i32))
-        .bind(&meta.file_hash)
         .bind(&meta.business_type)
         .bind(&meta.business_id)
-        .bind(meta.encryption_version)
-        .bind(&meta.cek)
-        .bind(meta.encryption_key_id.map(i16::from))
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| ServerError::Database(format!("插入上传记录失败: {}", e)))?;
@@ -473,29 +482,39 @@ impl FileUploadRepository {
         struct Row {
             file_id: i64,
             original_filename: String,
-            file_size: i64,
             file_type: String,
             mime_type: String,
-            file_path: String,
-            storage_source_id: i32,
             uploader_id: i64,
             uploader_ip: Option<String>,
             uploaded_at: i64,
             width: Option<i32>,
             height: Option<i32>,
-            file_hash: Option<String>,
             business_type: Option<String>,
             business_id: Option<String>,
-            encryption_version: i32,
+            object_id: i64,
+            dedup_id: Option<String>,
+            sealed_sha256: Option<String>,
+            sealed_size: i64,
+            plaintext_size: Option<i64>,
+            file_path: String,
+            storage_source_id: i32,
+            format_version: Option<i16>,
             encryption_key_id: Option<i16>,
-            cek: Option<String>,
+            status: String,
         }
+        // 🔴 物理事实一律从对象表读。引用行上已经没有这些列了（migration 032），
+        // 所以这条 JOIN 不是优化，是唯一的读法。
         let row = sqlx::query_as::<_, Row>(
             r#"
-            SELECT file_id, original_filename, file_size, file_type, mime_type,
-                   file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at, width, height, file_hash,
-                   business_type, business_id, encryption_version, cek, encryption_key_id
-            FROM privchat_file_uploads WHERE file_id = $1
+            SELECT u.file_id, u.original_filename, u.file_type, u.mime_type,
+                   u.uploader_id, u.uploader_ip, u.uploaded_at, u.width, u.height,
+                   u.business_type, u.business_id,
+                   o.object_id, o.dedup_id, o.sealed_sha256, o.sealed_size, o.plaintext_size,
+                   o.file_path, o.storage_source_id, o.format_version, o.encryption_key_id,
+                   o.status
+            FROM privchat_file_uploads u
+            JOIN privchat_attachment_objects o ON o.object_id = u.object_id
+            WHERE u.file_id = $1
             "#
         )
         .bind(file_id as i64)
@@ -506,23 +525,27 @@ impl FileUploadRepository {
         Ok(row.map(|r| FileMetadata {
             file_id: r.file_id as u64,
             original_filename: r.original_filename,
-            file_size: r.file_size as u64,
             original_size: None,
             file_type: FileType::from_str(&r.file_type).unwrap_or(FileType::Other),
             mime_type: r.mime_type,
-            file_path: r.file_path,
-            storage_source_id: r.storage_source_id as u32,
             uploader_id: r.uploader_id as u64,
             uploader_ip: r.uploader_ip,
             uploaded_at: r.uploaded_at as u64,
             width: r.width.map(|w| w as u32),
             height: r.height.map(|h| h as u32),
-            file_hash: r.file_hash,
             business_type: r.business_type,
             business_id: r.business_id,
-            encryption_version: r.encryption_version,
-            cek: r.cek,
-            encryption_key_id: r.encryption_key_id.and_then(|v| u8::try_from(v).ok()),
+            object: AttachmentObject {
+                object_id: r.object_id as u64,
+                dedup_id: r.dedup_id,
+                sealed_sha256: r.sealed_sha256,
+                sealed_size: r.sealed_size as u64,
+                plaintext_size: r.plaintext_size.map(|v| v as u64),
+                file_path: r.file_path,
+                storage_source_id: r.storage_source_id as u32,
+                format_version: r.format_version.and_then(|v| u8::try_from(v).ok()),
+                encryption_key_id: r.encryption_key_id.and_then(|v| u8::try_from(v).ok()),
+            },
         }))
     }
 

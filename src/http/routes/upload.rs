@@ -371,15 +371,15 @@ async fn completed_response(
         file_id: meta.file_id,
         file_url: state
             .file_service
-            .build_access_url(&meta.file_path, meta.storage_source_id),
+            .build_access_url(&meta.file_path(), meta.storage_source_id()),
         thumbnail_url: None,
-        file_size: meta.file_size,
+        file_size: meta.sealed_size(),
         original_size: meta.original_size,
         width: meta.width,
         height: meta.height,
         mime_type: meta.mime_type,
         uploaded_at: meta.uploaded_at,
-        storage_source_id: meta.storage_source_id,
+        storage_source_id: meta.storage_source_id(),
     }))
 }
 
@@ -558,7 +558,7 @@ async fn upload_file(
     // 返回响应（含 storage_source_id，便于客户端写入消息 content，未来多存储源）
     Ok(ApiEnvelope::ok(UploadResponse {
         file_id: metadata.file_id,
-        file_url: file_service.build_access_url(&metadata.file_path, metadata.storage_source_id),
+        file_url: file_service.build_access_url(&metadata.file_path(), metadata.storage_source_id()),
         thumbnail_url: None,
         file_size: metadata.file_size,
         original_size: metadata.original_size,
@@ -566,7 +566,7 @@ async fn upload_file(
         height: metadata.height,
         mime_type: metadata.mime_type,
         uploaded_at: metadata.uploaded_at,
-        storage_source_id: metadata.storage_source_id,
+        storage_source_id: metadata.storage_source_id(),
     }))
 }
 
@@ -908,15 +908,15 @@ pub(super) fn upload_response_of(state: &FileServerState, meta: crate::service::
         file_id: meta.file_id,
         file_url: state
             .file_service
-            .build_access_url(&meta.file_path, meta.storage_source_id),
+            .build_access_url(&meta.file_path(), meta.storage_source_id()),
         thumbnail_url: None,
-        file_size: meta.file_size,
+        file_size: meta.sealed_size(),
         original_size: meta.original_size,
         width: meta.width,
         height: meta.height,
         mime_type: meta.mime_type,
         uploaded_at: meta.uploaded_at,
-        storage_source_id: meta.storage_source_id,
+        storage_source_id: meta.storage_source_id(),
     }
 }
 
@@ -925,7 +925,7 @@ pub(crate) fn manifest_matches(session: &ChunkedSession, meta: &crate::service::
     let m = session.manifest();
     meta.uploader_id == m.uploader_id
         && meta.file_type.as_str() == m.file_type
-        && meta.file_size == m.total_size
+        && meta.sealed_size() == m.total_size
         && meta
             .file_hash
             .as_deref()

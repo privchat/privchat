@@ -499,23 +499,98 @@ COMMENT ON COLUMN public.privchat_devices.last_ip IS '最后活跃IP地址';
 -- Name: privchat_file_uploads; Type: TABLE; Schema: public; Owner: -
 --
 
+--
+-- 物理附件对象：桶里/磁盘上那串字节，以及解开它所需的一切。
+--
+-- 🔴 这是物理事实的**唯一真源**。用户的上传记录只按 object_id 引用它，自己说不出
+-- 路径、大小、摘要和加密方式——两边各存一份的话它们可以独立漂移，代码约定拦不住。
+--
+-- 跨用户秒传要求「一个物理对象被多条用户记录引用」。分表之后：
+--   · 「同一份内容只有一个物理对象」由 plaintext_sha256 的 UNIQUE 保证；
+--   · 「引用不会指向已删除的对象」由外键保证；
+--   · 「还有没有人在用」由 count(*) 回答，不必维护会漂移的手工计数；
+--   · 秒传取用只复制 object_id，不逐列复制元数据（漏一列就造出「指向同一份字节却
+--     描述不一致」的记录）。
+--
+-- 🔴 表里**只有已通过 complete 校验的对象**，没有状态字段。"还没验过"只存在于上传
+-- 会话里，随会话消失。少一个状态就少一条"忘了过滤 pending"的读取路径，而那条路径的
+-- 后果是把没核对过的内容当成秒传结果交给下一个用户。
+--
+CREATE TABLE public.privchat_attachment_objects (
+    object_id bigserial PRIMARY KEY,
+
+    -- 🔴 跨用户秒传的判重键，就是**明文**的 SHA-256。
+    --
+    -- 不是密文摘要：每块都有独立的随机 nonce，同一份明文由不同人封装会产出不同密文
+    -- ——按密文判重等于秒传只对「自己重发自己」生效，而秒传的收益（省用户上行带宽
+    -- 和等待时间）几乎全在「别人已经传过这份文件」的场景。
+    --
+    -- 客户端申请 token 时声明它，服务端在 complete 时**解密重算**核对，否则任何登录
+    -- 用户都能用「文件 A 的摘要 + 文件 B 的密文」污染秒传映射。
+    plaintext_sha256 text NOT NULL UNIQUE,
+    plaintext_size bigint NOT NULL,
+
+    -- 服务端对**实际落盘字节**算出的 SHA-256。客户端声明的同名值只作预检。
+    sealed_sha256 text NOT NULL,
+    sealed_size bigint NOT NULL,
+
+    file_path text NOT NULL,
+    storage_source_id integer NOT NULL,
+
+    -- 与 privchat-protocol 的 attachment_crypto::FORMAT_VERSION 同源。
+    format_version smallint NOT NULL,
+    -- 用的是哪一把全站密钥。记在对象上，将来换密钥不影响存量：get_url 按它取出
+    -- **这一把**返回，既不必重新加密，也不必把全部密钥一起下发。
+    encryption_key_id smallint NOT NULL,
+
+    published_at bigint DEFAULT public.now_millis() NOT NULL,
+
+    CONSTRAINT privchat_attachment_objects_digests_are_sha256
+        CHECK (plaintext_sha256 ~ '^[0-9a-f]{64}$' AND sealed_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT privchat_attachment_objects_sizes_are_sane
+        CHECK (plaintext_size >= 0 AND sealed_size >= 0 AND storage_source_id >= 0),
+    CONSTRAINT privchat_attachment_objects_key_id_in_range
+        CHECK (encryption_key_id BETWEEN 0 AND 255)
+);
+
+-- 同一条物理路径只能有一个对象行。没有它，一次失败重试就可能建出第二行指向同一份
+-- 字节，而删除任一行都会把另一行的对象删掉。
+CREATE UNIQUE INDEX idx_privchat_attachment_objects_path
+    ON public.privchat_attachment_objects (storage_source_id, file_path);
+
+--
+-- 用户的一条上传记录：谁、什么时候、以什么名字引用了哪个物理对象。
+--
 CREATE TABLE public.privchat_file_uploads (
     file_id bigint NOT NULL,
     original_filename character varying(512) NOT NULL,
-    file_size bigint NOT NULL,
     file_type character varying(32) NOT NULL,
     mime_type character varying(128) NOT NULL,
-    file_path text NOT NULL,
-    storage_source_id integer DEFAULT 0 NOT NULL,
+    -- 🔴 不能级联删除：CASCADE 会让「清理一个物理对象」顺手删掉所有引用它的用户
+    -- 记录，那正好反了——有引用的时候本来就不该删对象。
+    object_id bigint NOT NULL
+        REFERENCES public.privchat_attachment_objects (object_id) ON DELETE RESTRICT,
     uploader_id bigint NOT NULL,
     uploader_ip character varying(45),
     uploaded_at bigint DEFAULT public.now_millis() NOT NULL,
     width integer,
     height integer,
-    file_hash character varying(128),
     business_type character varying(64),
-    business_id character varying(128)
+    business_id character varying(128),
+    -- 秒传取用的幂等键：数据库提交了但响应丢了，客户端拿同一个 token 重试要拿回
+    -- 同一个 file_id。与那一行同事务写入，不放 Redis（跨存储的两步不是原子的）。
+    claim_key_hash character varying(64)
 );
+
+-- 引用是否归零由这条索引上的 count(*) 回答，**不维护手工计数**：那种计数在异常重试
+-- 与事务回滚下会漂移，而漂移方向恰好是"以为还有人用"（泄漏）或"以为没人用了"
+-- （删掉别人还在用的文件）。
+CREATE INDEX idx_privchat_file_uploads_object_id
+    ON public.privchat_file_uploads (object_id);
+
+CREATE UNIQUE INDEX uq_privchat_file_uploads_claim_key
+    ON public.privchat_file_uploads (uploader_id, claim_key_hash)
+    WHERE claim_key_hash IS NOT NULL;
 
 
 --

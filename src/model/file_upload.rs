@@ -104,20 +104,45 @@ impl FileType {
     }
 }
 
-/// 文件上传记录元数据
+/// 一个**物理附件对象**：桶里/磁盘上那串字节，以及解开它所需的一切。
+///
+/// 🔴 这是物理事实的唯一真源（表 `privchat_attachment_objects`）。用户的上传记录
+/// 只按 `object_id` 引用它，自己说不出路径、大小、摘要和加密方式——两边各存一份的话
+/// 它们可以独立漂移，而代码约定拦不住。
+///
+/// 🔴 **表里只有已通过 complete 校验的对象，所以这里没有状态字段。** "还没验过"
+/// 只存在于上传会话里，随会话消失。少一个状态就少一条"忘了过滤 pending"的路径，
+/// 而那条路径的后果是把没核对过的内容当成秒传结果交给下一个用户。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentObject {
+    pub object_id: u64,
+    /// 跨用户秒传判重键：**明文**的 SHA-256。
+    ///
+    /// 不是密文摘要——每个对象有自己的随机 nonce 前缀，同一份明文由不同人封装会产出
+    /// 不同密文，按密文判重等于秒传只对"自己重发自己"生效。
+    pub plaintext_sha256: String,
+    pub plaintext_size: u64,
+    /// 服务端对**实际落盘字节**算出的 SHA-256。客户端声明的同名值只作预检。
+    pub sealed_sha256: String,
+    pub sealed_size: u64,
+    pub file_path: String,
+    pub storage_source_id: u32,
+    /// 密文格式版本，与 `privchat_protocol::attachment_crypto::FORMAT_VERSION` 同源。
+    pub format_version: u8,
+    /// 用的是哪一把全站密钥。记在对象上，将来换密钥不影响存量：`get_url` 按它取出
+    /// **这一把**返回，既不必重新加密，也不必把全部密钥一起下发。
+    pub encryption_key_id: u8,
+}
+
+/// 用户的一条上传记录：谁、什么时候、以什么名字引用了哪个物理对象。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     /// 文件ID（数据库 BIGSERIAL 自增，u64）
     pub file_id: u64,
     pub original_filename: String,
-    pub file_size: u64,
     pub original_size: Option<u64>,
     pub file_type: FileType,
     pub mime_type: String,
-    /// 存储路径（如 public/chat/message/202601/{file_hash}），与 storage_source_id 配合定位文件
-    pub file_path: String,
-    /// 存储源：0=本地，1=S3，2=阿里云 OSS，3=腾讯云 COS 等
-    pub storage_source_id: u32,
     pub uploader_id: u64,
     /// 上传时客户端 IP（便于审计与安全，可选）
     pub uploader_ip: Option<String>,
@@ -125,22 +150,32 @@ pub struct FileMetadata {
     pub uploaded_at: u64,
     pub width: Option<u32>,
     pub height: Option<u32>,
-    pub file_hash: Option<String>,
     /// 业务类型（如 message/avatar/group_avatar），便于按业务清理
     pub business_type: Option<String>,
     /// 业务具体ID（字符串，兼容各类业务如 message_id/uuid 等），便于随业务数据删除时清理
     pub business_id: Option<String>,
-    /// 附件加密版本：0=明文 legacy；1=AES-256-GCM（客户端加密，见 ATTACHMENT_ENCRYPTION_SPEC）
-    pub encryption_version: i32,
-    /// 内容密钥 CEK：base64url(no-pad) 的 32 字节；nonce 在密文 blob 头部，不入库。
-    /// 仅在鉴权后的 get_url 响应返回，绝不进日志/URL。version=0 时为 None。
-    pub cek: Option<String>,
-    /// v2：本文件用的是哪一把全站密钥（对应 config `[[attachment.keys]].id`
-    /// 与密文 blob 头部的 key_id）。`None` = 非 v2。
+    /// 这条记录指向的物理对象。读取路径统一从这里取路径、大小、摘要与加密元数据。
+    pub object: AttachmentObject,
+}
+
+impl FileMetadata {
+    pub fn file_path(&self) -> &str {
+        &self.object.file_path
+    }
+    pub fn storage_source_id(&self) -> u32 {
+        self.object.storage_source_id
+    }
+    /// 存储字节数（密文大小）。展示给用户的应该是明文大小，见 `display_size`。
+    pub fn sealed_size(&self) -> u64 {
+        self.object.sealed_size
+    }
+    /// 用户看到的大小。
     ///
-    /// 记在行上，密钥轮换才不影响存量对象：`get_url` 按它取出**这一把**返回，
-    /// 既不必重新加密，也不必把全部历史密钥一起下发。
-    pub encryption_key_id: Option<u8>,
+    /// 🔴 与密文大小差着每块的 tag 和文件头。拿密文大小去显示，用户会看到一个和
+    /// 原始文件对不上的数字；拿它去做「下载完了没」的判断更糟。
+    pub fn display_size(&self) -> u64 {
+        self.object.plaintext_size
+    }
 }
 
 #[cfg(test)]

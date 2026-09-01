@@ -115,40 +115,26 @@ pub async fn claim_existing_file(
         ));
     }
 
-    // 判重只看摘要：字节相同就是同一份东西。
+    // 🔴 **持有明文摘要即视为持有该内容**——这是有意的取舍，不是遗漏。
     //
-    // 🔴 同一串字节可能已经有好几条记录（alice 发在群 A、bob 发在群 B……）。
-    // 物理文件一份，记录多条，而**授权是按记录算的**：调用者有权读的未必是最老
-    // 那条。所以逐条试，取第一条他现在读得到的，不能先钉死一条再判。
-    let candidates = file_service.find_all_by_content(&normalized).await?;
-    let mut source = None;
-    for candidate in candidates {
-        let decision = crate::service::attachment_authorization::resolve_attachment_access(
-            message_repository,
-            channel_service,
-            &candidate,
-            user_id,
-        )
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                "秒传授权判定不可用 source_file_id={} user_id={}: {}",
-                candidate.file_id,
-                user_id,
-                error
-            );
-            ServerError::Internal("ATTACHMENT_AUTHORIZATION_UNAVAILABLE".to_string())
+    // 原来的实现要求申请者对**已有的某条记录**有访问权（逐条试授权，取第一条他读得到
+    // 的）。那条规则让跨用户秒传根本不成立：两个互不相识的人发同一份文件，第二个人对
+    // 第一个人的记录当然没有访问权，于是 claim 必然失败、退回整传。省不下带宽，也做
+    // 不到「同一份文件只存一份」，与 spec 承诺的「第二个人零字节上传」直接矛盾。
+    //
+    // 代价说清楚：**知道明文 SHA-256 的人可以拿到该对象的一个引用**。这不是新开的
+    // 口子——跨用户秒传本身就允许任何登录用户探测「某份内容在不在系统里」，
+    // 而摘要要么来自他自己持有的文件（那他本来就有内容），要么靠猜（SHA-256 猜不出来）。
+    // 换来的是秒传真的生效。见 ATTACHMENT_ENCRYPTION_SPEC §6。
+    let source = file_service
+        .find_by_plaintext_sha256(&normalized)
+        .await?
+        // 🔴 与「服务端没有这份内容」是同一句话，不区分「没有」和「有但……」：
+        // 分开说的话，这个接口就成了文件存在性探测器。
+        .ok_or_else(|| {
+            ServerError::NotFound("服务端没有这份内容，请正常上传".to_string())
         })?;
-        if decision.authorized {
-            source = Some(candidate);
-            break;
-        }
-    }
-    // 🔴 与「服务端没有这份内容」返回同一句话。分开说的话，这个接口就成了
-    // 文件存在性探测器：拿一堆摘要来问，能区分「没有」和「有但你无权」。
-    let source = source.ok_or_else(|| {
-        ServerError::NotFound("服务端没有这份内容，请正常上传".to_string())
-    })?;
+
 
     let file_id = file_service
         .copy_for_user(&source, user_id, &token.business_type, Some(&key))

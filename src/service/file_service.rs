@@ -39,7 +39,9 @@ use crate::error::{Result, ServerError};
 use crate::repository::FileUploadRepository;
 
 // 向后兼容：从 service 层继续导出类型（upload_token_service 等使用）
-pub use crate::model::file_upload::{FileMetadata, FileType};
+pub use crate::model::file_upload::{
+    AttachmentObject, FileMetadata, FileType,
+};
 
 /// 存储源 ID：0=本地，1=S3 等
 pub const STORAGE_SOURCE_LOCAL: u32 = 0;
@@ -527,9 +529,13 @@ pub(crate) struct RecordFields {
     pub uploader_ip: Option<String>,
     pub business_type: String,
     pub business_id: Option<String>,
-    pub encryption_version: i32,
-    pub cek: Option<String>,
-    /// v2：本文件用的是哪一把全站密钥。`None` = 非 v2。
+    /// 跨用户秒传判重键，由服务端 HMAC 明文摘要得到；`None` = 不参与秒传。
+    pub dedup_id: Option<String>,
+    /// 明文字节数（加密对象必填，明文对象为 `None`）。
+    pub plaintext_size: Option<u64>,
+    /// 密文格式版本；`None` = 明文对象。
+    pub format_version: Option<u8>,
+    /// 本文件用的是哪一把全站密钥。`None` = 明文对象。
     pub encryption_key_id: Option<u8>,
 }
 
@@ -1093,12 +1099,14 @@ impl FileService {
         let placement = converge_upload(
             &mut tx,
             &UploadPlacement {
-                stored_sha256: stored_sha256.clone(),
-                encryption_version: fields.encryption_version,
+                dedup_id: fields.dedup_id.clone(),
+                sealed_sha256: stored_sha256.clone(),
+                sealed_size: m.total_size,
+                plaintext_size: fields.plaintext_size,
                 my_path: final_key.clone(),
                 my_source_id: source_id as i32,
-                my_cek: fields.cek.clone(),
-                my_encryption_key_id: fields.encryption_key_id,
+                format_version: fields.format_version,
+                encryption_key_id: fields.encryption_key_id,
             },
         )
         .await?;
@@ -1110,24 +1118,28 @@ impl FileService {
         let metadata = FileMetadata {
             file_id: m.reserved_file_id,
             original_filename: fields.filename.clone(),
-            file_size: m.total_size,
             original_size: None,
             file_type: file_type.clone(),
             mime_type: fields.mime_type.clone(),
-            file_path: placement.file_path.clone(),
-            storage_source_id: placement.storage_source_id as u32,
             uploader_id: fields.uploader_id,
             uploader_ip: fields.uploader_ip.clone(),
             uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
             width: None,
             height: None,
-            file_hash: Some(stored_sha256),
             business_type: Some(fields.business_type.clone()),
             business_id: fields.business_id.clone(),
-            encryption_version: placement.encryption_version,
-            cek: placement.cek.clone(),
-            // 命中去重时跟已有对象走，否则用本次声明的。
-            encryption_key_id: placement.encryption_key_id,
+            object: AttachmentObject {
+                object_id: placement.object_id,
+                dedup_id: fields.dedup_id.clone(),
+                sealed_sha256: Some(stored_sha256),
+                sealed_size: m.total_size,
+                plaintext_size: fields.plaintext_size,
+                file_path: placement.file_path.clone(),
+                storage_source_id: placement.storage_source_id as u32,
+                // 命中去重时跟已有对象走，否则用本次声明的。
+                format_version: placement.format_version,
+                encryption_key_id: placement.encryption_key_id,
+            },
         };
         // 幂等同 publish_and_record：预留 id 主键冲突 → 回读既有行核身份。
         let inserted = self.insert_within(&mut tx, &metadata).await?;
@@ -1141,9 +1153,9 @@ impl FileService {
                 .ok_or_else(|| {
                     ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
                 })?;
+            // 身份核对看**对象**：摘要和大小已经不在引用行上了。
             let same_identity = existing.uploader_id == metadata.uploader_id
-                && existing.file_hash == metadata.file_hash
-                && existing.file_size == metadata.file_size
+                && existing.object.object_id == metadata.object.object_id
                 && existing.file_type.as_str() == metadata.file_type.as_str();
             if !same_identity {
                 return Err(ServerError::Internal(format!(
@@ -1282,26 +1294,30 @@ impl FileService {
         crash_point("after_publish_before_commit");
 
         let metadata = FileMetadata {
-            file_id: file_id,
+            file_id,
             original_filename: filename,
-            file_size: written,
             original_size: None,
             file_type: file_type.clone(),
             mime_type,
-            file_path: file_path.clone(),
-            storage_source_id: source_id as u32,
             uploader_id,
             uploader_ip,
             uploaded_at: chrono::Utc::now().timestamp_millis() as u64,
             width: None,
             height: None,
-            file_hash: Some(stored_sha256.clone()),
             business_type: Some(business_type),
             business_id,
-            encryption_version: enc_version,
-            cek: stored_cek,
-            // 命中去重时跟已有对象走，否则用本次声明的。
-            encryption_key_id: placement.encryption_key_id,
+            object: AttachmentObject {
+                object_id: placement.object_id,
+                dedup_id: dedup_id.clone(),
+                sealed_sha256: Some(stored_sha256.clone()),
+                sealed_size: written,
+                plaintext_size,
+                file_path: file_path.clone(),
+                storage_source_id: source_id as u32,
+                // 命中去重时跟已有对象走，否则用本次声明的。
+                format_version: placement.format_version,
+                encryption_key_id: placement.encryption_key_id,
+            },
         };
         // 🔴 幂等完全靠**已有的主键**。`file_id` 在收 body 之前就分配好并记进会话
         // （`state.json` 的 `reserved_file_id`），重试复用同一个 id；于是「上一次其实
@@ -1322,9 +1338,9 @@ impl FileService {
                 .ok_or_else(|| {
                     ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
                 })?;
+            // 身份核对看**对象**：摘要和大小已经不在引用行上了。
             let same_identity = existing.uploader_id == metadata.uploader_id
-                && existing.file_hash == metadata.file_hash
-                && existing.file_size == metadata.file_size
+                && existing.object.object_id == metadata.object.object_id
                 && existing.file_type.as_str() == metadata.file_type.as_str();
             if !same_identity {
                 return Err(ServerError::Internal(format!(
@@ -1374,8 +1390,8 @@ impl FileService {
         .bind(meta.file_size as i64)
         .bind(meta.file_type.as_str())
         .bind(&meta.mime_type)
-        .bind(&meta.file_path)
-        .bind(meta.storage_source_id as i32)
+        .bind(&meta.file_path())
+        .bind(meta.storage_source_id() as i32)
         .bind(meta.uploader_id as i64)
         .bind(&meta.uploader_ip)
         .bind(meta.uploaded_at as i64)
@@ -1525,7 +1541,7 @@ impl FileService {
         //
         // 用按 file_path 的 advisory 锁把同一个物理文件上的删除与秒传取用串起来。
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(&meta.file_path)
+            .bind(&meta.file_path())
             .execute(&mut *tx)
             .await
             .map_err(|e| ServerError::Database(format!("获取物理文件锁失败: {e}")))?;
@@ -1534,7 +1550,7 @@ impl FileService {
             "SELECT count(*) FROM privchat_file_uploads \
              WHERE file_path = $1 AND file_id <> $2",
         )
-        .bind(&meta.file_path)
+        .bind(&meta.file_path())
         .bind(file_id as i64)
         .fetch_one(&mut *tx)
         .await
@@ -1560,9 +1576,9 @@ impl FileService {
 
         // 最后一行没了才删物理文件。删失败只记日志：数据库已经提交，
         // 再回滚出一行"指向不存在文件"的记录更糟；留下的孤儿对象由 GC 收。
-        let op = self.operator_for_source(meta.storage_source_id).await?;
-        if let Err(e) = op.delete(&meta.file_path).await {
-            tracing::warn!("删除物理文件失败（留待 GC）path={}: {}", meta.file_path, e);
+        let op = self.operator_for_source(meta.storage_source_id()).await?;
+        if let Err(e) = op.delete(&meta.file_path()).await {
+            tracing::warn!("删除物理文件失败（留待 GC）path={}: {}", meta.file_path(), e);
         }
         Ok(())
     }
@@ -1697,7 +1713,7 @@ impl FileService {
         // 泄的是密文不是明文，可元数据（大小、类型、上传时序）是明的，
         // 密文语料也能留着等将来密钥或算法出问题时再解。
         let (file_url, expires_at) = self
-            .presigned_read_url(&metadata.file_path, metadata.storage_source_id)
+            .presigned_read_url(&metadata.file_path(), metadata.storage_source_id())
             .await;
 
         Ok(FileUrlResponse {
@@ -1706,7 +1722,7 @@ impl FileService {
             expires_at,
             file_size: metadata.file_size,
             mime_type: metadata.mime_type,
-            storage_source_id: metadata.storage_source_id,
+            storage_source_id: metadata.storage_source_id(),
             encryption_version: metadata.encryption_version,
             cek: metadata.cek,
         })
@@ -1722,14 +1738,14 @@ impl FileService {
             .operators
             .read()
             .await
-            .get(&metadata.storage_source_id)
+            .get(&metadata.storage_source_id())
             .cloned()
             .ok_or_else(|| {
-                ServerError::Internal(format!("未找到存储源 id={}", metadata.storage_source_id))
+                ServerError::Internal(format!("未找到存储源 id={}", metadata.storage_source_id()))
             })?;
 
         let buf = op
-            .read(&metadata.file_path)
+            .read(&metadata.file_path())
             .await
             .map_err(|e| ServerError::Internal(format!("存储读取失败: {}", e)))?;
         Ok(buf.to_vec())
@@ -1982,121 +1998,146 @@ mod authz_tests {
     }
 }
 
-/// 一次上传要落到哪个物理文件上的输入。
+/// 一次上传要落到哪个物理对象上的输入。
 #[derive(Debug, Clone)]
 pub struct UploadPlacement {
-    /// 服务端对**实际收到并落盘的字节**算出的 SHA-256。
-    pub stored_sha256: String,
-    pub encryption_version: i32,
+    /// 跨用户秒传判重键：`HMAC(dedup_master_key, tag || plaintext_sha256)`。
+    ///
+    /// `None` = 不参与秒传（明文对象，或部署没配 dedup 密钥）。
+    pub dedup_id: Option<String>,
+    /// 服务端对**实际落盘字节**算出的 SHA-256。
+    pub sealed_sha256: String,
+    pub sealed_size: u64,
+    /// 明文字节数。明文对象为 `None`。
+    pub plaintext_size: Option<u64>,
     pub my_path: String,
     pub my_source_id: i32,
-    pub my_cek: Option<String>,
-    /// 本次上传声明用的 key id（v2）；命中已有对象时会被对方的值覆盖。
-    pub my_encryption_key_id: Option<u8>,
+    /// 密文格式版本；`None` = 明文对象。
+    pub format_version: Option<u8>,
+    /// 本次上传用的 key id；命中已有对象时会被对方的值覆盖。
+    pub encryption_key_id: Option<u8>,
 }
 
-/// 收敛结果：这条记录最终指向哪个物理文件。
+/// 收敛结果：这条记录最终指向哪个物理对象。
 #[derive(Debug, Clone)]
 pub struct ResolvedPlacement {
+    pub object_id: u64,
     pub file_path: String,
     pub storage_source_id: i32,
-    pub encryption_version: i32,
-    pub cek: Option<String>,
-    /// 🔴 命中已有对象时必须跟着**那份对象**走：密文头里写的是它的 key id，
-    /// 记成本次声明的那把，下载就会拿错密钥去解，而错误离现场已经很远。
+    /// 🔴 命中已有对象时必须跟着**那份对象**走：密文头里写的是它的格式与 key id，
+    /// 记成本次声明的那套，下载就会拿错密钥去解，而错误离现场已经很远。
+    pub format_version: Option<u8>,
     pub encryption_key_id: Option<u8>,
     /// true = 命中了别人先落的那份，自己刚写的对象可以删。
     pub duplicate: bool,
 }
 
-/// 并发首传收敛：同一串字节只保留一份物理文件。
+/// 并发首传收敛：同一份内容只保留一个物理对象。
 ///
-/// 两个人同时上传同样的字节，两边预检都没命中，于是各写了一份对象。这里在
-/// **内容锁**里再查一次：已经有人先落了就指向他那份，自己那份可以删。
-/// 少了这一步，「物理文件只存一份」恰好在并发时不成立——而并发正是它最该成立的时候。
+/// 两个人同时上传同样的内容，两边预检都没命中，于是各写了一份对象。这里在
+/// **判重锁**里再查一次：已经有人先落了就指向他那份，自己那份可以删。
 ///
-/// 🔴 去重的单位是**最终上传的字节**，服务端不理解加密：明文与密文不会互相命中，
-/// 同一明文用不同随机 CEK/nonce 加密两次也是两个物理文件——这是预期行为。
-/// 客户端要拿到秒传，就得保留并重传当初参与哈希的那个 blob。
+/// 🔴 **调用点必须在首传校验之后**。这里插进去的对象直接是 `published`，
+/// 会立刻被后来者的秒传命中——还没验过就发布，等于把一份未经核对的内容塞进索引。
 ///
-/// 生产与测试**调用的是同一个函数**。此前测试把这段 SQL 抄了一份，
-/// 那样只能证明抄件自洽：改了生产的判据，先红的是测试，而测试证明不了产品。
+/// 🔴 判重键是 `dedup_id`（明文摘要的 HMAC），不是密文摘要。每个对象有自己的随机
+/// salt，同一份明文由不同人封装会产出不同密文——按密文判重等于秒传只对「自己重发
+/// 自己」生效，而秒传的收益几乎全在「别人已经传过」的场景。
 pub async fn converge_upload(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     input: &UploadPlacement,
 ) -> Result<ResolvedPlacement> {
-    // 同一串字节的所有首传串行到这一把锁上。粒度是内容，不是全表。
-
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-        .bind(&input.stored_sha256)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| ServerError::Database(format!("获取内容锁失败: {e}")))?;
-
-    // 判重只看 hash：摘要相同即字节相同，大小自然相同，也不存在
-    // 「明文和密文互相复用」——字节都一样了，就是同一份东西。
-    let existing: Option<(String, i32, i32, Option<String>, Option<i16>)> = sqlx::query_as(
-        "SELECT file_path, storage_source_id, encryption_version, cek, encryption_key_id \
-         FROM privchat_file_uploads \
-         WHERE file_hash = $1 ORDER BY file_id LIMIT 1",
-    )
-    .bind(&input.stored_sha256)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {e}")))?;
-
-    if let Some((path, src, enc, existing_cek, existing_key_id)) = existing {
-        // 🔴 选中了别人那份物理文件之后，还要取**同一把 `file_path` 锁**再确认它没被删。
-        //
-        // 只有内容锁挡不住这条：上传选中旧路径 → 删除把最后一行连同物理对象删掉 →
-        // 上传插入一条指向已删除对象的记录。增加引用与减少引用必须共用一把锁。
-        //
-        // 锁序固定为「内容锁 → 路径锁」，而删除/取用只拿路径锁，因此不会成环。
+    // 同一份内容的所有首传串行到这一把锁上。粒度是内容，不是全表。
+    //
+    // 没有 dedup_id 就没有跨用户判重可言（明文对象），跳过整段收敛直接建对象。
+    if let Some(dedup_id) = input.dedup_id.as_deref() {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(&path)
+            .bind(dedup_id)
             .execute(&mut **tx)
             .await
-            .map_err(|e| ServerError::Database(format!("获取物理文件锁失败: {e}")))?;
+            .map_err(|e| ServerError::Database(format!("获取内容锁失败: {e}")))?;
 
-        let still_there: Option<(i64,)> = sqlx::query_as(
-            "SELECT file_id FROM privchat_file_uploads WHERE file_path = $1 LIMIT 1",
+        // 🔴 只认 published。pending 的还没通过首传校验，命中它就等于把一份
+        // 未经核对的内容交给下一个用户。
+        let existing: Option<(i64, String, i32, Option<i16>, Option<i16>)> = sqlx::query_as(
+            "SELECT object_id, file_path, storage_source_id, format_version, encryption_key_id \
+             FROM privchat_attachment_objects \
+             WHERE dedup_id = $1 AND status = 'published' LIMIT 1",
         )
-        .bind(&path)
+        .bind(dedup_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|e| ServerError::Database(format!("复查物理文件失败: {e}")))?;
+        .map_err(|e| ServerError::Database(format!("查询同内容对象失败: {e}")))?;
 
-        if still_there.is_some() {
+        if let Some((object_id, path, src, fmt, key_id)) = existing {
             return Ok(ResolvedPlacement {
-                duplicate: path != input.my_path,
+                object_id: object_id as u64,
                 file_path: path,
                 storage_source_id: src,
-                encryption_version: enc,
-                cek: existing_cek,
-                encryption_key_id: existing_key_id.and_then(|v| u8::try_from(v).ok()),
+                format_version: fmt.and_then(|v| u8::try_from(v).ok()),
+                encryption_key_id: key_id.and_then(|v| u8::try_from(v).ok()),
+                duplicate: true,
             });
         }
-        // 等锁期间它被删了：退回用自己刚上传的那份，物理文件不丢。
     }
 
+    // 未命中：把自己这份登记成正式对象。
+    //
+    // 路径唯一索引兜住另一种并发：两个请求算出同一条路径（内容寻址下这就是
+    // 同一份字节）。冲突时回读既有行，而不是报错——两边指向的本来就是同一个对象。
+    let inserted: Option<(i64,)> = sqlx::query_as(
+        "INSERT INTO privchat_attachment_objects \
+            (dedup_id, sealed_sha256, sealed_size, plaintext_size, file_path, \
+             storage_source_id, format_version, encryption_key_id, status, published_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'published', now_millis()) \
+         ON CONFLICT (storage_source_id, file_path) DO NOTHING \
+         RETURNING object_id",
+    )
+    .bind(input.dedup_id.as_deref())
+    .bind(&input.sealed_sha256)
+    .bind(input.sealed_size as i64)
+    .bind(input.plaintext_size.map(|v| v as i64))
+    .bind(&input.my_path)
+    .bind(input.my_source_id)
+    .bind(input.format_version.map(i16::from))
+    .bind(input.encryption_key_id.map(i16::from))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| ServerError::Database(format!("登记物理对象失败: {e}")))?;
+
+    if let Some((object_id,)) = inserted {
+        return Ok(ResolvedPlacement {
+            object_id: object_id as u64,
+            file_path: input.my_path.clone(),
+            storage_source_id: input.my_source_id,
+            format_version: input.format_version,
+            encryption_key_id: input.encryption_key_id,
+            duplicate: false,
+        });
+    }
+
+    let (object_id, fmt, key_id): (i64, Option<i16>, Option<i16>) = sqlx::query_as(
+        "SELECT object_id, format_version, encryption_key_id \
+         FROM privchat_attachment_objects \
+         WHERE storage_source_id = $1 AND file_path = $2",
+    )
+    .bind(input.my_source_id)
+    .bind(&input.my_path)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| ServerError::Database(format!("回读同路径对象失败: {e}")))?;
+
     Ok(ResolvedPlacement {
+        object_id: object_id as u64,
         file_path: input.my_path.clone(),
         storage_source_id: input.my_source_id,
-        encryption_version: input.encryption_version,
-        cek: input.my_cek.clone(),
-        encryption_key_id: input.my_encryption_key_id,
-        duplicate: false,
+        format_version: fmt.and_then(|v| u8::try_from(v).ok()),
+        encryption_key_id: key_id.and_then(|v| u8::try_from(v).ok()),
+        // 路径相同即字节相同（内容寻址），所以自己刚写那份是多余的。
+        duplicate: true,
     })
 }
 
-/// 这次上传要不要核对声明的字节数，要的话核对哪个值。
-///
-/// 🔴 只有**同时**带了摘要和大小才核对。老客户端报的是**明文**大小，之后才加密，
-/// 密文固定多 28 字节（12 nonce + 16 tag）——无条件比对会让新服务端一上线就把
-/// 所有老客户端的正常上传全部拒掉。那不是「秒传暂时不可用」，是附件直接发不出去。
-///
-/// 抽成函数是为了让测试调**这一个**，而不是在测试里抄一份同样的条件：
-/// 抄件只能证明抄件自洽，生产改回无条件核对时它照样绿。
 pub fn size_check_target(declared_digest: Option<&str>, declared_size: Option<i64>) -> Option<i64> {
     match (declared_digest, declared_size) {
         (Some(_), Some(size)) => Some(size),

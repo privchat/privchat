@@ -1008,7 +1008,7 @@ async fn s3_expired_session_ready(
     match file_service.get_file_metadata(manifest.reserved_file_id).await {
         Ok(Some(meta))
             if meta.uploader_id == manifest.uploader_id
-                && meta.file_size == manifest.total_size
+                && meta.sealed_size() == manifest.total_size
                 && meta
                     .file_hash
                     .as_deref()

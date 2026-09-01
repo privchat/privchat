@@ -67,7 +67,7 @@ pub async fn claim_existing(
     tracing::info!(
         "⚡ 秒传取用: user={} 复用 path={} → file_id={}",
         user_id,
-        meta.file_path,
+        meta.file_path(),
         meta.file_id
     );
 
@@ -86,7 +86,7 @@ fn upload_result(
         "file_id": meta.file_id,
         "file_url": services
             .file_service
-            .build_access_url(&meta.file_path, meta.storage_source_id),
+            .build_access_url(&meta.file_path(), meta.storage_source_id()),
         "thumbnail_url": serde_json::Value::Null,
         "file_size": meta.file_size,
         "original_size": meta.original_size,
@@ -94,7 +94,7 @@ fn upload_result(
         "height": meta.height,
         "mime_type": meta.mime_type,
         "uploaded_at": chrono::Utc::now().timestamp_millis(),
-        "storage_source_id": meta.storage_source_id,
+        "storage_source_id": meta.storage_source_id(),
     }))
 }
 
