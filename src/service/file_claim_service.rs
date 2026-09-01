@@ -43,13 +43,13 @@ pub fn claim_key_hash(token: &str) -> String {
 ///
 /// 重复调用返回同一条：数据库提交了但响应丢了，客户端拿同一个 token 重试，
 /// 拿到的是同一个 `file_id`，而不是又多一行。
-#[allow(clippy::too_many_arguments)]
+///
+/// 🔴 **不接收 message_repository / channel_service**。摘要即持有证明之后它们不再参与
+/// 判断，留着签名里就是给"哪天把记录授权接回来"留了条路——而那条路会让跨用户秒传
+/// 再次失效，并且不会有任何测试发现。
 pub async fn claim_existing_file(
     file_service: &Arc<FileService>,
     token_service: &Arc<UploadTokenService>,
-    // 判定「这个人现在还能不能读这份文件」用的是 get_url 那一套，不另立判据。
-    message_repository: &crate::repository::message_repo::PgMessageRepository,
-    channel_service: &crate::service::channel_service::ChannelService,
     user_id: u64,
     token_str: &str,
     request_sha256: &str,

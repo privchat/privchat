@@ -127,274 +127,100 @@ impl FileUploadRepository {
         ServerError::Database(format!("{context}: {e}"))
     }
 
-    pub async fn copy_for_user(
+}
+
+/// 建立引用时要写的**逻辑**元数据。
+///
+/// 🔴 全部来自**当前**这次 claim 的 token，一个字段都不从源记录复制。
+///
+/// 以前是照着源记录逐列复制 `original_filename` / `mime_type` / 宽高的。那是隐私泄露：
+/// 第一个人上传 `离婚协议-张三李四.pdf`，第二个人按摘要秒传同一串字节之后，
+/// 拿到的记录上写着第一个人的文件名。物理对象能提供的只有 `object_id`；
+/// 「这个文件叫什么、是什么类型、属于哪条业务」是当前用户自己的事。
+pub struct ReferenceMetadata<'a> {
+    pub original_filename: &'a str,
+    pub file_type: &'a FileType,
+    pub mime_type: &'a str,
+    pub business_type: &'a str,
+}
+
+impl FileUploadRepository {
+    /// 秒传取用：让**当前用户**多持有一条指向既有物理对象的引用。
+    ///
+    /// 🔴 这里**不做任何授权判断**。判据在调用方（`file_claim_service`）：持有明文
+    /// SHA-256 即视为持有该内容。以前这个函数里还有一整套"申请者对源记录所在的消息/
+    /// 频道/群是否有权"的复查，那条规则让跨用户秒传根本不成立——两个互不相识的人发
+    /// 同一份文件时，第二个人对第一个人的记录当然没有访问权，于是必然退回整传。
+    ///
+    /// 它同时还在按 `file_hash` 查表，而那一列已经不存在了；SQL 不受编译器检查，
+    /// 所以只会在运行到这条路径时才炸。
+    pub async fn create_reference(
         &self,
-        source: &FileMetadata,
+        object_id: u64,
         uploader_id: u64,
-        business_type: &str,
+        meta: &ReferenceMetadata<'_>,
         // 幂等键（token 的摘要）。与那一行**同事务**写入，所以「插进去了」
-        // 与「记下取用过」是同一件事，不存在中间态。
+        // 和「记下取用过了」不可能只发生一半。
         claim_key_hash: Option<&str>,
     ) -> Result<u64> {
-        // 🔴 秒传取用的身份是**对象**，不是摘要字符串。
-        //
-        // 以前按 `file_hash` 匹配，缺了摘要就得用空串顶上，于是匹配会落到
-        // "所有没有摘要的记录"上——那是拿授权去赌一个空值。现在直接拿 object_id：
-        // 它是外键，不存在"匹配到一堆"的可能。
-        let object_id = source.object.object_id as i64;
-
-        // 只有通过首传校验的对象可以被取用。pending 还没验过，legacy 是废止格式。
-        if !source.object.status.is_usable() {
-            return Err(ServerError::NotFound(
-                "服务端没有这份内容，请正常上传".to_string(),
-            ));
-        }
-
         let file_id = self.next_file_id().await?;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|e| ServerError::Database(format!("开启秒传取用事务失败: {}", e)))?;
+            .map_err(|e| ServerError::Database(format!("开启秒传取用事务失败: {e}")))?;
 
-        // 🔴 与删除**共用同一把 file_path 锁**。否则会出现：
-        //   claim 读到源行 → delete 删掉最后一行并删物理文件 → claim 插入新行
-        // 结果是一条指向已被删除文件的记录。加引用和减引用必须排成序。
-        // 🔴 等待上限必须在**第一把锁之前**设。放在后面的话，最先取的这把
-        // file_path advisory 锁仍然可以无限等——「封顶 3 秒」就是句空话。
+        // 🔴 等待上限必须在**第一把锁之前**设，否则下面那把 advisory 锁仍可无限等，
+        // 「封顶 3 秒」就是句空话。
         sqlx::query("SET LOCAL lock_timeout = '3s'")
             .execute(&mut *tx)
             .await
-            .map_err(|e| ServerError::Database(format!("设置锁等待上限失败: {}", e)))?;
+            .map_err(|e| ServerError::Database(format!("设置锁等待上限失败: {e}")))?;
 
-        // 锁的粒度是物理对象。用 object_id 而不是路径字符串：同一个对象只有一个 id，
-        // 而路径是它的属性，将来搬运存储源会变。
+        // 🔴 与删除**共用同一把对象锁**。否则会出现：
+        //   claim 读到对象 → GC 删掉最后一条引用并删物理文件 → claim 插入新引用
+        // 结果是一条指向已被删除对象的记录。加引用和减引用必须排成序。
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(object_id)
+            .bind(object_id as i64)
             .execute(&mut *tx)
             .await
-            .map_err(|e| Self::map_lock_error("获取物理文件锁失败", e))?;
+            .map_err(|e| Self::map_lock_error("获取物理对象锁失败", e))?;
 
-        // 🔴 在**事务内、对数据库**再确认一次调用者此刻仍有权读这份内容。
-        //
-        // 两个理由，各自都足够：
-        //
-        // 1. claim 是一次**新的授权动作**。「撤回收不回已经下载的东西」不等于
-        //    「撤回之后还能继续开新的 file_id」——后者是在失权之后继续授予。
-        // 2. 规范判据 `resolve_attachment_access` 的成员部分走 ChannelService，
-        //    而它命中内存缓存就直接返回（`get_channel_members`）。那份缓存陈旧多久，
-        //    窗口就有多长，不是微秒级。这里直查库，绕开缓存。
-        //
-        // 这道闸**只能拒、不能放行**：规范判据仍是 `authorize_file_access`，
-        // 这里只负责确认它依据的事实没有在期间变过。两者的状态对应关系由
-        // `the_guard_agrees_with_the_canonical_rule` 钉住。
-        // 🔴 授权复查必须**锁住**它依据的那几行，否则「在事务里查一次」只是查得晚
-        // 一点：READ COMMITTED 下，撤回或退群完全可以在这条 SELECT 之后、INSERT
-        // 之前提交。
-        //
-        // 锁序固定为 advisory(file_path) → message → channel，到此为止。
-        // **绝不再往下锁成员行**：退群的顺序是 member(写) → AFTER trigger → channel(写)，
-        // 再去锁 member 就成了环。成员状态改用「拿到频道锁之后新起一条语句重读」，
-        // 见下方。撤回、移出成员、退群都是对这些行的
-        // UPDATE/DELETE，会自然等在共享锁上；最终语义是二者必有一个先提交：
-        //   claim 先提交 → 取用成功，随后撤回；
-        //   撤回先提交 → claim 等到锁后重新判定，拒绝。
-        //
-        // 等待封顶，免得一次异常的长事务把 claim 卡死。
-        // 第一步：挑一条**此刻确实授权**的有效引用，并锁住消息行与频道行。
-        //
-        // 锁频道行同时覆盖了私聊：私聊的权威成员就写在这一行的
-        // `direct_user1/2_id` 上，没有 participants 行（成员判据与投递收件人那份
-        // 表达式同形，见 `message_repo` 的 dispatch_recipient 插入）。
-        // 排序只为让并发的多个 claim 以相同顺序取锁。
-        let candidates: Vec<(i64, i16)> = sqlx::query_as(
-            r#"
-            SELECT m.channel_id, c.channel_type
-            FROM privchat_message_file_refs r
-            JOIN privchat_messages m
-              ON m.message_id = r.message_id
-             AND m.created_at = r.message_created_at
-            JOIN privchat_channels c
-              ON c.channel_id = m.channel_id
-            -- 🔴 跨**同一份内容的所有逻辑记录**找，不是只看传进来那条。
-            --
-            -- 同一串字节可能已经有好几条记录：alice 发在群 A（file_id=1），
-            -- bob 发在群 B（file_id=2）。charlie 只在群 B，他能读的是 2。
-            -- 先按 `ORDER BY file_id` 钉死最老那条再判授权，charlie 就会被拒——
-            -- 而他明明有权拿到这份内容。物理文件是同一个，授权是按记录算的。
-            WHERE r.file_id IN (
-                    SELECT file_id FROM privchat_file_uploads WHERE file_hash = $3
-                  )
-              AND m.deleted = false
-              AND m.revoked = false
-              AND (
-                    (c.channel_type = 0
-                     AND $2 IN (c.direct_user1_id, c.direct_user2_id))
-                 OR (c.channel_type = 1
-                     AND EXISTS (
-                           SELECT 1 FROM privchat_group_members g
-                           WHERE g.group_id = c.channel_id
-                             AND g.user_id = $2
-                             AND g.left_at IS NULL
-                         ))
-                 OR (c.channel_type NOT IN (0, 1)
-                     AND EXISTS (
-                           SELECT 1 FROM privchat_channel_participants p
-                           WHERE p.channel_id = c.channel_id
-                             AND p.user_id = $2
-                             AND p.left_at IS NULL
-                         ))
-                  )
-            ORDER BY m.message_id
-            FOR SHARE OF m, c
-            -- 🔴 有上限的遍历（**不是只取一条**），两头都要顾：
-            --   只取 1 条 → 第一条在等锁期间失效就直接拒，哪怕还有别的有效引用；
-            --   全取     → 一次 claim 锁住热门文件的所有引用消息，挡下大量无关撤回。
-            -- 取到上限之外的候选一律不看：那种情况退化成「照常上传」，不是错误。
-            LIMIT 16
-            "#,
-        )
-        .bind(source.file_id as i64)
-        .bind(uploader_id as i64)
-        .bind(&content_hash)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| Self::map_lock_error("锁定取用授权依据失败", e))?;
-
-        // 🔴 只锁**频道行**，绝不再去锁 group_members。
-        //
-        // 频道行就是成员变更的串行化点，这是 016 那条 migration 明写的设计：
-        // 「Advancing the channel row also serializes membership changes」。
-        // 退群的顺序是 member(写) → AFTER trigger → channel(写)；claim 如果在
-        // 持有 channel 之后再去锁 member，两边就成了 channel→member 与
-        // member→channel 的环，PostgreSQL 只能靠中止一方来解，用户看到的是
-        // 随机失败的退群或转发。
-        //
-        // 成员是否有效已经由上面那条查询的 EXISTS 判过，而 `FOR SHARE` 会在拿到
-        // 锁后按最新版本重新求值——所以退群一旦先提交，这里就选不出候选。
-        //
-        // 也因此只取一条：一次 claim 不该把这份文件的所有引用消息全锁住，
-        // 热门文件会因此挡下大量无关的撤回。
-        let mut authorized = false;
-        for (channel_id, channel_type) in &candidates {
-            // 私聊：成员就写在刚锁住的频道行上，EvalPlanQual 会按最新版本重求，
-            // 不需要再读一次。
-            if *channel_type == 0 {
-                authorized = true;
-                break;
-            }
-            // 🔴 群聊 / 其它：成员在另一张表上，必须用**一条新语句**重读一次。
-            //
-            // 上面那条查询的 `FOR SHARE OF m, c` 只让 PostgreSQL 对 m/c 两行做
-            // EvalPlanQual；成员判定在 `EXISTS` 子查询里，走的是语句开始时的快照。
-            // 等锁期间提交的退群，它看不见——于是「已经退群了还能取用」。
-            //
-            // 用新语句而不是给成员行加 `FOR SHARE`：READ COMMITTED 下每条语句
-            // 取新快照，够看到那次提交；而加锁会变成 channel→member，与退群的
-            // member→channel（AFTER trigger 写 membership_version）成环。
-            // 串行化由频道行负责——migration 016 就是这么设计的。
-            let sql = if *channel_type == 1 {
-                "SELECT 1 FROM privchat_group_members
-                  WHERE group_id = $1 AND user_id = $2 AND left_at IS NULL"
-            } else {
-                "SELECT 1 FROM privchat_channel_participants
-                  WHERE channel_id = $1 AND user_id = $2 AND left_at IS NULL"
-            };
-            if sqlx::query_as::<_, (i32,)>(sql)
-                .bind(channel_id)
-                .bind(uploader_id as i64)
+        // 拿到锁之后复查对象还在不在：等锁期间它可能已经被 GC 掉了。
+        let still_there: Option<(i64,)> =
+            sqlx::query_as("SELECT object_id FROM privchat_attachment_objects WHERE object_id = $1")
+                .bind(object_id as i64)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| ServerError::Database(format!("重读成员关系失败: {e}")))?
-                .is_some()
-            {
-                authorized = true;
-                break;
-            }
-        }
-
-        // 一条有效引用都没有：只有「文件从未被任何消息引用过」且取用者就是
-        // 上传者时才放行——那是「自己重发自己刚传的东西」，不是给别人的口子。
-        if !authorized && candidates.is_empty() {
-            {
-                let pending_self: Option<(i32,)> = sqlx::query_as(
-                    r#"
-                    SELECT 1
-                    WHERE NOT EXISTS (
-                            SELECT 1 FROM privchat_message_file_refs
-                             WHERE file_id IN (
-                                     SELECT file_id FROM privchat_file_uploads
-                                      WHERE file_hash = $4
-                                   )
-                          )
-                      AND $2 = $3
-                    "#,
-                )
-                .bind(source.file_id as i64)
-                .bind(uploader_id as i64)
-                .bind(source.uploader_id as i64)
-                .bind(&content_hash)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| ServerError::Database(format!("复查取用授权失败: {}", e)))?;
-                authorized = pending_self.is_some();
-            }
-        }
-        if !authorized {
-            // 授权在这期间没了（撤回、删除、退群）。整事务回滚，不留下新的 file_id。
+                .map_err(|e| ServerError::Database(format!("复查物理对象失败: {e}")))?;
+        if still_there.is_none() {
             tx.rollback().await.ok();
             return Err(ServerError::NotFound(
                 "服务端没有这份内容，请正常上传".to_string(),
             ));
         }
 
-        // 拿到锁之后复查源**对象**还在不在、还是不是可用状态：等锁期间它可能已经被
-        // GC 掉了。查对象行而不是"还有没有别人引用它"——引用为零的对象照样可以被
-        // 取用，只要它还在；反过来，对象没了的话有多少引用都不算数。
-        let still_there: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM privchat_attachment_objects WHERE object_id = $1",
-        )
-        .bind(object_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| ServerError::Database(format!("复查源文件失败: {}", e)))?;
-        if still_there.as_ref().map(|(s,)| s.as_str()) != Some("published") {
-            tx.rollback().await.ok();
-            return Err(ServerError::NotFound(
-                "该文件已被删除，请正常上传".to_string(),
-            ));
-        }
-
-        // 🔴 秒传取用只是**多一条引用**，物理对象一个字节都不动。
-        //
-        // 以前这里要逐列复制 file_path / 存储源 / 加密版本 / CEK / key id，任何一列漏掉
-        // 都会造出一条"指向同一份字节却描述不一致"的记录——曾经漏掉 key id，新记录
-        // version=2 却没有密钥 id，下载时给得出 URL 给不出密钥。现在那些列根本不在
-        // 这张表上，漏不掉。
         sqlx::query(
             r#"
             INSERT INTO privchat_file_uploads (
                 file_id, original_filename, file_type, mime_type,
-                object_id, uploader_id, uploaded_at,
-                width, height, business_type, claim_key_hash
-            ) VALUES ($1, $2, $3, $4, $5, $6, now_millis(), $7, $8, $9, $10)
+                object_id, uploader_id, uploaded_at, business_type, claim_key_hash
+            ) VALUES ($1, $2, $3, $4, $5, $6, now_millis(), $7, $8)
             ON CONFLICT (uploader_id, claim_key_hash) WHERE claim_key_hash IS NOT NULL
             DO NOTHING
             "#,
         )
         .bind(file_id as i64)
-        .bind(&source.original_filename)
-        .bind(source.file_type.as_str())
-        .bind(&source.mime_type)
-        .bind(object_id)
+        .bind(meta.original_filename)
+        .bind(meta.file_type.as_str())
+        .bind(meta.mime_type)
+        .bind(object_id as i64)
         .bind(uploader_id as i64)
-        .bind(source.width.map(|v| v as i32))
-        .bind(source.height.map(|v| v as i32))
-        .bind(business_type)
+        .bind(meta.business_type)
         .bind(claim_key_hash)
         .execute(&mut *tx)
         .await
-        .map_err(|e| ServerError::Database(format!("创建秒传记录失败: {}", e)))?;
+        .map_err(|e| ServerError::Database(format!("创建秒传记录失败: {e}")))?;
 
         // 唯一索引把并发的第二个 claim 挡成 0 行：读回先到那个的 file_id 返回，
         // 而不是报错。两个人拿同一个 token 重试，应该拿到同一份，不是一个成功一个失败。
@@ -407,7 +233,7 @@ impl FileUploadRepository {
             .bind(key)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| ServerError::Database(format!("回读秒传记录失败: {}", e)))?;
+            .map_err(|e| ServerError::Database(format!("回读秒传记录失败: {e}")))?;
             row.map(|(id,)| id as u64).unwrap_or(file_id)
         } else {
             file_id
@@ -415,7 +241,7 @@ impl FileUploadRepository {
 
         tx.commit()
             .await
-            .map_err(|e| ServerError::Database(format!("提交秒传取用事务失败: {}", e)))?;
+            .map_err(|e| ServerError::Database(format!("提交秒传取用事务失败: {e}")))?;
         Ok(file_id)
     }
 

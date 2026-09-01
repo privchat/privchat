@@ -550,7 +550,12 @@ CREATE TABLE public.privchat_attachment_objects (
     CONSTRAINT privchat_attachment_objects_sizes_are_sane
         CHECK (plaintext_size >= 0 AND sealed_size >= 0 AND storage_source_id >= 0),
     CONSTRAINT privchat_attachment_objects_key_id_in_range
-        CHECK (encryption_key_id BETWEEN 0 AND 255)
+        CHECK (encryption_key_id BETWEEN 0 AND 255),
+    -- 🔴 当前只有一种密文格式，就把它钉死。不加这条的话，任意版本号都能建行成功，
+    -- 一直到客户端下载解不开才暴露——而那时故障点离成因已经很远。
+    -- 将来真要加第二种格式，改这条约束是必经的一步，而不是"忘了改"。
+    CONSTRAINT privchat_attachment_objects_format_version_is_current
+        CHECK (format_version = 1)
 );
 
 -- 同一条物理路径只能有一个对象行。没有它，一次失败重试就可能建出第二行指向同一份
