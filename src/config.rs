@@ -516,113 +516,10 @@ impl ServerConfig {
             anyhow::bail!("[file] s3_direct_threshold 已废止：单一数据面（配置单选）没有阈值/回退，请删除该配置项");
         }
 
-        // 🔴 附件密钥配错必须**拒绝启动**。长度不对的话服务照常起来，但每个客户端
-        // 的加密都会在运行期失败；key_id 重复会让密文头部的自描述失效——两代密钥
-        // 指向同一个 id，老对象再也解不开。
-        if let Some(keys) = toml_config
-            .attachment
-            .as_ref()
-            .and_then(|a| a.keys.as_ref())
-        {
-            use base64::Engine as _;
-            let mut seen: Vec<u8> = Vec::new();
-            for k in keys {
-                if seen.contains(&k.id) {
-                    anyhow::bail!("[[attachment.keys]] key_id 重复: {}", k.id);
-                }
-                seen.push(k.id);
-                let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(k.key.as_bytes())
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "[[attachment.keys]] id={} 的 key 不是合法 base64url(no-pad)",
-                            k.id
-                        )
-                    })?;
-                if decoded.len() != 32 {
-                    anyhow::bail!(
-                        "[[attachment.keys]] id={} 的 key 解码后必须是 32 字节，实际 {}",
-                        k.id,
-                        decoded.len()
-                    );
-                }
-            }
-            // 同一把密钥挂两个 id 等于假轮换：换了 id 却没换密钥。
-            let mut material: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
-            material.sort_unstable();
-            let unique = material.len();
-            material.dedup();
-            if material.len() != unique {
-                anyhow::bail!("[[attachment.keys]] 存在重复的密钥内容，轮换无效");
-            }
-        }
-
-        // 🔴 配了附件加密就**必须**配 dedup 密钥。
-        //
-        // 缺了它服务照常启动，只是跨用户秒传永远不命中——用户看到的是每次发同一张图
-        // 都在重新上传，没人会把这归因到一行缺失的配置。跨用户秒传是明确的产品要求，
-        // 不是可选增强，所以这里是启动失败，不是静默降级。
-        {
-            let att = toml_config.attachment.as_ref();
-            let has_keys = att
-                .and_then(|a| a.keys.as_ref())
-                .is_some_and(|k| !k.is_empty());
-            let has_dedup = att
-                .and_then(|a| a.dedup_master_key.as_deref())
-                .is_some_and(|k| !k.trim().is_empty());
-            if has_keys && !has_dedup {
-                anyhow::bail!(
-                    "[attachment] 配置了 [[attachment.keys]] 就必须同时配 dedup_master_key：\
-                     缺了它跨用户秒传永远不命中，而运行期不会有任何报错"
-                );
-            }
-            if has_dedup && !has_keys {
-                anyhow::bail!(
-                    "[attachment] 配了 dedup_master_key 却没有 [[attachment.keys]]：\
-                     没有加密就没有附件对象要去重，这多半是配置写漏了一半"
-                );
-            }
-        }
-
-        // 🔴 dedup 密钥同样是配错就拒绝启动。它错了不会有任何运行期报错——
-        // 秒传只是"再也不命中"，用户看到的是每次都在上传，没人会把这归因到配置。
-        if let Some(raw) = toml_config
-            .attachment
-            .as_ref()
-            .and_then(|a| a.dedup_master_key.as_deref())
-        {
-            use base64::Engine as _;
-            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(raw.trim().as_bytes())
-                .map_err(|_| {
-                    anyhow::anyhow!("[attachment] dedup_master_key 不是合法 base64url(no-pad)")
-                })?;
-            if decoded.len() != 32 {
-                anyhow::bail!(
-                    "[attachment] dedup_master_key 解码后必须是 32 字节，实际 {}",
-                    decoded.len()
-                );
-            }
-            // 🔴 和任何一把加密密钥相同就等于"从加密密钥派生"：加密密钥一轮换，
-            // 运维很可能顺手把这里也换掉，全站秒传索引当场作废。
-            //
-            // 比的是**解码后的 32 字节**，不是 base64 串：编码写法上的一点差异
-            // （多一个空格、换一种 padding 习惯）就能让字符串比较判为不同，
-            // 而底下是同一把密钥——那正是这条检查要拦的情况。
-            if let Some(keys) = toml_config.attachment.as_ref().and_then(|a| a.keys.as_ref()) {
-                let same = keys.iter().any(|k| {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(k.key.trim().as_bytes())
-                        .is_ok_and(|other| other == decoded)
-                });
-                if same {
-                    anyhow::bail!(
-                        "[attachment] dedup_master_key 不能与 [[attachment.keys]] 中任何一把相同：\
-                         它必须独立于可轮换的加密密钥，否则轮换会让历史对象再也无法秒传命中"
-                    );
-                }
-            }
-        }
+        // 附件密钥的全部校验与解码集中在一处（见 `attachment_material_from_toml`）：
+        // 校验规则散落在"文件加载"和"结构体转换"两条路径上过，结果是一边返回 Result、
+        // 一边 panic，而且两边的规则并不一样。
+        crate::config::attachment_material_from_toml(toml_config.attachment.as_ref())?;
 
         // 🔴 listener 级 tls_cert/tls_key 已废止，迁到网关级 [gateway.tls]。
         // 出现即报错，绝不"接受但忽略"——那正是这次要修的死配置 bug：字段解析了
@@ -644,7 +541,7 @@ impl ServerConfig {
             }
         }
 
-        Ok(toml_config.into())
+        ServerConfig::try_from(toml_config)
     }
 
     /// 从环境变量加载配置（PRIVCHAT_ 前缀）
@@ -1645,31 +1542,105 @@ pub fn load_early_logging_config(config_file: Option<&str>) -> EarlyLoggingConfi
     }
 }
 
-impl From<TomlConfig> for ServerConfig {
-    fn from(toml: TomlConfig) -> Self {
+/// `[attachment]` 段的**唯一**校验与解码入口。
+///
+/// 🔴 这些规则曾经散落在两条路径上：`from_toml_file` 返回 `Result`，
+/// `From<TomlConfig>` 里 panic，而且两边规则并不一样——一边查了成对性和密钥相同，
+/// 另一边只查编码。任何一条构造路径漏掉一条规则，都会把配置错误变成
+/// "跨用户秒传悄悄关掉"，而运行期毫无迹象。
+fn attachment_material_from_toml(
+    att: Option<&TomlAttachmentConfig>,
+) -> Result<(AttachmentKeys, DedupMasterKey)> {
+    use base64::Engine as _;
+
+    fn decode_32(raw: &str, what: &str) -> Result<Vec<u8>> {
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw.trim().as_bytes())
+            .map_err(|_| anyhow::anyhow!("{what} 不是合法 base64url(no-pad)"))?;
+        if decoded.len() != 32 {
+            anyhow::bail!("{what} 解码后必须是 32 字节，实际 {}", decoded.len());
+        }
+        Ok(decoded)
+    }
+
+    let keys = att.and_then(|a| a.keys.as_ref());
+    let dedup_raw = att
+        .and_then(|a| a.dedup_master_key.as_deref())
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let has_keys = keys.is_some_and(|k| !k.is_empty());
+
+    // 🔴 配了一半就拒绝启动，不是静默降级。缺 dedup 密钥时跨用户秒传永远不命中，
+    // 而运行期不会有任何报错——用户只看到每次发同一张图都在重新上传。
+    if has_keys && dedup_raw.is_none() {
+        anyhow::bail!(
+            "[attachment] 配置了 [[attachment.keys]] 就必须同时配 dedup_master_key：\
+             缺了它跨用户秒传永远不命中，而运行期不会有任何报错"
+        );
+    }
+    if dedup_raw.is_some() && !has_keys {
+        anyhow::bail!(
+            "[attachment] 配了 dedup_master_key 却没有 [[attachment.keys]]：\
+             没有加密就没有附件对象要去重，这多半是配置写漏了一半"
+        );
+    }
+
+    let mut decoded_keys: Vec<(u8, Vec<u8>)> = Vec::new();
+    if let Some(keys) = keys {
+        for k in keys {
+            // key_id 重复会让密文头的自描述失效：两代密钥指向同一个 id，
+            // 老对象再也解不开。
+            if decoded_keys.iter().any(|(id, _)| *id == k.id) {
+                anyhow::bail!("[[attachment.keys]] key_id 重复: {}", k.id);
+            }
+            let material = decode_32(&k.key, &format!("[[attachment.keys]] id={} 的 key", k.id))?;
+            // 同一把密钥挂两个 id 等于假轮换：换了 id 却没换密钥。
+            if decoded_keys.iter().any(|(_, m)| *m == material) {
+                anyhow::bail!("[[attachment.keys]] 存在重复的密钥内容，轮换无效");
+            }
+            decoded_keys.push((k.id, material));
+        }
+    }
+
+    let dedup = match dedup_raw {
+        None => DedupMasterKey::default(),
+        Some(raw) => {
+            let decoded = decode_32(raw, "[attachment] dedup_master_key")?;
+            // 🔴 与任何一把加密密钥相同就等于"从加密密钥派生"：加密密钥一轮换，
+            // 运维很可能顺手把这里也换掉，全站秒传索引当场作废。
+            //
+            // 比的是解码后的 32 字节，不是 base64 串——编码写法上的一点差异
+            // （多一个空格、换一种 padding 习惯）会让字符串比较判为不同，
+            // 而底下是同一把密钥，那正是这条检查要拦的情况。
+            if decoded_keys.iter().any(|(_, m)| *m == decoded) {
+                anyhow::bail!(
+                    "[attachment] dedup_master_key 不能与 [[attachment.keys]] 中任何一把相同：\
+                     它必须独立于可轮换的加密密钥，否则轮换会让历史对象再也无法秒传命中"
+                );
+            }
+            DedupMasterKey(Some(decoded))
+        }
+    };
+
+    // 密钥表保留原始 base64 形态：它要原样下发给客户端。
+    let table = AttachmentKeys(
+        keys.map(|k| k.iter().map(|k| (k.id, k.key.trim().to_string())).collect())
+            .unwrap_or_default(),
+    );
+    Ok((table, dedup))
+}
+
+impl TryFrom<TomlConfig> for ServerConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(toml: TomlConfig) -> Result<Self> {
         let mut config = Self::default();
 
         // 网关：gateway.listeners
-        if let Some(att) = toml.attachment {
-            if let Some(keys) = att.keys {
-                config.attachment_keys = AttachmentKeys(keys.into_iter().map(|k| (k.id, k.key)).collect());
-            }
-            // 🔴 解不出来就**留空**是不行的：那会把一个配置错误变成"跨用户秒传
-            // 悄悄关掉"，而这条路径不经过 from_toml_file 的校验（ServerConfig 也能
-            // 从别处构造）。这里 panic 是刻意的——启动期发现总比运行期无声失效好。
-            if let Some(raw) = att.dedup_master_key.as_deref() {
-                use base64::Engine as _;
-                let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(raw.trim().as_bytes())
-                    .expect("[attachment] dedup_master_key 不是合法 base64url(no-pad)");
-                assert_eq!(
-                    decoded.len(),
-                    32,
-                    "[attachment] dedup_master_key 解码后必须是 32 字节"
-                );
-                config.dedup_master_key = DedupMasterKey(Some(decoded));
-            }
-        }
+        // 无论从哪条路径构造，附件密钥都走同一套规则。
+        let (keys, dedup) = attachment_material_from_toml(toml.attachment.as_ref())?;
+        config.attachment_keys = keys;
+        config.dedup_master_key = dedup;
 
         if let Some(gw) = toml.gateway {
             // 网关级 TLS 身份，QUIC 与 TLS/TCP 共用。此前 listener 上的
@@ -2132,7 +2103,7 @@ impl From<TomlConfig> for ServerConfig {
             }
         }
 
-        config
+        Ok(config)
     }
 }
 
@@ -3235,5 +3206,93 @@ mod attachment_config_tests {
         ))
         .expect_err("必须拒绝");
         assert!(format!("{err:#}").contains("32 字节"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod attachment_material_tests {
+    use super::{
+        attachment_material_from_toml, ServerConfig, TomlAttachmentConfig, TomlAttachmentKey,
+        TomlConfig,
+    };
+
+    const KEY_A: &str = "oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE";
+    const KEY_B: &str = "srKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrI";
+    const KEY_C: &str = "w8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8M";
+
+    fn att(dedup: Option<&str>, keys: &[(u8, &str)]) -> TomlAttachmentConfig {
+        TomlAttachmentConfig {
+            dedup_master_key: dedup.map(str::to_string),
+            keys: Some(
+                keys.iter()
+                    .map(|(id, key)| TomlAttachmentKey {
+                        id: *id,
+                        key: key.to_string(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn err_of(dedup: Option<&str>, keys: &[(u8, &str)]) -> String {
+        format!(
+            "{:#}",
+            attachment_material_from_toml(Some(&att(dedup, keys))).expect_err("必须拒绝")
+        )
+    }
+
+    #[test]
+    fn a_matching_pair_decodes() {
+        let (keys, dedup) =
+            attachment_material_from_toml(Some(&att(Some(KEY_A), &[(1, KEY_B)]))).expect("接受");
+        assert!(dedup.is_configured());
+        // 密钥表保留 base64 原文：它要原样下发给客户端。
+        assert_eq!(keys.first(), Some(&(1u8, KEY_B.to_string())));
+    }
+
+    #[test]
+    fn no_attachment_section_is_fine() {
+        let (keys, dedup) = attachment_material_from_toml(None).expect("不配也行");
+        assert!(keys.is_empty());
+        assert!(!dedup.is_configured());
+    }
+
+    #[test]
+    fn each_half_on_its_own_is_refused() {
+        assert!(err_of(None, &[(1, KEY_B)]).contains("dedup_master_key"));
+        assert!(err_of(Some(KEY_A), &[]).contains("attachment.keys"));
+    }
+
+    #[test]
+    fn the_two_keys_must_differ() {
+        assert!(err_of(Some(KEY_A), &[(1, KEY_A)]).contains("不能与"));
+        // 写法不同、密钥相同也要拦住：比的是解码后的字节。
+        assert!(err_of(Some(&format!(" {KEY_A} ")), &[(1, KEY_A)]).contains("不能与"));
+    }
+
+    #[test]
+    fn duplicate_key_ids_and_duplicate_material_are_refused() {
+        assert!(err_of(Some(KEY_A), &[(1, KEY_B), (1, KEY_C)]).contains("key_id 重复"));
+        assert!(err_of(Some(KEY_A), &[(1, KEY_B), (2, KEY_B)]).contains("重复的密钥内容"));
+    }
+
+    #[test]
+    fn malformed_material_is_refused() {
+        assert!(err_of(Some("AAAA"), &[(1, KEY_B)]).contains("32 字节"));
+        assert!(err_of(Some(KEY_A), &[(1, "!!!!")]).contains("base64url"));
+    }
+
+    /// 🔴 这条才是重构的意义：**结构体转换路径**同样执行全部规则。
+    ///
+    /// 之前 `From<TomlConfig>` 只在编码错误时 panic，成对性、密钥相同、id 重复
+    /// 一条都不查——从这条路径构造出来的配置可以带着一半的附件密钥启动。
+    #[test]
+    fn the_struct_conversion_path_enforces_the_same_rules() {
+        let toml: TomlConfig = toml::from_str(&format!(
+            "[attachment]\n\n[[attachment.keys]]\nid = 1\nkey = \"{KEY_B}\"\n"
+        ))
+        .expect("parse");
+        let err = ServerConfig::try_from(toml).expect_err("缺 dedup 密钥必须拒绝");
+        assert!(format!("{err:#}").contains("dedup_master_key"), "{err:#}");
     }
 }
