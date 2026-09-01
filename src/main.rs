@@ -154,14 +154,10 @@ fn validate_config(path: &str) -> Result<()> {
     Ok(())
 }
 
-// 编译时自动扫描 migrations/ 目录，按文件名排序嵌入（跳过 000_ 开头的文件）
-include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
-
 /// 执行数据库迁移
 async fn run_migrate(cli: &Cli) -> Result<()> {
     let _ = dotenvy::dotenv();
 
-    // 获取 DATABASE_URL（从 CLI > 环境变量 > 配置文件）
     let database_url = cli
         .database_url
         .clone()
@@ -172,77 +168,17 @@ async fn run_migrate(cli: &Cli) -> Result<()> {
     let pool = sqlx::PgPool::connect(&database_url)
         .await
         .context("数据库连接失败，请检查 DATABASE_URL")?;
-    // Run the complete migration sequence on one connection. The baseline SQL
-    // intentionally changes session search_path while restoring a pg_dump, so
-    // hopping across pooled connections makes later migrations nondeterministic.
+
+    // 整个序列跑在同一条连接上：基线迁移会改会话级 search_path，
+    // 换连接会让后面的迁移变得不确定。
     let mut connection = pool.acquire().await.context("获取迁移连接失败")?;
 
-    // 创建迁移记录表（如果不存在）
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS public.privchat_migrations (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE,
-            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )",
-    )
-    .execute(&mut *connection)
-    .await
-    .context("创建迁移记录表失败")?;
+    let executed = privchat::migrate::apply_pending(&mut connection, |line| println!("{line}")).await?;
 
-    // 查询已执行的迁移
-    let applied: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM public.privchat_migrations ORDER BY id")
-            .fetch_all(&mut *connection)
-            .await
-            .context("查询迁移记录失败")?;
-
-    let mut count = 0;
-    for (name, sql) in MIGRATIONS {
-        if applied.contains(&name.to_string()) {
-            println!("  ⏭ {} (已执行，跳过)", name);
-            continue;
-        }
-
-        println!("  ▶ 执行 {}...", name);
-        sqlx::raw_sql(sql)
-            .execute(&mut *connection)
-            .await
-            .with_context(|| format!("执行迁移失败: {}", name))?;
-
-        sqlx::query("SET search_path TO public")
-            .execute(&mut *connection)
-            .await
-            .with_context(|| format!("恢复迁移 search_path 失败: {}", name))?;
-
-        // The baseline schema migration intentionally rebuilds the public
-        // schema, including dropping this bookkeeping table. Recreate it before
-        // recording the baseline so a fresh database can continue with 002+.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS public.privchat_migrations (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-        )
-        .execute(&mut *connection)
-        .await
-        .with_context(|| format!("重建迁移记录表失败: {}", name))?;
-
-        // 记录迁移
-        sqlx::query("INSERT INTO public.privchat_migrations (name) VALUES ($1)")
-            .bind(*name)
-            .execute(&mut *connection)
-            .await
-            .with_context(|| format!("记录迁移状态失败: {}", name))?;
-
-        println!("  ✅ {} 完成", name);
-        count += 1;
-    }
-
-    if count == 0 {
+    if executed.is_empty() {
         println!("✅ 数据库已是最新，无需迁移");
     } else {
-        println!("✅ 成功执行 {} 个迁移", count);
+        println!("✅ 成功执行 {} 个迁移", executed.len());
     }
 
     drop(connection);

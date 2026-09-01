@@ -30,6 +30,7 @@ pub mod http; // HTTP 文件服务器
 pub mod infra;
 pub mod logging;
 pub mod middleware;
+pub mod migrate;
 pub mod model;
 pub mod offline;
 pub mod push;
