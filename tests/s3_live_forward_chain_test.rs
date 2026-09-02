@@ -196,8 +196,13 @@ async fn make_rig(env: &LiveEnv) -> Rig {
 
 fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
     ChunkedTokenServices {
-        // 这些用例验的是分片协商，不涉及加密密钥下发。
-        attachment_key: None,
+        // 🔴 按生产口径把密钥下发出去（生产走 `current_attachment_key(config)`）。
+        // 这里原来写死 None，理由是"只验分片协商"——可正向链路要真封装才能上传，
+        // 拿不到密钥就只能退回上传明文，于是这条链路验的就不再是它要验的东西。
+        attachment_key: Some(privchat_protocol::rpc::file::upload::AttachmentKey {
+            key_id: test_config().attachment_keys.0[0].0,
+            key: test_config().attachment_keys.0[0].1.clone(),
+        }),
         file_service: &rig.state.file_service,
         upload_token_service: &rig.state.upload_token_service,
         config: &rig.config,
@@ -296,26 +301,63 @@ async fn live_forward_chain_issue_to_pg_row() {
     let pool = rig.pool.clone();
     run_with_cleanup(&pool, async move {
         let seed: u8 = rand::random();
-        let mut p1 = part_data(seed, PART_SIZE);
-        p1[0] = seed; // 随机种子落首字节，整文件摘要唯一
-        let p2 = part_data(seed.wrapping_add(1), PART_SIZE);
-        let p3 = part_data(seed.wrapping_add(2), 100 << 10);
-        let full: Vec<u8> = p1.iter().chain(&p2).chain(&p3).copied().collect();
-        let total = full.len() as i64;
-        let sealed = sha256_hex(&full);
+        let mut plaintext = part_data(seed, PART_SIZE);
+        plaintext[0] = seed; // 随机种子落首字节，整文件摘要唯一
+        plaintext.extend_from_slice(&part_data(seed.wrapping_add(1), PART_SIZE));
+        plaintext.extend_from_slice(&part_data(seed.wrapping_add(2), 100 << 10));
+        let plaintext_size = plaintext.len() as i64;
+        let plaintext_digest = sha256_hex(&plaintext);
 
         // ① 真实签发：真 CreateMultipartUpload，冻结字段一次写成。
-        let resp = issue_chunked_upload_token(&services(&rig), UPLOADER, req(total, &sealed))
-            .await
-            .expect("真实签发应成功");
+        let resp = issue_chunked_upload_token(
+            &services(&rig),
+            UPLOADER,
+            req(plaintext_size, &plaintext_digest),
+        )
+        .await
+        .expect("真实签发应成功");
         assert_eq!(resp.transport.as_deref(), Some("s3_multipart_v1"));
-        let (part_size, total_parts) = chunked_upload::s3_part_geometry(total as u64);
+
+        // 🔴 分片几何按**密文**长度算，不按明文。上传的也是密文——这条链路上传的
+        // 每一个字节都是封装之后的，明文只用来算判重键和最后的身份复核。
+        // 早先这里按明文切片，服务端按密文收，于是最后一片总差 36 + 32×块数 个字节。
+        let total_size = resp.total_size.expect("签发必须下发密文总长");
+        let chunk_plain_size = resp.chunk_plain_size.expect("签发必须下发分块几何");
+        let key = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &test_config().attachment_keys.0[0].1,
+        )
+        .expect("测试密钥必须是 base64url");
+        let sealed_blob = privchat_protocol::attachment_crypto::encrypt_attachment_with_chunk_size(
+            &plaintext,
+            &key,
+            resp.attachment_key.as_ref().expect("签发必须下发密钥").key_id,
+            chunk_plain_size,
+        )
+        .expect("封装");
+        assert_eq!(
+            sealed_blob.len() as u64,
+            total_size,
+            "🔴 客户端封出的长度必须等于服务端签下的 total_size"
+        );
+        let sealed_digest = sha256_hex(&sealed_blob);
+
+        let (part_size, total_parts) = chunked_upload::s3_part_geometry(total_size);
         assert_eq!((part_size, total_parts), (PART_SIZE as u64, 3));
         let token = resp.upload_token.expect("token");
         let upload_id = token.split('.').next().expect("upload id").to_string();
 
+        // 按服务端几何切密文，而不是切明文。
+        let parts: Vec<Vec<u8>> = (0..total_parts)
+            .map(|i| {
+                let start = i as usize * part_size as usize;
+                let end = ((start + part_size as usize) as u64).min(total_size) as usize;
+                sealed_blob[start..end].to_vec()
+            })
+            .collect();
+
         // ② part-url：批量签发真实预签名（3 片一次）。
-        let items: Vec<serde_json::Value> = [&p1, &p2, &p3]
+        let items: Vec<serde_json::Value> = parts
             .iter()
             .enumerate()
             .map(|(i, data)| {
@@ -340,7 +382,7 @@ async fn live_forward_chain_issue_to_pg_row() {
         assert_eq!(status, StatusCode::OK, "part-url 必须放行：{json}");
 
         // ③ 预签名直传：照抄 required_headers（客户端口径）。
-        for (i, data) in [&p1, &p2, &p3].iter().enumerate() {
+        for (i, data) in parts.iter().enumerate() {
             let part = &json["data"]["parts"][i];
             let url = part["url"].as_str().expect("url");
             let mut put = reqwest::Client::new().put(url).body(data.to_vec());
@@ -367,7 +409,7 @@ async fn live_forward_chain_issue_to_pg_row() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json["data"]["received_bytes"], total as u64);
+        assert_eq!(json["data"]["received_bytes"], total_size);
         assert_eq!(json["data"]["missing"].as_array().expect("missing").len(), 0);
 
         // ⑤ complete：If-None-Match complete + 整文件回读摘要核对 + PG 建行。
@@ -388,16 +430,27 @@ async fn live_forward_chain_issue_to_pg_row() {
 
         // ⑥ 建行核对 + 对象回读身份一致。
         // 身份字段都在对象行上（引用行只留 object_id）。
-        let (row_sha, row_uploader): (String, i64) = sqlx::query_as(
-            "SELECT o.sealed_sha256, u.uploader_id FROM privchat_file_uploads u \
-             JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
-             WHERE u.file_id = $1",
-        )
-        .bind(file_id)
-        .fetch_one(&*rig.pool)
-        .await
-        .expect("建行必须在");
-        assert_eq!(row_sha, sealed, "对象行的密文摘要 = 服务端回读算出的整文件摘要");
+        let (row_sealed_sha, row_plaintext_sha, row_uploader): (String, String, i64) =
+            sqlx::query_as(
+                "SELECT o.sealed_sha256, o.plaintext_sha256, u.uploader_id \
+                 FROM privchat_file_uploads u \
+                 JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
+                 WHERE u.file_id = $1",
+            )
+            .bind(file_id)
+            .fetch_one(&*rig.pool)
+            .await
+            .expect("建行必须在");
+        // 两个摘要各司其职，混用过一次就再也发现不了：密文摘要证明桶里那串字节没被
+        // 动过，明文摘要才是判重键、也才是服务端解密回读之后重算出来的身份。
+        assert_eq!(
+            row_sealed_sha, sealed_digest,
+            "对象行的密文摘要 = 服务端回读算出的整文件摘要"
+        );
+        assert_eq!(
+            row_plaintext_sha, plaintext_digest,
+            "对象行的明文摘要 = 申请时冻结的那个"
+        );
         assert_eq!(row_uploader, UPLOADER as i64);
 
         // 收尾：删 PG 行 + 删桶内对象（对 ETag 条件删；MinIO 上条件被忽略，
