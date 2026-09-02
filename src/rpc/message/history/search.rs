@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn escape_ilike_escapes_metacharacters() {
         assert_eq!(escape_ilike("50%_off\\x"), "%50\\%\\_off\\\\x%");
-        assert_eq!(escape_ilike("福寿"), "%福寿%");
+        assert_eq!(escape_ilike("红包"), "%红包%");
     }
 
     #[test]
@@ -331,15 +331,15 @@ mod tests {
     #[test]
     fn snippet_windows_and_highlights() {
         // 命中居中，两侧截断加省略号，偏移含省略号
-        let content = "零".repeat(40) + "福寿万家" + &"零".repeat(40);
-        let (snippet, ranges) = build_snippet(&content, "福寿");
+        let content = "零".repeat(40) + "恭喜发财红包" + &"零".repeat(40);
+        let (snippet, ranges) = build_snippet(&content, "红包");
         assert!(snippet.starts_with('…') && snippet.ends_with('…'));
         assert_eq!(ranges.len(), 1);
         let (s, e) = ranges[0];
         let chars: Vec<char> = snippet.chars().collect();
         assert_eq!(
             chars[s as usize..e as usize].iter().collect::<String>(),
-            "福寿"
+            "红包"
         );
 
         // 大小写不敏感
