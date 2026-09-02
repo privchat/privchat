@@ -864,12 +864,43 @@ impl FileService {
                 } else {
                     format!("https://{}", endpoint)
                 };
+            // 🔴 寻址方式与 region 必须与 `s3_backend` 同口径。
+            //
+            // 这里原来写死 `region("auto")` 且从不开虚拟主机寻址，于是签出来的读地址
+            // 是 path-style `{endpoint}/{bucket}/{key}`。腾讯 COS 明确禁止 path-style：
+            // 实测同一个对象，虚拟主机寻址 200、path-style 403。上传面（s3_backend）
+            // 一直是对的，读取面不是——表现为**东西传上去了、收件人永远只看到
+            // 「[图片]」占位**，而链路上没有任何一处报错。
+            let region = src
+                .region
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .unwrap_or("us-east-1");
+            let virtual_hosted = match src
+                .addressing_style
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None | Some("path") => false,
+                Some("virtual") => true,
+                Some(other) => {
+                    return Err(ServerError::Internal(format!(
+                        "存储源 id={} addressing_style={other} 非法，只支持 path / virtual",
+                        src.id
+                    )))
+                }
+            };
             let mut builder = opendal::services::S3::default()
                 .bucket(bucket)
                 .endpoint(&endpoint_url)
-                .region("auto")
+                .region(region)
                 .access_key_id(access_key_id)
                 .secret_access_key(secret_access_key);
+            if virtual_hosted {
+                builder = builder.enable_virtual_host_style();
+            }
             if let Some(ref prefix) = src.path_prefix {
                 let p = prefix.trim().trim_end_matches('/');
                 if !p.is_empty() {
@@ -1839,7 +1870,12 @@ impl FileService {
                 return unsigned();
             }
         };
-        match op.presign_read(file_path, SIGNED_URL_TTL).await {
+        // 🔴 库里存的是**完整对象 key**（S3 直传那条路径由 `object_key()` 把
+        // path_prefix 拼了进去），而 operator 的 `root` 已经是同一个前缀——原样交给
+        // presign 会得到 `prefix/prefix/...`，签出来的地址指向一个不存在的 key。
+        // 交给 operator 的必须是**相对 root 的路径**。
+        let relative = self.storage_relative_path(file_path, storage_source_id);
+        match op.presign_read(&relative, SIGNED_URL_TTL).await {
             Ok(signed) => (
                 signed.uri().to_string(),
                 Utc::now().timestamp() + SIGNED_URL_TTL.as_secs() as i64,
@@ -1851,6 +1887,28 @@ impl FileService {
                 );
                 unsigned()
             }
+        }
+    }
+
+    /// 把库里存的对象 key 换算成**相对 operator root** 的路径。
+    ///
+    /// 两条上传路径存进库的形状不一致：S3 直传经 `object_key()` 把 `path_prefix`
+    /// 拼进了 key，代理路径存的是不带前缀的 `generate_file_path()`。读取侧只能兼容
+    /// 两种，否则总有一半对象取不到。
+    fn storage_relative_path(&self, file_path: &str, storage_source_id: u32) -> String {
+        let prefix = self
+            .sources_by_id
+            .get(&storage_source_id)
+            .and_then(|s| s.path_prefix.as_deref())
+            .map(str::trim)
+            .map(|p| p.trim_matches('/'))
+            .filter(|p| !p.is_empty());
+        match prefix {
+            Some(p) => file_path
+                .strip_prefix(p)
+                .map(|rest| rest.trim_start_matches('/').to_string())
+                .unwrap_or_else(|| file_path.to_string()),
+            None => file_path.to_string(),
         }
     }
 
