@@ -173,17 +173,27 @@ pub struct UploadTokenClaims {
     pub ft: String,
     pub bt: String,
     pub mx: i64,
-    pub tv: i32,
     #[serde(rename = "fnm", skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     #[serde(rename = "sh", skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
+    pub plaintext_sha256: Option<String>,
+    /// 明文字节数。complete 解密之后与它比对。
+    #[serde(rename = "ps", default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_size: Option<i64>,
+    /// 服务端冻结的分块几何。客户端不得自选——同一份明文按不同块大小封装会得到不同
+    /// 长度的密文，`sealed_blob_size` 就对不上。
+    #[serde(rename = "cps", default, skip_serializing_if = "Option::is_none")]
+    pub chunk_plain_size: Option<u32>,
+    /// 密文格式版本，与 protocol 的 `attachment_crypto::FORMAT_VERSION` 同源。
+    #[serde(rename = "fv", default, skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<u8>,
+    /// 本次上传该用哪一把全站密钥。complete 只核对不接收。
+    #[serde(rename = "ki", default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key_id: Option<u8>,
     #[serde(rename = "sz", skip_serializing_if = "Option::is_none")]
     pub sealed_blob_size: Option<i64>,
     #[serde(rename = "mt", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
-    #[serde(rename = "ev", skip_serializing_if = "Option::is_none")]
-    pub encryption_version: Option<i32>,
     #[serde(rename = "nd", skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
     #[serde(rename = "url", skip_serializing_if = "Option::is_none")]
@@ -207,7 +217,6 @@ impl UploadTokenClaims {
         file_type: &str,
         business_type: String,
         max_size: i64,
-        transform_version: i32,
     ) -> Self {
         Self {
             v: CLAIMS_VERSION,
@@ -218,13 +227,15 @@ impl UploadTokenClaims {
             ft: file_type.to_string(),
             bt: business_type,
             mx: max_size,
-            tv: transform_version,
             filename: None,
-            sha256: None,
+            plaintext_sha256: None,
+            plaintext_size: None,
+            chunk_plain_size: None,
+            format_version: None,
+            encryption_key_id: None,
             sealed_blob_size: None,
             mime_type: None,
-            encryption_version: None,
-            node_id: None,
+                        node_id: None,
             upload_base_url: None,
             plan: None,
             iat: 0,
@@ -383,7 +394,7 @@ pub fn validate_claims(claims: &UploadTokenClaims) -> Result<(), IssueError> {
             return Err(IssueError::SizeAboveMax);
         }
     }
-    if let Some(digest) = &claims.sha256 {
+    if let Some(digest) = &claims.plaintext_sha256 {
         if !is_sha256_hex(digest) {
             return Err(IssueError::BadDigest);
         }
@@ -568,6 +579,10 @@ mod tests {
 
     fn claims() -> UploadTokenClaims {
         UploadTokenClaims {
+            plaintext_size: None,
+            chunk_plain_size: None,
+            format_version: None,
+            encryption_key_id: None,
             v: CLAIMS_VERSION,
             upload_id: "0".repeat(32),
             aud: TOKEN_AUD.to_string(),
@@ -576,12 +591,10 @@ mod tests {
             ft: "image".to_string(),
             bt: "message".to_string(),
             mx: 200 * 1024 * 1024,
-            tv: 1,
             filename: Some("holiday.png".to_string()),
-            sha256: Some("a".repeat(64)),
+            plaintext_sha256: Some("a".repeat(64)),
             sealed_blob_size: Some(73_400_320),
             mime_type: Some("image/png".to_string()),
-            encryption_version: Some(1),
             node_id: None,
             upload_base_url: None,
             plan: Some(PlanClaims::from(&plan())),
@@ -773,14 +786,13 @@ mod tests {
         let mut worst = claims();
         worst.upload_id = "f".repeat(64);
         worst.filename = Some("名".repeat(MAX_FILENAME_BYTES / 3));
-        worst.sha256 = Some("f".repeat(64));
+        worst.plaintext_sha256 = Some("f".repeat(64));
         worst.mime_type = Some(
             "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string(),
         );
         worst.bt = "group_file".to_string();
         worst.node_id = Some("upload-node-99".to_string());
         worst.upload_base_url = Some("https://upload-99.fflunp.cn".to_string());
-        worst.encryption_version = Some(2);
         let worst_len = sign(&c, now(), worst).expect("sign").len();
 
         println!("token bytes: typical={typical_len} worst={worst_len}");
@@ -868,7 +880,7 @@ mod tests {
         );
 
         let mut bad_digest = claims();
-        bad_digest.sha256 = Some("not-a-digest".to_string());
+        bad_digest.plaintext_sha256 = Some("not-a-digest".to_string());
         bad_digest.iat = now();
         bad_digest.exp = bad_digest.iat + 600;
         assert_eq!(

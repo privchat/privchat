@@ -12,8 +12,13 @@ use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
 
-use privchat::model::file_upload::{FileMetadata, FileType};
-use privchat::repository::FileUploadRepository;
+use privchat::model::file_upload::{AttachmentObject, FileMetadata, FileType};
+use privchat::repository::{FileUploadRepository, ReferenceMetadata};
+
+// 🔴 这里删掉了一组只为旧判据存在的 helper（`InsertBarrier` / `wait_until_blocked_by`
+// / `wait_for_claim_at_barrier` / `authorization_deps`）。它们是用来证明"并发撤回被
+// claim 持有的消息行锁挡住"的——而 claim 已经不再读消息域，那套跨域加锁连同它的
+// 观测脚手架一起没了意义。留着只会让人以为那条链路还在。
 
 const OWNER: i64 = 9_980_001;
 const OTHER: i64 = 9_980_002;
@@ -44,7 +49,7 @@ async fn cleanup(pool: &sqlx::PgPool) {
     // 🔴 这里漏掉哪个 uploader，它的残留行就会以 `file_path` 相同的方式，破坏
     // 别的用例「源文件已被删」这类前提——失败点离病因很远，非常难查。
     sqlx::query("DELETE FROM privchat_file_uploads WHERE uploader_id = ANY($1)")
-        .bind(&vec![OWNER, OTHER, DIRECT_PEER, DIRECT_HOST])
+        .bind(&vec![OWNER, OTHER, DIRECT_PEER, DIRECT_HOST, 9_980_031])
         .execute(pool)
         .await
         .expect("clean uploads");
@@ -63,34 +68,95 @@ async fn cleanup(pool: &sqlx::PgPool) {
 }
 
 /// 原始上传：OWNER 传了一份文件。
+///
+/// 🔴 身份与物理坐标都落在**对象行**上，文件行只是一条引用。
 async fn seed_original(repo: &FileUploadRepository) -> FileMetadata {
+    let object_id = seed_object(repo.pool(), SHA, SHARED_PATH).await;
     let file_id = repo.next_file_id().await.expect("file id");
     let meta = FileMetadata {
         file_id,
         original_filename: "photo.png".to_string(),
-        file_size: 1024,
         original_size: None,
         file_type: FileType::Image,
         mime_type: "image/png".to_string(),
-        file_path: SHARED_PATH.to_string(),
-        storage_source_id: 0,
         uploader_id: OWNER as u64,
         uploader_ip: None,
         uploaded_at: 0,
         width: None,
         height: None,
-        // 秒传身份：客户端声明的最终明文内容摘要。
-        file_hash: Some(SHA.to_string()),
         business_type: Some("message".to_string()),
-        // ⚠️ 必须给真值：留 None 的话「新行不继承别人的绑定」那条断言是空的——
+        // ⚠️ 必须给真值：留 None 的话「新引用不继承别人的绑定」那条断言是空的——
         // 复制不复制都得到 None，把 business_id 一起复制过去测试照样绿。
         business_id: Some("7777".to_string()),
-        encryption_version: 0,
-        cek: None,
-        encryption_key_id: None,
+        object: object_of(object_id, SHA, SHARED_PATH),
     };
     repo.insert(&meta).await.expect("insert original");
     meta
+}
+
+/// 一份已发布对象的行；返回 object_id。
+async fn seed_object(pool: &sqlx::PgPool, plaintext_sha256: &str, path: &str) -> u64 {
+    // 同一份 fixture 反复跑：孤儿对象会撞 plaintext_sha256 唯一约束。
+    let _ = sqlx::query(
+        "DELETE FROM privchat_attachment_objects o WHERE o.plaintext_sha256 = $1 \
+         AND NOT EXISTS (SELECT 1 FROM privchat_file_uploads u WHERE u.object_id = o.object_id)",
+    )
+    .bind(plaintext_sha256)
+    .execute(pool)
+    .await;
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO privchat_attachment_objects \
+         (plaintext_sha256, plaintext_size, sealed_sha256, sealed_size, file_path, \
+          storage_source_id, format_version, encryption_key_id) \
+         VALUES ($1, 1024, $2, 1092, $3, 0, 1, 1) RETURNING object_id",
+    )
+    .bind(plaintext_sha256)
+    .bind("5e".repeat(32))
+    .bind(path)
+    .fetch_one(pool)
+    .await
+    .expect("seed object") as u64
+}
+
+fn object_of(object_id: u64, plaintext_sha256: &str, path: &str) -> AttachmentObject {
+    AttachmentObject {
+        object_id,
+        plaintext_sha256: plaintext_sha256.to_string(),
+        plaintext_size: 1024,
+        sealed_sha256: "5e".repeat(32),
+        sealed_size: 1092,
+        file_path: path.to_string(),
+        storage_source_id: 0,
+        format_version: 1,
+        encryption_key_id: 1,
+    }
+}
+
+/// 秒传取用：给 `uid` 复制出**自己的**一条引用（口径同 `file_claim_service`）。
+///
+/// 🔴 元数据来自**取用者自己**（生产里来自他那张 token），不是从源记录抄的：
+/// 同一份内容，两个人可以起不同的文件名、报不同的 mime、绑到各自的业务上。
+/// 从源记录复制等于把第一个上传者的文件名和业务绑定塞给第二个人。
+async fn claim_for(
+    repo: &FileUploadRepository,
+    object_id: u64,
+    uid: u64,
+    filename: &str,
+    mime: &str,
+) -> u64 {
+    repo.create_reference(
+        object_id,
+        uid,
+        &ReferenceMetadata {
+            original_filename: filename,
+            file_type: &FileType::Image,
+            mime_type: mime,
+            business_type: "message",
+        },
+        None,
+    )
+    .await
+    .expect("claim")
 }
 
 /// 同一份内容第二次发送：查得到，复制出**自己的**一行，物理文件不动。
@@ -102,27 +168,26 @@ async fn a_second_sender_gets_their_own_row_over_the_same_file() {
     let repo = FileUploadRepository::new(pool.clone());
 
     let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
     // 探测：按 内容摘要 + 类型 + 大小 找。
     let found = repo
-        .find_by_content(SHA)
+        .find_object_by_plaintext_sha256(SHA)
         .await
         .expect("probe")
         .expect("命中已有内容");
-    assert_eq!(found.file_id, original.file_id);
+    assert_eq!(found.object_id, original.object.object_id, "命中的必须是同一个物理对象");
 
     // 取用：给 OTHER 复制一行。
-    let mine = repo
-        .copy_for_user(&found, OTHER as u64, "message", None)
-        .await
-        .expect("copy");
+    let mine = claim_for(&repo, found.object_id, OTHER as u64, "mine.png", "image/png").await;
 
     assert_ne!(mine, original.file_id, "拿到的必须是自己的新 file_id");
 
-    let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT file_id, uploader_id, file_path, business_id FROM privchat_file_uploads \
-         WHERE file_id = ANY($1) ORDER BY file_id",
+    // 物理坐标在对象行上；引用行只带自己的归属与业务字段。
+    let rows: Vec<(i64, i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT u.file_id, u.uploader_id, o.file_path, u.original_filename, u.business_id \
+         FROM privchat_file_uploads u \
+         JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
+         WHERE u.file_id = ANY($1) ORDER BY u.file_id",
     )
     .bind(&vec![original.file_id as i64, mine as i64])
     .fetch_all(pool.as_ref())
@@ -130,16 +195,30 @@ async fn a_second_sender_gets_their_own_row_over_the_same_file() {
     .expect("read rows");
 
     assert_eq!(rows.len(), 2, "两个人各一行");
-    for (file_id, uploader_id, path, business_id) in &rows {
-        assert_eq!(path, SHARED_PATH, "两行指向同一个物理文件——这就是「不重传」");
+    for (file_id, uploader_id, path, filename, business_id) in &rows {
+        assert_eq!(path, SHARED_PATH, "两行指向同一个物理对象——这就是「不重传」");
         if *file_id == mine as i64 {
             assert_eq!(*uploader_id, OTHER, "新行归属请求者自己");
+            // 🔴 元数据来自**取用者自己的 token**，不是从源行抄的。
+            assert_eq!(filename, "mine.png", "文件名是我自己报的，不是第一个上传者的");
             assert!(
                 business_id.is_none(),
                 "新行不继承别人的业务绑定：它要绑到我自己的那条消息上",
             );
+        } else {
+            assert_eq!(filename, "photo.png", "源行不受影响");
         }
     }
+
+    // 物理对象只有一个。
+    let objects: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM privchat_attachment_objects WHERE plaintext_sha256 = $1",
+    )
+    .bind(SHA)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("count objects");
+    assert_eq!(objects, 1, "两条引用，一个物理对象");
 
     cleanup(&pool).await;
 }
@@ -153,14 +232,10 @@ async fn deleting_one_row_keeps_the_file_while_others_point_at_it() {
     let repo = FileUploadRepository::new(pool.clone());
 
     let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
-    let mine = repo
-        .copy_for_user(&original, OTHER as u64, "message", None)
-        .await
-        .expect("copy");
+    let mine = claim_for(&repo, original.object.object_id, OTHER as u64, "mine.png", "image/png").await;
 
     assert!(
-        repo.other_rows_share_path(mine, SHARED_PATH)
+        repo.other_rows_share_object(mine, original.object.object_id)
             .await
             .expect("count"),
         "两行都在时，删任意一行都不该动物理文件",
@@ -170,7 +245,7 @@ async fn deleting_one_row_keeps_the_file_while_others_point_at_it() {
 
     assert!(
         !repo
-            .other_rows_share_path(original.file_id, SHARED_PATH)
+            .other_rows_share_object(original.file_id, original.object.object_id)
             .await
             .expect("count"),
         "只剩最后一行时，才轮到删物理文件",
@@ -231,12 +306,16 @@ async fn converge(pool: &sqlx::PgPool, uploader: i64, my_path: &str) -> String {
     let placement = converge_upload(
         &mut tx,
         &UploadPlacement {
-            stored_sha256: SHA.to_string(),
-            encryption_version: 0,
+            // 🔴 判重键是**明文**摘要：密文每次封装都不同，按它判等于秒传只对
+            // "自己重发自己"生效。
+            plaintext_sha256: SHA.to_string(),
+            plaintext_size: 1024,
+            sealed_sha256: "5e".repeat(32),
+            sealed_size: 1092,
             my_path: my_path.to_string(),
             my_source_id: 0,
-            my_cek: None,
-            my_encryption_key_id: None,
+            format_version: 1,
+            encryption_key_id: 1,
         },
     )
     .await
@@ -247,17 +326,17 @@ async fn converge(pool: &sqlx::PgPool, uploader: i64, my_path: &str) -> String {
     // 有锁时后到者根本进不到这里（它还堵在锁上），所以这段停顿不会造成死等。
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
+    // 引用行只挂 object_id：物理事实在收敛出来的那个对象上。
     sqlx::query(
         "INSERT INTO privchat_file_uploads \
-         (file_id, original_filename, file_size, file_type, mime_type, file_path, \
-          uploader_id, file_hash, business_type) \
-         VALUES ($1, 'x.png', 1024, $2, 'image/png', $3, $4, $5, 'message')",
+         (file_id, original_filename, file_type, mime_type, object_id, \
+          uploader_id, business_type) \
+         VALUES ($1, 'x.png', $2, 'image/png', $3, $4, 'message')",
     )
     .bind(file_id as i64)
     .bind(FileType::Image.as_str())
-    .bind(&placement.file_path)
+    .bind(placement.object_id as i64)
     .bind(uploader)
-    .bind(SHA)
     .execute(&mut *tx)
     .await
     .expect("insert");
@@ -278,19 +357,34 @@ async fn claiming_a_file_that_was_just_deleted_is_refused() {
     let repo = FileUploadRepository::new(pool.clone());
 
     let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
-    // 模拟「claim 已经读到了源行」：拿着这份快照，但库里那行随后被删掉。
+    // 模拟「claim 已经读到了对象」：拿着这份快照，但那个**物理对象**随后被 GC 掉。
+    //
+    // 🔴 判据换成删对象，不是删引用行：引用行的删除不再牵动物理对象（那正是
+    // 多条引用共享一个对象的意义）。删掉一条引用之后 claim 当然还该成立——
+    // 真正必须拒绝的是"对象已经不在了"。
     let snapshot = original.clone();
-    repo.delete(original.file_id).await.expect("delete source");
+    repo.delete(original.file_id).await.expect("delete source reference");
+    sqlx::query("DELETE FROM privchat_attachment_objects WHERE object_id = $1")
+        .bind(snapshot.object.object_id as i64)
+        .execute(pool.as_ref())
+        .await
+        .expect("GC 掉物理对象");
 
-    let refused = repo.copy_for_user(&snapshot, OTHER as u64, "message", None).await;
+    let refused = repo.create_reference(snapshot.object.object_id, OTHER as u64, &ReferenceMetadata {
+            original_filename: &snapshot.original_filename,
+            file_type: &snapshot.file_type,
+            mime_type: &snapshot.mime_type,
+            business_type: "message",
+        }, None).await;
     assert!(
         refused.is_err(),
-        "源文件已被删除时必须拒绝，不能留下指向不存在文件的记录",
+        "物理对象已被删除时必须拒绝，不能留下指向不存在对象的引用",
     );
 
     let rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM privchat_file_uploads WHERE file_path = $1",
+        "SELECT count(*) FROM privchat_file_uploads u \
+         JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
+         WHERE o.file_path = $1",
     )
     .bind(SHARED_PATH)
     .fetch_one(pool.as_ref())
@@ -303,40 +397,15 @@ async fn claiming_a_file_that_was_just_deleted_is_refused() {
 
 /// 老数据不会误命中。
 ///
-/// 存量行的 file_hash 是 `hash:<u64>`（DefaultHasher，跨 Rust 版本都不稳定），
-/// 与 64 位十六进制摘要不可能相等——所以老文件只是命不中，不会张冠李戴。
-#[tokio::test]
-async fn legacy_hashes_never_match() {
-    let _guard = fixture_lock().lock().await;
-    let Some(pool) = pool().await else { return };
-    cleanup(&pool).await;
-    let repo = FileUploadRepository::new(pool.clone());
+// 🔴 删掉了 `legacy_hashes_never_match`。
+//
+// 它盯的是 `privchat_file_uploads.file_hash` 这一列——存量行里放着
+// `hash:<u64>`（DefaultHasher）格式的老摘要，用例证明它不会与 64 位十六进制
+// 摘要张冠李戴。这一列已经随 migration 032 删除，身份统一搬到
+// `privchat_attachment_objects` 上，且判重键换成了明文摘要并带
+// `^[0-9a-f]{64}$` 的 CHECK 约束——老格式在数据库层就进不来了。
+// 用例失去了它要守的东西，留着只会是一段永远为真的空断言。
 
-    let mut legacy = seed_original(&repo).await;
-    legacy.file_hash = Some("hash:12345678901234567890".to_string());
-    sqlx::query("UPDATE privchat_file_uploads SET file_hash = $2 WHERE file_id = $1")
-        .bind(legacy.file_id as i64)
-        .bind(legacy.file_hash.as_deref())
-        .execute(pool.as_ref())
-        .await
-        .expect("legacy hash");
-
-    assert!(
-        repo.find_by_content(SHA)
-            .await
-            .expect("probe")
-            .is_none(),
-        "老摘要格式与内容摘要不可能相等",
-    );
-
-    cleanup(&pool).await;
-}
-
-/// 🔴 claim 响应丢失后重试，必须拿回**同一个** file_id。
-///
-/// 这是幂等真正的判据。只做到「并发只有一个成功」是不够的：数据库提交了、响应在
-/// 网络上丢了，客户端重试如果又插一行，用户就多了一份没人用的记录，
-/// 而他手上那条消息引用的还是拿不到的那个 id。
 #[tokio::test]
 async fn replaying_a_claim_returns_the_same_file_id() {
     let _guard = fixture_lock().lock().await;
@@ -345,16 +414,35 @@ async fn replaying_a_claim_returns_the_same_file_id() {
     let repo = FileUploadRepository::new(pool.clone());
 
     let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
     let key = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
 
     let first = repo
-        .copy_for_user(&original, OTHER as u64, "message", Some(key))
+        .create_reference(
+            original.object.object_id,
+            OTHER as u64,
+            &ReferenceMetadata {
+                original_filename: "mine.png",
+                file_type: &FileType::Image,
+                mime_type: "image/png",
+                business_type: "message",
+            },
+            Some(key),
+        )
         .await
         .expect("first claim");
     // 「响应丢了」= 客户端没收到结果，拿同一个 token 又来一次。
     let replay = repo
-        .copy_for_user(&original, OTHER as u64, "message", Some(key))
+        .create_reference(
+            original.object.object_id,
+            OTHER as u64,
+            &ReferenceMetadata {
+                original_filename: "mine.png",
+                file_type: &FileType::Image,
+                mime_type: "image/png",
+                business_type: "message",
+            },
+            Some(key),
+        )
         .await
         .expect("replayed claim");
 
@@ -401,17 +489,21 @@ fn a_client_that_declares_no_digest_is_not_size_checked() {
     assert_eq!(size_check_target(Some("d0"), None), None);
 }
 
-/// 🔴 收敛选中了某个路径，而那个路径的最后一行在它拿到路径锁**之前**被删掉：
-/// 必须退回用自己刚上传的那份，而不是留下一条指向已删除物理文件的记录。
+/// 🔴 收敛命中了一个已有对象，而那个对象在它拿到**对象锁**之前被删掉：
+/// 必须退回用自己刚上传的那份，而不是把一个已经不存在的 object_id 交出去
+/// （调用方拿它去插引用会撞 FK，一次本可成功的上传就此失败）。
 ///
-/// 这一臂之前没有覆盖——删掉行再调用的话，按 hash 的查询直接落到 `None` 分支，
-/// 走不到复查。这里用两条连接把顺序钉死，不需要给生产函数开测试注入点：
+/// 这条门禁盯的正是「内容锁与删除锁不是同一把」这个洞：内容锁只把同内容的首传
+/// 串起来，删除和 `create_reference` 锁的是 `object_id`，两者互不同步。所以命中之后
+/// 必须再取一次对象锁并复查。
 ///
-///   1. A 先持有目标 `file_path` 的 advisory 锁；
-///   2. B 调生产 `converge_upload`：内容锁拿得到、按 hash 查得到旧行，
-///      然后**堵在**路径锁上；
-///   3. A 删掉最后一行并提交（锁随之释放）；
-///   4. B 拿到锁，复查发现路径上已经没有行，退回自己的路径。
+/// 用两条连接把顺序钉死，不需要给生产函数开测试注入点：
+///
+///   1. A 先持有该对象的 advisory 锁；
+///   2. B 调生产 `converge_upload`：内容锁拿得到、按明文摘要查得到那个对象，
+///      然后**堵在**对象锁上；
+///   3. A 删掉对象行并提交（锁随之释放）；
+///   4. B 拿到锁，复查发现对象已经没了，退回自己那份。
 #[tokio::test]
 async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
     use privchat::service::file_service::{converge_upload, UploadPlacement};
@@ -421,29 +513,31 @@ async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
     let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
-    // 1. A 抢先占住路径锁。
+    // 1. A 抢先占住对象锁。
+    let object_id = original.object.object_id as i64;
     let mut tx_a = pool.begin().await.expect("tx a");
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-        .bind(SHARED_PATH)
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(object_id)
         .execute(&mut *tx_a)
         .await
-        .expect("a holds path lock");
+        .expect("a holds object lock");
 
-    // 2. B 去收敛：会查到旧行，然后堵在路径锁上。
+    // 2. B 去收敛：会查到那个对象，然后堵在对象锁上。
     let pool_b = pool.clone();
     let b = tokio::spawn(async move {
         let mut tx = pool_b.begin().await.expect("tx b");
         let placement = converge_upload(
             &mut tx,
             &UploadPlacement {
-                stored_sha256: SHA.to_string(),
-                encryption_version: 0,
+                plaintext_sha256: SHA.to_string(),
+                plaintext_size: 1024,
+                sealed_sha256: "5e".repeat(32),
+                sealed_size: 1092,
                 my_path: "/tmp/privchat-dedup-test/mine.bin".to_string(),
                 my_source_id: 0,
-                my_cek: None,
-            my_encryption_key_id: None,
+                format_version: 1,
+                encryption_key_id: 1,
             },
         )
         .await
@@ -457,132 +551,33 @@ async fn convergence_falls_back_when_the_path_is_deleted_while_it_waits() {
     // 固定等待在慢机器上会失效：B 可能还没执行到查询，删除就发生了，
     // 这条测试于是退化成「先删再收敛」——走的是 `None` 分支，复查根本没被执行，
     // 也就成了假绿。这里直接问 Postgres：有没有人在等这把 advisory 锁。
-    wait_until_blocked_on_advisory_lock(&pool, SHARED_PATH).await;
+    wait_until_blocked_on_advisory_lock(&pool, object_id).await;
 
-    // 3. A 删掉最后一行并提交，释放锁。
+    // 3. A 删掉最后一条引用连同对象行并提交，释放锁。
     sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = $1")
         .bind(original.file_id as i64)
         .execute(&mut *tx_a)
         .await
-        .expect("delete last row");
+        .expect("delete last reference");
+    sqlx::query("DELETE FROM privchat_attachment_objects WHERE object_id = $1")
+        .bind(object_id)
+        .execute(&mut *tx_a)
+        .await
+        .expect("delete the object");
     tx_a.commit().await.expect("commit a");
 
     // 4. B 拿到锁后复查失败，退回自己那份。
     let placement = b.await.expect("join b");
     assert_eq!(
         placement.file_path, "/tmp/privchat-dedup-test/mine.bin",
-        "等锁期间路径上的最后一行被删了，必须退回自己刚上传的那份",
+        "等锁期间对象被删了，必须退回自己刚上传的那份",
     );
     assert!(!placement.duplicate, "自己那份现在是唯一的一份，不能删");
 
     cleanup(&pool).await;
 }
 
-/// 🔴 claim 的**生产入口**：token 已被消费之后重放，必须返回同一个 file_id。
-///
-/// 之前这条只测到仓储层。仓储层看不见「幂等查询排在 token 校验之前」这个顺序——
-/// 让 `claimer` 对源文件**确实有读取权限**：把文件挂到一条双方都在的会话消息上。
-///
-/// 不建这个前提的话，claim 会被授权闸门拒掉——那正是它该做的事，但这两条用例
-/// 要验的是 token 用途和重放幂等，不是授权本身（授权在 `attachment_authz_db_test`）。
-async fn authorize_claimer(pool: &sqlx::PgPool, file_id: u64, uploader: i64, claimer: i64) {
-    const CH: i64 = 970_001;
-    const MSG: i64 = 970_002;
-    let qr = |n: i64| format!("dedup-qr-{n}");
-    for (uid, name) in [(uploader, "dedup_uploader"), (claimer, "dedup_claimer")] {
-        sqlx::query(
-            "INSERT INTO privchat_users (user_id, username, display_name, qr_key)
-             VALUES ($1, $2, $2, $3) ON CONFLICT (user_id) DO NOTHING",
-        )
-        .bind(uid)
-        .bind(name)
-        .bind(qr(uid))
-        .execute(pool)
-        .await
-        .expect("ensure user");
-    }
-    sqlx::query(
-        "INSERT INTO privchat_channels (channel_id, channel_type, direct_user1_id, direct_user2_id)
-         VALUES ($1, 0, $2, $3) ON CONFLICT (channel_id) DO NOTHING",
-    )
-    .bind(CH)
-    .bind(uploader)
-    .bind(claimer)
-    .execute(pool)
-    .await
-    .expect("ensure channel");
-    for uid in [uploader, claimer] {
-        sqlx::query(
-            "INSERT INTO privchat_channel_participants (channel_id, user_id, role, joined_at, left_at)
-             VALUES ($1, $2, 2, now_millis(), NULL)
-             ON CONFLICT (channel_id, user_id) DO UPDATE SET left_at = NULL",
-        )
-        .bind(CH)
-        .bind(uid)
-        .execute(pool)
-        .await
-        .expect("ensure participant");
-    }
-    // 🔴 先删后建，别指望 ON CONFLICT。
-    //
-    // `privchat_messages` 的主键含 `created_at`，而它默认取 now()——所以每跑一次
-    // 就多一行同 message_id 的消息，ON CONFLICT 永远不命中。撤回过的那些旧行
-    // 一直留着，引用 join 照样命中它们，于是一堆与撤回无关的用例集体被闸门拒掉。
-    sqlx::query("DELETE FROM privchat_messages WHERE message_id = $1")
-        .bind(MSG)
-        .execute(pool)
-        .await
-        .expect("reset message");
-    sqlx::query(
-        "INSERT INTO privchat_messages (message_id, channel_id, sender_id, pts, message_type, content)
-         VALUES ($1, $2, $3, 1, 1, '[image]')",
-    )
-    .bind(MSG)
-    .bind(CH)
-    .bind(uploader)
-    .execute(pool)
-    .await
-    .expect("ensure message");
-    // 🔴 先删。引用表主键不含 file_id，上一轮跑剩的行会让 ON CONFLICT DO NOTHING
-    // 静默吞掉这次插入——于是文件看起来「从未被引用」，授权回落到只有上传者可读，
-    // 表现为一条与授权无关的用例莫名其妙失败。
-    sqlx::query("DELETE FROM privchat_message_file_refs WHERE message_id = $1")
-        .bind(MSG)
-        .execute(pool)
-        .await
-        .expect("reset file refs");
-    sqlx::query(
-        "INSERT INTO privchat_message_file_refs
-             (message_id, message_created_at, file_id, role, ordinal, created_at)
-         SELECT $1, m.created_at, $2, 0, 0, m.created_at
-         FROM privchat_messages m WHERE m.message_id = $1
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(MSG)
-    .bind(file_id as i64)
-    .execute(pool)
-    .await
-    .expect("insert file ref");
-}
 
-/// 秒传取用的授权判据与 `file/get_url` 同一套，所以测试也得把那两样依赖备齐。
-fn authorization_deps(
-    pool: &sqlx::PgPool,
-) -> (
-    privchat::repository::message_repo::PgMessageRepository,
-    privchat::service::channel_service::ChannelService,
-) {
-    (
-        privchat::repository::message_repo::PgMessageRepository::new(std::sync::Arc::new(
-            pool.clone(),
-        )),
-        privchat::service::channel_service::ChannelService::new_with_repository(std::sync::Arc::new(
-            privchat::repository::channel_repo::PgChannelRepository::new(std::sync::Arc::new(
-                pool.clone(),
-            )),
-        )),
-    )
-}
 
 /// 有人把它挪到后面，仓储测试照样绿，而实际行为是：成功过的 token 已被消费，
 /// 再去校验只会得到「无效」，客户端永远拿不回那条记录。
@@ -603,7 +598,6 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
 
     let repo = FileUploadRepository::new(pool.clone());
     let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
     let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
     let token_service = Arc::new(UploadTokenService::new());
@@ -615,10 +609,15 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
             "message".to_string(),
             Some("photo.png".to_string()),
             UploadIdentity {
-                sha256: Some(SHA.to_string()),
-                declared_size: Some(1024),
+                plaintext_sha256: Some(SHA.to_string()),
+                plaintext_size: Some(1024),
+                declared_size: Some(1092),
                 mime_type: Some("image/png".to_string()),
-                transform_version: 0,
+                format_version: Some(1),
+                encryption_key_id: Some(1),
+                chunk_plain_size: Some(
+                    privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE,
+                ),
             },
             // 预检命中签发的就是这种用途。
             UploadTokenPurpose::ClaimExisting,
@@ -626,9 +625,7 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
         .await
         .expect("token");
 
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
-    let (messages, channels) = authorization_deps(&pool);
-    let first = claim_existing_file(&file_service, &token_service, &messages, &channels, OTHER as u64, &token.token, SHA)
+    let first = claim_existing_file(&file_service, &token_service, OTHER as u64, &token.token, SHA)
         .await
         .expect("first claim");
     assert_ne!(first.file_id, original.file_id, "拿到的是自己的新 file_id");
@@ -663,7 +660,7 @@ async fn replaying_a_claim_through_the_service_returns_the_same_file_id() {
     );
 
     // 「响应丢了」：客户端拿同一个 token 再来一次。
-    let replay = claim_existing_file(&file_service, &token_service, &messages, &channels, OTHER as u64, &token.token, SHA)
+    let replay = claim_existing_file(&file_service, &token_service, OTHER as u64, &token.token, SHA)
         .await
         .expect("replayed claim must succeed and must not create a second row");
     assert_eq!(first.file_id, replay.file_id, "重放必须返回同一个 file_id");
@@ -816,169 +813,29 @@ async fn seed_reference_for(pool: &sqlx::PgPool, channel_type: i16, file_id: u64
     msg
 }
 
-/// 轮询 `pg_locks`，直到确实有连接在等**行**锁（tuple / transactionid）。
+
+
+
+
+
+
+
+/// claim 与「撤回 / 退群」**互不阻塞** —— 这是新语义下必须钉住的那一面。
 ///
-/// 判据同样是「有一条未授予的锁记录」而不是睡够时间：撤回被 claim 的共享锁挡住
-/// 时，等待就体现在这里。
-async fn wait_until_blocked_on_row_lock(pool: &sqlx::PgPool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_locks \
-             WHERE NOT granted AND locktype IN ('tuple', 'transactionid')",
-        )
-        .fetch_one(pool)
-        .await
-        .expect("read pg_locks");
-        if waiting > 0 {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "10 秒内没有观察到有人在等行锁；不能继续，否则并发断言变成假绿",
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-}
-
-/// 撤回 / 退群必须等在**生产代码**持有的共享锁上。
+/// 🔴 这两条用例（私聊撤回、群聊退群）原本断言的是反面：并发撤回/退群必须被
+/// claim 持有的消息行、频道行锁挡住。那套锁是旧判据的产物——当时 claim 要先核对
+/// "取用者对源记录所在的消息/频道有没有访问权"，为了让这个判定不被并发改写，
+/// 它得一路锁住 message / channel / group_members。
 ///
-/// 🔴 这里有两个必须做对的地方，之前各栽过一次：
+/// 判据换成"持有 token 冻结的明文摘要即可取用"之后，claim 根本不再读这些表，
+/// 那些锁也就不该存在了。**把旧断言留着会反过来钉死一套已经废弃的跨域加锁**：
+/// 谁哪天顺手把 message 行锁加回 claim 里，旧用例反而变绿。所以这里翻过来钉
+/// 新方向——claim 不碰消息域，撤回/退群不必等它。
 ///
-/// 1. 必须跑**真实的** `copy_for_user`。测试自己写一条 `FOR SHARE` 只能证明
-///    PostgreSQL 的锁语义，删掉生产锁照样绿。
-/// 2. 必须确认「挡住我的就是那个 claim」。只看「我在等某个事务」不够——被别的
-///    事务挡住也满足，同样是假绿。`pg_blocking_pids()` 直接回答这个问题，而且
-///    不需要知道锁具体在哪一行。
-struct InsertBarrier {
-    pool: std::sync::Arc<sqlx::PgPool>,
-}
-
-impl InsertBarrier {
-    /// 装一个 BEFORE INSERT trigger，让写 `privchat_file_uploads` 的事务停在
-    /// 指定的 advisory 锁上——那一刻它的授权锁已经全部持住。
-    async fn arm(pool: &std::sync::Arc<sqlx::PgPool>, key: i64, claim_key: &str) -> Self {
-        // 先清残留：上一次跑如果在断言处 panic，Drop 也可能没跑成。
-        Self::drop_all(pool).await;
-        // 🔴 只对**本测试那一次 claim** 生效（按 claim_key_hash 匹配）。
-        // 全局 trigger 万一残留，会把后续每一次文件 INSERT 都挂住，一条测试失败
-        // 拖垮整个套件；限定之后，残留最多影响这一个不会再出现的键。
-        sqlx::raw_sql(&format!(
-            "CREATE OR REPLACE FUNCTION dedup_claim_barrier() RETURNS trigger AS $$
-             BEGIN
-               PERFORM pg_advisory_xact_lock({key});
-               RETURN NEW;
-             END; $$ LANGUAGE plpgsql;
-             CREATE TRIGGER dedup_claim_barrier BEFORE INSERT ON privchat_file_uploads
-               FOR EACH ROW WHEN (NEW.claim_key_hash = '{claim_key}')
-               EXECUTE FUNCTION dedup_claim_barrier();"
-        ))
-        .execute(pool.as_ref())
-        .await
-        .expect("arm insert barrier");
-        Self { pool: pool.clone() }
-    }
-
-    async fn drop_all(pool: &std::sync::Arc<sqlx::PgPool>) {
-        sqlx::raw_sql(
-            "DROP TRIGGER IF EXISTS dedup_claim_barrier ON privchat_file_uploads;
-             DROP FUNCTION IF EXISTS dedup_claim_barrier();",
-        )
-        .execute(pool.as_ref())
-        .await
-        .expect("drop insert barrier");
-    }
-}
-
-impl Drop for InsertBarrier {
-    /// 🔴 断言 panic 时也要拆掉。留在库里的话，后面每一次文件 INSERT 都会挂在
-    /// 那把 advisory 锁上——一条测试失败会连累整个套件。
-    fn drop(&mut self) {
-        let pool = self.pool.clone();
-        // Drop 里不能 await：交给一个独立线程上的运行时同步跑完。
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("cleanup runtime");
-            rt.block_on(async { InsertBarrier::drop_all(&pool).await });
-        })
-        .join();
-    }
-}
-
-/// 等到 `waiter` 被挡住，并且**挡住它的正是** `blocker`。
-async fn wait_until_blocked_by(pool: &sqlx::PgPool, waiter: i32, blocker: i32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let blockers: Vec<i32> = sqlx::query_scalar("SELECT unnest(pg_blocking_pids($1))")
-            .bind(waiter)
-            .fetch_all(pool)
-            .await
-            .expect("pg_blocking_pids");
-        if blockers.contains(&blocker) {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "10 秒内 pid={waiter} 没有被 claim(pid={blocker}) 挡住；实际挡它的是 {blockers:?}",
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-}
-
-/// 等真实 claim 停在 barrier 上，返回它的后端 pid。
-async fn wait_for_claim_at_barrier(pool: &sqlx::PgPool, key: i64) -> i32 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let pid: Option<(i32,)> = sqlx::query_as(
-            "SELECT pid FROM pg_locks
-              WHERE locktype = 'advisory' AND NOT granted
-                AND objid = ($1::bigint & 4294967295) LIMIT 1",
-        )
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .expect("find claim pid");
-        if let Some((pid,)) = pid {
-            return pid;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "10 秒内真实 claim 没有停在 barrier 上"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-}
-
-/// 报出自己的后端 pid，然后执行一条会被挡住的写操作。
-async fn spawn_blocked_write(
-    pool: std::sync::Arc<sqlx::PgPool>,
-    sql: &'static str,
-    a: i64,
-    b: i64,
-) -> (i32, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
-    let handle = tokio::spawn(async move {
-        let mut conn = pool.acquire().await.expect("conn");
-        let pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
-            .fetch_one(&mut *conn)
-            .await
-            .expect("pid");
-        tx.send(pid.0).expect("report pid");
-        sqlx::query(sql)
-            .bind(a)
-            .bind(b)
-            .execute(&mut *conn)
-            .await
-            .expect("write completes once unblocked");
-    });
-    (rx.await.expect("pid"), handle)
-}
-
-/// 私聊：并发撤回必须被真实 claim 持有的**消息行**锁挡住。
+/// 撤回真正该拦住的是**下载**，那条门禁在 `attachment_authz_db_test`
+/// （撤回后该引用不再授权，兄弟引用仍然授权）。
 #[tokio::test]
-async fn a_revoke_is_blocked_by_the_production_claim() {
+async fn a_claim_does_not_lock_the_message_domain() {
     let _guard = fixture_lock().lock().await;
     let Some(pool) = pool().await else { return };
     cleanup(&pool).await;
@@ -986,170 +843,44 @@ async fn a_revoke_is_blocked_by_the_production_claim() {
     let original = seed_original(&repo).await;
     let msg = seed_reference_for(&pool, 0, original.file_id).await;
 
-    const BARRIER: i64 = 973_001;
-    const CLAIM_KEY: &str = "barrier-claim-key";
-    let _barrier = InsertBarrier::arm(&pool, BARRIER, CLAIM_KEY).await;
-    let mut holder = pool.begin().await.expect("holder tx");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(BARRIER)
-        .execute(&mut *holder)
-        .await
-        .expect("hold barrier");
-
+    // claim 与撤回同时发生。
     let claim_pool = pool.clone();
     let source = original.clone();
     let claim = tokio::spawn(async move {
         FileUploadRepository::new(claim_pool)
-            .copy_for_user(&source, OTHER as u64, "message", Some(CLAIM_KEY))
-            .await
-    });
-    let claim_pid = wait_for_claim_at_barrier(&pool, BARRIER).await;
-
-    let (revoke_pid, revoker) = spawn_blocked_write(
-        pool.clone(),
-        "UPDATE privchat_messages SET revoked = true WHERE message_id = $1 AND $2 = $2",
-        msg,
-        0,
-    )
-    .await;
-    wait_until_blocked_by(&pool, revoke_pid, claim_pid).await;
-
-    holder.commit().await.expect("release barrier");
-    claim.await.expect("claim task").expect("claim succeeds");
-    revoker.await.expect("revoke task");
-
-    cleanup(&pool).await;
-}
-
-/// 群聊：并发退群必须被真实 claim 挡住。
-///
-/// ⚠️ 它守住的是**频道行锁**这条链路，不是成员行锁那一句。退群会触发
-/// `trg_privchat_group_membership_version` 去更新 `privchat_channels.membership_version`，
-/// 而那一行已经被 claim 的 `FOR SHARE OF m, c` 锁住——所以删掉生产里的
-/// `privchat_group_members ... FOR SHARE`，这条依旧绿。实测确认过。
-///
-/// 成员行锁因此没有独立门禁；保留它的理由写在 `copy_for_user` 里（串行化不该
-/// 依赖一个为同步版本号而加的 trigger 恰好存在）。
-#[tokio::test]
-async fn leaving_a_group_is_blocked_by_the_production_claim() {
-    let _guard = fixture_lock().lock().await;
-    let Some(pool) = pool().await else { return };
-    cleanup(&pool).await;
-    let repo = FileUploadRepository::new(pool.clone());
-    let original = seed_original(&repo).await;
-    let msg = seed_reference_for(&pool, 1, original.file_id).await;
-    let group: (i64,) =
-        sqlx::query_as("SELECT channel_id FROM privchat_messages WHERE message_id = $1")
-            .bind(msg)
-            .fetch_one(pool.as_ref())
-            .await
-            .expect("group id");
-
-    const BARRIER: i64 = 973_002;
-    const CLAIM_KEY: &str = "barrier-claim-key-group";
-    let _barrier = InsertBarrier::arm(&pool, BARRIER, CLAIM_KEY).await;
-    let mut holder = pool.begin().await.expect("holder tx");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(BARRIER)
-        .execute(&mut *holder)
-        .await
-        .expect("hold barrier");
-
-    let claim_pool = pool.clone();
-    let source = original.clone();
-    let claim = tokio::spawn(async move {
-        FileUploadRepository::new(claim_pool)
-            .copy_for_user(&source, OTHER as u64, "message", Some(CLAIM_KEY))
-            .await
-    });
-    let claim_pid = wait_for_claim_at_barrier(&pool, BARRIER).await;
-
-    let (leave_pid, leaver) = spawn_blocked_write(
-        pool.clone(),
-        "UPDATE privchat_group_members SET left_at = now_millis()
-          WHERE group_id = $1 AND user_id = $2",
-        group.0,
-        OTHER,
-    )
-    .await;
-    wait_until_blocked_by(&pool, leave_pid, claim_pid).await;
-
-    holder.commit().await.expect("release barrier");
-    claim.await.expect("claim task").expect("claim succeeds");
-    leaver.await.expect("leave task");
-
-    cleanup(&pool).await;
-}
-
-/// 建一条群引用（OTHER 是群成员），返回 group/channel id。
-async fn seed_group_reference(pool: &sqlx::PgPool, msg: i64, file_id: u64) -> i64 {
-    const GROUP: i64 = 974_100;
-    sqlx::query(
-        "INSERT INTO privchat_groups (group_id, name, owner_id, qr_key)
-         VALUES ($1, 'dedup-fallthrough', $2, 'dfq974100')
-         ON CONFLICT (group_id) DO NOTHING",
-    )
-    .bind(GROUP)
-    .bind(OWNER)
-    .execute(pool)
-    .await
-    .expect("group");
-    sqlx::query(
-        "INSERT INTO privchat_channels (channel_id, channel_type, group_id)
-         VALUES ($1, 1, $1) ON CONFLICT (channel_id) DO NOTHING",
-    )
-    .bind(GROUP)
-    .execute(pool)
-    .await
-    .expect("group channel");
-    sqlx::query(
-        "INSERT INTO privchat_group_members (group_id, user_id, role, joined_at, left_at)
-         VALUES ($1, $2, 2, now_millis(), NULL)
-         ON CONFLICT (group_id, user_id) DO UPDATE SET left_at = NULL",
-    )
-    .bind(GROUP)
-    .bind(OTHER)
-    .execute(pool)
-    .await
-    .expect("group member");
-    seed_message_ref(pool, msg, GROUP, file_id).await;
-    GROUP
-}
-
-/// 建一条私聊引用（OWNER ↔ OTHER），复用已有的那条 DM。
-async fn seed_direct_reference(pool: &sqlx::PgPool, msg: i64, file_id: u64) {
-    let existing: Option<(i64,)> = sqlx::query_as(
-        "SELECT channel_id FROM privchat_channels
-          WHERE channel_type = 0
-            AND LEAST(direct_user1_id, direct_user2_id) = LEAST($1, $2)
-            AND GREATEST(direct_user1_id, direct_user2_id) = GREATEST($1, $2)
-          LIMIT 1",
-    )
-    .bind(OWNER)
-    .bind(OTHER)
-    .fetch_optional(pool)
-    .await
-    .expect("look up direct channel");
-    let channel = match existing {
-        Some((id,)) => id,
-        None => {
-            const DM: i64 = 974_101;
-            sqlx::query(
-                "INSERT INTO privchat_channels
-                     (channel_id, channel_type, direct_user1_id, direct_user2_id)
-                 VALUES ($1, 0, $2, $3)",
+            .create_reference(
+                source.object.object_id,
+                OTHER as u64,
+                &ReferenceMetadata {
+                    original_filename: "mine.png",
+                    file_type: &FileType::Image,
+                    mime_type: "image/png",
+                    business_type: "message",
+                },
+                Some("no-cross-domain-lock"),
             )
-            .bind(DM)
-            .bind(OWNER)
-            .bind(OTHER)
-            .execute(pool)
             .await
-            .expect("direct channel");
-            DM
-        }
-    };
-    seed_message_ref(pool, msg, channel, file_id).await;
+    });
+
+    // 🔴 撤回必须**自己走完**，不需要等 claim：两者之间没有锁耦合。
+    // 有耦合的话这句会一直等到 claim 结束，超时就是红。
+    let revoke = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = $1")
+            .bind(msg)
+            .execute(pool.as_ref()),
+    )
+    .await
+    .expect("🔴 撤回被 claim 挡住了：claim 不该在消息域上加锁");
+    revoke.expect("revoke");
+
+    let mine = claim.await.expect("claim task").expect("claim 照常成立");
+    assert_ne!(mine, original.file_id, "拿到的是自己的新引用");
+
+    cleanup(&pool).await;
 }
+
+
 
 /// 先删后建一条消息并挂上文件引用（消息主键含 created_at，ON CONFLICT 不管用）。
 async fn seed_message_ref(pool: &sqlx::PgPool, msg: i64, channel: i64, file_id: u64) {
@@ -1186,94 +917,72 @@ async fn seed_message_ref(pool: &sqlx::PgPool, msg: i64, channel: i64, file_id: 
     .expect("file ref");
 }
 
-/// 第一候选在等锁期间失效 → 换下一条；没有下一条才拒绝。
+/// 多条引用共享一个对象：删掉其中一条，按摘要 claim 仍命中同一个对象。
 ///
-/// 🔴 守住「`LIMIT 1` 也够用」的全部依据：拿到锁之后 PostgreSQL 按最新版本重新
-/// 求值，第一条不再满足就继续找。不成立的话单条候选就是并发下的误拒。
+/// 🔴 这条替换掉了 `a_stale_first_candidate_falls_through_to_the_next_one`。
+/// 那条用例守的是旧模型的"遍历同内容的候选**文件记录**、逐条判授权、失效就落到
+/// 下一条"。新模型里根本没有候选列表：明文摘要唯一对应一个物理对象
+/// （`plaintext_sha256` 上有唯一约束），所以"落到下一条"这件事不存在了，
+/// 机械移植只会得到一条永远为真的空断言。
 ///
-/// 不用 INSERT barrier——退群事务自己控制何时提交就够确定。关键是先断言
-/// **确实有人被退群那个事务挡住**：只看「claim 还没结束」在它根本没阻塞时也成立，
-/// 那样测的就不是这件事（上一版正是栽在这儿）。
-async fn run_fall_through_case(pool: &std::sync::Arc<sqlx::PgPool>, with_direct: bool) -> bool {
-    cleanup(pool).await;
-    let repo = FileUploadRepository::new(pool.clone());
-    let original = seed_original(&repo).await;
-
-    // 群引用的 message_id 必须**更小**：生产按 message_id 排序，否则私聊那条
-    // 先被选中，压根走不到 fall-through。
-    const GROUP_MSG: i64 = 974_001;
-    const DIRECT_MSG: i64 = 974_002;
-    let group = seed_group_reference(pool, GROUP_MSG, original.file_id).await;
-    if with_direct {
-        seed_direct_reference(pool, DIRECT_MSG, original.file_id).await;
-    }
-
-    let mut leave = pool.begin().await.expect("leave tx");
-    let leave_pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
-        .fetch_one(&mut *leave)
-        .await
-        .expect("leave pid");
-    let touched = sqlx::query(
-        "UPDATE privchat_group_members SET left_at = now_millis()
-          WHERE group_id = $1 AND user_id = $2",
-    )
-    .bind(group)
-    .bind(OTHER)
-    .execute(&mut *leave)
-    .await
-    .expect("leave the group")
-    .rows_affected();
-    assert_eq!(touched, 1, "前提：退群要真的改到那一行，否则 trigger 不触发");
-
-    let claim_pool = pool.clone();
-    let source = original.clone();
-    let claim = tokio::spawn(async move {
-        FileUploadRepository::new(claim_pool)
-            .copy_for_user(&source, OTHER as u64, "message", None)
-            .await
-    });
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let blocked: Vec<i32> = sqlx::query_scalar(
-            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
-        )
-        .bind(leave_pid.0)
-        .fetch_all(pool.as_ref())
-        .await
-        .expect("pg_blocking_pids");
-        if !blocked.is_empty() {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "10 秒内没有连接被退群事务(pid={})挡住；claim 没有等在群频道行上，\
-             这条用例测不到 fall-through",
-            leave_pid.0
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-
-    leave.commit().await.expect("commit the leave");
-    let claimed = claim.await.expect("claim task");
-    cleanup(pool).await;
-    claimed.is_ok()
-}
-
-/// 两个方向一起断言：有兜底引用必须成功，没有必须拒绝。缺一边都可能是假绿。
+/// 换成守新模型真正的性质：引用与对象的生命周期是分开的——少一条引用不影响
+/// 对象，也不影响后来者按摘要命中它。
 #[tokio::test]
-async fn a_stale_first_candidate_falls_through_to_the_next_one() {
+async fn dropping_one_reference_keeps_the_object_claimable() {
     let _guard = fixture_lock().lock().await;
     let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+    let repo = FileUploadRepository::new(pool.clone());
 
-    assert!(
-        run_fall_through_case(&pool, true).await,
-        "🔴 群引用失效但私聊引用仍有效时必须成功——就此拒绝是并发下的误拒"
-    );
-    assert!(
-        !run_fall_through_case(&pool, false).await,
-        "🔴 唯一的引用失效之后必须拒绝；仍然成功说明授权没有重新求值"
-    );
+    let original = seed_original(&repo).await;
+    // 第二个用户取用同一份内容。
+    let second = claim_for(&repo, original.object.object_id, OTHER as u64, "second.png", "image/png").await;
+
+    // 删掉第一条引用（源行）。物理对象还被第二条引用着，必须留下。
+    repo.delete(original.file_id).await.expect("delete the first reference");
+
+    let object = repo
+        .find_object_by_plaintext_sha256(SHA)
+        .await
+        .expect("probe")
+        .expect("🔴 还有引用指着它，对象不该被删");
+    assert_eq!(object.object_id, original.object.object_id, "还是同一个物理对象");
+
+    // 第三个用户仍能按摘要命中它，并拿到**自己**的元数据。
+    const THIRD: i64 = 9_980_031;
+    sqlx::query(
+        "INSERT INTO privchat_users (user_id, username, display_name, qr_key) \
+         VALUES ($1, 'dedup_third', 'dedup_third', $2) ON CONFLICT (user_id) DO NOTHING",
+    )
+    .bind(THIRD)
+    .bind(privchat::rpc::qr::generate_qr_key())
+    .execute(pool.as_ref())
+    .await
+    .expect("third user");
+    let third = claim_for(&repo, object.object_id, THIRD as u64, "third.png", "image/jpeg").await;
+    assert_ne!(third, second, "各人各一条引用");
+
+    let (filename, mime): (String, String) = sqlx::query_as(
+        "SELECT original_filename, mime_type FROM privchat_file_uploads WHERE file_id = $1",
+    )
+    .bind(third as i64)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("read third row");
+    assert_eq!(filename, "third.png", "元数据来自取用者自己的 token");
+    assert_eq!(mime, "image/jpeg");
+
+    // 全程只有一个物理对象。
+    let objects: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM privchat_attachment_objects WHERE plaintext_sha256 = $1",
+    )
+    .bind(SHA)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("count objects");
+    assert_eq!(objects, 1, "三条引用，一个物理对象");
+
+    cleanup(&pool).await;
 }
 
 /// 同一份内容有多条记录时，按**请求者能读哪一条**授权，不是钉死最老那条。
@@ -1371,23 +1080,22 @@ async fn a_claimer_is_authorized_against_the_record_they_can_actually_read() {
             "message".to_string(),
             None,
             UploadIdentity {
-                sha256: Some(SHA.to_string()),
-                declared_size: Some(1024),
+                plaintext_sha256: Some(SHA.to_string()),
+                plaintext_size: Some(1024),
+                declared_size: Some(1092),
                 mime_type: Some("image/png".to_string()),
-                transform_version: 0,
+                format_version: Some(1),
+                encryption_key_id: Some(1),
+                chunk_plain_size: Some(
+                    privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE,
+                ),
             },
             UploadTokenPurpose::ClaimExisting,
         )
         .await
         .expect("token");
 
-    let (messages, channels) = authorization_deps(&pool);
-    let claimed = claim_existing_file(
-        &file_service,
-        &token_service,
-        &messages,
-        &channels,
-        CHARLIE as u64,
+    let claimed = claim_existing_file(&file_service, &token_service, CHARLIE as u64,
         &token.token,
         SHA,
     )
@@ -1397,7 +1105,7 @@ async fn a_claimer_is_authorized_against_the_record_they_can_actually_read() {
         "🔴 charlie 有权读较新那条记录，不能因为 find_by_content 先返回最老那条就拒绝",
     );
     assert_eq!(claimed.uploader_id, CHARLIE as u64, "拿到的是自己的记录");
-    assert_eq!(claimed.file_path, older.file_path, "指向同一个物理文件");
+    assert_eq!(claimed.file_path(), older.file_path(), "指向同一个物理文件");
 
     sqlx::query("DELETE FROM privchat_file_uploads WHERE uploader_id = $1")
         .bind(CHARLIE)
@@ -1409,8 +1117,9 @@ async fn a_claimer_is_authorized_against_the_record_they_can_actually_read() {
 
 /// 锁等待超时必须是**可重试**的，不是终局失败。
 ///
-/// 占住 file_path 那把 advisory 锁不放，真实 claim 会在 `lock_timeout` 到点后
-/// 拿到 `55P03`。包成 internal 的话，一次瞬时竞争就让这条附件永远发不出去。
+/// 🔴 占的必须是**生产真正在等的那把**：`create_reference` 锁的是 `object_id`。
+/// 这条用例原本占 `hashtext(file_path)`——那把锁生产早就不用了，于是 claim 一路
+/// 畅通返回 Ok，用例"通过"证明的是它自己没挡住任何东西。
 #[tokio::test]
 async fn a_lock_timeout_is_retryable_not_terminal() {
     let _guard = fixture_lock().lock().await;
@@ -1418,18 +1127,22 @@ async fn a_lock_timeout_is_retryable_not_terminal() {
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
     let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
-    // 别人占着同一把 file_path 锁不放。
+    // 别人占着同一把对象锁不放。
     let mut squatter = pool.begin().await.expect("squatter tx");
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-        .bind(&original.file_path)
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(original.object.object_id as i64)
         .execute(&mut *squatter)
         .await
         .expect("squat the file lock");
 
     let result = repo
-        .copy_for_user(&original, OTHER as u64, "message", None)
+        .create_reference(original.object.object_id, OTHER as u64, &ReferenceMetadata {
+            original_filename: &original.original_filename,
+            file_type: &original.file_type,
+            mime_type: &original.mime_type,
+            business_type: "message",
+        }, None)
         .await;
     squatter.rollback().await.ok();
 
@@ -1445,13 +1158,13 @@ async fn a_lock_timeout_is_retryable_not_terminal() {
 ///
 /// 判据是「有一条 advisory 锁记录处于未授予状态」——不是睡够时间，
 /// 所以机器再慢也不会提前往下走。
-async fn wait_until_blocked_on_advisory_lock(pool: &sqlx::PgPool, key: &str) {
+async fn wait_until_blocked_on_advisory_lock(pool: &sqlx::PgPool, key: i64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_locks \
              WHERE locktype = 'advisory' AND NOT granted \
-               AND objid = (hashtext($1)::bigint & 4294967295)",
+               AND ((classid::bigint << 32) | objid::bigint) = $1",
         )
         .bind(key)
         .fetch_one(pool)
@@ -1469,15 +1182,18 @@ async fn wait_until_blocked_on_advisory_lock(pool: &sqlx::PgPool, key: &str) {
     }
 }
 
-/// 摘要不是授权：拿得到 `stored_sha256` 不等于现在还能读这份文件。
+/// **持有 token 冻结的明文摘要即可 claim** —— 这是冻结下来的语义，这条用例钉住它。
 ///
-/// 🔴 摘要会比访问权限活得久——读者退群、消息被删之后，那串哈希还在他手里。
-/// 只认摘要就等于让任何拿到过哈希的人随时把文件领走。
+/// 🔴 方向与上一版相反，不是放松了要求，而是换了判据。上一版要求「取用者对源记录
+/// 所在的消息/频道有访问权」，那条规则让**跨用户秒传根本不成立**：两个互不相识的人
+/// 发同一份文件时，第二个人对第一个人的记录当然没有访问权，于是每次都退回整传，
+/// 秒传的收益（几乎全在"别人已经传过"）一分都拿不到。
 ///
-/// 拒绝时必须与「服务端没有这份内容」返回同一句话，否则这个接口就成了文件
-/// 存在性探测器：拿一堆摘要来问，能区分「没有」和「有但你无权」。
+/// 新判据下能拿到的只是「一条指向同一物理对象的**自己的**引用」。撤回、退群影响的是
+/// **原引用的下载授权**（门禁在 `attachment_authz_db_test`），不影响新引用的创建；
+/// 而想 claim 就得先有明文摘要——它由 token 冻结，不是随便猜得出来的。
 #[tokio::test]
-async fn a_digest_alone_does_not_authorize_a_claim() {
+async fn holding_the_frozen_digest_is_enough_to_claim() {
     use privchat::service::file_claim_service::claim_existing_file;
     use privchat::service::upload_token_service::{
         UploadIdentity, UploadTokenPurpose, UploadTokenService,
@@ -1501,45 +1217,41 @@ async fn a_digest_alone_does_not_authorize_a_claim() {
             "message".to_string(),
             None,
             UploadIdentity {
-                sha256: Some(SHA.to_string()),
-                declared_size: Some(1024),
+                plaintext_sha256: Some(SHA.to_string()),
+                plaintext_size: Some(1024),
+                declared_size: Some(1092),
                 mime_type: Some("image/png".to_string()),
-                transform_version: 0,
+                format_version: Some(1),
+                encryption_key_id: Some(1),
+                chunk_plain_size: Some(
+                    privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE,
+                ),
             },
             UploadTokenPurpose::ClaimExisting,
         )
         .await
         .expect("token");
 
-    let (messages, channels) = authorization_deps(&pool);
-    let refused = claim_existing_file(
-        &file_service,
-        &token_service,
-        &messages,
-        &channels,
-        OTHER as u64,
+    let refused = claim_existing_file(&file_service, &token_service, OTHER as u64,
         &token.token,
         SHA,
     )
     .await;
 
-    match refused {
-        Err(e) => {
-            let text = e.to_string();
-            assert!(
-                text.contains("没有这份内容"),
-                "拒绝语必须与「内容不存在」一致，实际: {text}"
-            );
-        }
-        Ok(meta) => panic!("🔴 无权者仅凭摘要就领到了 file_id={}", meta.file_id),
-    }
+    let mine = refused.expect("持有冻结摘要即可取用");
+    assert_ne!(mine.file_id, original.file_id, "拿到的是自己的新引用");
+    assert_eq!(mine.uploader_id, OTHER as u64, "新引用归属取用者自己");
+    assert_eq!(
+        mine.object.object_id, original.object.object_id,
+        "指向同一个物理对象——这才是秒传"
+    );
 
-    // 而且不能留下任何痕迹：被拒的 claim 不该写库。
+    // 幂等键落库：同一张 token 再来一次会回到同一个 file_id。
     let claimed = repo
         .find_claimed(OTHER as u64, &privchat::service::file_claim_service::claim_key_hash(&token.token))
         .await
         .expect("query claimed");
-    assert!(claimed.is_none(), "被拒的 claim 不该留下记录");
+    assert_eq!(claimed, Some(mine.file_id), "claim 必须记下幂等键");
 
     cleanup(&pool).await;
 }
@@ -1656,7 +1368,12 @@ async fn direct_and_group_members_are_authorized_without_participant_rows() {
         .expect("file ref");
 
         let claimed = repo
-            .copy_for_user(&original, DIRECT_PEER as u64, "message", None)
+            .create_reference(original.object.object_id, DIRECT_PEER as u64, &ReferenceMetadata {
+            original_filename: &original.original_filename,
+            file_type: &original.file_type,
+            mime_type: &original.mime_type,
+            business_type: "message",
+        }, None)
             .await;
         assert!(
             claimed.is_ok(),
@@ -1666,59 +1383,53 @@ async fn direct_and_group_members_are_authorized_without_participant_rows() {
     }
 }
 
-/// 授权检查通过之后、写入之前撤回消息 → 不能再开出新的 file_id。
+/// 撤回之后再 claim：**照常成立**，而且这条规则是有意的。
 ///
-/// 🔴 claim 是一次**新的授权动作**。「撤回收不回已经下载的东西」不等于「撤回之后
-/// 还能继续开新的 file_id」——后者是在失权之后继续授予。
+/// 🔴 这条用例原本断言的是反面（"撤回之后不能再开出新的 file_id"）。那个判据
+/// 已经随跨用户秒传一起去掉了，理由写在 `create_reference` 的文档里：claim 的
+/// 授权依据是**持有明文 SHA-256**，不是"对源记录所在的消息/频道有访问权"。
+/// 保留旧判据的话，两个互不相识的人发同一份文件时，第二个人对第一个人的记录
+/// 当然没有访问权——跨用户秒传于是根本不成立，每次都退回整传。
 ///
-/// 这条不靠时序：测试自己按顺序走完「判定 → 撤回 → 写入」，正是那个窗口里
-/// 会发生的事，所以确定性复现。
+/// 我没有把它悄悄删掉：语义换了方向的用例，改成钉住**新方向**才拦得住"哪天有人
+/// 又把授权复查加回 claim 里"。撤回该拦住的是**下载**，那条门禁在
+/// `attachment_authz_db_test`（撤回后引用不再授权，兄弟引用仍然授权）。
 #[tokio::test]
-async fn revoking_between_the_check_and_the_write_stops_the_claim() {
+async fn a_claim_still_succeeds_after_the_source_message_is_revoked() {
     let _guard = fixture_lock().lock().await;
     let Some(pool) = pool().await else { return };
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
     let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
 
-    // 1) 判定：此刻是有权的（规范判据）。
-    let (messages, channels) = authorization_deps(&pool);
-    let decision = privchat::service::attachment_authorization::resolve_attachment_access(
-        &messages,
-        &channels,
-        &original,
-        OTHER as u64,
-    )
-    .await
-    .expect("authorization available");
-    assert!(decision.authorized, "前提：撤回之前是有权的");
-
-    // 2) 撤回：判定与写入之间发生的事。
     sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = 970002")
         .execute(pool.as_ref())
         .await
         .expect("revoke");
 
-    // 3) 写入：必须被事务内那道闸拦下。
-    let refused = repo
-        .copy_for_user(&original, OTHER as u64, "message", Some("race-key"))
-        .await;
-    assert!(
-        refused.is_err(),
-        "🔴 撤回之后不能再开出新的 file_id——那是在失权之后继续授予"
-    );
+    let mine = repo
+        .create_reference(
+            original.object.object_id,
+            OTHER as u64,
+            &ReferenceMetadata {
+                original_filename: "mine.png",
+                file_type: &FileType::Image,
+                mime_type: "image/png",
+                business_type: "message",
+            },
+            Some("race-key"),
+        )
+        .await
+        .expect("持有明文摘要即可取用，与源消息是否被撤回无关");
+    assert_ne!(mine, original.file_id, "拿到的是自己的新引用");
 
-    // 而且整事务回滚，不留半条记录。
-    let rows: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM privchat_file_uploads WHERE uploader_id = $1 AND file_path = $2",
-    )
-    .bind(OTHER)
-    .bind(&original.file_path)
-    .fetch_one(pool.as_ref())
-    .await
-    .expect("count");
-    assert_eq!(rows.0, 0, "被拒的 claim 不该留下任何行");
+    // 两条引用指向同一个物理对象：秒传的意义就在这里。
+    assert!(
+        repo.other_rows_share_object(mine, original.object.object_id)
+            .await
+            .expect("count"),
+        "新引用必须指向既有对象，而不是另建一份",
+    );
 
     cleanup(&pool).await;
 }
@@ -1739,17 +1450,20 @@ async fn a_token_can_only_be_used_for_its_own_purpose() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool).await;
     let repo = FileUploadRepository::new(pool.clone());
-    let original = seed_original(&repo).await;
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
+    // 库里得有这份内容，purpose 隔离才谈得上"本来能成"。
+    let _original = seed_original(&repo).await;
 
     let file_service = Arc::new(FileService::new(Vec::new(), 0, pool.clone()));
     let token_service = Arc::new(UploadTokenService::new());
 
     let identity = || UploadIdentity {
-        sha256: Some(SHA.to_string()),
-        declared_size: Some(1024),
+        plaintext_sha256: Some(SHA.to_string()),
+        plaintext_size: Some(1024),
+        declared_size: Some(1092),
         mime_type: Some("image/png".to_string()),
-        transform_version: 0,
+        format_version: Some(1),
+        encryption_key_id: Some(1),
+        chunk_plain_size: Some(privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE),
     };
 
     // 实体上传用途的 token 拿去 claim → 拒绝。
@@ -1765,14 +1479,7 @@ async fn a_token_can_only_be_used_for_its_own_purpose() {
         )
         .await
         .expect("upload token");
-    authorize_claimer(&pool, original.file_id, original.uploader_id as i64, OTHER).await;
-    let (messages, channels) = authorization_deps(&pool);
-    let refused = claim_existing_file(
-        &file_service,
-        &token_service,
-        &messages,
-        &channels,
-        OTHER as u64,
+    let refused = claim_existing_file(&file_service, &token_service, OTHER as u64,
         &upload_token.token,
         SHA,
     )
@@ -1803,17 +1510,70 @@ async fn a_token_can_only_be_used_for_its_own_purpose() {
     );
 
     // 用途正确时照常放行。
-    assert!(claim_existing_file(
-        &file_service,
-        &token_service,
-        &messages,
-        &channels,
-        OTHER as u64,
+    assert!(claim_existing_file(&file_service, &token_service, OTHER as u64,
         &claim_token.token,
         SHA,
     )
     .await
     .is_ok());
+
+    cleanup(&pool).await;
+}
+
+/// 🔴 **内容锁**的等待上限与错误分类。
+///
+/// 这条盯的是两件事，缺一条都会让瞬时竞争变成终局失败：
+///
+///   1. `lock_timeout` 必须设在**第一把锁之前**。它曾经设在"命中已有对象之后、
+///      取对象锁之前"——而同内容首传的竞争恰恰全发生在内容锁上，那个 3 秒上限
+///      对它一次都不生效，一个卡住的事务能把上传挂到天荒地老。
+///   2. 超时必须映射成**可重试**的 `ServiceUnavailable`，与 `create_reference`
+///      同一处映射。包成 `Database` 就是终局失败，而且同一类超时会在不同上传
+///      路径上表现成不同错误。
+#[tokio::test]
+async fn a_content_lock_timeout_is_retryable_not_terminal() {
+    use privchat::service::file_service::{converge_upload, UploadPlacement};
+
+    let _guard = fixture_lock().lock().await;
+    let Some(pool) = pool().await else { return };
+    cleanup(&pool).await;
+
+    // 别人占着同一份内容的那把锁不放（对象还不存在，收敛必然堵在第一把锁上）。
+    let mut squatter = pool.begin().await.expect("squatter tx");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(SHA)
+        .execute(&mut *squatter)
+        .await
+        .expect("squat the content lock");
+
+    let mut tx = pool.begin().await.expect("tx");
+    let started = std::time::Instant::now();
+    let result = converge_upload(
+        &mut tx,
+        &UploadPlacement {
+            plaintext_sha256: SHA.to_string(),
+            plaintext_size: 1024,
+            sealed_sha256: "5e".repeat(32),
+            sealed_size: 1092,
+            my_path: "/tmp/privchat-dedup-test/timeout.bin".to_string(),
+            my_source_id: 0,
+            format_version: 1,
+            encryption_key_id: 1,
+        },
+    )
+    .await;
+    let waited = started.elapsed();
+    tx.rollback().await.ok();
+    squatter.rollback().await.ok();
+
+    assert!(
+        matches!(result, Err(privchat::error::ServerError::ServiceUnavailable(_))),
+        "锁等待超时必须是可重试的 ServiceUnavailable，实际: {result:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "🔴 上限没生效：等了 {waited:?}——`lock_timeout` 必须设在第一把锁之前"
+    );
 
     cleanup(&pool).await;
 }

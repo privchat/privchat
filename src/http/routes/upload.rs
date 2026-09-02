@@ -27,8 +27,6 @@ use axum::{
     Router,
 };
 use axum_extra::extract::Multipart;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -101,7 +99,8 @@ pub fn create_route() -> Router<FileServerState> {
 /// 流式接收 multipart：file 字段按 chunk 直写存储（大小硬顶即时校验），
 /// 其余字段照常收集；收完后做加密结构校验。任何失败都会清理已写入的半文件。
 ///
-/// 返回 (upload, filename, mime_type, business_id, encryption_version, cek, transform_version, encryption_key_id)。
+/// 返回 (upload, filename, mime_type, business_id)。加密参数与身份一概不从表单收——
+/// 它们由 token 冻结，客户端在这里说什么都不作数。
 async fn receive_streaming(
     state: &FileServerState,
     token_info: &crate::service::upload_token_service::ValidatedUploadToken,
@@ -113,11 +112,6 @@ async fn receive_streaming(
         String,
         String,
         Option<String>,
-        i32,
-        Option<String>,
-        i32,
-        // v2 加密所用密钥 id；None = 非 v2
-        Option<u8>,
     ),
     ServerError,
 > {
@@ -125,12 +119,6 @@ async fn receive_streaming(
     let mut filename: Option<String> = None;
     let mut mime_type: Option<String> = None;
     let mut business_id: Option<String> = None;
-    // 附件加密 v1：encryption_version 0/1；version=1 时 cek=base64url(32B)，nonce 在 blob 头。
-    let mut encryption_version: i32 = 0;
-    let mut cek: Option<String> = None;
-    // 客户端处理版本：参与秒传身份。压缩算法一变就是另一份字节，不能命中旧对象。
-    let mut transform_version: i32 = 0;
-    let mut encryption_key_id: Option<u8> = None;
 
     // 失败路径统一清理半文件后返回错误。
     macro_rules! fail {
@@ -222,31 +210,6 @@ async fn receive_streaming(
                     }
                 }
             }
-            "encryption_version" => {
-                if let Ok(s) = field.text().await {
-                    encryption_version = s.trim().parse::<i32>().unwrap_or(0);
-                }
-            }
-            "transform_version" => {
-                if let Ok(s) = field.text().await {
-                    transform_version = s.trim().parse::<i32>().unwrap_or(0);
-                }
-            }
-            "cek" => {
-                if let Ok(s) = field.text().await {
-                    let s = s.trim().to_string();
-                    if !s.is_empty() {
-                        cek = Some(s);
-                    }
-                }
-            }
-            // v2：客户端加密用的那把密钥 id（服务端签发 token 时给的）。
-            // 记在文件行上，下载时按它取回对应密钥——轮换后存量对象照样解得开。
-            "encryption_key_id" => {
-                if let Ok(s) = field.text().await {
-                    encryption_key_id = s.trim().parse::<u8>().ok();
-                }
-            }
             _ => {}
         }
     }
@@ -258,92 +221,15 @@ async fn receive_streaming(
     let filename = filename.unwrap_or_else(|| "file.bin".to_string());
     let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
-    // 附件加密结构校验（服务端不解密、不验 GCM tag，仅防脏数据入库；ATTACHMENT_ENCRYPTION_SPEC §3.2）。
-    // 注意：cek 绝不进日志。
-    match encryption_version {
-        0 => {
-            if cek.is_some() {
-                fail!(
-                    upload,
-                    ServerError::Validation("encryption_version=0 时不应携带 cek".to_string())
-                );
-            }
-        }
-        1 => {
-            let Some(cek_str) = cek.as_deref() else {
-                fail!(
-                    upload,
-                    ServerError::Validation("encryption_version=1 缺少 cek".to_string())
-                );
-            };
-            let decoded = match URL_SAFE_NO_PAD.decode(cek_str.as_bytes()) {
-                Ok(d) => d,
-                Err(_) => fail!(
-                    upload,
-                    ServerError::Validation("cek 不是合法 base64url".to_string())
-                ),
-            };
-            if decoded.len() != 32 {
-                fail!(
-                    upload,
-                    ServerError::Validation(format!(
-                        "cek 解码后必须为 32 字节，实际 {}",
-                        decoded.len()
-                    ))
-                );
-            }
-            // blob = nonce(12) || ciphertext(>=0) || tag(16)，最少 28 字节
-            let written = upload.as_ref().map(|u| u.written()).unwrap_or(0);
-            if written < 28 {
-                fail!(
-                    upload,
-                    ServerError::Validation(format!(
-                        "加密 blob 至少 28 字节（12 nonce + 16 tag），实际 {}",
-                        written
-                    ))
-                );
-            }
-        }
-        // v2：全站密钥。密钥不在请求里（服务端签发 token 时已给客户端），
-        // 这里只结构校验：cek 必须缺席，blob 至少 4 头 + 12 nonce + 16 tag。
-        2 => {
-            if cek.is_some() {
-                fail!(
-                    upload,
-                    ServerError::Validation(
-                        "encryption_version=2 使用全站密钥，不得再带 cek".to_string()
-                    )
-                );
-            }
-            let written = upload.as_ref().map(|u| u.written()).unwrap_or(0);
-            if written < 32 {
-                fail!(
-                    upload,
-                    ServerError::Validation(format!(
-                        "v2 加密 blob 至少 32 字节（4 头 + 12 nonce + 16 tag），实际 {written}"
-                    ))
-                );
-            }
-        }
-        v => {
-            fail!(
-                upload,
-                ServerError::Validation(format!("不支持的 encryption_version: {}", v))
-            );
-        }
-    }
-
-    let sink = upload.take().expect("upload present after validation");
-    Ok((
-        sink,
-        filename,
-        mime_type,
-        business_id,
-        encryption_version,
-        cek,
-        transform_version,
-        encryption_key_id,
-    ))
+    // 🔴 这里曾经有一段"附件加密结构校验"：按客户端表单自报的 encryption_version
+    // 检查 cek 在不在、blob 够不够长。它现在**整段删掉**了。
+    //
+    // 自报的东西校验不了自己：客户端说 version=0 就按明文放行，说 version=2 就只量
+    // 长度——两条都不回答"这串字节是不是 token 声明的那份内容"。真正的判据在
+    // `commit_streaming_upload` 里：解密重算明文摘要，与 token 冻结的身份比对。
+    // 留着这段只会给人"已经校验过了"的错觉，而它挡不住任何一种伪造。
+    let sink = upload.take().expect("upload present");
+    Ok((sink, filename, mime_type, business_id))
 }
 
 /// 已完成的上传：按 `file_id` 回读、**核对身份**并构造与首次一致的响应。
@@ -373,13 +259,18 @@ async fn completed_response(
             .file_service
             .build_access_url(&meta.file_path(), meta.storage_source_id()),
         thumbnail_url: None,
-        file_size: meta.sealed_size(),
+        // 🔴 报**明文**大小，与整包路径同口径。
+        //
+        // 密文比明文多出文件头和每块的 tag。分片/S3 这两条路径此前报的是密文大小，
+        // 于是同一个文件从不同路径传上去，客户端拿到两个不同的 `file_size`——
+        // 展示对不上原文件，"下载完了没"的判断也会错。
+        file_size: meta.display_size(),
         original_size: meta.original_size,
         width: meta.width,
         height: meta.height,
+        storage_source_id: meta.storage_source_id(),
         mime_type: meta.mime_type,
         uploaded_at: meta.uploaded_at,
-        storage_source_id: meta.storage_source_id(),
     }))
 }
 
@@ -503,8 +394,15 @@ async fn upload_file(
         reserved
     );
 
+    // 🔴 密钥按 **token 冻结的 key_id** 取，而且在收字节**之前**取：拿不到密钥就
+    // 校验不了，校验不了就不该发布——那就没有理由先把一份注定要被删的 body 收下来。
+    let key_id = token_info
+        .encryption_key_id
+        .ok_or_else(|| ServerError::Validation("token 未冻结加密密钥 id".to_string()))?;
+    let site_key = site_key_of(&state, key_id)?;
+
     // P0-10：流式接收——数据边收边写存储，任何失败清理半文件，不再全量进内存。
-    let (upload, filename, mime_type, business_id, encryption_version, cek, transform_version, encryption_key_id) =
+    let (upload, filename, mime_type, business_id) =
         receive_streaming(&state, &token_info, reserved, &mut multipart).await?;
 
     let uploader_id = token_info.user_id;
@@ -530,15 +428,25 @@ async fn upload_file(
             uploader_ip,
             token_info.business_type.clone(),
             business_id,
-            encryption_version,
-            cek,
-            encryption_key_id,
-            // 处理版本只是元数据，不参与秒传身份（身份只看内容摘要）。
-            transform_version,
-            // 🔴 内容摘要取自 **token**，不取表单。表单里的值是这一次请求带来的，
-            // 客户端可以在 prepare 之后换掉；token 里那份是 prepare 当时签下的。
-            token_info.sha256.clone(),
+            // 🔴 身份与加密参数全部取自 **token**，不取表单。表单里的值是这一次请求带来
+            // 的，客户端可以在 prepare 之后换掉；token 里那份是 prepare 当时签下的。
+            token_info
+                .plaintext_sha256
+                .clone()
+                .ok_or_else(|| ServerError::Validation("token 未冻结明文摘要".to_string()))?,
+            token_info
+                .plaintext_size
+                .ok_or_else(|| ServerError::Validation("token 未冻结明文大小".to_string()))?
+                as u64,
+            token_info
+                .format_version
+                .ok_or_else(|| ServerError::Validation("token 未冻结密文格式版本".to_string()))?,
+            key_id,
+            token_info
+                .chunk_plain_size
+                .ok_or_else(|| ServerError::Validation("token 未冻结分块几何".to_string()))?,
             token_info.sealed_blob_size,
+            &site_key,
         )
         .await?;
 
@@ -555,18 +463,20 @@ async fn upload_file(
 
     info!("✅ 文件上传成功: {}", metadata.file_id);
 
+    // 先算出来：下面几个字段会把 metadata 拆开 move 掉。
+    let display_size = metadata.display_size();
     // 返回响应（含 storage_source_id，便于客户端写入消息 content，未来多存储源）
     Ok(ApiEnvelope::ok(UploadResponse {
         file_id: metadata.file_id,
         file_url: file_service.build_access_url(&metadata.file_path(), metadata.storage_source_id()),
         thumbnail_url: None,
-        file_size: metadata.file_size,
+        file_size: display_size,
         original_size: metadata.original_size,
         width: metadata.width,
         height: metadata.height,
+        storage_source_id: metadata.storage_source_id(),
         mime_type: metadata.mime_type,
         uploaded_at: metadata.uploaded_at,
-        storage_source_id: metadata.storage_source_id(),
     }))
 }
 
@@ -604,16 +514,34 @@ pub struct ChunkQuery {
     pub offset: u64,
 }
 
-/// `POST /files/complete` 请求体：只带申请 token 时还不知道、而建行又必需的字段。
+/// `POST /files/complete` 请求体。
+///
+/// 🔴 **这里只剩 `business_id`，而且不该再长回来。**
+///
+/// 加密参数（`cek` / `encryption_version` / `encryption_key_id`）曾经在这里，由客户端
+/// 在 complete 时自报。那是一条完整的绕过通道：token 在 prepare 时冻结了一套身份，
+/// complete 又接受另一套说法——两者不一致时，秒传判定用的是一组、落库用的是另一组。
+/// 而且服务端此刻已经**解密重算**过明文身份，客户端的自报不能给这件事增加任何信息，
+/// 只能削弱它。
+///
+/// `business_id` 留下是因为它不是身份：它是"这份文件挂到哪条业务记录上"，
+/// 申请 token 时确实还不知道。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CompleteRequest {
-    pub cek: Option<String>,
     pub business_id: Option<String>,
-    pub encryption_version: i32,
-    /// v2：客户端加密时用的那把密钥的 id（服务端签发 token 时给的）。
-    /// 记在文件行上，下载时按它取出对应密钥——轮换后存量对象照样解得开。
-    pub encryption_key_id: Option<u8>,
+}
+
+/// 取校验要用的那把全站密钥。
+///
+/// 🔴 **拿不到就拒绝**，不是"跳过校验发布"：没有密钥就重算不出明文身份，而
+/// "没校验"和"校验过了"绝不能是同一个结果。这是配置问题（改配置后重试即可自愈），
+/// 不是客户端的内容错误，所以回可重试的 5xx。
+pub(super) fn site_key_of(state: &FileServerState, key_id: u8) -> Result<Vec<u8>, ServerError> {
+    state.attachment_keys.material_for(key_id).ok_or_else(|| {
+        tracing::error!(key_id, "服务端没有该附件密钥，无法校验首传对象");
+        ServerError::ServiceUnavailable("服务端暂时无法校验该附件，请稍后重试".to_string())
+    })
 }
 
 /// 上传专用的类型化错误。见 `ErrorCode` 20610-20618。
@@ -910,66 +838,43 @@ pub(super) fn upload_response_of(state: &FileServerState, meta: crate::service::
             .file_service
             .build_access_url(&meta.file_path(), meta.storage_source_id()),
         thumbnail_url: None,
-        file_size: meta.sealed_size(),
+        // 🔴 报**明文**大小，与整包路径同口径。
+        //
+        // 密文比明文多出文件头和每块的 tag。分片/S3 这两条路径此前报的是密文大小，
+        // 于是同一个文件从不同路径传上去，客户端拿到两个不同的 `file_size`——
+        // 展示对不上原文件，"下载完了没"的判断也会错。
+        file_size: meta.display_size(),
         original_size: meta.original_size,
         width: meta.width,
         height: meta.height,
+        storage_source_id: meta.storage_source_id(),
         mime_type: meta.mime_type,
         uploaded_at: meta.uploaded_at,
-        storage_source_id: meta.storage_source_id(),
     }
 }
 
-/// 正式行是不是这个会话那份上传：uploader / 类型 / 摘要 / 大小四项都对。
+/// 正式行是不是这个会话那份上传。
+///
+/// 🔴 比的是**冻结的明文身份**，不是密文摘要/密文大小。
+///
+/// 密文摘要不是内容的函数：每块都用新的随机 nonce，同一份明文封装两次得到两串
+/// 不同的密文。而秒传是**跨用户**的——命中别人先传的同一份内容时，行指向的对象
+/// 就是别人那次封装的产物，密文摘要和密文大小都跟本会话 manifest 里的不一样。
+/// 拿密文摘要比对，秒传命中之后的幂等 complete 会一律判成"身份不符"，客户端
+/// 拿到一个内部错误，而那条行其实完全正确。
+///
+/// 明文摘要由服务端在 complete 时解密重算，才是这份内容的身份。
 pub(crate) fn manifest_matches(session: &ChunkedSession, meta: &crate::service::FileMetadata) -> bool {
     let m = session.manifest();
     meta.uploader_id == m.uploader_id
         && meta.file_type.as_str() == m.file_type
-        && meta.sealed_size() == m.total_size
+        && meta.object.plaintext_size == m.plaintext_size
         && meta
-            .file_hash
-            .as_deref()
-            .is_some_and(|h| h.eq_ignore_ascii_case(&m.sealed_sha256))
+            .object
+            .plaintext_sha256
+            .eq_ignore_ascii_case(&m.plaintext_sha256)
 }
 
-/// 与整包表单同一套 cek 校验规则。
-pub(super) fn validate_cek(encryption_version: i32, cek: &Option<String>) -> Result<(), ServerError> {
-    match encryption_version {
-        // v2 用全站密钥，cek 必须缺席（密钥由 token/get_url 下发，不随上传走）。
-        2 => {
-            if cek.is_some() {
-                return Err(ServerError::Validation(
-                    "encryption_version=2 使用全站密钥，不得再带 cek".to_string(),
-                ));
-            }
-        }
-        0 => {
-            if cek.is_some() {
-                return Err(ServerError::Validation(
-                    "encryption_version=0 时不应携带 cek".to_string(),
-                ));
-            }
-        }
-        1 => {
-            let Some(cek_str) = cek.as_deref() else {
-                return Err(ServerError::Validation("encryption_version=1 缺少 cek".to_string()));
-            };
-            let decoded = URL_SAFE_NO_PAD
-                .decode(cek_str.as_bytes())
-                .map_err(|_| ServerError::Validation("cek 不是合法 base64url".to_string()))?;
-            if decoded.len() != 32 {
-                return Err(ServerError::Validation(format!(
-                    "cek 解码后必须为 32 字节，实际 {}",
-                    decoded.len()
-                )));
-            }
-        }
-        v => {
-            return Err(ServerError::Validation(format!("不支持的 encryption_version: {v}")));
-        }
-    }
-    Ok(())
-}
 
 /// `POST /api/app/files/complete` —— 顺序冻结（spec §3.3），持锁全程：
 ///
@@ -1013,8 +918,9 @@ async fn complete_upload(
         return chunked_completed_response(&state, &session, reserved).await;
     }
 
-    // cek 只在这一刻校验：走到拼接之前就把参数错拦掉，别让用户白等一次拼接。
-    validate_cek(extra.encryption_version, &extra.cek)?;
+    // 🔴 密钥按 manifest 冻结的 key_id 取，而且在拼接**之前**取：拿不到密钥就校验
+    // 不了，没必要先花一次拼接的 IO。
+    let site_key = site_key_of(&state, session.manifest().encryption_key_id)?;
 
     // 3. 拼接 + 核验
     let (_, written, stored_sha256) = match session.assemble() {
@@ -1034,13 +940,6 @@ async fn complete_upload(
         Err(AssembleError::Overlap) => {
             return Err(coded(E::UploadRangeOverlap, 409, "分片区间有重叠，请 GET status 对齐"))
         }
-        Err(AssembleError::DigestMismatch) => {
-            return Err(coded(
-                E::UploadChunkChecksumMismatch,
-                422,
-                "拼接后的内容与申请 token 时声明的摘要不一致",
-            ))
-        }
         Err(AssembleError::Io(e)) => return Err(e),
     };
 
@@ -1059,10 +958,16 @@ async fn complete_upload(
                 uploader_ip: client_ip_from_headers(&headers),
                 business_type: m.business_type.clone(),
                 business_id: extra.business_id,
-                encryption_version: extra.encryption_version,
-                cek: extra.cek,
-                encryption_key_id: extra.encryption_key_id,
+                // 🔴 身份取自 manifest（= token 冻结的那份），不取 complete 请求体。
+                plaintext_sha256: m.plaintext_sha256.clone(),
+                plaintext_size: m.plaintext_size,
+                format_version: m.format_version,
+                encryption_key_id: m.encryption_key_id,
+                chunk_plain_size: m.chunk_plain_size,
+                // 冻结的密文长度 = 建会话时签下的 total_size。
+                sealed_size: m.total_size,
             },
+            &site_key,
         )
         .await?;
 

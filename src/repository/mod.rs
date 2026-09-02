@@ -111,7 +111,7 @@ pub use bot_follow_repo::{
 };
 pub use channel_repo::{ChannelRepository, PgChannelRepository};
 pub use device_repo::*;
-pub use file_upload_repo::FileUploadRepository;
+pub use file_upload_repo::{FileUploadRepository, ReferenceMetadata};
 pub use login_log_repository::{CreateLoginLogRequest, LoginLogQuery, LoginLogRepository};
 pub use message_repo::{
     AtomicMessageCommitRequest, AtomicTimelineEventRequest, ClientRegistryClaim,

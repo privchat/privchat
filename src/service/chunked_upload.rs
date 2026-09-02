@@ -155,13 +155,24 @@ pub struct Manifest {
     pub secret_sha256: String,
     pub uploader_id: u64,
     pub total_size: u64,
-    pub sealed_sha256: String,
+    /// 客户端声明的密文摘要，只作完整性预检。
+    /// 🔴 以下五项是 token 冻结的身份，写进 manifest 是为了让 complete 在**不重新
+    /// 信任客户端**的前提下拿得到它们——complete 请求体里没有、也不该有这些字段。
+    #[serde(default)]
+    pub plaintext_sha256: String,
+    #[serde(default)]
+    pub plaintext_size: u64,
+    #[serde(default)]
+    pub format_version: u8,
+    #[serde(default)]
+    pub encryption_key_id: u8,
+    #[serde(default)]
+    pub chunk_plain_size: u32,
     pub file_type: String,
     pub business_type: String,
     pub filename: String,
     pub mime_type: String,
     #[serde(default)]
-    pub transform_version: i32,
     /// Unix 秒。
     pub expires_at: i64,
     /// 建会话时就预分配的 `file_id`（只取序列号，不产生 PG 临时行）。
@@ -329,13 +340,17 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
 /// 建会话时的输入：除 secret / id / 时间之外的全部冻结事实。
 pub struct NewSession {
     pub uploader_id: u64,
+    /// token 冻结的身份，原样落进 manifest。
+    pub plaintext_sha256: String,
+    pub plaintext_size: u64,
+    pub format_version: u8,
+    pub encryption_key_id: u8,
+    pub chunk_plain_size: u32,
     pub total_size: u64,
-    pub sealed_sha256: String,
     pub file_type: String,
     pub business_type: String,
     pub filename: String,
     pub mime_type: String,
-    pub transform_version: i32,
     pub reserved_file_id: u64,
     /// 协商选定的数据面（RESUMABLE §8.2）。
     pub transport: String,
@@ -452,12 +467,15 @@ impl ChunkedSession {
             secret_sha256: sha256_hex(secret.as_bytes()),
             uploader_id: input.uploader_id,
             total_size: input.total_size,
-            sealed_sha256: input.sealed_sha256.to_ascii_lowercase(),
+            plaintext_sha256: input.plaintext_sha256.to_ascii_lowercase(),
+            plaintext_size: input.plaintext_size,
+            format_version: input.format_version,
+            encryption_key_id: input.encryption_key_id,
+            chunk_plain_size: input.chunk_plain_size,
             file_type: input.file_type,
             business_type: input.business_type,
             filename: input.filename,
             mime_type: input.mime_type,
-            transform_version: input.transform_version,
             expires_at: now + TOKEN_TTL_SECS,
             reserved_file_id: input.reserved_file_id,
             transport: input.transport,
@@ -764,10 +782,14 @@ impl ChunkedSession {
                 ))));
             }
         };
-        if !sha.eq_ignore_ascii_case(&self.manifest.sealed_sha256) {
-            let _ = std::fs::remove_file(&out_path);
-            return Err(AssembleError::DigestMismatch);
-        }
+        // 🔴 这里**不再**拿"客户端申请时声明的密文摘要"做预检——那个字段已经删掉了。
+        //
+        // 申请 token 时客户端还没拿到服务端下发的全站密钥，封装不出最终字节，
+        // 也就算不出密文摘要；让它先封装再申请会绕成"要密钥才能封装、要封装才能申请"
+        // 的循环依赖。传输期的完整性由每段的 `X-Chunk-SHA256` 保证。
+        //
+        // 身份判据在 complete：`verify_attachment` 流式解密重算明文摘要，并顺带
+        // 产出权威的密文摘要落进对象行。密文摘要证明不了身份，少这道预检不丢任何保证。
         Ok((out_path, total, sha))
     }
 
@@ -795,7 +817,6 @@ pub enum ChunkError {
 pub enum AssembleError {
     Missing(Vec<Range>),
     Overlap,
-    DigestMismatch,
     Io(ServerError),
 }
 
@@ -1006,13 +1027,26 @@ async fn s3_expired_session_ready(
     // 4. 属于本会话：先查 PG——「PG 已提交、墓碑没写」的崩溃窗口里对象是
     // 正式数据，绝不能删；只有无行引用的对象才是冗余，才条件删除。
     match file_service.get_file_metadata(manifest.reserved_file_id).await {
+        // 🔴 同 `manifest_matches`：按冻结的**明文**身份认这一行。密文摘要在秒传
+        // 命中之后必然对不上（那是别人那次封装的产物），拿它判会把一条正当的
+        // PG 行当成"不是我的"，于是扫描器去删一个正在被引用的对象。
+        //
+        // 🔴 身份对上还不够，**物理坐标也要对上**：这一行引用的必须就是 final_key
+        // 上的这个对象（同一个 bucket 内路径 + 同一个存储源）。
+        //
+        // 秒传命中时行会指向**别人先落的那份对象**——身份（明文摘要/大小/uploader）
+        // 完全一致，但 file_path 是对方的路径。只按身份判的话，这里会把 final_key
+        // 上那个真正冗余的对象当成"正在被引用"而留下来，于是每一次"秒传命中 +
+        // 崩在墓碑之前"都在桶里多留一个永远没人引用的孤儿。
         Ok(Some(meta))
             if meta.uploader_id == manifest.uploader_id
-                && meta.sealed_size() == manifest.total_size
+                && meta.object.plaintext_size == manifest.plaintext_size
                 && meta
-                    .file_hash
-                    .as_deref()
-                    .is_some_and(|h| h.eq_ignore_ascii_case(&manifest.sealed_sha256)) =>
+                    .object
+                    .plaintext_sha256
+                    .eq_ignore_ascii_case(&manifest.plaintext_sha256)
+                && manifest.final_key.as_deref() == Some(meta.object.file_path.as_str())
+                && manifest.storage_source_id == Some(meta.object.storage_source_id) =>
         {
             tracing::info!(
                 "扫描器：过期会话 {session_id} 的 final 对象已有 PG 行（file_id={}），保留对象，只删目录",
@@ -1197,14 +1231,17 @@ mod tests {
 
     fn new_input(total: u64, sha: &str) -> NewSession {
         NewSession {
+            plaintext_sha256: "c".repeat(64),
+            plaintext_size: 1,
+            format_version: 1,
+            encryption_key_id: 1,
+            chunk_plain_size: 1024 * 1024,
             uploader_id: 7,
             total_size: total,
-            sealed_sha256: sha.to_string(),
             file_type: "image".into(),
             business_type: "message".into(),
             filename: "payload.jpg".into(),
             mime_type: "image/jpeg".into(),
-            transform_version: 0,
             reserved_file_id: 4242,
             transport: TRANSPORT_PROXY_OFFSET_V1.to_string(),
             s3: None,

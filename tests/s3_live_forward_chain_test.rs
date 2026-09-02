@@ -129,6 +129,7 @@ struct Rig {
     state: FileServerState,
     backend: Arc<S3DirectBackend>,
     pool: Arc<PgPool>,
+    config: privchat::config::ServerConfig,
     _dir: tempfile::TempDir,
 }
 
@@ -168,9 +169,11 @@ async fn make_rig(env: &LiveEnv) -> Rig {
             auth: None,
             numbered_part_backend: Some(backend.clone()),
             final_object_probe: Some(backend.clone()),
+            attachment_keys: test_config().attachment_keys.clone(),
         },
         backend,
         pool,
+        config: test_config(),
         _dir: dir,
     }
 }
@@ -181,20 +184,20 @@ fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
         attachment_key: None,
         file_service: &rig.state.file_service,
         upload_token_service: &rig.state.upload_token_service,
+        config: &rig.config,
         file_api_base_url: Some("http://e2e.local/files"),
     }
 }
 
 /// 单一数据面：S3 接线在位 → 客户端必须声明 s3_multipart_v1（带全两项声明）。
-fn req(file_size: i64, file_hash: &str) -> FileRequestChunkedUploadTokenRequest {
+fn req(file_size: i64, plaintext_sha256: &str) -> FileRequestChunkedUploadTokenRequest {
     FileRequestChunkedUploadTokenRequest {
         file_type: "file".to_string(),
         business_type: "message".to_string(),
-        file_size,
-        file_hash: file_hash.to_string(),
+        plaintext_size: file_size,
+        plaintext_sha256: plaintext_sha256.to_string(),
         mime_type: "application/octet-stream".to_string(),
         filename: Some("payload.bin".to_string()),
-        transform_version: 0,
         force_upload: true,
         supported_upload_transports: Some(vec![
             "proxy_offset_v1".to_string(),
@@ -258,6 +261,17 @@ const PART_SIZE: usize = 8 << 20;
 /// 🔴 第二十轮评审 P1 正向验收：真实签发（真 CreateMPU）→ 预签名分片直传 →
 /// status/ListParts → complete（If-None-Match + 整文件回读摘要）→ PG 建行。
 /// 内容随机种子保证每次运行摘要唯一，不命中秒传索引。
+/// 签发要按配置冻结加密参数；没有附件密钥时 `freeze_crypto` 直接失败（fail-closed）。
+fn test_config() -> privchat::config::ServerConfig {
+    privchat::config::ServerConfig {
+        attachment_keys: privchat::config::AttachmentKeys(vec![(
+            1,
+            "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo".to_string(),
+        )]),
+        ..privchat::config::ServerConfig::default()
+    }
+}
+
 #[tokio::test]
 async fn live_forward_chain_issue_to_pg_row() {
     let Some(env) = live_env() else { return };
@@ -357,14 +371,17 @@ async fn live_forward_chain_issue_to_pg_row() {
         assert!(file_id > 0);
 
         // ⑥ 建行核对 + 对象回读身份一致。
+        // 身份字段都在对象行上（引用行只留 object_id）。
         let (row_sha, row_uploader): (String, i64) = sqlx::query_as(
-            "SELECT file_hash, uploader_id FROM privchat_file_uploads WHERE file_id = $1",
+            "SELECT o.sealed_sha256, u.uploader_id FROM privchat_file_uploads u \
+             JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
+             WHERE u.file_id = $1",
         )
         .bind(file_id)
         .fetch_one(&*rig.pool)
         .await
         .expect("建行必须在");
-        assert_eq!(row_sha, sealed, "PG 行摘要 = 整文件摘要");
+        assert_eq!(row_sha, sealed, "对象行的密文摘要 = 服务端回读算出的整文件摘要");
         assert_eq!(row_uploader, UPLOADER as i64);
 
         // 收尾：删 PG 行 + 删桶内对象（对 ETag 条件删；MinIO 上条件被忽略，

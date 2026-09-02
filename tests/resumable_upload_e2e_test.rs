@@ -82,6 +82,8 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, dir: Option<tempfile::Te
             auth: None,
             numbered_part_backend: None,
             final_object_probe: None,
+            // 装配没配密钥 = 校验不可能成立，需要校验的发布路径一律拒绝（fail-closed）。
+            attachment_keys: privchat::config::AttachmentKeys(vec![(1, site_key_b64())]),
         },
         root,
         _dir: dir,
@@ -94,7 +96,7 @@ impl Rig {
     }
 
     /// 与生产 RPC 同一条构造路径：预留 file_id → `ChunkedSession::create`。
-    async fn issue(&self, uid: u64, body: &[u8]) -> String {
+    async fn issue(&self, uid: u64, plain: &[u8], body: &[u8]) -> String {
         let reserved = self.state.file_service.reserve_file_id().await.expect("reserve");
         let root = self.state.file_service.upload_session_root().expect("root");
         let (_, token, _) = ChunkedSession::create(
@@ -102,12 +104,16 @@ impl Rig {
             NewSession {
                 uploader_id: uid,
                 total_size: body.len() as u64,
-                sealed_sha256: sha256_hex(body),
+                // 🔴 冻结身份取自**明文**：complete 解密重算之后核对的就是它。
+                plaintext_sha256: sha256_hex(plain),
+                plaintext_size: plain.len() as u64,
+                format_version: privchat_protocol::attachment_crypto::FORMAT_VERSION,
+                encryption_key_id: 1,
+                chunk_plain_size: privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE,
                 file_type: "file".into(),
                 business_type: "message".into(),
                 filename: "resumable.bin".into(),
                 mime_type: "application/octet-stream".into(),
-                transform_version: 0,
                 reserved_file_id: reserved,
                 transport: "proxy_offset_v1".to_string(),
                 s3: None,
@@ -205,7 +211,7 @@ impl Rig {
             .await
             .expect("query")
             .expect("row");
-        std::fs::read(self.root.join(meta.file_path.trim_start_matches('/'))).expect("读正式对象")
+        std::fs::read(self.root.join(meta.file_path().trim_start_matches('/'))).expect("读正式对象")
     }
 
     async fn rows_of(&self, pool: &sqlx::PgPool, uid: u64) -> i64 {
@@ -223,10 +229,45 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes))
 }
 
-fn payload(len: usize, seed: u8) -> Vec<u8> {
+fn plain_payload(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| ((i as u32).wrapping_mul(2654435761) >> 13) as u8 ^ seed)
         .collect()
+}
+
+fn site_key() -> [u8; 32] {
+    [0x5au8; 32]
+}
+
+fn site_key_b64() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(site_key())
+}
+
+/// 一份上传素材：明文（身份的来源）+ 真密文（实际传的字节）。
+///
+/// 🔴 proxy complete 会**解密重算明文摘要**来核对身份，所以这里必须是真封装。
+/// 传裸明文的话，走到的不是"校验通过"，而是"根本解不开"——这条路径上的
+/// 断点续传、乱序、幂等全都会变成校验失败，测不到它们本来要测的东西。
+///
+/// 🔴 参数是**密文**长度，不是明文长度：分片必须按 `BASE_UNIT` 网格对齐，而网格
+/// 管的是实际传输的字节。按明文长度取素材的话，密文会比它多出一个封装头，用例里
+/// 那些精心对齐的偏移量就全部错位——错位报出来的是 20617 网格错误，跟用例想验的
+/// 断点续传毫无关系。
+fn attachment(sealed_len: usize, seed: u8) -> (Vec<u8>, Vec<u8>) {
+    use privchat_protocol::attachment_crypto as ac;
+    // 单块封装的固定开销：36 头 + 12 nonce + 4 长度 + 16 tag。
+    const OVERHEAD: usize = ac::HEADER_LEN + ac::NONCE_LEN + 4 + ac::TAG_LEN;
+    let plain = plain_payload(sealed_len - OVERHEAD, seed);
+    let sealed = ac::encrypt_attachment_with_chunk_size(
+        &plain,
+        &site_key(),
+        1,
+        ac::DEFAULT_CHUNK_PLAIN_SIZE,
+    )
+    .expect("封装测试密文");
+    assert_eq!(sealed.len(), sealed_len, "素材必须正好是要求的密文长度");
+    (plain, sealed)
 }
 
 async fn cleanup(pool: &sqlx::PgPool, uploaders: &[u64]) {
@@ -236,6 +277,19 @@ async fn cleanup(pool: &sqlx::PgPool, uploaders: &[u64]) {
         .execute(pool)
         .await
         .expect("clean uploads");
+    // 🔴 对象行也要清。
+    //
+    // 判重键是明文摘要，而用例的素材是定死的（同一个 seed 每次都是同一份明文）。
+    // 只删文件行的话，上一轮留下的对象行会让这一轮被判成秒传命中——复用的
+    // `file_path` 指向的是**上一轮那个已经销毁的临时根**，于是"上传成功"之后
+    // 磁盘上什么都没有。这种失败看起来像发布丢字节，其实是真库没清干净。
+    sqlx::query(
+        "DELETE FROM privchat_attachment_objects o WHERE NOT EXISTS \
+         (SELECT 1 FROM privchat_file_uploads u WHERE u.object_id = o.object_id)",
+    )
+    .execute(pool)
+    .await
+    .expect("clean orphan objects");
 }
 
 fn file_id_of(json: &serde_json::Value) -> u64 {
@@ -264,8 +318,8 @@ async fn a_chunked_upload_completes_and_matches_byte_for_byte() {
     cleanup(&pool, &[UPLOADER_FLOW]).await;
     let rig = rig(pool.clone()).await;
 
-    let body = payload(UNIT * 3 + 12_345, 0x5a);
-    let token = rig.issue(UPLOADER_FLOW, &body).await;
+    let (body_plain, body) = attachment(UNIT * 3 + 12_345, 0x5a);
+    let token = rig.issue(UPLOADER_FLOW, &body_plain, &body).await;
     let dir = rig.session_dir(&token);
 
     for (i, part) in body.chunks(UNIT).enumerate() {
@@ -298,11 +352,11 @@ async fn an_interrupted_upload_resumes_from_the_gap_after_a_restart() {
     cleanup(&pool, &[UPLOADER_RESUME]).await;
     let keep = tempfile::tempdir().expect("tempdir");
     let root = keep.path().to_path_buf();
-    let body = payload(UNIT * 4, 0x11);
+    let (body_plain, body) = attachment(UNIT * 4, 0x11);
 
     let token = {
         let rig = rig_at(root.clone(), pool.clone(), None).await;
-        let token = rig.issue(UPLOADER_RESUME, &body).await;
+        let token = rig.issue(UPLOADER_RESUME, &body_plain, &body).await;
         for i in [0usize, 2] {
             let (code, json) = rig.chunk(&token, i * UNIT, &body[i * UNIT..(i + 1) * UNIT]).await;
             assert_eq!(code, StatusCode::OK, "{json}");
@@ -337,8 +391,8 @@ async fn an_interrupted_upload_resumes_from_the_gap_after_a_restart() {
 async fn resending_the_same_chunk_is_idempotent_and_other_bytes_conflict() {
     let Some(pool) = pool().await else { return };
     let rig = rig(pool.clone()).await;
-    let body = payload(UNIT * 2, 0x22);
-    let token = rig.issue(UPLOADER_IDEMPOTENT, &body).await;
+    let (body_plain, body) = attachment(UNIT * 2, 0x22);
+    let token = rig.issue(UPLOADER_IDEMPOTENT, &body_plain, &body).await;
     let dir = rig.session_dir(&token);
     let part = dir.join("parts").join(format!("0-{UNIT}.part"));
 
@@ -350,7 +404,7 @@ async fn resending_the_same_chunk_is_idempotent_and_other_bytes_conflict() {
     assert_eq!(json["data"]["outcome"], "already_present");
     assert_eq!(std::fs::metadata(&part).unwrap().modified().unwrap(), mtime, "磁盘不能动");
 
-    let other = payload(UNIT, 0x99);
+    let (_other_plain, other) = attachment(UNIT, 0x99);
     let (code, json) = rig.chunk(&token, 0, &other).await;
     assert_eq!(code, StatusCode::CONFLICT, "{json}");
     assert_eq!(code_of(&json), 20610);
@@ -367,8 +421,8 @@ async fn out_of_order_chunks_still_assemble() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool, &[UPLOADER_ORDER]).await;
     let rig = rig(pool.clone()).await;
-    let body = payload(UNIT * 3 + 777, 0x33);
-    let token = rig.issue(UPLOADER_ORDER, &body).await;
+    let (body_plain, body) = attachment(UNIT * 3 + 777, 0x33);
+    let token = rig.issue(UPLOADER_ORDER, &body_plain, &body).await;
     let mut pieces: Vec<(usize, &[u8])> = body.chunks(UNIT).enumerate().map(|(i, c)| (i * UNIT, c)).collect();
     pieces.reverse();
     for (off, part) in pieces {
@@ -387,8 +441,8 @@ async fn replaying_complete_returns_the_same_file_id() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool, &[UPLOADER_REPLAY]).await;
     let rig = rig(pool.clone()).await;
-    let body = payload(UNIT + 5, 0x44);
-    let token = rig.issue(UPLOADER_REPLAY, &body).await;
+    let (body_plain, body) = attachment(UNIT + 5, 0x44);
+    let token = rig.issue(UPLOADER_REPLAY, &body_plain, &body).await;
     for (i, part) in body.chunks(UNIT).enumerate() {
         rig.chunk(&token, i * UNIT, part).await;
     }
@@ -421,8 +475,8 @@ async fn a_lost_tombstone_is_recovered_through_the_reserved_file_id() {
     let Some(pool) = pool().await else { return };
     cleanup(&pool, &[UPLOADER_TOMB]).await;
     let rig = rig(pool.clone()).await;
-    let body = payload(UNIT * 2, 0x55);
-    let token = rig.issue(UPLOADER_TOMB, &body).await;
+    let (body_plain, body) = attachment(UNIT * 2, 0x55);
+    let token = rig.issue(UPLOADER_TOMB, &body_plain, &body).await;
     for (i, part) in body.chunks(UNIT).enumerate() {
         rig.chunk(&token, i * UNIT, part).await;
     }
@@ -431,7 +485,7 @@ async fn a_lost_tombstone_is_recovered_through_the_reserved_file_id() {
     let dir = rig.session_dir(&token);
     std::fs::remove_file(dir.join("completed.json")).unwrap();
     let meta = rig.state.file_service.get_file_metadata(id).await.unwrap().unwrap();
-    let obj = rig.root.join(meta.file_path.trim_start_matches('/'));
+    let obj = rig.root.join(meta.file_path().trim_start_matches('/'));
     let mtime = std::fs::metadata(&obj).unwrap().modified().unwrap();
 
     let (code, again) = rig.complete(&token).await;
@@ -448,8 +502,8 @@ async fn a_lost_tombstone_is_recovered_through_the_reserved_file_id() {
 async fn completing_early_is_refused_and_abort_drops_the_session() {
     let Some(pool) = pool().await else { return };
     let rig = rig(pool.clone()).await;
-    let body = payload(UNIT * 2, 0x66);
-    let token = rig.issue(UPLOADER_ABORT, &body).await;
+    let (body_plain, body) = attachment(UNIT * 2, 0x66);
+    let token = rig.issue(UPLOADER_ABORT, &body_plain, &body).await;
     rig.chunk(&token, 0, &body[..UNIT]).await;
     let (code, json) = rig.complete(&token).await;
     assert_eq!(code, StatusCode::CONFLICT, "{json}");
@@ -480,8 +534,8 @@ async fn completing_early_is_refused_and_abort_drops_the_session() {
 async fn bad_credentials_and_bad_chunks_are_refused_up_front() {
     let Some(pool) = pool().await else { return };
     let rig = rig(pool.clone()).await;
-    let body = payload(UNIT * 2, 0x77);
-    let token = rig.issue(UPLOADER_CONFLICT, &body).await;
+    let (body_plain, body) = attachment(UNIT * 2, 0x77);
+    let token = rig.issue(UPLOADER_CONFLICT, &body_plain, &body).await;
     let dir = rig.session_dir(&token);
 
     let (id, _) = token.split_once('.').unwrap();

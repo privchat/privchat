@@ -144,6 +144,23 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(data))
 }
 
+/// 回读整个对象算密文摘要。
+///
+/// 🔴 探测接口交出的是**流**，不是摘要：真正的校验要在同一趟里既算密文摘要又解密
+/// 重算明文身份，一次 GET 就够。这里的用例只关心"桶里那串字节是不是我传上去的
+/// 那串"，所以自己把流读完算一次——顺带证明 `open_stream` 交出的长度与字节一致。
+async fn sha256_of_object(
+    backend: &S3DirectBackend,
+    reference: &UploadReference,
+) -> Result<String, privchat::service::final_object_probe::ProbeError> {
+    use tokio::io::AsyncReadExt as _;
+    let (len, mut reader) = backend.open_stream(reference).await?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.expect("回读流");
+    assert_eq!(bytes.len() as u64, len, "open_stream 报的长度必须等于实际字节数");
+    Ok(sha256_hex(&bytes))
+}
+
 /// 按预签名 URL 上传一片（客户端口径：必须原样携带签发时的 checksum 头）。
 async fn put_part(url: &str, data: &[u8], checksum_b64: &str) -> reqwest::Response {
     reqwest::Client::new()
@@ -267,7 +284,7 @@ async fn live_multipart_resume_pagination_checksum_and_metadata() {
     );
     assert!(!head.etag.is_empty());
     assert_eq!(
-        backend.sha256_of(&reference).await.expect("回读"),
+        sha256_of_object(&backend, &reference).await.expect("回读"),
         sha256_hex(&full),
         "回读摘要 = 整文件摘要（文件身份唯一权威）"
     );
@@ -498,7 +515,7 @@ async fn live_complete_if_none_match_rejects_overwrite() {
     );
 
     // 原对象未被覆盖：内容摘要不变。
-    assert_eq!(backend.sha256_of(&first).await.unwrap(), sha256_hex(&data));
+    assert_eq!(sha256_of_object(&backend, &first).await.unwrap(), sha256_hex(&data));
     assert_eq!(backend.head(&first).await.unwrap().unwrap().etag, etag_before);
 
     // 清理：第二次 MPU 作废 + 删对象。

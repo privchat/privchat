@@ -2299,6 +2299,7 @@ impl ChatServer {
             Some(self.unified_token_service.clone()),
             self.config.http_file_server_port,
             self.config.http_file_server_host.clone(),
+            self.config.attachment_keys.clone(),
         );
 
         // P1-11：bind 在启动路径 fail-fast（端口占用/权限问题阻断启动，不再带着

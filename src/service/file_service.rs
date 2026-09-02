@@ -55,10 +55,6 @@ pub struct FileUrlResponse {
     pub file_size: u64,
     pub mime_type: String,
     pub storage_source_id: u32,
-    /// 附件加密版本：0=明文；1=AES-256-GCM。
-    pub encryption_version: i32,
-    /// CEK（base64url 32B）；仅鉴权后返回，绝不进日志/URL。version=0 时 None。
-    pub cek: Option<String>,
 }
 
 /// 一个文件的引用现状：由调用方把 IO 查好再传进来（纯决策，便于单测）。
@@ -529,14 +525,75 @@ pub(crate) struct RecordFields {
     pub uploader_ip: Option<String>,
     pub business_type: String,
     pub business_id: Option<String>,
-    /// 跨用户秒传判重键，由服务端 HMAC 明文摘要得到；`None` = 不参与秒传。
-    pub dedup_id: Option<String>,
-    /// 明文字节数（加密对象必填，明文对象为 `None`）。
-    pub plaintext_size: Option<u64>,
-    /// 密文格式版本；`None` = 明文对象。
-    pub format_version: Option<u8>,
-    /// 本文件用的是哪一把全站密钥。`None` = 明文对象。
-    pub encryption_key_id: Option<u8>,
+    /// 跨用户秒传判重键：**明文**的 SHA-256，由 token 冻结、complete 时解密重算核对。
+    pub plaintext_sha256: String,
+    pub plaintext_size: u64,
+    /// 密文格式版本，与 protocol 的 `attachment_crypto::FORMAT_VERSION` 同源。
+    pub format_version: u8,
+    /// 本文件用的是哪一把全站密钥。
+    pub encryption_key_id: u8,
+    /// 冻结的分块几何。客户端不得自选：同一份明文按不同块大小封装，密文长度不同，
+    /// 每块的边界也不同——校验必须按冻结的这一份来算，而不是信密文头的自述。
+    pub chunk_plain_size: u32,
+    /// token 冻结的**密文**字节数。落盘对象的长度必须等于它，且这一步发生在读第一个
+    /// 字节之前——那是唯一能把「对象本身不完整」（终局拒绝）和「读到一半断线」
+    /// （可重试）分开的地方。
+    pub sealed_size: u64,
+}
+
+impl RecordFields {
+    /// 这次上传声明的身份，交给 [`attachment_verify::verify_attachment`] 核对。
+    fn frozen(&self) -> crate::service::attachment_verify::FrozenIdentity {
+        crate::service::attachment_verify::FrozenIdentity {
+            plaintext_sha256: self.plaintext_sha256.clone(),
+            plaintext_size: self.plaintext_size,
+            sealed_size: self.sealed_size,
+            format_version: self.format_version,
+            encryption_key_id: self.encryption_key_id,
+            chunk_plain_size: self.chunk_plain_size,
+        }
+    }
+}
+
+/// 回读**已落盘的密文对象**做首传校验（整包 / proxy complete 共用）。
+///
+/// 🔴 校验的对象是 staging，不是正式路径：发布必须发生在校验之后，否则一份没验过的
+/// 字节会先出现在别人可以引用的位置上。
+///
+/// 🔴 流式读，全程只驻留单个 chunk 的内存——校验的内存占用不能随文件大小走。
+///
+/// 🔴 权威长度取**落盘对象自己的 metadata**，不取"我们写进去了多少字节"的计数。
+/// 写入计数只证明调用方喂了多少，证明不了后端最终持久化了多少——writer 收尾出问题、
+/// 对象被截断时，两者会分家，而"长度已核过"正是把后续 IO 失败一律判成可重试的前提。
+async fn verify_staged_object(
+    op: &Operator,
+    staging_path: &str,
+    frozen: &crate::service::attachment_verify::FrozenIdentity,
+    site_key: &[u8],
+) -> Result<crate::service::attachment_verify::VerifiedAttachment> {
+    let observed_size = op
+        .stat(staging_path)
+        .await
+        .map_err(|e| {
+            tracing::warn!(staging_path, error = %e, "读取待校验对象 metadata 失败（可重试）");
+            ServerError::ServiceUnavailable("读取待校验附件失败".to_string())
+        })?
+        .content_length();
+    let reader = op.reader(staging_path).await.map_err(|e| {
+        tracing::warn!(staging_path, error = %e, "打开待校验对象失败（可重试）");
+        ServerError::ServiceUnavailable("读取待校验附件失败".to_string())
+    })?;
+    let stream = reader.into_bytes_stream(..).await.map_err(|e| {
+        tracing::warn!(staging_path, error = %e, "打开待校验对象流失败（可重试）");
+        ServerError::ServiceUnavailable("读取待校验附件失败".to_string())
+    })?;
+    crate::service::attachment_verify::verify_attachment(
+        tokio_util::io::StreamReader::new(Box::pin(stream)),
+        observed_size,
+        frozen,
+        site_key,
+    )
+    .await
 }
 
 /// [`FileService::record_s3_published`] 的结果。
@@ -916,17 +973,19 @@ impl FileService {
         uploader_ip: Option<String>,
         business_type: String,
         business_id: Option<String>,
-        encryption_version: i32,
-        cek: Option<String>,
-        // v2：客户端加密时用的那把密钥 id（服务端签发 token 时给的）。
-        encryption_key_id: Option<u8>,
-        // 产出这份字节的客户端处理版本；0 = 原始未处理。
-        transform_version: i32,
-        // 客户端在 prepare 声明并签进 token 的**最终上传 blob** 摘要。
-        // `None` = 老客户端没报，这次上传不参与秒传。
-        declared_content_sha256: Option<String>,
-        // token 里签下的精确字节数；`None` = 老客户端没报。
+        // 🔴 以下四项全部来自 **token 冻结的身份**，不接收客户端在这次请求里的说法。
+        //
+        // 冻结的意义就在这：客户端在 prepare 与 upload 之间换掉任何一项，秒传判定用的
+        // 就是一组参数、落库用的是另一组。
+        plaintext_sha256: String,
+        plaintext_size: u64,
+        format_version: u8,
+        encryption_key_id: u8,
+        chunk_plain_size: u32,
+        // token 里签下的精确**密文**字节数。
         declared_size: Option<i64>,
+        // 🔴 校验要解密：没有密钥就证明不了身份，调用方必须 fail-closed 地取到它。
+        site_key: &[u8],
     ) -> Result<FileMetadata> {
         let mut writer = upload
             .writer
@@ -937,23 +996,18 @@ impl FileService {
             .await
             .map_err(|e| ServerError::Internal(format!("存储写入收尾失败: {}", e)))?;
 
-        // 🔴 权威摘要由**服务端**计算，对象是**实际收到并落盘的那串字节**。
+        // 落盘字节的 SHA-256，由**服务端**边写边算。
         //
-        // 服务端不理解加密，也不需要理解：去重的单位就是「最终上传的字节」。
-        // 字节完全相同才复用，因此——
-        //   · 明文文件与加密文件不会互相命中；
-        //   · 同一明文用不同随机 CEK/nonce 加密两次，是**两个**物理文件，这是预期行为。
+        // 🔴 它是**存储事实**，不是身份：记在对象行上用来核对"桶里那串字节还是不是
+        // 当初发布的那串"。去重不看它——同一份明文每次封装都用新的随机 nonce，
+        // 密文摘要按定义无法跨用户命中，拿它当判重键等于秒传只对"自己重发自己"生效。
         //
-        // 客户端要拿到秒传，就必须**保留并重传当初参与哈希的那个 blob**：
-        // 预检之后重新加密一次，字节就变了，本来也不该命中。
-        //
-        // 客户端在 prepare 报的值只用于预检，不能直接写库——那等于让调用方自己
-        // 声明「我这份字节叫什么」，之后别人算出同一个名字就会拿到他的东西。
+        // 判重键是**明文**摘要，由下面的首传校验解密重算得到（`verify_staged_object`）。
+        // 客户端在 prepare 报的那个值只是预检：让调用方自己声明"我这份字节叫什么"，
+        // 等于允许他用别人的名字占位。
         let stored_sha256 = hex::encode(sha2::Digest::finalize(upload.hasher));
 
-        if let Some(declared_size) =
-            size_check_target(declared_content_sha256.as_deref(), declared_size)
-        {
+        if let Some(declared_size) = declared_size {
             if declared_size != upload.written as i64 {
                 // 删的是**临时对象**：这一刻正式路径上什么都没有，字节还没发布。
                 if let Ok(op) = self.operator_for_source(upload.source_id).await {
@@ -966,21 +1020,66 @@ impl FileService {
             }
         }
 
-        if let Some(declared) = declared_content_sha256.as_deref() {
-            if !declared.eq_ignore_ascii_case(&stored_sha256) {
-                // 声明与实际不符：删临时对象。正式路径从头到尾没被碰过。
+        // 🔴 **首传校验：解开重算明文摘要。**
+        //
+        // 密文摘要（上面那个 `stored_sha256`）只能证明字节没在传输中坏掉，证明不了
+        // "这串字节就是你声明的那份内容"——客户端每次封装用新的随机 nonce，密文摘要
+        // 不由内容唯一决定。不解密重算的话，任何登录用户都能用「文件 A 的摘要 +
+        // 文件 B 的密文」污染秒传映射。见 ATTACHMENT_ENCRYPTION_SPEC §3 第 5 步。
+        //
+        // 校验的是 **staging**：发布必须发生在校验之后，没验过的字节不能先出现在
+        // 别人可以引用的位置上。
+        let fields = RecordFields {
+            filename,
+            mime_type,
+            uploader_id,
+            uploader_ip,
+            business_type,
+            business_id,
+            plaintext_sha256,
+            plaintext_size,
+            format_version,
+            encryption_key_id,
+            chunk_plain_size,
+            // token 冻结的密文长度；没签就按冻结的明文大小 + 块几何算——两者本来
+            // 一一对应，`verify_attachment` 还会再交叉核一次。
+            sealed_size: match declared_size {
+                Some(d) if d >= 0 => d as u64,
+                _ => privchat_protocol::attachment_crypto::sealed_len(
+                    plaintext_size,
+                    chunk_plain_size,
+                )
+                .map_err(|e| {
+                    ServerError::Internal(format!("冻结身份的密文长度算不出来: {e}"))
+                })?,
+            },
+        };
+
+        let verified = match verify_staged_object(
+            &upload.op,
+            &upload.staging_path,
+            &fields.frozen(),
+            site_key,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // 删的是**临时对象**：正式路径从头到尾没被碰过。整包路径崩了客户端
+                // 本来就要重发整个 body，留着这份半成品没有意义。
                 if let Ok(op) = self.operator_for_source(upload.source_id).await {
                     let _ = op.delete(&upload.staging_path).await;
                 }
-                return Err(ServerError::Validation(
-                    "上传内容与 prepare 阶段声明的摘要不一致".to_string(),
-                ));
+                return Err(e);
             }
-        }
+        };
+        // 🔴 落库用**回读算出来的**密文摘要：它和真正会被发布的那串字节同源。
+        debug_assert_eq!(verified.sealed_sha256, stored_sha256);
+        let stored_sha256 = verified.sealed_sha256;
 
         // 正式路径按内容摘要算——开始上传时还不知道字节内容，只能等到这里。
         let final_path =
-            self.generate_file_path(&stored_sha256, &upload.file_type, &filename);
+            self.generate_file_path(&stored_sha256, &upload.file_type, &fields.filename);
 
         self.publish_and_record(
             StagedObject {
@@ -992,17 +1091,7 @@ impl FileService {
                 written: upload.written,
                 stored_sha256,
             },
-            RecordFields {
-                filename,
-                mime_type,
-                uploader_id,
-                uploader_ip,
-                business_type,
-                business_id,
-                encryption_version,
-                cek,
-                encryption_key_id,
-            },
+            fields,
         )
         .await
     }
@@ -1019,12 +1108,13 @@ impl FileService {
         written: u64,
         stored_sha256: String,
         fields: RecordFields,
+        // 🔴 与整包同理：拼接核过的是**密文**摘要，证明不了身份，必须解密重算。
+        site_key: &[u8],
     ) -> Result<FileMetadata> {
         let m = session.manifest();
         let file_type = FileType::from_str(&m.file_type).unwrap_or(FileType::File);
         let source = self.resolve_storage_source()?;
         let source_id = source.id;
-        let file_path = self.generate_file_path(&stored_sha256, &file_type, &fields.filename);
         let staging_path = format!(
             "tmp/uploads/chunked/{}/{}",
             session.upload_id(),
@@ -1034,6 +1124,20 @@ impl FileService {
                 .and_then(|n| n.to_str())
                 .unwrap_or("body.complete.tmp")
         );
+
+        // 🔴 校验在发布之前，对象仍在 staging。
+        //
+        // `assemble` 只核过区间齐全与**密文**摘要——那两项都不回答"这串字节是不是
+        // token 声明的那份内容"。proxy 路径漏掉这一步，它就是和整包等价的绕过入口。
+        //
+        // 失败不删 staging：分片会话是可重试的（客户端不必重传整份），拼接结果留给
+        // 会话自己的 abort / 过期扫描收拾。
+        let op = self.operator_for_source(source_id).await?;
+        let verified = verify_staged_object(&op, &staging_path, &fields.frozen(), site_key).await?;
+        debug_assert_eq!(verified.sealed_sha256, stored_sha256);
+        let stored_sha256 = verified.sealed_sha256;
+
+        let file_path = self.generate_file_path(&stored_sha256, &file_type, &fields.filename);
 
         self.publish_and_record(
             StagedObject {
@@ -1099,10 +1203,10 @@ impl FileService {
         let placement = converge_upload(
             &mut tx,
             &UploadPlacement {
-                dedup_id: fields.dedup_id.clone(),
+                plaintext_sha256: fields.plaintext_sha256.clone(),
+                plaintext_size: fields.plaintext_size,
                 sealed_sha256: stored_sha256.clone(),
                 sealed_size: m.total_size,
-                plaintext_size: fields.plaintext_size,
                 my_path: final_key.clone(),
                 my_source_id: source_id as i32,
                 format_version: fields.format_version,
@@ -1130,10 +1234,10 @@ impl FileService {
             business_id: fields.business_id.clone(),
             object: AttachmentObject {
                 object_id: placement.object_id,
-                dedup_id: fields.dedup_id.clone(),
-                sealed_sha256: Some(stored_sha256),
-                sealed_size: m.total_size,
+                plaintext_sha256: fields.plaintext_sha256.clone(),
                 plaintext_size: fields.plaintext_size,
+                sealed_sha256: stored_sha256,
+                sealed_size: m.total_size,
                 file_path: placement.file_path.clone(),
                 storage_source_id: placement.storage_source_id as u32,
                 // 命中去重时跟已有对象走，否则用本次声明的。
@@ -1146,13 +1250,17 @@ impl FileService {
         let metadata = if inserted {
             metadata
         } else {
-            let existing = self
-                .file_upload_repo
-                .get_by_file_id(metadata.file_id)
-                .await?
-                .ok_or_else(|| {
-                    ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
-                })?;
+            // 🔴 在**同一个事务**里回读：冲突意味着那一行正被某个事务写着，
+            // 从池外另开连接读到的是另一个快照，可能读不到（于是报出
+            // "主键冲突却读不到"这种自相矛盾的错），也可能读到它提交前的样子。
+            let existing = crate::repository::FileUploadRepository::get_by_file_id_within(
+                &mut tx,
+                metadata.file_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
+            })?;
             // 身份核对看**对象**：摘要和大小已经不在引用行上了。
             let same_identity = existing.uploader_id == metadata.uploader_id
                 && existing.object.object_id == metadata.object.object_id
@@ -1200,9 +1308,13 @@ impl FileService {
             uploader_ip,
             business_type,
             business_id,
-            encryption_version,
-            cek,
+            plaintext_sha256,
+            plaintext_size,
+            format_version,
             encryption_key_id,
+            // 冻结的分块几何与密文长度只服务于校验（已在调用方发生），不进文件行。
+            chunk_plain_size: _,
+            sealed_size: _,
         } = fields;
 
         // 窗口一：字节收完并校验通过，但还没发布。
@@ -1218,20 +1330,20 @@ impl FileService {
         let placement = converge_upload(
             &mut tx,
             &UploadPlacement {
-                stored_sha256: stored_sha256.clone(),
-                encryption_version,
+                plaintext_sha256: plaintext_sha256.clone(),
+                plaintext_size,
+                sealed_sha256: stored_sha256.clone(),
+                sealed_size: written,
                 my_path: my_path.clone(),
                 my_source_id: my_source_id as i32,
-                my_cek: cek,
-                my_encryption_key_id: encryption_key_id,
+                format_version,
+                encryption_key_id,
             },
         )
         .await?;
-        let (file_path, source_id, enc_version, stored_cek, duplicate) = (
+        let (file_path, source_id, duplicate) = (
             placement.file_path.clone(),
             placement.storage_source_id,
-            placement.encryption_version,
-            placement.cek.clone(),
             placement.duplicate,
         );
 
@@ -1308,10 +1420,10 @@ impl FileService {
             business_id,
             object: AttachmentObject {
                 object_id: placement.object_id,
-                dedup_id: dedup_id.clone(),
-                sealed_sha256: Some(stored_sha256.clone()),
-                sealed_size: written,
+                plaintext_sha256: plaintext_sha256.clone(),
                 plaintext_size,
+                sealed_sha256: stored_sha256.clone(),
+                sealed_size: written,
                 file_path: file_path.clone(),
                 storage_source_id: source_id as u32,
                 // 命中去重时跟已有对象走，否则用本次声明的。
@@ -1331,13 +1443,17 @@ impl FileService {
         } else {
             // 🔴 主键冲突**只有在既有记录与本次身份一致时**才算「上次已落库」的幂等成功。
             // 不核对就直接返回，等于把另一条文件记录交给当前调用者。
-            let existing = self
-                .file_upload_repo
-                .get_by_file_id(metadata.file_id)
-                .await?
-                .ok_or_else(|| {
-                    ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
-                })?;
+            // 🔴 在**同一个事务**里回读：冲突意味着那一行正被某个事务写着，
+            // 从池外另开连接读到的是另一个快照，可能读不到（于是报出
+            // "主键冲突却读不到"这种自相矛盾的错），也可能读到它提交前的样子。
+            let existing = crate::repository::FileUploadRepository::get_by_file_id_within(
+                &mut tx,
+                metadata.file_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                ServerError::Internal(format!("主键冲突却读不到 {}", metadata.file_id))
+            })?;
             // 身份核对看**对象**：摘要和大小已经不在引用行上了。
             let same_identity = existing.uploader_id == metadata.uploader_id
                 && existing.object.object_id == metadata.object.object_id
@@ -1377,44 +1493,30 @@ impl FileService {
         let done = sqlx::query(
             r#"
             INSERT INTO privchat_file_uploads (
-                file_id, original_filename, file_size, file_type, mime_type,
-                file_path, storage_source_id, uploader_id, uploader_ip, uploaded_at,
-                width, height, file_hash, business_type, business_id,
-                encryption_version, cek
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                file_id, original_filename, file_type, mime_type,
+                object_id, uploader_id, uploader_ip, uploaded_at,
+                width, height, business_type, business_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (file_id) DO NOTHING
             "#,
         )
         .bind(meta.file_id as i64)
         .bind(&meta.original_filename)
-        .bind(meta.file_size as i64)
         .bind(meta.file_type.as_str())
         .bind(&meta.mime_type)
-        .bind(&meta.file_path())
-        .bind(meta.storage_source_id() as i32)
+        .bind(meta.object.object_id as i64)
         .bind(meta.uploader_id as i64)
         .bind(&meta.uploader_ip)
         .bind(meta.uploaded_at as i64)
         .bind(meta.width.map(|v| v as i32))
         .bind(meta.height.map(|v| v as i32))
-        .bind(&meta.file_hash)
         .bind(&meta.business_type)
         .bind(&meta.business_id)
-        .bind(meta.encryption_version)
-        .bind(&meta.cek)
         .execute(&mut **tx)
         .await
         .map_err(|e| ServerError::Database(format!("插入上传记录失败: {e}")))?;
         // 0 行 = 这个 file_id 上次已落库（崩溃重试复用了预留 id），回读而不是当新插入。
         Ok(done.rows_affected() > 0)
-    }
-
-    /// 秒传探测：这份内容在不在（不写任何东西）。
-    pub async fn find_by_content(
-        &self,
-        sha256: &str,
-    ) -> Result<Option<crate::model::file_upload::FileMetadata>> {
-        self.file_upload_repo.find_by_content(sha256).await
     }
 
     /// 秒传预检：这份**明文**在不在。
@@ -1512,83 +1614,26 @@ impl FileService {
     /// 直接物理删除文件——**已停用**（MEDIA_REFERENCE_AND_FORWARD_SPEC §8.2）。
     ///
     /// 共享引用模型下「我上传的文件我能删」不成立：一个文件可能同时被原消息和
-    /// 若干转发副本引用，删掉物理文件会让那些副本一起变成打不开的图。
+    /// 若干转发副本引用，删掉物理对象会让那些副本一起变成打不开的图。
     ///
     /// 「先数引用再删」也不够——两步之间可以插入一条新引用（转发只要一个事务），
     /// 删除照样发生。要做对必须是 GC 状态机：`status=gc_pending` + 宽限期 +
     /// 到点复查引用，全程可被新引用取消。
     ///
-    /// 在那套状态机落地之前这里直接拒绝。**不做 ownership / 引用计数查询**——
-    /// 查了也不影响结果，只是让人误以为这里还有一套判断在生效。
-    /// 现状：本方法无 RPC 调用方，这是拆引信，不是砍功能。
-    pub async fn delete_file(&self, file_id: u64, user_id: u64) -> Result<()> {
-        let Some(meta) = self.file_upload_repo.get_by_file_id(file_id).await? else {
-            return Ok(());
-        };
-        if meta.uploader_id != user_id {
-            return Err(ServerError::Forbidden("只能删除自己的文件".to_string()));
-        }
-
-        // 🔴 先看还有没有别人指着同一个物理文件，再删自己这行——顺序反过来的话，
-        // 两个人同时删各自的行会双双读到「还有别人」，物理文件永远没人删。
-        // 反过来说，先删行再判断也不行：两边都判成「没人了」，然后都去删同一个对象。
-        //
-        // 这里用一次 SELECT ... FOR UPDATE 把同 path 的行锁住，让删除与秒传取用
-        // （它会插入新的一行指向同一个 path）排成序。
-        let mut tx = self
-            .file_upload_repo
-            .pool()
-            .begin()
-            .await
-            .map_err(|e| ServerError::Database(format!("开启删除事务失败: {e}")))?;
-
-        // 🔴 `COUNT(*) ... FOR UPDATE` **不构成任何锁**：聚合结果没有行可锁，
-        // Postgres 直接把它当普通查询。上一版写成那样，等于两个并发删除都读到
-        // 「还有别人」（各自看见对方的行），物理文件永远没人删；或者都读到
-        // 「没人了」，双双去删同一个对象。
-        //
-        // 用按 file_path 的 advisory 锁把同一个物理文件上的删除与秒传取用串起来。
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(&meta.file_path())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ServerError::Database(format!("获取物理文件锁失败: {e}")))?;
-
-        let others: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM privchat_file_uploads \
-             WHERE file_path = $1 AND file_id <> $2",
-        )
-        .bind(&meta.file_path())
-        .bind(file_id as i64)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| ServerError::Database(format!("统计共享物理文件的记录失败: {e}")))?;
-
-        sqlx::query("DELETE FROM privchat_file_uploads WHERE file_id = $1")
-            .bind(file_id as i64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ServerError::Database(format!("删除上传记录失败: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| ServerError::Database(format!("提交删除事务失败: {e}")))?;
-
-        if others.0 > 0 {
-            tracing::info!(
-                "🗑️ 只删记录 file_id={file_id}：还有 {} 行指向同一个物理文件",
-                others.0
-            );
-            return Ok(());
-        }
-
-        // 最后一行没了才删物理文件。删失败只记日志：数据库已经提交，
-        // 再回滚出一行"指向不存在文件"的记录更糟；留下的孤儿对象由 GC 收。
-        let op = self.operator_for_source(meta.storage_source_id()).await?;
-        if let Err(e) = op.delete(&meta.file_path()).await {
-            tracing::warn!("删除物理文件失败（留待 GC）path={}: {}", meta.file_path(), e);
-        }
-        Ok(())
+    /// 🔴 **函数体只剩一个拒绝，删除逻辑整段删掉了。**
+    ///
+    /// 在这之前，文档写着"已停用、直接拒绝"，函数却老老实实地删引用行、删对象行、
+    /// 删物理文件——一整套**能跑**的半成品删除，只差一个调用方。注释拦不住调用方：
+    /// 下一个人看见 `delete_file` 存在、签名合适，接上就是了，而它缺的宽限期和
+    /// 引用复查一个都没有。
+    ///
+    /// 拆引信的正确做法是让它拒绝，不是让它正确。GC 状态机落地时在这里重写。
+    pub async fn delete_file(&self, _file_id: u64, _user_id: u64) -> Result<()> {
+        Err(ServerError::Unsupported(
+            "直接删除附件已停用：共享引用模型下需要 GC 状态机（宽限期 + 到点复查引用），\
+             在它落地之前不提供任何删除入口"
+                .to_string(),
+        ))
     }
 
     fn detect_file_type(&self, mime_type: &str) -> Result<FileType> {
@@ -1728,11 +1773,12 @@ impl FileService {
             file_url,
             thumbnail_url: None,
             expires_at,
-            file_size: metadata.file_size,
-            mime_type: metadata.mime_type,
+            // 🔴 给用户看的是**明文**大小。密文比它大（每块多一个 nonce 和一个 tag），
+            // 拿密文大小去显示，用户会看到一个和原始文件对不上的数字；
+            // 拿它判断"下载完了没"更糟。
+            file_size: metadata.display_size(),
             storage_source_id: metadata.storage_source_id(),
-            encryption_version: metadata.encryption_version,
-            cek: metadata.cek,
+            mime_type: metadata.mime_type,
         })
     }
 
@@ -2009,21 +2055,17 @@ mod authz_tests {
 /// 一次上传要落到哪个物理对象上的输入。
 #[derive(Debug, Clone)]
 pub struct UploadPlacement {
-    /// 跨用户秒传判重键：`HMAC(dedup_master_key, tag || plaintext_sha256)`。
-    ///
-    /// `None` = 不参与秒传（明文对象，或部署没配 dedup 密钥）。
-    pub dedup_id: Option<String>,
+    /// 跨用户秒传判重键：**明文**的 SHA-256。
+    pub plaintext_sha256: String,
+    pub plaintext_size: u64,
     /// 服务端对**实际落盘字节**算出的 SHA-256。
     pub sealed_sha256: String,
     pub sealed_size: u64,
-    /// 明文字节数。明文对象为 `None`。
-    pub plaintext_size: Option<u64>,
     pub my_path: String,
     pub my_source_id: i32,
-    /// 密文格式版本；`None` = 明文对象。
-    pub format_version: Option<u8>,
+    pub format_version: u8,
     /// 本次上传用的 key id；命中已有对象时会被对方的值覆盖。
-    pub encryption_key_id: Option<u8>,
+    pub encryption_key_id: u8,
 }
 
 /// 收敛结果：这条记录最终指向哪个物理对象。
@@ -2034,8 +2076,8 @@ pub struct ResolvedPlacement {
     pub storage_source_id: i32,
     /// 🔴 命中已有对象时必须跟着**那份对象**走：密文头里写的是它的格式与 key id，
     /// 记成本次声明的那套，下载就会拿错密钥去解，而错误离现场已经很远。
-    pub format_version: Option<u8>,
-    pub encryption_key_id: Option<u8>,
+    pub format_version: u8,
+    pub encryption_key_id: u8,
     /// true = 命中了别人先落的那份，自己刚写的对象可以删。
     pub duplicate: bool,
 }
@@ -2048,45 +2090,82 @@ pub struct ResolvedPlacement {
 /// 🔴 **调用点必须在首传校验之后**。这里插进去的对象直接是 `published`，
 /// 会立刻被后来者的秒传命中——还没验过就发布，等于把一份未经核对的内容塞进索引。
 ///
-/// 🔴 判重键是 `dedup_id`（明文摘要的 HMAC），不是密文摘要。每个对象有自己的随机
-/// salt，同一份明文由不同人封装会产出不同密文——按密文判重等于秒传只对「自己重发
-/// 自己」生效，而秒传的收益几乎全在「别人已经传过」的场景。
+/// 🔴 判重键是**明文 SHA-256**，不是密文摘要：每块封装都用新的随机 nonce，同一份
+/// 明文由不同人封装会产出不同密文——按密文判重等于秒传只对「自己重发自己」生效，
+/// 而秒传的收益几乎全在「别人已经传过」的场景。
 pub async fn converge_upload(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     input: &UploadPlacement,
 ) -> Result<ResolvedPlacement> {
+    // 🔴 等待上限必须在**第一把锁之前**设。
+    //
+    // 之前它设在"命中已有对象之后、取对象锁之前"，于是内容锁那一把仍然可以无限等——
+    // 而同内容首传的竞争恰恰全发生在第一把锁上，3 秒上限对它一次都不生效。
+    sqlx::query("SET LOCAL lock_timeout = '3s'")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| ServerError::Database(format!("设置锁等待上限失败: {e}")))?;
+
     // 同一份内容的所有首传串行到这一把锁上。粒度是内容，不是全表。
     //
-    // 没有 dedup_id 就没有跨用户判重可言（明文对象），跳过整段收敛直接建对象。
-    if let Some(dedup_id) = input.dedup_id.as_deref() {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(dedup_id)
+    // 🔴 超时走与 `create_reference` **同一处**映射：55P03 是瞬时竞争，可重试。
+    // 包成 Database 就成了终局失败，同一类超时还会在不同上传路径上表现成不同错误。
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&input.plaintext_sha256)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            crate::repository::FileUploadRepository::map_lock_error("获取内容锁失败", e)
+        })?;
+
+    let existing: Option<(i64, String, i32, i16, i16)> = sqlx::query_as(
+        "SELECT object_id, file_path, storage_source_id, format_version, encryption_key_id \
+         FROM privchat_attachment_objects WHERE plaintext_sha256 = $1",
+    )
+    .bind(&input.plaintext_sha256)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| ServerError::Database(format!("查询同内容对象失败: {e}")))?;
+
+    if let Some((object_id, _, _, _, _)) = existing {
+        // 🔴 内容锁串起来的是「同内容的首传之间」，它**同步不到删除**：
+        // GC / 删除和 `create_reference` 锁的是 `object_id`，两把锁互不相干。
+        // 于是存在这样一条时序：这里查到对象 → 删除事务拿到 object 锁、删掉最后一条
+        // 引用连同对象 → 调用方去插引用，撞 FK 报错。不会留下悬空引用，但会把一次
+        // 本可以成功的上传变成失败。
+        //
+        // 所以命中之后要拿**同一把** object 锁再复查一遍：等锁期间对象还在，才能把它
+        // 交出去；已经被删掉的话就当没命中，往下登记自己这份。
+        //
+        // 等锁上限在函数开头就设好了（见那里的说明）。
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(object_id)
             .execute(&mut **tx)
             .await
-            .map_err(|e| ServerError::Database(format!("获取内容锁失败: {e}")))?;
+            .map_err(|e| {
+                crate::repository::FileUploadRepository::map_lock_error("获取物理对象锁失败", e)
+            })?;
 
-        // 🔴 只认 published。pending 的还没通过首传校验，命中它就等于把一份
-        // 未经核对的内容交给下一个用户。
-        let existing: Option<(i64, String, i32, Option<i16>, Option<i16>)> = sqlx::query_as(
-            "SELECT object_id, file_path, storage_source_id, format_version, encryption_key_id \
-             FROM privchat_attachment_objects \
-             WHERE dedup_id = $1 AND status = 'published' LIMIT 1",
+        let still_there: Option<(String, i32, i16, i16)> = sqlx::query_as(
+            "SELECT file_path, storage_source_id, format_version, encryption_key_id \
+             FROM privchat_attachment_objects WHERE object_id = $1",
         )
-        .bind(dedup_id)
+        .bind(object_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|e| ServerError::Database(format!("查询同内容对象失败: {e}")))?;
+        .map_err(|e| ServerError::Database(format!("复查同内容对象失败: {e}")))?;
 
-        if let Some((object_id, path, src, fmt, key_id)) = existing {
+        if let Some((path, src, fmt, key_id)) = still_there {
             return Ok(ResolvedPlacement {
                 object_id: object_id as u64,
                 file_path: path,
                 storage_source_id: src,
-                format_version: fmt.and_then(|v| u8::try_from(v).ok()),
-                encryption_key_id: key_id.and_then(|v| u8::try_from(v).ok()),
+                format_version: fmt as u8,
+                encryption_key_id: key_id as u8,
                 duplicate: true,
             });
         }
+        tracing::info!("等对象锁期间 object_id={object_id} 已被删除，改为登记本次上传这一份");
     }
 
     // 未命中：把自己这份登记成正式对象。
@@ -2095,20 +2174,20 @@ pub async fn converge_upload(
     // 同一份字节）。冲突时回读既有行，而不是报错——两边指向的本来就是同一个对象。
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO privchat_attachment_objects \
-            (dedup_id, sealed_sha256, sealed_size, plaintext_size, file_path, \
-             storage_source_id, format_version, encryption_key_id, status, published_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'published', now_millis()) \
+            (plaintext_sha256, plaintext_size, sealed_sha256, sealed_size, file_path, \
+             storage_source_id, format_version, encryption_key_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (storage_source_id, file_path) DO NOTHING \
          RETURNING object_id",
     )
-    .bind(input.dedup_id.as_deref())
+    .bind(&input.plaintext_sha256)
+    .bind(input.plaintext_size as i64)
     .bind(&input.sealed_sha256)
     .bind(input.sealed_size as i64)
-    .bind(input.plaintext_size.map(|v| v as i64))
     .bind(&input.my_path)
     .bind(input.my_source_id)
-    .bind(input.format_version.map(i16::from))
-    .bind(input.encryption_key_id.map(i16::from))
+    .bind(i16::from(input.format_version))
+    .bind(i16::from(input.encryption_key_id))
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| ServerError::Database(format!("登记物理对象失败: {e}")))?;
@@ -2124,7 +2203,7 @@ pub async fn converge_upload(
         });
     }
 
-    let (object_id, fmt, key_id): (i64, Option<i16>, Option<i16>) = sqlx::query_as(
+    let (object_id, fmt, key_id): (i64, i16, i16) = sqlx::query_as(
         "SELECT object_id, format_version, encryption_key_id \
          FROM privchat_attachment_objects \
          WHERE storage_source_id = $1 AND file_path = $2",
@@ -2139,8 +2218,8 @@ pub async fn converge_upload(
         object_id: object_id as u64,
         file_path: input.my_path.clone(),
         storage_source_id: input.my_source_id,
-        format_version: fmt.and_then(|v| u8::try_from(v).ok()),
-        encryption_key_id: key_id.and_then(|v| u8::try_from(v).ok()),
+        format_version: fmt as u8,
+        encryption_key_id: key_id as u8,
         // 路径相同即字节相同（内容寻址），所以自己刚写那份是多余的。
         duplicate: true,
     })

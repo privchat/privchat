@@ -7,11 +7,16 @@
 // 用真实 repo/service 打到真库，覆盖 ATTACHMENT_ENCRYPTION_SPEC §授权 的 7 条规则：
 //   1. 发送附件后 file.business_id = message_id（绑定机制 / update_business）
 //   2. thumbnail_file_id 同样绑定 message_id
-//   3. channel member 调 get_url 成功，拿到 cek
-//   4. 非 channel member forbidden
+//   3. channel member 调 get_url 成功（授权通过）
+//   4. 非 channel member forbidden——拿不到 URL，也就拿不到密钥
 //   5. pending file（未绑定 business）只有 uploader 可 get_url
 //   6. broken business_id（指向不存在的 message）→ forbidden（不 fallback 放行）
-//   7. legacy encryption_version=0 授权规则一样，但 cek=null
+//
+// 🔴 per-file `cek` 已经不存在了：密钥是**全站**的，按对象行的 `encryption_key_id`
+// 选一把。所以这里不再断言"这个文件的 cek 是什么"——授权是这个文件的事，
+// 密钥选取与"漏配必须 fail-closed"是 `rpc::file::get_url` 的事，那三条门禁
+// （明文摘要 / 缺密钥 ATTACHMENT_KEY_UNAVAILABLE / 判据按当前格式版本）在那边，
+// 且都做过变异验证。
 //
 // gate：未配 PRIVCHAT_TEST_DATABASE_URL / DATABASE_URL 时跳过。
 
@@ -19,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 
 use sqlx::postgres::PgPoolOptions;
 
-use privchat::model::file_upload::{FileMetadata, FileType};
+use privchat::model::file_upload::{AttachmentObject, FileMetadata, FileType};
 use privchat::repository::{FileUploadRepository, PgChannelRepository, PgMessageRepository};
 use privchat::service::attachment_authorization::resolve_attachment_access;
 use privchat::service::ChannelService;
@@ -127,59 +132,98 @@ async fn ensure_message(pool: &sqlx::PgPool, message_id: i64, channel_id: i64, s
     .expect("ensure message");
 }
 
-fn file_meta(
+/// 预置一条**已发布对象**行，返回它的 object_id。
+///
+/// 🔴 身份与物理坐标都在对象行上，文件行只是一条引用。所以 fixture 必须先建对象
+/// 再建引用——直接往 `privchat_file_uploads` 塞 file_size/file_path 的老写法不成立了。
+async fn seed_object(pool: &sqlx::PgPool, file_id: u64, key_id: i16) -> u64 {
+    let digest = format!("{file_id:064x}");
+    // 同一份 fixture 反复跑：孤儿对象会撞 plaintext_sha256 唯一约束。
+    let _ = sqlx::query(
+        "DELETE FROM privchat_attachment_objects o WHERE o.plaintext_sha256 = $1 \
+         AND NOT EXISTS (SELECT 1 FROM privchat_file_uploads u WHERE u.object_id = o.object_id)",
+    )
+    .bind(&digest)
+    .execute(pool)
+    .await;
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO privchat_attachment_objects \
+         (plaintext_sha256, plaintext_size, sealed_sha256, sealed_size, file_path, \
+          storage_source_id, format_version, encryption_key_id) \
+         VALUES ($1, 64, $2, 132, $3, 0, 1, $4) RETURNING object_id",
+    )
+    .bind(&digest)
+    .bind(format!("{:064x}", file_id + 1))
+    .bind(format!("public/chat/message/202601/test_{file_id}"))
+    .bind(key_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed object") as u64
+}
+
+/// 一条引用行。
+///
+/// 🔴 加密参数不再是**每个文件**一份：`cek` / `encryption_version` 已经没有了，
+/// 取而代之的是对象行上的 `encryption_key_id` —— 指向一把**全站**密钥。所以这里
+/// 也不再有"这个文件的 cek 是什么"可断言；能断言的是授权判定本身，以及
+/// 服务端会按对象记录的 key_id 去取哪一把（那条在 `rpc::file::get_url` 的单测里，
+/// 连同"密钥漏配必须 fail-closed"一起，带变异验证）。
+async fn file_meta(
+    pool: &sqlx::PgPool,
     file_id: u64,
     uploader_id: i64,
-    encryption_version: i32,
-    cek: Option<&str>,
     business_id: Option<i64>,
 ) -> FileMetadata {
+    let object_id = seed_object(pool, file_id, 1).await;
     FileMetadata {
         file_id,
         original_filename: "a.png".to_string(),
-        file_size: 64,
         original_size: None,
         file_type: FileType::Image,
         mime_type: "image/png".to_string(),
-        file_path: format!("public/chat/message/202601/test_{file_id}"),
-        storage_source_id: 0,
         uploader_id: uploader_id as u64,
         uploader_ip: None,
         uploaded_at: 1_767_200_000_000,
         width: None,
         height: None,
-        file_hash: None,
         business_type: business_id.map(|_| "message".to_string()),
         business_id: business_id.map(|id| id.to_string()),
-        encryption_version,
-        cek: cek.map(|s| s.to_string()),
-        encryption_key_id: None,
+        object: AttachmentObject {
+            object_id,
+            plaintext_sha256: format!("{file_id:064x}"),
+            plaintext_size: 64,
+            sealed_sha256: format!("{:064x}", file_id + 1),
+            sealed_size: 132,
+            file_path: format!("public/chat/message/202601/test_{file_id}"),
+            storage_source_id: 0,
+            format_version: 1,
+            encryption_key_id: 1,
+        },
     }
 }
 
-/// 走 get_url 用的**同一个**判定入口；返回 (authorized, cek_if_returned, encryption_version)。
+/// 走 get_url 用的**同一个**判定入口。
+///
+/// 🔴 只回"授权与否"：未授权时 RPC 在这一步就返回 403，既不签 URL 也不取密钥
+/// （取密钥那步在授权之后，见 `rpc::file::get_url`）。所以"未授权拿不到 URL 和
+/// 密钥"在这里的可观测形式就是这个 false。
 async fn resolve_get_url(
     file_repo: &FileUploadRepository,
     msg_repo: &PgMessageRepository,
     channel_service: &ChannelService,
     file_id: u64,
     user_id: u64,
-) -> (bool, Option<String>, i32) {
+) -> bool {
     let meta = file_repo
         .get_by_file_id(file_id)
         .await
         .expect("query file")
         .expect("file exists");
 
-    let decision = resolve_attachment_access(msg_repo, channel_service, &meta, user_id)
+    resolve_attachment_access(msg_repo, channel_service, &meta, user_id)
         .await
-        .expect("授权判定不该因数据库故障而不可用");
-    let cek = if decision.authorized {
-        meta.cek.clone()
-    } else {
-        None
-    };
-    (decision.authorized, cek, meta.encryption_version)
+        .expect("授权判定不该因数据库故障而不可用")
+        .authorized
 }
 
 async fn cleanup(pool: &sqlx::PgPool, file_repo: &FileUploadRepository) {
@@ -235,55 +279,25 @@ async fn attachment_get_url_authz_rc_gate() {
 
     // 绑定到 channel 内 message 的文件：v1（带 cek）、v0（legacy）、缩略图（v1）。
     file_repo
-        .insert(&file_meta(
-            FILE_V1_BOUND,
-            UPLOADER_UID,
-            1,
-            Some("cek-v1-main"),
-            Some(MESSAGE_ID),
-        ))
+        .insert(&file_meta(&pool, FILE_V1_BOUND, UPLOADER_UID, Some(MESSAGE_ID)).await)
         .await
         .expect("insert v1 bound");
     file_repo
-        .insert(&file_meta(
-            FILE_V0_BOUND,
-            UPLOADER_UID,
-            0,
-            None,
-            Some(MESSAGE_ID),
-        ))
+        .insert(&file_meta(&pool, FILE_V0_BOUND, UPLOADER_UID, Some(MESSAGE_ID)).await)
         .await
         .expect("insert v0 bound");
     file_repo
-        .insert(&file_meta(
-            FILE_THUMB_BOUND,
-            UPLOADER_UID,
-            1,
-            Some("cek-v1-thumb"),
-            Some(MESSAGE_ID),
-        ))
+        .insert(&file_meta(&pool, FILE_THUMB_BOUND, UPLOADER_UID, Some(MESSAGE_ID)).await)
         .await
         .expect("insert thumb bound");
     // pending：无 business 绑定。
     file_repo
-        .insert(&file_meta(
-            FILE_PENDING,
-            UPLOADER_UID,
-            1,
-            Some("cek-pending"),
-            None,
-        ))
+        .insert(&file_meta(&pool, FILE_PENDING, UPLOADER_UID, None).await)
         .await
         .expect("insert pending");
     // broken：business_id 指向不存在的 message。
     file_repo
-        .insert(&file_meta(
-            FILE_BROKEN,
-            UPLOADER_UID,
-            1,
-            Some("cek-broken"),
-            Some(MISSING_MESSAGE_ID),
-        ))
+        .insert(&file_meta(&pool, FILE_BROKEN, UPLOADER_UID, Some(MISSING_MESSAGE_ID)).await)
         .await
         .expect("insert broken");
 
@@ -295,48 +309,37 @@ async fn attachment_get_url_authz_rc_gate() {
     }
 
     // 3) channel member 调 get_url 成功，返回 cek。
-    let (ok, cek, ver) = resolve!(FILE_V1_BOUND, MEMBER_UID);
+    let ok = resolve!(FILE_V1_BOUND, MEMBER_UID);
     assert!(ok, "case3: member must be authorized");
-    assert_eq!(
-        cek.as_deref(),
-        Some("cek-v1-main"),
-        "case3: member gets cek"
-    );
-    assert_eq!(ver, 1);
 
     // 4) 非 channel member forbidden（拿不到 cek）。
-    let (ok, cek, _) = resolve!(FILE_V1_BOUND, STRANGER_UID);
+    let ok = resolve!(FILE_V1_BOUND, STRANGER_UID);
     assert!(!ok, "case4: stranger must be forbidden");
-    assert!(cek.is_none(), "case4: forbidden returns no cek");
 
     // 7) legacy v0 授权规则一样（member ok / stranger forbidden），但 cek=null。
-    let (ok, cek, ver) = resolve!(FILE_V0_BOUND, MEMBER_UID);
+    let ok = resolve!(FILE_V0_BOUND, MEMBER_UID);
     assert!(ok, "case7: v0 member authorized");
-    assert!(cek.is_none(), "case7: v0 has no cek");
-    assert_eq!(ver, 0);
-    let (ok, _, _) = resolve!(FILE_V0_BOUND, STRANGER_UID);
+    let ok = resolve!(FILE_V0_BOUND, STRANGER_UID);
     assert!(!ok, "case7: v0 stranger forbidden (same authz)");
 
     // 2) 缩略图（独立 file_id）绑定同一 message，授权同主文件。
-    let (ok, cek, _) = resolve!(FILE_THUMB_BOUND, MEMBER_UID);
+    let ok = resolve!(FILE_THUMB_BOUND, MEMBER_UID);
     assert!(ok, "case2: thumbnail file member authorized");
-    assert_eq!(cek.as_deref(), Some("cek-v1-thumb"));
-    let (ok, _, _) = resolve!(FILE_THUMB_BOUND, STRANGER_UID);
+    let ok = resolve!(FILE_THUMB_BOUND, STRANGER_UID);
     assert!(!ok, "case2: thumbnail stranger forbidden");
 
     // 5) pending file（未绑定）只有 uploader 可 get_url。
-    let (ok, cek, _) = resolve!(FILE_PENDING, UPLOADER_UID);
+    let ok = resolve!(FILE_PENDING, UPLOADER_UID);
     assert!(ok, "case5: pending uploader authorized");
-    assert_eq!(cek.as_deref(), Some("cek-pending"));
-    let (ok, _, _) = resolve!(FILE_PENDING, MEMBER_UID);
+    let ok = resolve!(FILE_PENDING, MEMBER_UID);
     assert!(!ok, "case5: pending non-uploader forbidden");
-    let (ok, _, _) = resolve!(FILE_PENDING, STRANGER_UID);
+    let ok = resolve!(FILE_PENDING, STRANGER_UID);
     assert!(!ok, "case5: pending stranger forbidden");
 
     // 6) broken binding（business_id 指向不存在 message）→ forbidden，连 uploader 也不放行。
-    let (ok, _, _) = resolve!(FILE_BROKEN, UPLOADER_UID);
+    let ok = resolve!(FILE_BROKEN, UPLOADER_UID);
     assert!(!ok, "case6: broken binding forbidden even for uploader");
-    let (ok, _, _) = resolve!(FILE_BROKEN, MEMBER_UID);
+    let ok = resolve!(FILE_BROKEN, MEMBER_UID);
     assert!(!ok, "case6: broken binding forbidden for member");
 
     cleanup(&pool, &file_repo).await;
@@ -358,23 +361,11 @@ async fn attachment_file_and_thumbnail_bind_to_message() {
 
     // 模拟发送：先是 pending（无 business），随后 send_message_handler 绑定到 message。
     file_repo
-        .insert(&file_meta(
-            FILE_BIND_MAIN,
-            UPLOADER_UID,
-            1,
-            Some("cek-main"),
-            None,
-        ))
+        .insert(&file_meta(&pool, FILE_BIND_MAIN, UPLOADER_UID, None).await)
         .await
         .expect("insert main pending");
     file_repo
-        .insert(&file_meta(
-            FILE_BIND_THUMB,
-            UPLOADER_UID,
-            1,
-            Some("cek-thumb"),
-            None,
-        ))
+        .insert(&file_meta(&pool, FILE_BIND_THUMB, UPLOADER_UID, None).await)
         .await
         .expect("insert thumb pending");
 
@@ -432,7 +423,7 @@ async fn authorization_reads_membership_from_the_database_not_the_cache() {
     cleanup(&pool, &file_repo).await;
     seed_common(&pool).await;
     file_repo
-        .insert(&file_meta(FILE_V1_BOUND, UPLOADER_UID, 1, Some("cek"), None))
+        .insert(&file_meta(&pool, FILE_V1_BOUND, UPLOADER_UID, None).await)
         .await
         .expect("insert file");
     sqlx::query(
@@ -521,7 +512,7 @@ async fn a_revoked_reference_stops_authorizing_but_a_sibling_reference_still_doe
 
     // 文件没有 business_id —— 授权只能来自引用表，正是转发副本的形态。
     file_repo
-        .insert(&file_meta(FILE_SHARED, UPLOADER_UID, 1, Some("cek-shared"), None))
+        .insert(&file_meta(&pool, FILE_SHARED, UPLOADER_UID, None).await)
         .await
         .expect("insert shared file");
 

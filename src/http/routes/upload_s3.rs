@@ -37,7 +37,7 @@ use crate::service::numbered_parts::{
 
 use super::upload::{
     chunked_completed_response, client_ip_from_headers, coded, lock_or_busy, manifest_matches,
-    upload_response_of, validate_cek, ChunkedStatusResponse, CompleteRequest, UploadResponse,
+    upload_response_of, ChunkedStatusResponse, CompleteRequest, UploadResponse,
 };
 
 /// 20618：会话作废，客户端废弃它从零重新申请（HTTP 422，终局）。
@@ -285,8 +285,6 @@ pub(super) async fn s3_complete(
         return chunked_completed_response(state, session, reserved).await;
     }
 
-    validate_cek(extra.encryption_version, &extra.cek)?;
-
     let (part_size, total_parts, reference) = s3_reference_of(session.manifest())?;
     let backend = numbered_backend(state)?;
     let probe = object_probe(state)?;
@@ -397,33 +395,62 @@ pub(super) async fn s3_complete(
         };
     }
 
-    // 6. 🔴 流式回读算整文件 SHA-256（multipart 的 SHA-256 是 composite，不等于
-    // 整文件摘要）：文件身份的唯一权威。
-    let stored = probe
-        .sha256_of(&reference)
+    // 6. 🔴 流式回读 + 解密重算：文件身份的唯一权威。
+    //
+    // multipart 的 SHA-256 是 composite，不等于整文件摘要；而**密文摘要本身也证明
+    // 不了身份**——每块用新随机 nonce，同一份明文封装两次得到不同密文，摘要对得上
+    // 只说明字节没坏。只有解出明文重算摘要，才能挡住「声明 A 的身份 + 上传 B 的密文」。
+    let verified = match verify_final_object(state, probe.as_ref(), &reference, session.manifest())
         .await
-        .map_err(|e| probe_err(e, "回读 final 对象失败"))?;
-    if !stored.eq_ignore_ascii_case(&session.manifest().sealed_sha256) {
-        // 本次 Complete 刚组装的对象天然携带本会话 metadata（第二十九轮起「它此前不存在」
-        // 由 final_key 唯一性 + HEAD 预检保证）→ 满足统一删除规则。删除需先 HEAD 拿 ETag 作条件
-        // （防 TOCTOU）；HEAD 读不到 = 对象已被并发清除，等同删除成功。
-        return match probe
-            .head(&reference)
-            .await
-            .map_err(|e| probe_err(e, "HEAD final key 失败"))?
-        {
-            None => Err(restart_required(
-                "回读摘要与声明不符且对象已不存在，请重新申请 token 从头上传",
-            )),
-            Some(head) => {
-                delete_then_restart_or_retry(probe, &reference, "回读摘要与声明不符", &head.etag)
-                    .await
-            }
-        };
-    }
+    {
+        Ok(v) => v,
+        // 内容不符是终局的：本次 Complete 刚组装的对象本该携带本会话 metadata，
+        // 满足统一删除规则。
+        //
+        // 🔴 但删除前**必须重新证明归属**，不能只靠"这是我刚组装的"。校验读流与这次
+        // HEAD 之间对象可以被替换：ETag 条件删除只保证「删的是我 HEAD 到的那一个」，
+        // 保证不了「那一个是我的」——少了这一步，一个被替换进来的、别人的对象会被
+        // 条件删除干净利落地删掉。归属核对与条件删除必须一起用，缺一不可。
+        Err(ServerError::Validation(_)) => {
+            return match probe
+                .head(&reference)
+                .await
+                .map_err(|e| probe_err(e, "HEAD final key 失败"))?
+            {
+                // 对象已被并发清除：等同删除成功，让客户端从头来。
+                None => Err(restart_required(
+                    "回读校验与声明不符且对象已不存在，请重新申请 token 从头上传",
+                )),
+                Some(head)
+                    if head.privchat_upload_id.as_deref() == Some(session.upload_id()) =>
+                {
+                    delete_then_restart_or_retry(probe, &reference, "回读校验与声明不符", &head.etag)
+                        .await
+                }
+                // 归属证明不了 → 一律不删（口径同 §8.5 第 3 步分支一）：保留对象、
+                // abort 当前 MPU、报冲突等人工排查。🔴 不得回 20618——重申请仍是同一
+                // final_key，会死循环。
+                Some(_) => {
+                    must_abort(backend, &reference).await?;
+                    tracing::error!(
+                        "回读校验与声明不符，但 final key 上的对象 metadata 不属于会话 {}，保留对象人工排查",
+                        session.upload_id()
+                    );
+                    Err(ServerError::Internal(
+                        "final key 上存在不属于当前会话的对象，拒绝继续，请人工排查".to_string(),
+                    ))
+                }
+            };
+        }
+        // 存储读取故障（可重试）：🔴 绝不能顺手删对象——字节可能好好地躺在桶里，
+        // 删掉等于把一次网络抖动变成用户的重传。
+        Err(e) => return Err(e),
+    };
 
     // 7. 建行（对象已在 final 路径）→ 墓碑 → 删本地 parts（本就为空）。
-    let metadata = record_and_finish(state, session, &extra, headers, probe, &reference, stored).await?;
+    let metadata =
+        record_and_finish(state, session, &extra, headers, probe, &reference, verified.sealed_sha256)
+            .await?;
     tracing::info!(
         "✅ S3 直传完成: file_id={} upload_id={}",
         metadata.file_id,
@@ -457,28 +484,43 @@ async fn recover_from_existing_object(
         ));
     }
 
-    let stored = probe
-        .sha256_of(reference)
-        .await
-        .map_err(|e| probe_err(e, "回读 final 对象失败"))?;
-
-    if stored.eq_ignore_ascii_case(&session.manifest().sealed_sha256) {
-        // 分支二：属于本 session + 摘要一致 → 补建行 + 墓碑（幂等 abort 当前 MPU；
-        // 🔴 abort 失败回可重试 5xx，绝不带着存活的 MPU 建行）。
-        must_abort(backend, reference).await?;
-        let metadata =
-            record_and_finish(state, session, extra, headers, probe, reference, stored).await?;
-        tracing::info!(
-            "♻️ final key 已有本会话对象且摘要一致，补建行: file_id={}",
-            metadata.file_id
-        );
-        return Ok(ApiEnvelope::ok(upload_response_of(state, metadata)));
+    // 🔴 这条恢复路径也必须真校验。"对象是本会话留下的"只说明谁写的，不说明写的是
+    // 什么——跳过校验就等于给这条路留了一个完整的绕过入口。
+    match verify_final_object(state, probe.as_ref(), reference, session.manifest()).await {
+        Ok(verified) => {
+            // 分支二：属于本 session + 身份一致 → 补建行 + 墓碑（幂等 abort 当前 MPU；
+            // 🔴 abort 失败回可重试 5xx，绝不带着存活的 MPU 建行）。
+            must_abort(backend, reference).await?;
+            let metadata = record_and_finish(
+                state,
+                session,
+                extra,
+                headers,
+                probe,
+                reference,
+                verified.sealed_sha256,
+            )
+            .await?;
+            tracing::info!(
+                "♻️ final key 已有本会话对象且校验一致，补建行: file_id={}",
+                metadata.file_id
+            );
+            Ok(ApiEnvelope::ok(upload_response_of(state, metadata)))
+        }
+        // 分支三：属于本 session + 内容不符（上一轮校验不过但删除失败的重试）→
+        // 满足统一删除规则，允许删：成功 → 20618；失败/拒绝 → 保留会话、可重试 5xx。
+        Err(ServerError::Validation(_)) => {
+            delete_then_restart_or_retry(
+                probe,
+                reference,
+                "final key 上对象与本次上传的声明不符",
+                &head.etag,
+            )
+            .await
+        }
+        // 读取故障：可重试，绝不因此删对象。
+        Err(e) => Err(e),
     }
-
-    // 分支三：属于本 session + 摘要不一致（上一轮回读不符但删除失败的重试）→
-    // 满足统一删除规则，允许删：成功 → 20618；失败/拒绝 → 保留会话、可重试 5xx。
-    delete_then_restart_or_retry(probe, reference, "final key 上对象摘要与本次上传不符", &head.etag)
-        .await
 }
 
 /// §8.5 第 5 步 412（PreconditionFailed）恢复：final key 已有对象、本次 MPU
@@ -506,23 +548,36 @@ async fn verify_precondition_failed(
         Some(head) => {
             let ours = head.privchat_upload_id.as_deref() == Some(session.upload_id());
             if ours {
-                let stored = probe
-                    .sha256_of(reference)
+                // 🔴 复用已有对象前必须真校验：这条路径同样是一条发布路径，
+                // 归属核对只回答"谁写的"，回答不了"写的是不是 token 声明的那份"。
+                match verify_final_object(state, probe.as_ref(), reference, session.manifest())
                     .await
-                    .map_err(|e| probe_err(e, "回读 final 对象失败"))?;
-                if stored.eq_ignore_ascii_case(&session.manifest().sealed_sha256) {
-                    // 身份一致 → 复用继续建行；🔴 建行前先幂等 abort 当前 MPU，
-                    // abort 失败回可重试 5xx，绝不带着存活的 MPU 建行。
-                    must_abort(backend, reference).await?;
-                    let metadata = record_and_finish(
-                        state, session, extra, headers, probe, reference, stored,
-                    )
-                    .await?;
-                    tracing::info!(
-                        "♻️ 412 后核验身份一致，复用已有对象建行: file_id={}",
-                        metadata.file_id
-                    );
-                    return Ok(ApiEnvelope::ok(upload_response_of(state, metadata)));
+                {
+                    Ok(verified) => {
+                        // 身份一致 → 复用继续建行；🔴 建行前先幂等 abort 当前 MPU，
+                        // abort 失败回可重试 5xx，绝不带着存活的 MPU 建行。
+                        must_abort(backend, reference).await?;
+                        let metadata = record_and_finish(
+                            state,
+                            session,
+                            extra,
+                            headers,
+                            probe,
+                            reference,
+                            verified.sealed_sha256,
+                        )
+                        .await?;
+                        tracing::info!(
+                            "♻️ 412 后核验身份一致，复用已有对象建行: file_id={}",
+                            metadata.file_id
+                        );
+                        return Ok(ApiEnvelope::ok(upload_response_of(state, metadata)));
+                    }
+                    // 内容不符 → 落到下面「保留对象、abort、人工排查」。
+                    Err(ServerError::Validation(_)) => {}
+                    // 读取故障是可重试的：🔴 不能因为读不动就判成"身份不符"，
+                    // 那会把一次抖动升级成需要人工排查的冲突。
+                    Err(e) => return Err(e),
                 }
             }
             // 身份不一致 → 保留已有对象、abort 当前 MPU、报内部冲突。
@@ -583,9 +638,14 @@ async fn record_and_finish(
         uploader_ip: client_ip_from_headers(headers),
         business_type: session.manifest().business_type.clone(),
         business_id: extra.business_id.clone(),
-        encryption_version: extra.encryption_version,
-        cek: extra.cek.clone(),
-        encryption_key_id: extra.encryption_key_id,
+        // 🔴 身份取自 manifest（= token 冻结的那份），不取 complete 请求体。
+        plaintext_sha256: session.manifest().plaintext_sha256.clone(),
+        plaintext_size: session.manifest().plaintext_size,
+        format_version: session.manifest().format_version,
+        encryption_key_id: session.manifest().encryption_key_id,
+        chunk_plain_size: session.manifest().chunk_plain_size,
+        // 冻结的密文长度 = 建会话时签下的 total_size。
+        sealed_size: session.manifest().total_size,
     };
     use crate::service::file_service::S3RecordOutcome;
     let metadata = match state
@@ -709,4 +769,49 @@ pub(super) async fn s3_abort(
     // 确认清空后才删本地目录。
     session.discard()?;
     Ok(ApiEnvelope::ok(serde_json::json!({ "aborted": true })))
+}
+
+/// S3 三条发布路径共用的首传校验。
+///
+/// 🔴 **一次 GET 同时拿长度和字节**，不先 HEAD 再 GET：两者之间对象可以被替换，
+/// 而"长度已核过"正是 `verify_attachment` 把后续 IO 失败判成可重试的前提。
+/// 也不先 `sha256_of()` 再 GET 一遍——密文摘要和明文摘要在同一趟里一起算出来。
+///
+/// 🔴 这三条路径（正常 complete、已存在对象恢复、412 恢复）**必须都走这里**。
+/// 漏掉任何一条，那条就是完整的绕过入口：密文摘要对得上只说明字节没坏，
+/// 说明不了"这串字节就是 token 声明的那份内容"。
+/// 🔴 密钥缺席时**拒绝**，不是跳过校验：没有密钥就重算不出明文身份，
+/// 而"没校验"和"校验过了"绝不能是同一个结果。这是配置问题（可修复后重试），
+/// 不是客户端的内容错误，所以回可重试的 5xx 而不是 400。
+async fn verify_final_object(
+    state: &FileServerState,
+    probe: &dyn crate::service::final_object_probe::FinalObjectProbe,
+    reference: &crate::service::final_object_probe::UploadReference,
+    manifest: &crate::service::chunked_upload::Manifest,
+) -> Result<crate::service::attachment_verify::VerifiedAttachment, ServerError> {
+    let site_key = super::upload::site_key_of(state, manifest.encryption_key_id)?;
+
+    // 🔴 建流失败（连不上、超时、缺 Content-Length）与「读到一半断线」是同一类事：
+    // 字节可能好好地躺在桶里，只是这一次没读成。必须回 `ServiceUnavailable`——
+    // `probe_err` 给的是 `Internal`，而 SDK 的可重试白名单并不覆盖所有 Internal，
+    // 一次抖动就会变成客户端眼里的终局失败。
+    let (observed_size, reader) = probe.open_stream(reference).await.map_err(|e| {
+        tracing::warn!(error = %e, "打开 final 对象回读流失败（可重试）");
+        ServerError::ServiceUnavailable("读取待校验附件失败".to_string())
+    })?;
+
+    crate::service::attachment_verify::verify_attachment(
+        reader,
+        observed_size,
+        &crate::service::attachment_verify::FrozenIdentity {
+            plaintext_sha256: manifest.plaintext_sha256.clone(),
+            plaintext_size: manifest.plaintext_size,
+            sealed_size: manifest.total_size,
+            format_version: manifest.format_version,
+            encryption_key_id: manifest.encryption_key_id,
+            chunk_plain_size: manifest.chunk_plain_size,
+        },
+        &site_key,
+    )
+    .await
 }

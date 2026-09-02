@@ -136,6 +136,7 @@ async fn rig_at(root: PathBuf, pool: Arc<sqlx::PgPool>, keep: Option<tempfile::T
             auth: None,
             numbered_part_backend: None,
             final_object_probe: None,
+            attachment_keys: privchat::config::AttachmentKeys(vec![(1, site_key_b64())]),
         },
         root,
         _dir: dir,
@@ -184,8 +185,9 @@ impl Rig {
     }
 
     /// 签一张整包上传 token，返回 (token, upload_id)。
-    async fn issue(&self, uid: u64, body: &[u8]) -> (String, String) {
-        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body));
+    async fn issue(&self, uid: u64, plain: &[u8], body: &[u8]) -> (String, String) {
+        // 🔴 冻结的是**明文**身份：complete 解密重算之后核对的就是它。
+        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(plain));
         let (token, upload_id, _exp) = self
             .state
             .upload_token_service
@@ -197,10 +199,15 @@ impl Rig {
                 "message".to_string(),
                 Some("e2e.bin".to_string()),
                 UploadIdentity {
-                    sha256: Some(sha),
+                    plaintext_sha256: Some(sha),
+                    plaintext_size: Some(plain.len() as i64),
                     declared_size: Some(body.len() as i64),
                     mime_type: Some("application/octet-stream".to_string()),
-                    transform_version: 0,
+                    format_version: Some(privchat_protocol::attachment_crypto::FORMAT_VERSION),
+                    encryption_key_id: Some(1),
+                    chunk_plain_size: Some(
+                        privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE,
+                    ),
                 },
                 UploadTokenPurpose::Upload,
                 None,
@@ -267,16 +274,51 @@ fn multipart_body(file: &[u8]) -> Vec<u8> {
     out.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
     out.extend_from_slice(file);
     out.extend_from_slice(format!("\r\n--{BOUNDARY}\r\n").as_bytes());
-    out.extend_from_slice(b"Content-Disposition: form-data; name=\"encryption_version\"\r\n\r\n0");
+    out.extend_from_slice(b"Content-Disposition: form-data; name=\"encryption_version\"\r\n\r\n2");
     out.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
     out
 }
 
 /// 可复现的伪随机负载：内容必须逐字节可断言，不能用全 0（全 0 的截断和覆盖看起来一样）。
-fn payload(len: usize, seed: u8) -> Vec<u8> {
+fn plain_payload(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
         .collect()
+}
+
+fn site_key() -> [u8; 32] {
+    [0x5au8; 32]
+}
+
+fn site_key_b64() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(site_key())
+}
+
+/// 一份上传素材：明文（身份的来源）+ 真密文（实际 POST 上去的字节）。
+///
+/// 🔴 整包 complete 会**解密重算明文摘要**核对身份，所以 body 必须是真封装的密文。
+/// 参数是密文长度：用例里的边界（缓冲区大小、崩溃点、断流位置）盯的都是实际传输
+/// 的字节数。
+fn attachment(sealed_len: usize, seed: u8) -> (Vec<u8>, Vec<u8>) {
+    use privchat_protocol::attachment_crypto as ac;
+    let chunk = ac::DEFAULT_CHUNK_PLAIN_SIZE;
+    // 每块固定开销 12 nonce + 4 长度 + 16 tag，外加一个 36 字节的头。
+    let per_chunk = (ac::NONCE_LEN + 4 + ac::TAG_LEN) as usize;
+    // 先按"一块"估算明文长度，再按真实块数校正。
+    let mut plain_len = sealed_len - ac::HEADER_LEN - per_chunk;
+    let chunks = |n: usize| (n as u64).div_ceil(chunk as u64).max(1) as usize;
+    plain_len = sealed_len - ac::HEADER_LEN - per_chunk * chunks(plain_len);
+    let plain = plain_payload(plain_len, seed);
+    let sealed = ac::encrypt_attachment_with_chunk_size(&plain, &site_key(), 1, chunk)
+        .expect("封装测试密文");
+    assert_eq!(sealed.len(), sealed_len, "素材必须正好是要求的密文长度");
+    (plain, sealed)
+}
+
+/// 子进程按 (len, seed) 重算出**同一串密文**：父子必须字节一致。
+fn payload(len: usize, seed: u8) -> Vec<u8> {
+    attachment(len, seed).1
 }
 
 async fn cleanup(pool: &sqlx::PgPool, uploaders: &[u64]) {
@@ -286,6 +328,19 @@ async fn cleanup(pool: &sqlx::PgPool, uploaders: &[u64]) {
         .execute(pool)
         .await
         .expect("clean uploads");
+    // 🔴 对象行也要清。
+    //
+    // 判重键是明文摘要，而用例的素材是定死的（同一个 seed 每次都是同一份明文）。
+    // 只删文件行的话，上一轮留下的对象行会让这一轮被判成秒传命中——复用的
+    // `file_path` 指向的是**上一轮那个已经销毁的临时根**，于是"上传成功"之后
+    // 磁盘上什么都没有。这种失败看起来像发布丢字节，其实是真库没清干净。
+    sqlx::query(
+        "DELETE FROM privchat_attachment_objects o WHERE NOT EXISTS \
+         (SELECT 1 FROM privchat_file_uploads u WHERE u.object_id = o.object_id)",
+    )
+    .execute(pool)
+    .await
+    .expect("clean orphan objects");
 }
 
 fn file_id_of(json: &serde_json::Value) -> u64 {
@@ -310,7 +365,7 @@ async fn stored_path(rig: &Rig, file_id: u64) -> PathBuf {
         .await
         .expect("query metadata")
         .expect("metadata row");
-    rig.root.join(meta.file_path.trim_start_matches('/'))
+    rig.root.join(meta.file_path().trim_start_matches('/'))
 }
 
 // ---------------------------------------------------------------- 用例
@@ -322,8 +377,8 @@ async fn a_whole_upload_lands_on_disk_and_in_the_database() {
     cleanup(&pool, &[UPLOADER_HAPPY]).await;
     let rig = rig(pool.clone()).await;
 
-    let body = payload(64 * 1024 + 7, 3);
-    let (token, upload_id) = rig.issue(UPLOADER_HAPPY, &body).await;
+    let (body_plain, body) = attachment(64 * 1024 + 7, 3);
+    let (token, upload_id) = rig.issue(UPLOADER_HAPPY, &body_plain, &body).await;
     let (status, json) = rig.post(&token, &body).await;
 
     assert_eq!(status, StatusCode::OK, "{json}");
@@ -356,8 +411,8 @@ async fn a_repeated_post_returns_the_same_file_id() {
     cleanup(&pool, &[UPLOADER_IDEMPOTENT]).await;
     let rig = rig(pool.clone()).await;
 
-    let body = payload(4096, 11);
-    let (token, _upload_id) = rig.issue(UPLOADER_IDEMPOTENT, &body).await;
+    let (body_plain, body) = attachment(4096, 11);
+    let (token, _upload_id) = rig.issue(UPLOADER_IDEMPOTENT, &body_plain, &body).await;
 
     let (s1, j1) = rig.post(&token, &body).await;
     assert_eq!(s1, StatusCode::OK, "{j1}");
@@ -389,8 +444,8 @@ async fn a_tampered_body_is_rejected_and_leaves_nothing_behind() {
     cleanup(&pool, &[UPLOADER_MISMATCH]).await;
     let rig = rig(pool.clone()).await;
 
-    let body = payload(8192, 5);
-    let (token, upload_id) = rig.issue(UPLOADER_MISMATCH, &body).await;
+    let (body_plain, body) = attachment(8192, 5);
+    let (token, upload_id) = rig.issue(UPLOADER_MISMATCH, &body_plain, &body).await;
 
     // 同样长度、不同内容：只比大小的实现会放它过去。
     let tampered = payload(8192, 6);
@@ -452,8 +507,15 @@ async fn crash_child_runs_a_real_upload() {
 
     let pool = pool().await.expect("child needs a database");
     let rig = rig_at(root, pool, None).await;
-    let body = payload(len, seed);
-    let _ = uid;
+    // 🔴 子进程**读**父进程落盘的那份密文，不自己重新封装。
+    //
+    // 同一份明文封装两次得到的是不同的密文——每块都用新的随机 nonce，这正是
+    // "密文摘要证明不了身份"的原因。让子进程按 (len, seed) 自己封一遍，父子手里
+    // 就是两串不同的字节，而用例要验的"发布的对象与上传的字节一致"当场变成假红。
+    let body = std::fs::read(std::env::var("PRIVCHAT_E2E_BODY").expect("body 素材路径"))
+        .expect("读 body 素材");
+    assert_eq!(body.len(), len, "素材长度必须与父进程一致");
+    let _ = (uid, seed);
 
     if stall {
         // 请求体只发前半截，剩下的永远不来。服务端会一直开着 writer 等——
@@ -561,17 +623,24 @@ fn spawn_crash_child(
     root: &Path,
     uid: u64,
     token: &str,
-    len: usize,
+    body: &[u8],
     seed: u8,
     crash_point: Option<&str>,
 ) -> ChildGuard {
+    let len = body.len();
+    // 素材落盘交给子进程读：随机 nonce 让"按同样参数再封一次"得不到同一串字节。
+    // 🔴 **不能放在存储根里**：正式区扫描会把它当成一个已发布对象，
+    // "发布之前崩溃，正式区必须为空"那条断言会因为它而假红。
+    let body_path = std::env::temp_dir().join(format!("privchat-e2e-body-{uid}.bin"));
+    std::fs::write(&body_path, body).expect("写 body 素材");
     let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
     cmd.args(["--exact", "crash_child_runs_a_real_upload", "--ignored", "--nocapture"])
         .env("PRIVCHAT_E2E_ROOT", root)
         .env("PRIVCHAT_E2E_UID", uid.to_string())
         .env("PRIVCHAT_E2E_TOKEN", token)
         .env("PRIVCHAT_E2E_LEN", len.to_string())
-        .env("PRIVCHAT_E2E_SEED", seed.to_string());
+        .env("PRIVCHAT_E2E_SEED", seed.to_string())
+        .env("PRIVCHAT_E2E_BODY", body_path);
     match crash_point {
         Some(p) => {
             cmd.env("PRIVCHAT_CRASH_POINT", p);
@@ -654,11 +723,11 @@ async fn an_upload_survives_a_kill_mid_transfer() {
     cleanup(&pool, &[UPLOADER_CRASH]).await;
     let rig = rig(pool.clone()).await;
 
-    let body = payload(512 * 1024 + 13, 7);
-    let (token, upload_id) = rig.issue(UPLOADER_CRASH, &body).await;
+    let (body_plain, body) = attachment(512 * 1024 + 13, 7);
+    let (token, upload_id) = rig.issue(UPLOADER_CRASH, &body_plain, &body).await;
 
     let staging = rig.staging(UPLOADER_CRASH, &upload_id);
-    let mut child = spawn_crash_child(&rig.root, UPLOADER_CRASH, &token, body.len(), 7, None);
+    let mut child = spawn_crash_child(&rig.root, UPLOADER_CRASH, &token, &body, 7, None);
 
     // 等到服务端真的在往 body.part 上写字节，再开枪。
     // 等到服务端**已经开着 writer**。判据是 body.part 出现，而不是它长到多少字节：
@@ -726,14 +795,14 @@ async fn a_crash_before_publish_leaves_the_final_area_empty() {
     cleanup(&pool, &[UPLOADER_W1]).await;
     let rig = rig(pool.clone()).await;
 
-    let body = payload(20_000, 21);
-    let (token, upload_id) = rig.issue(UPLOADER_W1, &body).await;
+    let (body_plain, body) = attachment(20_000, 21);
+    let (token, upload_id) = rig.issue(UPLOADER_W1, &body_plain, &body).await;
 
     let mut child = spawn_crash_child(
         &rig.root,
         UPLOADER_W1,
         &token,
-        body.len(),
+        &body,
         21,
         Some("after_verify_before_publish"),
     );
@@ -767,14 +836,14 @@ async fn a_crash_after_publish_recovers_without_overwriting() {
     cleanup(&pool, &[UPLOADER_W2]).await;
     let rig = rig(pool.clone()).await;
 
-    let body = payload(20_000, 33);
-    let (token, upload_id) = rig.issue(UPLOADER_W2, &body).await;
+    let (body_plain, body) = attachment(20_000, 33);
+    let (token, upload_id) = rig.issue(UPLOADER_W2, &body_plain, &body).await;
 
     let mut child = spawn_crash_child(
         &rig.root,
         UPLOADER_W2,
         &token,
-        body.len(),
+        &body,
         33,
         Some("after_publish_before_commit"),
     );
@@ -823,14 +892,14 @@ async fn a_crash_before_the_tombstone_still_answers_the_retry() {
     cleanup(&pool, &[UPLOADER_W3]).await;
     let rig = rig(pool.clone()).await;
 
-    let body = payload(20_000, 44);
-    let (token, upload_id) = rig.issue(UPLOADER_W3, &body).await;
+    let (body_plain, body) = attachment(20_000, 44);
+    let (token, upload_id) = rig.issue(UPLOADER_W3, &body_plain, &body).await;
 
     let mut child = spawn_crash_child(
         &rig.root,
         UPLOADER_W3,
         &token,
-        body.len(),
+        &body,
         44,
         Some("after_commit_before_tombstone"),
     );

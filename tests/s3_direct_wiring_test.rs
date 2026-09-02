@@ -146,8 +146,11 @@ impl FinalObjectProbe for IdleProbe {
     ) -> Result<Option<FinalObjectHead>, ProbeError> {
         Ok(None)
     }
-    async fn sha256_of(&self, _reference: &UploadReference) -> Result<String, ProbeError> {
-        Err(ProbeError::Backend("sha256_of 不在本测试路径上".into()))
+    async fn open_stream(
+        &self,
+        _reference: &UploadReference,
+    ) -> Result<(u64, std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>), ProbeError> {
+        Err(ProbeError::Backend("open_stream 不在本测试路径上".into()))
     }
     async fn delete_if_match(
         &self,
@@ -160,10 +163,24 @@ impl FinalObjectProbe for IdleProbe {
 
 // ---------- rig ----------
 
+/// 装配一份带附件密钥的配置：`freeze_crypto` 没有密钥就直接失败，那是有意的
+/// fail-closed（"没配密钥就当明文"会让全部新附件明文进桶）。
+fn test_config() -> privchat::config::ServerConfig {
+    privchat::config::ServerConfig {
+        attachment_keys: privchat::config::AttachmentKeys(vec![(
+            1,
+            "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo".to_string(),
+        )]),
+        ..privchat::config::ServerConfig::default()
+    }
+}
+
 struct Rig {
     file_service: Arc<FileService>,
     upload_token_service: UploadTokenService,
     backend: Arc<IssuanceBackend>,
+    /// 同上：签发要按它冻结加密参数。
+    config: privchat::config::ServerConfig,
     _dir: tempfile::TempDir,
 }
 
@@ -207,6 +224,7 @@ async fn make_rig(wired: bool) -> Rig {
     Rig {
         file_service,
         upload_token_service: UploadTokenService::new(),
+        config: test_config(),
         backend,
         _dir: dir,
     }
@@ -219,18 +237,18 @@ fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
         file_service: &rig.file_service,
         upload_token_service: &rig.upload_token_service,
         file_api_base_url: Some("http://e2e.local/files"),
+        config: &rig.config,
     }
 }
 
-fn req(file_size: i64) -> FileRequestChunkedUploadTokenRequest {
+fn req(plaintext_size: i64) -> FileRequestChunkedUploadTokenRequest {
     FileRequestChunkedUploadTokenRequest {
         file_type: "file".to_string(),
         business_type: "message".to_string(),
-        file_size,
-        file_hash: format!("ab{file_size:062x}"),
+        plaintext_size,
+        plaintext_sha256: format!("ab{plaintext_size:062x}"),
         mime_type: "application/octet-stream".to_string(),
         filename: Some("payload.bin".to_string()),
-        transform_version: 0,
         force_upload: true,
         supported_upload_transports: Some(vec![
             "proxy_offset_v1".to_string(),
@@ -246,14 +264,27 @@ fn req(file_size: i64) -> FileRequestChunkedUploadTokenRequest {
 #[tokio::test]
 async fn real_issuance_creates_mpu_then_freezes_all_fields() {
     let rig = make_rig(true).await;
-    let size: i64 = 32 << 20;
-    let resp = issue_chunked_upload_token(&services(&rig), UPLOADER, req(size))
+    let plaintext_size: i64 = 32 << 20;
+    let resp = issue_chunked_upload_token(&services(&rig), UPLOADER, req(plaintext_size))
         .await
         .expect("真实签发应成功");
     assert_eq!(resp.transport.as_deref(), Some("s3_multipart_v1"));
-    let (part_size, total_parts) = s3_part_geometry(size as u64);
-    assert_eq!(resp.part_size, Some(part_size), "响应片大小 = 冻结公式");
-    assert_eq!(resp.total_parts, Some(total_parts), "响应片数 = 冻结公式");
+
+    // 🔴 **长度公式门禁**：几何一律按服务端算出的**密文**长度，不按请求里的明文长度。
+    //
+    // 客户端申请时报的是明文大小（它此刻还没拿到密钥，封装不出最终字节）；密文比明文
+    // 多一个文件头和每块的 nonce/tag。按明文算几何的话，客户端会照着一个偏小的
+    // total_size 切片，最后一片对不上、complete 的长度核对也必然失败——而这个错
+    // 在申请阶段完全看不出来。
+    let sealed_size = privchat_protocol::attachment_crypto::sealed_len(
+        plaintext_size as u64,
+        privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE,
+    )
+    .expect("sealed_len");
+    assert!(sealed_size > plaintext_size as u64, "前提：密文必然比明文长");
+    let (part_size, total_parts) = s3_part_geometry(sealed_size);
+    assert_eq!(resp.part_size, Some(part_size), "响应片大小按密文长度算");
+    assert_eq!(resp.total_parts, Some(total_parts), "响应片数按密文长度算");
 
     // CreateMultipartUpload 发生在写 manifest 之前，且参数与会话一致。
     let token = resp.upload_token.expect("token");
@@ -263,7 +294,8 @@ async fn real_issuance_creates_mpu_then_freezes_all_fields() {
     let call = &calls[0];
     assert_eq!(call.session_upload_id, upload_id, "MPU metadata 记会话 id");
     assert_eq!(call.bucket, BUCKET);
-    assert_eq!(call.total_size, size as u64);
+    // MPU 也按密文长度建：三处（响应、manifest、MPU）必须是同一个数。
+    assert_eq!(call.total_size, sealed_size);
     assert!(
         call.final_key.starts_with(&format!("{PREFIX}/")),
         "final_key 走接线 path_prefix 拼接"
@@ -486,6 +518,7 @@ async fn file_http_server_wires_backend_and_probe_from_s3_direct() {
         None,
         0,
         "127.0.0.1".to_string(),
+        Default::default(),
     );
     let state = server.state();
     let wiring = rig.file_service.s3_direct().expect("接线必须存在");
@@ -504,6 +537,7 @@ async fn file_http_server_wires_backend_and_probe_from_s3_direct() {
         None,
         0,
         "127.0.0.1".to_string(),
+        Default::default(),
     );
     assert!(server.state().numbered_part_backend.is_none());
     assert!(server.state().final_object_probe.is_none());
@@ -523,12 +557,16 @@ async fn sweep_with_installed_wiring_cleans_expired_s3_session() {
         NewSession {
             uploader_id: UPLOADER,
             total_size: 10 << 20,
-            sealed_sha256: "0".repeat(64),
+            // 冻结身份（S3 会话在本用例里不走校验，成形即可）。
+            plaintext_sha256: "0".repeat(64),
+            plaintext_size: 16,
+            format_version: privchat_protocol::attachment_crypto::FORMAT_VERSION,
+            encryption_key_id: 1,
+            chunk_plain_size: privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE,
             file_type: "file".into(),
             business_type: "message".into(),
             filename: "payload.bin".into(),
             mime_type: "application/octet-stream".into(),
-            transform_version: 0,
             reserved_file_id: 9_975_901,
             transport: "s3_multipart_v1".to_string(),
             s3: Some(S3SessionSetup {

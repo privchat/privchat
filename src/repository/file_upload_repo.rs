@@ -104,7 +104,11 @@ impl FileUploadRepository {
     ///
     /// 包成 Database 的话它会一路落成 internal，客户端把一次锁竞争当成永久失败，
     /// 附件就再也发不出去了。映射成 ServiceUnavailable，让上层照常重试。
-    fn map_lock_error(context: &str, e: sqlx::Error) -> ServerError {
+    /// 🔴 `55P03`（`lock_not_available`）是**瞬时竞争**，不是数据库故障：包成
+    /// `Database` 就成了终局失败，一次并发让这条附件永远发不出去。
+    ///
+    /// 收敛与建引用共用这一处映射——同一类超时在不同上传路径上不能表现成不同错误。
+    pub(crate) fn map_lock_error(context: &str, e: sqlx::Error) -> ServerError {
         if let Some(db) = e.as_database_error() {
             if db.code().as_deref() == Some("55P03") {
                 return ServerError::ServiceUnavailable(format!("{context}: 锁等待超时，请重试"));
@@ -288,8 +292,30 @@ impl FileUploadRepository {
         Ok(())
     }
 
-    /// 按 file_id 查询
+    /// 按 file_id 查询（自己开连接）。
     pub async fn get_by_file_id(&self, file_id: u64) -> Result<Option<FileMetadata>> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| ServerError::Database(format!("获取查询连接失败: {e}")))?;
+        Self::get_by_file_id_within(&mut conn, file_id).await
+    }
+
+    /// 按 file_id 查询，**在调用方的事务里**。
+    ///
+    /// 🔴 事务中间去 pool 上另开一条连接读，读的是另一个快照：
+    ///   · 本事务刚写进去的行，它看不见；
+    ///   · 更要命的是主键冲突后的回读——冲突说明那一行**就在某个事务里**，
+    ///     从池外读到的可能是它提交前的样子，也可能干脆读不到，
+    ///     于是"冲突却读不到"这种自相矛盾的内部错误就冒出来了。
+    ///   · 池被本事务占满时，再要一条连接还会死等。
+    ///
+    /// 判定身份要用和写入同一个快照，所以这条必须收在事务里跑。
+    pub async fn get_by_file_id_within(
+        conn: &mut sqlx::PgConnection,
+        file_id: u64,
+    ) -> Result<Option<FileMetadata>> {
         #[derive(sqlx::FromRow)]
         struct Row {
             file_id: i64,
@@ -304,15 +330,14 @@ impl FileUploadRepository {
             business_type: Option<String>,
             business_id: Option<String>,
             object_id: i64,
-            dedup_id: Option<String>,
-            sealed_sha256: Option<String>,
+            plaintext_sha256: String,
+            plaintext_size: i64,
+            sealed_sha256: String,
             sealed_size: i64,
-            plaintext_size: Option<i64>,
             file_path: String,
             storage_source_id: i32,
-            format_version: Option<i16>,
-            encryption_key_id: Option<i16>,
-            status: String,
+            format_version: i16,
+            encryption_key_id: i16,
         }
         // 🔴 物理事实一律从对象表读。引用行上已经没有这些列了（migration 032），
         // 所以这条 JOIN 不是优化，是唯一的读法。
@@ -321,16 +346,16 @@ impl FileUploadRepository {
             SELECT u.file_id, u.original_filename, u.file_type, u.mime_type,
                    u.uploader_id, u.uploader_ip, u.uploaded_at, u.width, u.height,
                    u.business_type, u.business_id,
-                   o.object_id, o.dedup_id, o.sealed_sha256, o.sealed_size, o.plaintext_size,
-                   o.file_path, o.storage_source_id, o.format_version, o.encryption_key_id,
-                   o.status
+                   o.object_id, o.plaintext_sha256, o.plaintext_size,
+                   o.sealed_sha256, o.sealed_size,
+                   o.file_path, o.storage_source_id, o.format_version, o.encryption_key_id
             FROM privchat_file_uploads u
             JOIN privchat_attachment_objects o ON o.object_id = u.object_id
             WHERE u.file_id = $1
             "#
         )
         .bind(file_id as i64)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| ServerError::Database(format!("查询上传记录失败: {}", e)))?;
 
@@ -349,14 +374,14 @@ impl FileUploadRepository {
             business_id: r.business_id,
             object: AttachmentObject {
                 object_id: r.object_id as u64,
-                dedup_id: r.dedup_id,
+                plaintext_sha256: r.plaintext_sha256,
+                plaintext_size: r.plaintext_size as u64,
                 sealed_sha256: r.sealed_sha256,
                 sealed_size: r.sealed_size as u64,
-                plaintext_size: r.plaintext_size.map(|v| v as u64),
                 file_path: r.file_path,
                 storage_source_id: r.storage_source_id as u32,
-                format_version: r.format_version.and_then(|v| u8::try_from(v).ok()),
-                encryption_key_id: r.encryption_key_id.and_then(|v| u8::try_from(v).ok()),
+                format_version: r.format_version as u8,
+                encryption_key_id: r.encryption_key_id as u8,
             },
         }))
     }

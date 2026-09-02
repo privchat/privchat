@@ -33,10 +33,25 @@ use privchat_protocol::rpc::FileRequestChunkedUploadTokenRequest;
 
 const UPLOADER: u64 = 9_972_001;
 
+/// 装配一份带附件密钥的配置：`freeze_crypto` 没有密钥就直接失败，那是有意的
+/// fail-closed（"没配密钥就当明文"会让全部新附件明文进桶）。
+fn test_config() -> privchat::config::ServerConfig {
+    privchat::config::ServerConfig {
+        attachment_keys: privchat::config::AttachmentKeys(vec![(
+            1,
+            "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo".to_string(),
+        )]),
+        ..privchat::config::ServerConfig::default()
+    }
+}
+
 struct Rig {
     pool: Arc<sqlx::PgPool>,
     file_service: FileService,
     upload_token_service: UploadTokenService,
+    /// 冻结加密参数要读它：没有配置附件密钥时签发直接失败（fail-closed），
+    /// 所以测试装配必须给一把真的。
+    config: privchat::config::ServerConfig,
     _dir: tempfile::TempDir,
 }
 
@@ -98,6 +113,7 @@ async fn rig() -> Rig {
         pool,
         file_service,
         upload_token_service: UploadTokenService::new(),
+        config: test_config(),
         _dir: dir,
     }
 }
@@ -109,18 +125,18 @@ fn services(rig: &Rig) -> ChunkedTokenServices<'_> {
         file_service: &rig.file_service,
         upload_token_service: &rig.upload_token_service,
         file_api_base_url: Some("http://e2e.local/files"),
+        config: &rig.config,
     }
 }
 
-fn req(file_hash: &str, transports: Option<Vec<&str>>) -> FileRequestChunkedUploadTokenRequest {
+fn req(plaintext_sha256: &str, transports: Option<Vec<&str>>) -> FileRequestChunkedUploadTokenRequest {
     FileRequestChunkedUploadTokenRequest {
         file_type: "file".to_string(),
         business_type: "message".to_string(),
-        file_size: 1 << 20,
-        file_hash: file_hash.to_string(),
+        plaintext_size: 1 << 20,
+        plaintext_sha256: plaintext_sha256.to_string(),
         mime_type: "application/octet-stream".to_string(),
         filename: None,
-        transform_version: 0,
         force_upload: false,
         supported_upload_transports: transports
             .map(|list| list.into_iter().map(str::to_string).collect()),
@@ -236,8 +252,20 @@ async fn invalid_transport_set_is_rejected_even_when_dedup_would_hit() {
 }
 
 async fn ordering_case_core(rig: &Rig) {
-    let bytes: &[u8] = b"privchat negotiation ordering fixture";
-    let sha = hex::encode(sha2::Sha256::digest(bytes));
+    use privchat_protocol::attachment_crypto as ac;
+
+    // 🔴 落库的必须是**真的密文**：commit 会解密重算明文摘要来核对身份，喂明文
+    // 进去连不上这条路径。秒传判重键也是明文摘要（密文每次封装都不同）。
+    let plain: &[u8] = b"privchat negotiation ordering fixture";
+    let site_key = [0x5au8; 32];
+    let blob = ac::encrypt_attachment_with_chunk_size(
+        plain,
+        &site_key,
+        1,
+        ac::DEFAULT_CHUNK_PLAIN_SIZE,
+    )
+    .expect("封装测试密文");
+    let sha = hex::encode(sha2::Sha256::digest(plain));
 
     // 走真实流式上传把文件落库，保证 find_by_content 能命中。
     let mut upload = rig
@@ -245,7 +273,7 @@ async fn ordering_case_core(rig: &Rig) {
         .begin_streaming_upload(
             "application/octet-stream",
             "ordering.bin",
-            bytes.len() as i64,
+            blob.len() as i64,
             None,
             Some(FileType::from_str("file").expect("file type")),
             UPLOADER,
@@ -254,7 +282,7 @@ async fn ordering_case_core(rig: &Rig) {
         .await
         .expect("begin streaming upload");
     upload
-        .write_chunk(Bytes::copy_from_slice(bytes))
+        .write_chunk(Bytes::copy_from_slice(&blob))
         .await
         .expect("write chunk");
     rig.file_service
@@ -266,13 +294,14 @@ async fn ordering_case_core(rig: &Rig) {
             None,
             "message".to_string(),
             None,
-            0,
-            None,
-            // 本用例不验 v2 加密，不带 key_id。
-            None,
-            0,
-            Some(sha.clone()),
-            Some(bytes.len() as i64),
+            // 冻结身份：明文摘要 / 明文大小 / 格式版本 / 密钥 id / 块几何。
+            sha.clone(),
+            plain.len() as u64,
+            ac::FORMAT_VERSION,
+            1,
+            ac::DEFAULT_CHUNK_PLAIN_SIZE,
+            Some(blob.len() as i64),
+            &site_key,
         )
         .await
         .expect("commit streaming upload");

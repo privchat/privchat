@@ -59,6 +59,14 @@ pub struct FileServerState {
     /// 后端同门禁：`None` = 未接入，S3 会话的 status/complete/abort 分支不可达。
     pub final_object_probe:
         Option<Arc<dyn crate::service::final_object_probe::FinalObjectProbe>>,
+    /// 全站附件密钥（`[[attachment.keys]]`）。
+    ///
+    /// 🔴 首传校验要**解密重算明文摘要**才能证明"这串字节就是 token 声明的那份
+    /// 内容"，所以文件服务必须拿得到密钥材料——密文摘要证明不了身份。
+    ///
+    /// 空 = 没配密钥，此时任何需要校验的发布路径一律拒绝，而不是"跳过校验放行"：
+    /// 后者会让一次配置遗漏静默变成"谁都能污染秒传索引"。
+    pub attachment_keys: crate::config::AttachmentKeys,
 }
 
 /// 「这个 bearer 是谁」——文件服务需要知道的**全部**。
@@ -133,6 +141,7 @@ impl FileHttpServer {
         auth: Option<Arc<dyn UploadAuthenticator>>,
         port: u16,
         bind_host: String,
+        attachment_keys: crate::config::AttachmentKeys,
     ) -> Self {
         // 直传门禁接线（第十六轮评审 P0）：默认存储源显式 `direct_upload` 时，
         // FileService::init 已在启动期构建生产后端与探测；这里拿同一份接线，
@@ -145,6 +154,7 @@ impl FileHttpServer {
                 file_service,
                 upload_token_service,
                 auth,
+                attachment_keys,
             },
             port,
             bind_host,

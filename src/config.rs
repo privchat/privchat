@@ -48,6 +48,24 @@ impl AttachmentKeys {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// 取 `key_id` 对应的 **32 字节密钥材料**（服务端校验密文时要用的形态）。
+    ///
+    /// 🔴 列表里存的是下发给客户端的 base64 原文，不是可以直接拿去解密的字节。
+    /// 服务端每次要用密钥都自己 decode 一遍的话，"合法 base64url / 32 字节"这两条
+    /// 规则就又散到了调用点上——那正是 `attachment_material_from_toml` 收成单一
+    /// 入口要消灭的东西。这里是它在运行期的对应面：解码只在这一个地方发生。
+    ///
+    /// `None` = 没有这个 key_id，或材料不合规（配置期已挡住，运行期再兜一次底）。
+    /// 调用方必须 fail-closed：没有密钥就不能声称"校验过了"。
+    pub fn material_for(&self, key_id: u8) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        let (_, key) = self.0.iter().find(|(id, _)| *id == key_id)?;
+        let material = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(key.trim().as_bytes())
+            .ok()?;
+        (material.len() == 32).then_some(material)
+    }
 }
 
 /// 服务器配置
@@ -501,6 +519,17 @@ impl ServerConfig {
                 "0" | "false" | "no" | "off" => Some(false),
                 _ => None,
             }
+        }
+
+        // 🔴 附件主密钥走环境变量，**不进配置文件**。
+        //
+        // 这把密钥能解开同一 key_id 下的**全部**附件。config.toml 是受 Git 跟踪的，
+        // 把它写进去等于把全站附件的解密能力提交进仓库——一次 clone 就全泄了。
+        //
+        // 格式：`id:base64url` 用逗号分隔，第一项 = 当前上传使用，其余保留给老对象解密。
+        //   PRIVCHAT_ATTACHMENT_KEYS="1:AbCd...,2:EfGh..."
+        if let Ok(raw) = env::var("PRIVCHAT_ATTACHMENT_KEYS") {
+            self.attachment_keys = parse_attachment_keys_env(&raw)?;
         }
 
         // 服务器配置
@@ -1495,6 +1524,48 @@ pub fn load_early_logging_config(config_file: Option<&str>) -> EarlyLoggingConfi
 /// `From<TomlConfig>` 里 panic，而且两边规则并不一样——一边查了成对性和密钥相同，
 /// 另一边只查编码。任何一条构造路径漏掉一条规则，都会把配置错误变成
 /// "跨用户秒传悄悄关掉"，而运行期毫无迹象。
+/// `PRIVCHAT_ATTACHMENT_KEYS` → [`AttachmentKeys`]，走与 toml **同一套**校验规则。
+///
+/// 🔴 复用 `attachment_material_from_toml`，不另写一份：规则分家的那一刻，
+/// 两条配置路径就会在"哪些密钥算合法"上给出不同答案。
+/// 🔴 **报错里绝不回显条目内容。**
+///
+/// 一条 `收到: {entry}` 看着无害，但这个函数处理的就是全站附件主密钥：格式写错时
+/// 那串密钥会原样进启动错误 → systemd/journal → 日志采集，从此躺在所有能读日志的
+/// 地方。错误信息只说"第几项、哪条规则不满足"，够定位，不泄露。
+fn parse_attachment_keys_env(raw: &str) -> Result<AttachmentKeys> {
+    // 🔴 变量存在但为空 = 配置写错了，启动期就拒。
+    //
+    // 放过去的话它会变成一个"合法的空密钥列表"，一路安静到用户点发送才炸成
+    // 「服务端未配置附件加密密钥」——那时错误离病因（部署时 env 没填/被覆盖成空）
+    // 已经隔了十万八千里。既然这是生产取密钥的唯一入口，就必须在启动期失败。
+    if raw.trim().is_empty() {
+        anyhow::bail!(
+            "PRIVCHAT_ATTACHMENT_KEYS 已设置但为空。不配就整个不要设这个变量；\
+             设了就必须给出 `id:base64url`（逗号分隔多把）"
+        );
+    }
+    let mut keys = Vec::new();
+    let entries: Vec<&str> = raw.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+    // `",,"` 这类"非空但一项都没有"同理：变量设了却没给出任何密钥，是配置错误。
+    if entries.is_empty() {
+        anyhow::bail!("PRIVCHAT_ATTACHMENT_KEYS 已设置但没有任何有效项（期望 `id:base64url`）");
+    }
+    for (idx, entry) in entries.into_iter().enumerate() {
+        let (id, key) = entry.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!(
+                "PRIVCHAT_ATTACHMENT_KEYS 第 {} 项缺少 `:` 分隔符，格式应为 `id:base64url`",
+                idx + 1
+            )
+        })?;
+        let id: u8 = id.trim().parse().map_err(|_| {
+            anyhow::anyhow!("PRIVCHAT_ATTACHMENT_KEYS 第 {} 项的 id 不是 0-255", idx + 1)
+        })?;
+        keys.push(TomlAttachmentKey { id, key: key.trim().to_string() });
+    }
+    attachment_material_from_toml(Some(&TomlAttachmentConfig { keys: Some(keys) }))
+}
+
 fn attachment_material_from_toml(att: Option<&TomlAttachmentConfig>) -> Result<AttachmentKeys> {
     use base64::Engine as _;
 
@@ -3011,6 +3082,75 @@ mod attachment_config_tests {
     #[test]
     fn duplicate_key_ids_are_refused() {
         assert!(err_of(&[(1, KEY_A), (1, KEY_B)]).contains("key_id 重复"));
+    }
+
+    /// 🔴 环境变量是**生产取密钥的唯一路径**（config.toml 受 Git 跟踪，不许写真密钥），
+    /// 所以它的解析必须和 toml 走同一套规则、并且自己有门禁。
+    #[test]
+    fn keys_from_the_environment_parse_and_keep_order() {
+        use super::parse_attachment_keys_env;
+        let keys = parse_attachment_keys_env(&format!("1:{KEY_A}, 2:{KEY_B}")).expect("接受");
+        assert_eq!(keys.0.len(), 2);
+        // 🔴 顺序即语义：第一项是"本次上传该用的那把"，其余只为解老对象。
+        // 顺序错了不会报错，只会让新附件用错密钥——错误要到下载时才显形。
+        assert_eq!(keys.first().expect("first").0, 1);
+        assert_eq!(keys.material_for(2).expect("material").len(), 32);
+    }
+
+    /// 🔴 报错**绝不能带出密钥材料**。
+    ///
+    /// 这条不是洁癖：启动错误会进 systemd/journal，再被日志采集拉走。一条
+    /// `收到: 1:<32字节密钥>` 就等于把全站附件的解密能力抄送给所有能读日志的人。
+    #[test]
+    fn errors_never_echo_the_key_material() {
+        use super::parse_attachment_keys_env;
+        // 故意写错格式（缺 `:`），但内容是一把看起来像真密钥的串。
+        let secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let err = parse_attachment_keys_env(secret).expect_err("必须拒绝").to_string();
+        assert!(
+            !err.contains(secret),
+            "错误信息泄露了密钥材料: {err}"
+        );
+        assert!(err.contains("第 1 项"), "但要说清是哪一项: {err}");
+    }
+
+    /// 变量存在但为空 = 部署时填漏了/被覆盖成空。必须**启动期**失败，
+    /// 而不是安静地变成一个合法的空列表、等到用户发附件时才炸。
+    #[test]
+    fn an_empty_environment_variable_is_refused_at_startup() {
+        use super::parse_attachment_keys_env;
+        for empty in ["", "   ", ",", " , "] {
+            assert!(
+                parse_attachment_keys_env(empty).is_err(),
+                "空值必须在启动期拒绝: {empty:?}"
+            );
+        }
+    }
+
+    /// 环境变量里的坏输入必须**当场拒绝**，不能夹带一个"看起来配了"的空列表——
+    /// 那会让签发在运行期以「服务端未配置附件密钥」的面目失败，离病因很远。
+    #[test]
+    fn a_malformed_environment_value_is_refused() {
+        use super::parse_attachment_keys_env;
+        for bad in [
+            "no-colon-here",           // 缺 id:key 分隔
+            "999:oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE", // id 越界
+            "1:not-base64!!",          // 不是 base64url
+            "1:c2hvcnQ",               // 解出来不是 32 字节
+        ] {
+            assert!(
+                parse_attachment_keys_env(bad).is_err(),
+                "必须拒绝: {bad}"
+            );
+        }
+    }
+
+    /// 与 toml 同一套规则：重复 id / 重复密钥在环境变量里同样要被拒。
+    #[test]
+    fn the_environment_path_shares_the_toml_rules() {
+        use super::parse_attachment_keys_env;
+        assert!(parse_attachment_keys_env(&format!("1:{KEY_A},1:{KEY_B}")).is_err(), "id 重复");
+        assert!(parse_attachment_keys_env(&format!("1:{KEY_A},2:{KEY_A}")).is_err(), "同密钥换 id = 假轮换");
     }
 
     /// 同一把密钥挂两个 id 是假轮换：换了 id 却没换密钥。

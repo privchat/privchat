@@ -892,7 +892,12 @@ impl FinalObjectProbe for S3DirectBackend {
         }
     }
 
-    async fn sha256_of(&self, reference: &UploadReference) -> Result<String, ProbeError> {
+    async fn open_stream(
+        &self,
+        reference: &UploadReference,
+    ) -> Result<(u64, std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>), ProbeError> {
+        use futures::TryStreamExt as _;
+
         let url = self.object_url(&reference.bucket, &reference.final_key);
         let mut req = self
             .client
@@ -902,7 +907,7 @@ impl FinalObjectProbe for S3DirectBackend {
         self.signer
             .sign(&mut req, &self.cred)
             .map_err(|e| ProbeError::Backend(format!("SigV4 签名失败: {e}")))?;
-        let mut resp = self
+        let resp = self
             .client
             .execute(req)
             .await
@@ -913,19 +918,19 @@ impl FinalObjectProbe for S3DirectBackend {
                 resp.status().as_u16()
             )));
         }
-        // 🔴 流式：全程只驻留单个网络 chunk 的内存；S3 multipart 的 ETag/复合
-        // SHA-256 不等于整文件摘要，文件身份唯一权威就是这次回读（§3.5）。
-        let mut hasher = sha2::Sha256::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| ProbeError::Backend(format!("回读分块失败: {e}")))?
-        {
-            use sha2::Digest as _;
-            hasher.update(&chunk);
-        }
-        use sha2::Digest as _;
-        Ok(hex::encode(hasher.finalize()))
+        // 🔴 权威长度取**这一次响应**的 Content-Length，不用之前的 HEAD：两者之间
+        // 对象可以被替换，而校验器把"长度已核过"当作后续 IO 失败一律可重试的前提。
+        // 缺 Content-Length 时不猜——没有权威长度就没法把"对象本身短"和"读到一半
+        // 断线"分开，宁可回可重试错误。
+        let content_length = resp.content_length().ok_or_else(|| {
+            ProbeError::Backend("GET 响应没有 Content-Length，无法核定权威长度".to_string())
+        })?;
+        // 🔴 交出流而不是摘要：调用方在同一趟里既算密文摘要又解密重算明文身份，
+        // 一次 GET 就够；先算摘要再 GET 等于把大对象回读两遍。
+        // 全程只驻留单个网络 chunk 的内存。
+        let stream = resp.bytes_stream().map_err(std::io::Error::other);
+        let reader = tokio_util::io::StreamReader::new(Box::pin(stream));
+        Ok((content_length, Box::pin(reader)))
     }
 
     async fn delete_if_match(

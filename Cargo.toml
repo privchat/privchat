@@ -35,6 +35,8 @@ privchat-protocol = { git = "https://github.com/privchat/privchat-protocol.git",
 # 异步运行时
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = "0.1"
+# S3 回读要把 HTTP 响应流当 AsyncRead 用（附件校验是流式的，不整份进内存）。
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -105,7 +107,7 @@ axum-extra = { version = "0.12.5", features = ["multipart"] }
 multer = "3.1.0"  # multipart/form-data 解析
 
 # HTTP 客户端（Push Provider）
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # 数据库
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }

@@ -58,10 +58,16 @@ impl Default for UploadTokenPurpose {
 /// prepare 阶段声明的文件身份，签进 token 后在完成时逐项复核。
 #[derive(Debug, Clone, Default)]
 pub struct UploadIdentity {
-    pub sha256: Option<String>,
+    /// 🔴 **明文**摘要，不是密文摘要。见 [`ValidatedUploadToken::plaintext_sha256`]。
+    pub plaintext_sha256: Option<String>,
+    pub plaintext_size: Option<i64>,
+    /// 最终要上传的**密文**字节数，由服务端按明文大小与分块几何算出。
     pub declared_size: Option<i64>,
     pub mime_type: Option<String>,
-    pub transform_version: i32,
+    /// 服务端冻结的加密参数。客户端不选。
+    pub format_version: Option<u8>,
+    pub encryption_key_id: Option<u8>,
+    pub chunk_plain_size: Option<u32>,
 }
 
 /// 上传 Token 信息
@@ -85,16 +91,23 @@ pub struct UploadToken {
     /// 客户端可以在 prepare 与 upload 之间换掉摘要、大小或处理版本——
     /// 那样秒传判定用的是一组参数，落库用的是另一组。
     #[serde(default)]
-    pub sha256: Option<String>,
-    /// 声明的精确大小（字节）。`max_size` 是上限，这是「就该是这么大」。
+    pub plaintext_sha256: Option<String>,
+    /// 明文字节数。complete 解密之后与它比对。
+    #[serde(default)]
+    pub plaintext_size: Option<i64>,
+    /// 声明的精确**密文**大小（字节）。`max_size` 是上限，这是「就该是这么大」。
     #[serde(default)]
     pub declared_size: Option<i64>,
+    /// 服务端冻结的加密参数，complete 只核对不接收。
+    #[serde(default)]
+    pub format_version: Option<u8>,
+    #[serde(default)]
+    pub encryption_key_id: Option<u8>,
+    #[serde(default)]
+    pub chunk_plain_size: Option<u32>,
     /// 声明的 MIME。
     #[serde(default)]
     pub mime_type: Option<String>,
-    /// 产出这份字节的客户端处理版本。
-    #[serde(default)]
-    pub transform_version: i32,
     /// 这张 token 的用途，见 [`UploadTokenPurpose`]。
     #[serde(default)]
     pub purpose: UploadTokenPurpose,
@@ -133,10 +146,13 @@ impl UploadToken {
             max_size,
             business_type,
             filename,
-            sha256: identity.sha256,
+            plaintext_sha256: identity.plaintext_sha256,
+            plaintext_size: identity.plaintext_size,
             declared_size: identity.declared_size,
             mime_type: identity.mime_type,
-            transform_version: identity.transform_version,
+            format_version: identity.format_version,
+            encryption_key_id: identity.encryption_key_id,
+            chunk_plain_size: identity.chunk_plain_size,
             purpose,
             created_at: now,
             // 🔴 有效期由调用方给，**新旧 token 一个口径**（产品拍板：一种 token、
@@ -219,17 +235,29 @@ pub struct ValidatedUploadToken {
     pub max_size: i64,
     pub business_type: String,
     pub filename: Option<String>,
-    /// prepare 阶段冻结的文件身份，完成时逐项复核。
-    pub sha256: Option<String>,
+    /// 🔴 prepare 阶段冻结的**明文**身份，complete 时解密重算逐项复核。
+    ///
+    /// 判重键是明文摘要而不是密文摘要：每块都有独立的随机 nonce，同一份明文由不同人
+    /// 封装会产出不同密文，按密文判重等于秒传只对"自己重发自己"生效。
+    pub plaintext_sha256: Option<String>,
+    /// 明文字节数。complete 解密之后要与它比对。
+    pub plaintext_size: Option<i64>,
+    /// 服务端冻结的分块几何。客户端不得自选——同一份明文按不同块大小封装会得到
+    /// 不同长度的密文，token 里签的 `sealed_blob_size` 就对不上。
+    pub chunk_plain_size: Option<u32>,
     /// 最终要上传的**密文**字节数。
     ///
     /// 📌 旧 token 的 `declared_size` 就是这个量（`file_service` 拿它与实际落盘字节数
     /// 比对），换名不换义，映射时不需要任何换算。
     pub sealed_blob_size: Option<i64>,
     pub mime_type: Option<String>,
-    pub transform_version: i32,
-    /// 附件加密版本。旧 token 不带（当时由 multipart 表单提供）→ `None`。
-    pub encryption_version: Option<i32>,
+    /// 密文格式版本，与 protocol 的 `attachment_crypto::FORMAT_VERSION` 同源。
+    pub format_version: Option<u8>,
+    /// 本次上传该用哪一把全站密钥。
+    ///
+    /// 🔴 由服务端在签发时决定并冻结，complete 只核对不接收——让客户端在 complete
+    /// 时重新选加密参数，等于让被检查的一方来定检查标准。
+    pub encryption_key_id: Option<u8>,
     /// 服务端下发的上传方案；`None` = 整包直传（旧 token 恒为 `None`）。
     pub upload_plan: Option<UploadPlan>,
     /// 分片字节落在哪个节点。`None` = 本节点（旧 token 没有这个概念）。
@@ -256,16 +284,22 @@ impl ValidatedUploadToken {
         if meta.file_type.as_str() != self.file_type.as_str() {
             return false;
         }
-        if let Some(sha) = self.sha256.as_deref() {
+        if let Some(sha) = self.plaintext_sha256.as_deref() {
             // 🔴 摘要比较不区分大小写：客户端报大写十六进制是合法的，而服务端
             // 算出来的恒为小写。用精确比较会让「首次成功、重试报身份不符」。
-            match meta.file_hash.as_deref() {
-                Some(stored) if stored.eq_ignore_ascii_case(sha) => {}
-                _ => return false,
+            // 🔴 比的是**明文**摘要：它由服务端在 complete 时解密重算，是这份内容的
+            // 身份。密文摘要每次封装都不同，拿它比对会让重试永远判身份不符。
+            if !meta.object.plaintext_sha256.eq_ignore_ascii_case(sha) {
+                return false;
             }
         }
         if let Some(size) = self.sealed_blob_size {
-            if meta.file_size as i64 != size {
+            if meta.object.sealed_size as i64 != size {
+                return false;
+            }
+        }
+        if let Some(size) = self.plaintext_size {
+            if meta.object.plaintext_size as i64 != size {
                 return false;
             }
         }
@@ -290,11 +324,13 @@ impl ValidatedUploadToken {
             max_size: c.mx,
             business_type: c.bt.clone(),
             filename: c.filename.clone(),
-            sha256: c.sha256.clone(),
+            plaintext_sha256: c.plaintext_sha256.clone(),
+            plaintext_size: c.plaintext_size,
+            chunk_plain_size: c.chunk_plain_size,
             sealed_blob_size: c.sealed_blob_size,
             mime_type: c.mime_type.clone(),
-            transform_version: c.tv,
-            encryption_version: c.encryption_version,
+            format_version: c.format_version,
+            encryption_key_id: c.encryption_key_id,
             upload_plan: c.upload_plan(),
             node_id: c.node_id.clone(),
             upload_base_url: c.upload_base_url.clone(),
@@ -311,13 +347,15 @@ impl ValidatedUploadToken {
             max_size: record.max_size,
             business_type: record.business_type.clone(),
             filename: record.filename.clone(),
-            sha256: record.sha256.clone(),
+            plaintext_sha256: record.plaintext_sha256.clone(),
+            plaintext_size: record.plaintext_size,
+            chunk_plain_size: record.chunk_plain_size,
             sealed_blob_size: record.declared_size,
             mime_type: record.mime_type.clone(),
-            transform_version: record.transform_version,
             // 下面四项旧 token 提供不了：加密版本当时走 multipart 表单，
             // 分片方案与节点绑定是新协议才有的概念。
-            encryption_version: None,
+            format_version: record.format_version,
+            encryption_key_id: record.encryption_key_id,
             upload_plan: None,
             node_id: None,
             upload_base_url: None,
@@ -566,8 +604,8 @@ impl UploadTokenService {
         // 十六进制是合法的，而服务端算出来的恒为小写，签了大写就会「首次上传成功、
         // 重试报身份不符」。
         let identity = UploadIdentity {
-            sha256: identity
-                .sha256
+            plaintext_sha256: identity
+                .plaintext_sha256
                 .map(|d| d.trim().to_ascii_lowercase()),
             ..identity
         };
@@ -585,10 +623,13 @@ impl UploadTokenService {
                 file_type.as_str(),
                 business_type,
                 max_size,
-                identity.transform_version,
             );
             claims.filename = filename;
-            claims.sha256 = identity.sha256;
+            claims.plaintext_sha256 = identity.plaintext_sha256;
+            claims.plaintext_size = identity.plaintext_size;
+            claims.chunk_plain_size = identity.chunk_plain_size;
+            claims.format_version = identity.format_version;
+            claims.encryption_key_id = identity.encryption_key_id;
             claims.sealed_blob_size = identity.declared_size;
             claims.mime_type = identity.mime_type;
             claims.set_upload_plan(upload_plan);
@@ -761,10 +802,13 @@ mod tests {
                 "message".to_string(),
                 None,
                 UploadIdentity {
-                    sha256: Some("a".repeat(64)),
+                    plaintext_size: None,
+                    format_version: Some(1),
+                    encryption_key_id: Some(1),
+                    chunk_plain_size: Some(1024 * 1024),
+                    plaintext_sha256: Some("a".repeat(64)),
                     declared_size: Some(4096),
                     mime_type: Some("image/png".to_string()),
-                    transform_version: 0,
                 },
                 UploadTokenPurpose::ClaimExisting,
                 None,
@@ -803,10 +847,13 @@ mod tests {
                 "message".to_string(),
                 None,
                 UploadIdentity {
-                    sha256: Some("A".repeat(64)), // 客户端报大写
+                    plaintext_size: None,
+                    format_version: Some(1),
+                    encryption_key_id: Some(1),
+                    chunk_plain_size: Some(1024 * 1024),
+                    plaintext_sha256: Some("A".repeat(64)), // 客户端报大写
                     declared_size: Some(4096),
                     mime_type: Some("image/png".to_string()),
-                    transform_version: 0,
                 },
                 UploadTokenPurpose::Upload,
                 None,
@@ -819,7 +866,7 @@ mod tests {
             .await
             .expect("validate");
         assert_eq!(
-            validated.sha256.as_deref(),
+            validated.plaintext_sha256.as_deref(),
             Some("a".repeat(64).as_str()),
             "签进 token 的摘要必须已规范化为小写"
         );
@@ -843,40 +890,44 @@ mod tests {
                 600,
             ),
         );
-        token.sha256 = Some("A".repeat(64)); // 客户端报大写
+        token.plaintext_sha256 = Some("A".repeat(64)); // 客户端报大写
         token.sealed_blob_size = Some(4096);
 
         let meta = FileMetadata {
             file_id: 1,
             original_filename: "x.png".to_string(),
-            file_size: 4096,
             original_size: None,
             file_type: FileType::Image,
             mime_type: "image/png".to_string(),
-            file_path: "images/1.png".to_string(),
-            storage_source_id: 0,
             uploader_id: 42,
             uploader_ip: None,
             uploaded_at: 0,
             width: None,
             height: None,
-            file_hash: Some("a".repeat(64)), // 服务端算出来的小写
             business_type: Some("message".to_string()),
             business_id: None,
-            encryption_version: 0,
-            cek: None,
-            encryption_key_id: None,
+            object: crate::model::file_upload::AttachmentObject {
+                object_id: 1,
+                plaintext_sha256: "a".repeat(64), // 服务端算出来的小写
+                plaintext_size: 4096,
+                sealed_sha256: "d".repeat(64),
+                sealed_size: 4096,
+                file_path: "images/1.png".to_string(),
+                storage_source_id: 0,
+                format_version: 1,
+                encryption_key_id: 1,
+            },
         };
         assert!(token.matches_file(&meta), "大小写不同的同一个摘要必须视为相同");
 
         // 真正不同的摘要仍然要拒。
         let mut other = meta.clone();
-        other.file_hash = Some("b".repeat(64));
+        other.object.plaintext_sha256 = "b".repeat(64);
         assert!(!token.matches_file(&other));
 
         // 同一用户的**另一个**附件（大小不同）也要拒——只比 uploader 是不够的。
         let mut different_file = meta.clone();
-        different_file.file_size = 8192;
+        different_file.object.sealed_size = 8192;
         assert!(!token.matches_file(&different_file));
     }
 
@@ -959,10 +1010,13 @@ mod tests {
     async fn the_validated_projection_carries_the_frozen_identity() {
         let service = UploadTokenService::new();
         let identity = UploadIdentity {
-            sha256: Some("a".repeat(64)),
+            plaintext_sha256: Some("a".repeat(64)),
+            plaintext_size: Some(4000),
             declared_size: Some(4096),
             mime_type: Some("image/png".to_string()),
-            transform_version: 7,
+            format_version: Some(1),
+            encryption_key_id: Some(1),
+            chunk_plain_size: Some(1024 * 1024),
         };
         let token = service
             .generate_token(
@@ -984,11 +1038,10 @@ mod tests {
         assert_eq!(validated.purpose, UploadTokenPurpose::ClaimExisting);
         assert_eq!(validated.business_type, "message");
         assert_eq!(validated.filename.as_deref(), Some("holiday.png"));
-        assert_eq!(validated.sha256, Some("a".repeat(64)));
+        assert_eq!(validated.plaintext_sha256, Some("a".repeat(64)));
         // 换名不换义：老字段本来就是密文字节数（file_service 拿它与落盘字节数比对）。
         assert_eq!(validated.sealed_blob_size, Some(4096));
         assert_eq!(validated.mime_type.as_deref(), Some("image/png"));
-        assert_eq!(validated.transform_version, 7);
         assert_eq!(validated.max_size, 10485760);
         assert_eq!(validated.expires_at, token.expires_at);
     }
@@ -1015,7 +1068,6 @@ mod tests {
         // upload_plan 缺席 = 整包直传，正是旧客户端唯一会走的路。
         assert!(validated.upload_plan.is_none());
         // 加密版本当时走 multipart 表单，不在 token 里。
-        assert!(validated.encryption_version.is_none());
         // 节点绑定是新协议才有的概念；None 表示本节点。
         assert!(validated.node_id.is_none());
         assert!(validated.upload_base_url.is_none());

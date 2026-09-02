@@ -42,8 +42,11 @@ pub struct ChunkedTokenServices<'a> {
     pub file_service: &'a FileService,
     pub upload_token_service: &'a UploadTokenService,
     pub file_api_base_url: Option<&'a str>,
-    /// 本次上传该用的全站加密密钥（v2）。`None` = 未启用，客户端沿用 v1。
+    /// 本次上传该用的全站加密密钥。`None` = 服务端未配置——那不是"客户端自己看着办"，
+    /// 而是签发必须直接失败（见 `freeze_crypto`）。
     pub attachment_key: Option<privchat_protocol::rpc::file::upload::AttachmentKey>,
+    /// 冻结加密参数要读它。
+    pub config: &'a crate::config::ServerConfig,
 }
 
 pub async fn request_chunked_upload_token(
@@ -60,6 +63,7 @@ pub async fn request_chunked_upload_token(
         file_service: &services.file_service,
         upload_token_service: &services.upload_token_service,
         file_api_base_url: services.config.file_api_base_url.as_deref(),
+        config: &services.config,
     };
     let response = issue_chunked_upload_token(&narrowed, user_id, request).await?;
     serde_json::to_value(response)
@@ -75,20 +79,20 @@ pub async fn issue_chunked_upload_token(
 ) -> RpcResult<FileRequestChunkedUploadTokenResponse> {
     let file_type = FileType::from_str(&request.file_type)
         .ok_or_else(|| RpcError::validation(format!("无效的文件类型: {}", request.file_type)))?;
-    if request.file_size <= 0 {
-        return Err(RpcError::validation("file_size 必须大于 0".to_string()));
+    if request.plaintext_size <= 0 {
+        return Err(RpcError::validation("plaintext_size 必须大于 0".to_string()));
     }
     let max_size = file_type.max_size_bytes() as i64;
-    if request.file_size > max_size {
+    if request.plaintext_size > max_size {
         return Err(RpcError::from_code(
             ErrorCode::FileTooLarge,
             format!("文件大小超过限制（最大 {} MB）", max_size / 1024 / 1024),
         ));
     }
-    let sha256 = request.file_hash.trim().to_ascii_lowercase();
+    let sha256 = request.plaintext_sha256.trim().to_ascii_lowercase();
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(RpcError::validation(
-            "file_hash 必须是 64 位十六进制（SHA-256）".to_string(),
+            "plaintext_sha256 必须是 64 位十六进制（SHA-256）".to_string(),
         ));
     }
     if request.business_type.trim().is_empty() {
@@ -126,11 +130,22 @@ pub async fn issue_chunked_upload_token(
     })?
     .to_string();
 
+    // 服务端冻结本次上传的加密参数（格式、密钥、分块几何、密文大小）。
+    //
+    // 🔴 在秒传预检**之前**冻结：命中要发 claim token、未命中要发上传 token，两条路
+    // 都需要这组参数，放在分支里会漏掉一边。
+    let frozen = super::freeze_crypto(services.config, request.plaintext_size)
+        .map_err(RpcError::internal)?;
+    let attachment_format_version = frozen.format_version;
+    let attachment_key_id = Some(frozen.encryption_key_id);
+    let chunk_plain_size = frozen.chunk_plain_size;
+    let sealed_size = Some(frozen.sealed_size);
+
     // ---- 2.1 秒传预检：命中就回 claim_token，不建任何目录（协商校验已在它之前）----
     if !request.force_upload {
         let hit = services
             .file_service
-            .find_by_content(&sha256)
+            .find_object_by_plaintext_sha256(&sha256)
             .await
             .map_err(|e| RpcError::internal(e.to_string()))?
             .is_some();
@@ -150,10 +165,13 @@ pub async fn issue_chunked_upload_token(
                     request.business_type.clone(),
                     request.filename.clone(),
                     crate::service::upload_token_service::UploadIdentity {
-                        sha256: Some(sha256.clone()),
-                        declared_size: Some(request.file_size),
+                        plaintext_sha256: Some(sha256.clone()),
+                        plaintext_size: Some(request.plaintext_size),
+                        declared_size: sealed_size,
                         mime_type: Some(request.mime_type.clone()),
-                        transform_version: request.transform_version,
+                        format_version: Some(attachment_format_version),
+                        encryption_key_id: attachment_key_id,
+                        chunk_plain_size: Some(chunk_plain_size),
                     },
                     crate::service::upload_token_service::UploadTokenPurpose::ClaimExisting,
                     None,
@@ -208,7 +226,7 @@ pub async fn issue_chunked_upload_token(
         let wiring = s3_wiring.ok_or_else(|| {
             RpcError::internal("S3 直传门禁状态不一致：选中了 transport 但接线缺失".to_string())
         })?;
-        let (part_size, total_parts) = s3_part_geometry(request.file_size as u64);
+        let (part_size, total_parts) = s3_part_geometry(frozen.sealed_size as u64);
         let file_path = services
             .file_service
             .generate_file_path(&sha256, &file_type, &filename);
@@ -217,7 +235,7 @@ pub async fn issue_chunked_upload_token(
         let upload_id = ids.upload_id.clone();
         let reference = wiring
             .backend
-            .create(&ids.upload_id, &wiring.bucket, &final_key, request.file_size as u64)
+            .create(&ids.upload_id, &wiring.bucket, &final_key, frozen.sealed_size as u64)
             .await
             .map_err(|e| {
                 RpcError::internal(format!("创建 S3 分片上传失败，请稍后重试: {e:?}"))
@@ -258,13 +276,21 @@ pub async fn issue_chunked_upload_token(
             ids,
             NewSession {
                 uploader_id: user_id,
-                total_size: request.file_size as u64,
-                sealed_sha256: sha256,
+                // token 冻结的身份原样落进 manifest：complete 不再向客户端要这些值。
+                plaintext_sha256: sha256.clone(),
+                plaintext_size: request.plaintext_size as u64,
+                format_version: attachment_format_version,
+                encryption_key_id: attachment_key_id.unwrap_or_default(),
+                chunk_plain_size,
+                // 🔴 会话的 total_size 是**密文**长度：它决定分片几何、区间网格、
+                // complete 时的权威长度核对。用明文长度的话，客户端按它切片、
+                // 服务端按它算几何，而实际要传的字节多出一个封装头——每一次分片
+                // 上传都会在 complete 的长度核对上终局失败。
+                total_size: frozen.sealed_size as u64,
                 file_type: file_type.as_str().to_string(),
                 business_type: request.business_type,
                 filename,
                 mime_type,
-                transform_version: request.transform_version,
                 reserved_file_id,
                 transport: transport.clone(),
                 s3: Some(S3SessionSetup {
@@ -317,13 +343,21 @@ pub async fn issue_chunked_upload_token(
             &session_root,
             NewSession {
                 uploader_id: user_id,
-                total_size: request.file_size as u64,
-                sealed_sha256: sha256,
+                // token 冻结的身份原样落进 manifest：complete 不再向客户端要这些值。
+                plaintext_sha256: sha256.clone(),
+                plaintext_size: request.plaintext_size as u64,
+                format_version: attachment_format_version,
+                encryption_key_id: attachment_key_id.unwrap_or_default(),
+                chunk_plain_size,
+                // 🔴 会话的 total_size 是**密文**长度：它决定分片几何、区间网格、
+                // complete 时的权威长度核对。用明文长度的话，客户端按它切片、
+                // 服务端按它算几何，而实际要传的字节多出一个封装头——每一次分片
+                // 上传都会在 complete 的长度核对上终局失败。
+                total_size: frozen.sealed_size as u64,
                 file_type: file_type.as_str().to_string(),
                 business_type: request.business_type,
                 filename,
                 mime_type,
-                transform_version: request.transform_version,
                 reserved_file_id,
                 // manifest 记下协商结果：status/complete/abort 与 /files/part-url
                 // 的端点强绑定（RESUMABLE §8.3）都按它分流。
@@ -338,7 +372,7 @@ pub async fn issue_chunked_upload_token(
         "🎫 分片上传会话已建 upload_id={} 用户={} 大小={} 预留 file_id={}",
         session.upload_id(),
         user_id,
-        request.file_size,
+        frozen.sealed_size,
         reserved_file_id
     );
 
@@ -346,12 +380,16 @@ pub async fn issue_chunked_upload_token(
     // （RESUMABLE §8.2）。旧客户端的响应不新增字段。
     let is_s3 = transport == TRANSPORT_S3_MULTIPART_V1;
     let (part_size, total_parts) = if is_s3 {
-        s3_part_geometry(request.file_size as u64)
+        s3_part_geometry(frozen.sealed_size as u64)
     } else {
         (0, 0)
     };
     let response = FileRequestChunkedUploadTokenResponse {
         attachment_key: services.attachment_key.clone(),
+        // 🔴 客户端按这两项封装与切片：块大小必须原样用（几何是服务端冻结的），
+        // total_size 是封装之后真正要传的字节数。
+        chunk_plain_size: Some(chunk_plain_size),
+        total_size: Some(frozen.sealed_size as u64),
         already_exists: false,
         claim_token: None,
         upload_token: Some(token),

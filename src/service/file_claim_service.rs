@@ -97,7 +97,7 @@ pub async fn claim_existing_file(
     // 逐项复核 token 里签下的身份，不信这次请求带来的参数——
     // 否则可以 prepare 一个小文件、claim 另一份内容。
     let bound = token
-        .sha256
+        .plaintext_sha256
         .as_deref()
         .ok_or_else(|| ServerError::Validation("该 token 未绑定内容摘要".to_string()))?;
     if !bound.eq_ignore_ascii_case(request_sha256.trim()) {

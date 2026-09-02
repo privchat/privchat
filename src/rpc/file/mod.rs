@@ -211,3 +211,55 @@ mod attachment_key_tests {
         assert!(!json.contains("super-secret-material"), "密钥进了序列化输出");
     }
 }
+
+/// 签发 token 时冻结的加密参数。
+///
+/// 🔴 全部由**服务端**决定：客户端不选格式、不选密钥、不选块大小。让客户端在
+/// complete 时重新提供任何一项，就等于让被检查的一方来定检查标准。
+///
+/// 🔴 分块几何必须冻结的具体原因：同一份明文按不同块大小封装会得到**不同长度**的
+/// 密文（每块多一个 nonce 和一个 tag），token 里签的 `sealed_size` 就对不上，
+/// complete 会把一次正常上传判成身份不符。
+pub(crate) struct FrozenCrypto {
+    pub format_version: u8,
+    pub encryption_key_id: u8,
+    pub chunk_plain_size: u32,
+    /// 按明文大小与分块几何算出的密文字节数。
+    pub sealed_size: i64,
+}
+
+/// 为一次上传冻结加密参数。
+///
+/// 🔴 **没有配置附件密钥时直接报错，不回退明文。** 用「没有密钥就当明文」表达
+/// 未启用是 fail-open：一次配置遗漏就会让全部新附件以明文进桶，而桶里看起来一切正常，
+/// 没有任何报错会提醒运维。
+pub(crate) fn freeze_crypto(
+    config: &crate::config::ServerConfig,
+    plaintext_size: i64,
+) -> Result<FrozenCrypto, String> {
+    use privchat_protocol::attachment_crypto as ac;
+
+    let (key_id, _) = config
+        .attachment_keys
+        .first()
+        .ok_or_else(|| "服务端未配置附件加密密钥（[[attachment.keys]]）".to_string())?;
+
+    // 🔴 负数**拒绝**，不是夹到 0。
+    //
+    // `max(0)` 把一个非法请求（明文大小 -1）悄悄变成一个合法冻结：token 会签下
+    // "明文 0 字节"，而客户端心里想的是别的东西。签完之后这套参数就是权威身份，
+    // 后面每一步都按它算——错误在此刻不报，就只会在 complete 的校验里以
+    // 「身份不符」的面目出现，离真正的原因隔了整整一条链路。
+    if plaintext_size < 0 {
+        return Err(format!("明文大小不能是负数: {plaintext_size}"));
+    }
+    let chunk_plain_size = ac::DEFAULT_CHUNK_PLAIN_SIZE;
+    let sealed = ac::sealed_len(plaintext_size as u64, chunk_plain_size)?;
+
+    Ok(FrozenCrypto {
+        format_version: ac::FORMAT_VERSION,
+        encryption_key_id: *key_id,
+        chunk_plain_size,
+        sealed_size: sealed as i64,
+    })
+}

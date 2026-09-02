@@ -2388,6 +2388,54 @@ impl PgMessageRepository {
 
 #[cfg(test)]
 mod atomic_dispatch_tests {
+    /// 预置一条已发布的附件记录（对象行 + 文件行）。
+    ///
+    /// 🔴 身份字段都在 `privchat_attachment_objects` 上，文件行只引用它——
+    /// 直接往 `privchat_file_uploads` 塞 `file_size`/`file_path` 的老写法已经不成立。
+    async fn seed_file_row(pool: &sqlx::PgPool, file_id: i64, uploader: i64) {
+        let digest = format!("{:064x}", file_id);
+        // 🔴 对象行没有 uploader，用例开头那句按 file_id 删 uploads 清不到它；
+        // 留下的孤儿会在下一次跑同一个用例时撞 plaintext_sha256 唯一约束。
+        sqlx::query(
+            "DELETE FROM privchat_attachment_objects o WHERE o.plaintext_sha256 = $1 \
+             AND NOT EXISTS (SELECT 1 FROM privchat_file_uploads u WHERE u.object_id = o.object_id)",
+        )
+        .bind(&digest)
+        .execute(pool)
+        .await
+        .expect("清理孤儿对象行");
+        let object_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO privchat_attachment_objects
+                (plaintext_sha256, plaintext_size, sealed_sha256, sealed_size,
+                 file_path, storage_source_id, format_version, encryption_key_id)
+            VALUES ($1, 1, $2, 1, $3, 0, 1, 1)
+            RETURNING object_id
+            "#,
+        )
+        .bind(&digest)
+        .bind(&digest)
+        .bind(format!("/x-{file_id}.jpg"))
+        .fetch_one(pool)
+        .await
+        .expect("seed object row");
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_file_uploads
+                (file_id, original_filename, file_type, mime_type, object_id,
+                 uploader_id, business_type)
+            VALUES ($1, 'x.jpg', 'image', 'image/jpeg', $2, $3, 'message')
+            ON CONFLICT (file_id) DO NOTHING
+            "#,
+        )
+        .bind(file_id)
+        .bind(object_id)
+        .bind(uploader)
+        .execute(pool)
+        .await
+        .expect("seed file row");
+    }
+
     use super::*;
     use chrono::Utc;
     use sqlx::postgres::PgPoolOptions;
@@ -2702,20 +2750,7 @@ mod atomic_dispatch_tests {
             .execute(repo.pool())
             .await;
         for file_id in [100i64, 200i64] {
-            sqlx::query(
-                r#"
-                INSERT INTO privchat_file_uploads
-                    (file_id, original_filename, file_size, file_type, mime_type,
-                     file_path, uploader_id, business_type)
-                VALUES ($1, 'x.jpg', 1, 'image', 'image/jpeg', '/x.jpg', $2, 'message')
-                ON CONFLICT (file_id) DO NOTHING
-                "#,
-            )
-            .bind(file_id)
-            .bind(OWNER_ID)
-            .execute(repo.pool())
-            .await
-            .expect("seed file row");
+            seed_file_row(repo.pool(), file_id, OWNER_ID).await;
         }
 
         repo.create_message_and_commit_atomic(AtomicMessageCommitRequest {
@@ -2823,19 +2858,7 @@ mod atomic_dispatch_tests {
             .bind(4242i64)
             .execute(repo.pool())
             .await;
-        sqlx::query(
-            r#"
-            INSERT INTO privchat_file_uploads
-                (file_id, original_filename, file_size, file_type, mime_type,
-                 file_path, uploader_id, business_type)
-            VALUES ($1, 'x.jpg', 1, 'image', 'image/jpeg', '/x.jpg', $2, 'message')
-            "#,
-        )
-        .bind(4242i64)
-        .bind(OWNER_ID)
-        .execute(repo.pool())
-        .await
-        .expect("seed file row");
+        seed_file_row(repo.pool(), 4242i64, OWNER_ID).await;
 
         let now = Utc::now();
         let legacy = privchat_protocol::LocalMessagePayloadEnvelope {

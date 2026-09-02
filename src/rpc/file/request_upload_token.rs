@@ -39,7 +39,7 @@ pub async fn request_upload_token(
     // 伪造 uploader 会让 send 校验 file 所有权失效）。这也是 web 发文件失败的根因。
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
     let file_type_str = &request.file_type;
-    let file_size = request.file_size;
+    let file_size = request.plaintext_size;
     let mime_type = request.mime_type;
     let business_type = request.business_type;
     let filename = request.filename;
@@ -109,8 +109,16 @@ pub async fn request_upload_token(
     // 而且「探测」和「取得所有权」是两件事，混在一个接口里，任何一次重试
     // 都会多给调用方一份文件。命中之后由客户端另外调 `file/claim_existing`
     // 带 token + sha256 去换**他自己的** file_id。
+    // 服务端冻结本次上传的加密参数（格式、密钥、分块几何、密文大小）。
+    let frozen = super::freeze_crypto(&services.config, file_size)
+        .map_err(RpcError::internal)?;
+    let attachment_format_version = frozen.format_version;
+    let attachment_key_id = Some(frozen.encryption_key_id);
+    let chunk_plain_size = frozen.chunk_plain_size;
+    let sealed_size = Some(frozen.sealed_size);
+
     let mut already_exists = false;
-    if let Some(sha256) = request.sha256.as_deref() {
+    if let Some(sha256) = request.plaintext_sha256.as_deref() {
         let normalized = sha256.trim().to_ascii_lowercase();
         if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(RpcError::validation(
@@ -121,7 +129,7 @@ pub async fn request_upload_token(
         //（放在这里的话，将来多一条签发入口就会漏）。这里的 `normalized` 只用于查库。
         already_exists = services
             .file_service
-            .find_by_content(&normalized)
+            .find_object_by_plaintext_sha256(&normalized)
             .await
             .map_err(|e| RpcError::internal(e.to_string()))?
             .is_some();
@@ -149,10 +157,15 @@ pub async fn request_upload_token(
             // 文件身份签进 token，完成时逐项复核——否则客户端可以在 prepare 与
             // upload/claim 之间把摘要或大小换掉。
             crate::service::upload_token_service::UploadIdentity {
-                sha256: request.sha256.clone(),
-                declared_size: Some(file_size),
+                plaintext_sha256: request.plaintext_sha256.clone(),
+                plaintext_size: Some(file_size),
+                // 🔴 冻结的是**密文**大小，由服务端按明文大小与分块几何算出——
+                // 客户端报的那个数只是它自己的说法，不能当作 token 的承诺。
+                declared_size: sealed_size,
                 mime_type: Some(mime_type.clone()),
-                transform_version: request.transform_version,
+                format_version: Some(attachment_format_version),
+                encryption_key_id: attachment_key_id,
+                chunk_plain_size: Some(chunk_plain_size),
             },
             // 命中 → 这张 token 只能拿去 claim；未命中 → 只能拿去传字节。
             // 两个入口各自拒绝不属于自己的用途，堵住「同一张 token 两边各用一次」。
@@ -181,6 +194,9 @@ pub async fn request_upload_token(
         // 本次上传该用的全站密钥（v2）。客户端加密后再传，服务端与对象存储
         // 自始至终只见到密文。
         attachment_key: super::current_attachment_key(&services.config),
+        // 同分片：块大小与封装后长度由服务端冻结并下发，客户端不自选、也算不出。
+        chunk_plain_size: Some(chunk_plain_size),
+        total_size: sealed_size.map(|s| s as u64),
         token: token_str,
         upload_url,
         // 命中只是**告知**：字节已经在服务端，不必再传。要拿到自己的 file_id

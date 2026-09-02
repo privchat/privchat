@@ -33,7 +33,9 @@
 
 use async_trait::async_trait;
 
-use crate::service::numbered_parts::UploadReference;
+// 校验入口按 final key 定位对象，用的就是这个引用；从这里再导出一次，调用方不必
+// 为了一个坐标类型同时依赖 numbered_parts（MPU 控制面）。
+pub use crate::service::numbered_parts::UploadReference;
 
 /// HEAD 到的 final 对象：长度 + 归属 metadata + ETag。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,10 +72,21 @@ pub trait FinalObjectProbe: Send + Sync {
         reference: &UploadReference,
     ) -> Result<Option<FinalObjectHead>, ProbeError>;
 
-    /// 流式回读 final 对象，算**整文件** SHA-256（hex 小写）。
-    /// 🔴 S3 multipart 的 SHA-256 是 composite，不等于整文件摘要（FILE_STORAGE
-    /// §3.5）：文件身份的唯一权威就是这次回读。
-    async fn sha256_of(&self, reference: &UploadReference) -> Result<String, ProbeError>;
+    /// 单次流式 GET：交出**同一次响应**的 `Content-Length` 与字节流。
+    ///
+    /// 🔴 长度和字节必须来自同一次响应。拿之前 HEAD 的长度去核这次 GET 的字节，
+    /// 核的是两个不同时刻的东西——两者之间对象可以被替换，而
+    /// `verify_attachment` 把"长度已核过"当作后续 IO 失败一律可重试的前提。
+    ///
+    /// 🔴 也**不要**先 `sha256_of()` 再 GET 一次：`verify_attachment` 在同一趟里
+    /// 同时算密文摘要和明文摘要，一次 GET 就够，两次等于把大对象回读两遍。
+    ///
+    /// S3 multipart 的 SHA-256 是 composite，不等于整文件摘要（FILE_STORAGE §3.5）：
+    /// 文件身份的唯一权威就是这次回读之后的解密重算。
+    async fn open_stream(
+        &self,
+        reference: &UploadReference,
+    ) -> Result<(u64, std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>), ProbeError>;
 
     /// 条件删除 final 对象：🔴 只有当前对象的 ETag 与 `etag`（来自归属核对时
     /// 的 HEAD）一致才执行删除，把「核对」与「删除」合成一个原子判定，消除两步

@@ -435,10 +435,20 @@ mod tests {
             "message".to_string(),
             None,
             UploadIdentity {
-                sha256: Some("a".repeat(64)),
-                declared_size: Some(4096),
+                plaintext_sha256: Some("a".repeat(64)),
+                plaintext_size: Some(4096),
+                // 🔴 `declared_size` 是**密文**字节数，不是明文：4096 字节明文按
+                // 1 MiB 块封装是 1 块 = 36 头 + 12 nonce + 4 长度 + 4096 + 16 tag。
+                // 写成 4096 的话 `matches_file` 的 sealed_size 一项恒不过，回调路径
+                // 会在"身份不符"上失败，而失败原因跟身份毫无关系。
+                declared_size: Some(
+                    privchat_protocol::attachment_crypto::sealed_len(4096, 1024 * 1024)
+                        .expect("sealed_len") as i64,
+                ),
                 mime_type: Some("image/png".to_string()),
-                transform_version: 0,
+                format_version: Some(1),
+                encryption_key_id: Some(1),
+                chunk_plain_size: Some(1024 * 1024),
             },
             purpose,
             600,
@@ -452,23 +462,27 @@ mod tests {
         FileMetadata {
             file_id: 900,
             original_filename: "holiday.png".to_string(),
-            file_size: 4096,
             original_size: None,
             file_type: FileType::Image,
             mime_type: "image/png".to_string(),
-            file_path: "images/900.png".to_string(),
-            storage_source_id: 0,
             uploader_id: 42,
             uploader_ip: None,
             uploaded_at: 0,
             width: None,
             height: None,
-            file_hash: Some("a".repeat(64)),
             business_type: Some("message".to_string()),
             business_id: None,
-            encryption_version: 0,
-            cek: None,
-            encryption_key_id: None,
+            object: crate::model::file_upload::AttachmentObject {
+                object_id: 7,
+                plaintext_sha256: "a".repeat(64),
+                plaintext_size: 4096,
+                sealed_sha256: "b".repeat(64),
+                sealed_size: 4096 + 36 + 32,
+                file_path: "images/900.png".to_string(),
+                storage_source_id: 0,
+                format_version: 1,
+                encryption_key_id: 1,
+            },
         }
     }
 
@@ -608,8 +622,16 @@ mod tests {
         let r = tempfile::tempdir().expect("tmp");
         completed_session(r.path(), 900);
         for mutate in [
-            (|m: &mut FileMetadata| m.file_hash = Some("b".repeat(64))) as fn(&mut FileMetadata),
-            |m: &mut FileMetadata| m.file_size = 8192,
+            // 🔴 改的必须是 `matches_file` 真会看的那几项。
+            //
+            // 这里原本改的是 `sealed_sha256`，而 `meta()` 里它本来就是 "b"×64——
+            // 这条负例改了个寂寞，而且 `matches_file` 压根不比密文摘要（每次封装都
+            // 不同，比它会让重试永远判身份不符）。它一直"通过"，靠的是 fixture 里
+            // 另一处 declared_size 写错带来的巧合。身份判据是**明文**摘要。
+            (|m: &mut FileMetadata| m.object.plaintext_sha256 = "c".repeat(64))
+                as fn(&mut FileMetadata),
+            |m: &mut FileMetadata| m.object.plaintext_size = 8192,
+            |m: &mut FileMetadata| m.object.sealed_size = 8192,
             |m: &mut FileMetadata| m.file_type = FileType::File,
             |m: &mut FileMetadata| m.uploader_id = 43,
         ] {
@@ -664,9 +686,9 @@ mod tests {
         .expect_err("must fail");
         assert!(transient.is_internal());
 
-        // 身份不符 → 别重试
+        // 身份不符 → 别重试（比的是明文摘要，见上面那条负例的说明）
         let mut wrong = meta();
-        wrong.file_hash = Some("b".repeat(64));
+        wrong.object.plaintext_sha256 = "c".repeat(64);
         assert!(run_upload(r.path(), 900, Some(wrong))
             .await
             .expect_err("must fail")

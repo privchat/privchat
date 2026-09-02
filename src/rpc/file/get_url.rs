@@ -97,20 +97,9 @@ pub async fn get_file_url(
         return Err(RpcError::forbidden("无权访问该附件".to_string()));
     }
 
-    // 🔴 v2 对象取不到密钥是**服务端配置损坏**（历史密钥被从配置里删了），
-    // 不是客户端能兜底的缺省值。照常返回 URL 只会让客户端下到一堆解不开的密文，
-    // 故障表现成「图片坏了」，与真实成因隔了十万八千里。
-    let attachment_key = super::attachment_key_for(&services.config, file_meta.object.encryption_key_id);
-    if file_meta.object.format_version == 2 && attachment_key.is_none() {
-        tracing::error!(
-            "附件密钥缺失: file_id={} encryption_key_id={:?}——配置里已无此 key id",
-            request.file_id,
-            file_meta.object.encryption_key_id
-        );
-        return Err(RpcError::internal(
-            "ATTACHMENT_KEY_UNAVAILABLE".to_string(),
-        ));
-    }
+    // 🔴 顺序有意义：**先**取密钥、取不到就直接返回，再去要 URL。
+    // 反过来的话，一次注定不可用的响应还会先去签一个能下载密文的地址。
+    let attachment_key = attachment_key_or_fail(&services.config, &file_meta)?;
 
     let url = services
         .file_service
@@ -121,23 +110,177 @@ pub async fn get_file_url(
     // 🔴 第二十六轮评审：日志最小化——访问 URL 不进日志，只记 file_id。
     tracing::info!("🔗 返回文件 URL: file_id={}", request.file_id);
 
-    let response = FileGetUrlResponse {
+    let response = get_url_response(file_meta, url, attachment_key);
+
+    Ok(serde_json::to_value(response)
+        .map_err(|e| RpcError::internal(format!("序列化失败: {}", e)))?)
+}
+
+/// 取这个对象要用的那把全站密钥；取不到就 fail-closed。
+///
+/// 🔴 判据是 `format_version == FORMAT_VERSION`，**不是写死的数字**。
+/// 这里曾经写 `== 2`——那是"加密版本"旧口径的遗留值，而密文格式版本是 1
+/// （`attachment_crypto::FORMAT_VERSION`，数据库 CHECK 也钉着 1）。于是这道闸门对
+/// 库里每一个对象都不成立：密钥漏配时一次都不触发，照常回一个没有密钥的密文 URL，
+/// 故障表现成"图片坏了"，离真实成因十万八千里。fail-closed 写成了恒不生效。
+fn attachment_key_or_fail(
+    config: &crate::config::ServerConfig,
+    file_meta: &crate::service::FileMetadata,
+) -> Result<Option<privchat_protocol::rpc::file::upload::AttachmentKey>, RpcError> {
+    let key = super::attachment_key_for(config, Some(file_meta.object.encryption_key_id));
+    if file_meta.object.format_version == privchat_protocol::attachment_crypto::FORMAT_VERSION
+        && key.is_none()
+    {
+        tracing::error!(
+            "附件密钥缺失: file_id={} encryption_key_id={}——配置里已无此 key id",
+            file_meta.file_id,
+            file_meta.object.encryption_key_id
+        );
+        return Err(RpcError::internal("ATTACHMENT_KEY_UNAVAILABLE".to_string()));
+    }
+    Ok(key)
+}
+
+/// 组装响应。抽出来是为了让"哪个摘要进 `sha256`"这件事可以被直接断言——
+/// 它埋在 RPC 里的时候，只有一条要连库的路径能碰到它。
+fn get_url_response(
+    file_meta: crate::service::FileMetadata,
+    url: crate::service::file_service::FileUrlResponse,
+    attachment_key: Option<privchat_protocol::rpc::file::upload::AttachmentKey>,
+) -> FileGetUrlResponse {
+    FileGetUrlResponse {
         file_url: url.file_url,
         expires_at: url.expires_at,
         file_size: url.file_size as u64,
         mime_type: url.mime_type,
         // 文件名取自 file 表（已在上方鉴权时拉取的 file_meta），统一由 get_url 下发。
         original_filename: file_meta.original_filename,
-        // 只给解开这一个附件所需的那把。授权已在上面做过，密钥的暴露面
-        // 就该止步于这个文件——下发全量等于让任何拿到一个附件的人解开全部。
+        // 这个对象的 `encryption_key_id` 对应的那把**全站**密钥。
+        //
+        // 🔴 它不是 per-file key，别按"密钥暴露面止步于这个文件"去理解。同一个
+        // key_id 下的所有对象共用这一把——拿到它的人，密码学上就能解开那一批。
+        // 文件级的隔离来自别处：私有桶 + 短期 URL + `get_url` 的鉴权。
+        //
+        // 仍然只下发这一把、不下发全量密钥表：那样至少把暴露面限制在**一代**密钥上，
+        // 轮换之后旧对象不会跟着一起泄。这是纵深防御的一层，不是隔离本身。
         attachment_key,
         // 转发同一份附件时，客户端拿它直接走 prepare + claim。
-        sha256: file_meta.object.sealed_sha256.clone(),
+        //
+        // 🔴 必须是**明文**摘要：prepare/claim 的判重键就是它（`converge_upload`
+        // 按 plaintext_sha256 收敛）。这里回密文摘要的话，客户端拿去 prepare 永远
+        // 命不中——而且是"稳定命不中"：转发一份已经在库里的附件，每次都会重新上传
+        // 一遍，秒传对转发这条最该生效的路径完全失效。
+        plaintext_sha256: Some(file_meta.object.plaintext_sha256),
         // 真实类型由服务端下发，客户端不该按 mime 猜——猜出来的表还会在每个
         // 端各存一份。
         file_type: file_meta.file_type.as_str().to_string(),
-    };
+    }
+}
 
-    Ok(serde_json::to_value(response)
-        .map_err(|e| RpcError::internal(format!("序列化失败: {}", e)))?)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AttachmentKeys, ServerConfig};
+    use crate::model::file_upload::{AttachmentObject, FileType};
+    use crate::service::FileMetadata;
+    use privchat_protocol::attachment_crypto as ac;
+
+    const PLAIN: &str = "11111111111111111111111111111111111111111111111111111111111111aa";
+    const SEALED: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
+
+    fn meta(key_id: u8, format_version: u8) -> FileMetadata {
+        FileMetadata {
+            file_id: 900,
+            original_filename: "photo.png".to_string(),
+            original_size: None,
+            file_type: FileType::Image,
+            mime_type: "image/png".to_string(),
+            uploader_id: 42,
+            uploader_ip: None,
+            uploaded_at: 0,
+            width: None,
+            height: None,
+            business_type: Some("message".to_string()),
+            business_id: None,
+            object: AttachmentObject {
+                object_id: 7,
+                // 🔴 两个摘要**故意不同**：相同的话，"回错了哪一个"根本测不出来。
+                plaintext_sha256: PLAIN.to_string(),
+                plaintext_size: 4096,
+                sealed_sha256: SEALED.to_string(),
+                sealed_size: 4164,
+                file_path: "images/900.png".to_string(),
+                storage_source_id: 0,
+                format_version,
+                encryption_key_id: key_id,
+            },
+        }
+    }
+
+    fn config_with(key_ids: &[u8]) -> ServerConfig {
+        ServerConfig {
+            attachment_keys: AttachmentKeys(
+                key_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| {
+                        // 每个 id 一把不同的密钥（内容不同是配置校验的硬要求）。
+                        (*id, format!("{}{}", "A".repeat(42), (b'a' + i as u8) as char))
+                    })
+                    .collect(),
+            ),
+            ..ServerConfig::default()
+        }
+    }
+
+    /// 🔴 转发靠的是**明文**摘要：客户端拿响应里的 `sha256` 直接去 prepare + claim，
+    /// 而判重键是 plaintext_sha256。这里回密文摘要的话，转发会稳定秒传不中——
+    /// 每转发一次就重传一份，且没有任何报错。
+    #[test]
+    fn the_response_carries_the_plaintext_digest_not_the_sealed_one() {
+        let url = crate::service::file_service::FileUrlResponse {
+            file_url: "https://cdn/x".to_string(),
+            thumbnail_url: None,
+            expires_at: 0,
+            file_size: 4164,
+            mime_type: "image/png".to_string(),
+            storage_source_id: 0,
+        };
+        let resp = get_url_response(meta(1, ac::FORMAT_VERSION), url, None);
+        assert_eq!(resp.plaintext_sha256.as_deref(), Some(PLAIN), "必须是明文摘要");
+        assert_ne!(resp.plaintext_sha256.as_deref(), Some(SEALED), "绝不能回密文摘要");
+    }
+
+    /// 🔴 密钥漏配 → 稳定的 `ATTACHMENT_KEY_UNAVAILABLE`，而且**发生在要 URL 之前**。
+    ///
+    /// 照常返回 URL 只会让客户端下到一堆解不开的密文，故障表现成"图片坏了"。
+    #[test]
+    fn a_missing_key_fails_closed_with_a_stable_marker() {
+        // 对象用 key_id=2，配置里只有 1。
+        let err = attachment_key_or_fail(&config_with(&[1]), &meta(2, ac::FORMAT_VERSION))
+            .expect_err("密钥缺失必须拒绝");
+        assert!(
+            err.to_string().contains("ATTACHMENT_KEY_UNAVAILABLE"),
+            "标识必须稳定可监控: {err}"
+        );
+    }
+
+    /// 🔴 这条盯的是**判据本身**：闸门必须对"当前格式版本"的对象生效。
+    ///
+    /// 它曾经写成 `format_version == 2`，而当前格式版本是 1，于是对库里每一个对象
+    /// 都不成立——fail-closed 恒不触发。把版本换成当前值之后这条才谈得上有意义，
+    /// 所以这里直接钉住 `FORMAT_VERSION`：谁再把它改成某个具体数字，这条就红。
+    #[test]
+    fn the_guard_applies_to_objects_of_the_current_format_version() {
+        assert_eq!(ac::FORMAT_VERSION, 1, "格式版本变了就要重新检查这道闸门");
+        assert!(
+            attachment_key_or_fail(&config_with(&[9]), &meta(1, ac::FORMAT_VERSION)).is_err(),
+            "当前格式版本的对象缺密钥必须拒绝"
+        );
+        // 配得上就照常放行，并且给的是这个对象那一把。
+        let key = attachment_key_or_fail(&config_with(&[1, 2]), &meta(2, ac::FORMAT_VERSION))
+            .expect("配置里有这把 key")
+            .expect("必须下发");
+        assert_eq!(key.key_id, 2, "下发的必须是这个对象记录的那一把");
+    }
 }

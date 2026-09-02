@@ -86,7 +86,7 @@ fn upload_result(
             .file_service
             .build_access_url(&meta.file_path(), meta.storage_source_id()),
         "thumbnail_url": serde_json::Value::Null,
-        "file_size": meta.file_size,
+        "file_size": meta.display_size(),
         "original_size": meta.original_size,
         "width": meta.width,
         "height": meta.height,

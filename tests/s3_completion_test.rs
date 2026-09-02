@@ -21,7 +21,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use privchat::config::FileStorageSourceConfig;
+use privchat::config::{AttachmentKeys, FileStorageSourceConfig};
+use privchat_protocol::attachment_crypto as ac;
 use privchat::http::FileServerState;
 use privchat::service::chunked_upload::{self, ChunkedSession, NewSession, S3Anchor};
 use privchat::service::file_service::FileService;
@@ -32,16 +33,91 @@ use privchat::service::numbered_parts::{
 use privchat::service::upload_token_service::UploadTokenService;
 
 const PART_SIZE: u64 = 4 << 20;
-const TOTAL_SIZE: u64 = 10 << 20; // 3 片：4 + 4 + 2 MiB
+/// 明文 9 MiB → 密文略大于 9 MiB，按 4 MiB 分片正好 3 片（4 + 4 + 约 1 MiB）。
+const PLAIN_SIZE: u64 = 9 << 20;
 const TOTAL_PARTS: u32 = 3;
-// 每个用例独立摘要：真库共享，同摘要会在 converge_upload 里互相判重。
+const CHUNK_PLAIN_SIZE: u32 = ac::DEFAULT_CHUNK_PLAIN_SIZE;
+const KEY_ID: u8 = 1;
+
+/// 🔴 **用例喂给探测的必须是真密文**，不是一个假摘要。
+///
+/// 这些用例是"S3 三条发布路径都会解密重算身份"的门禁。探测只交出一个摘要字符串
+/// 时，服务端拿什么校验都无从谈起——上一版正是这样，于是"回读摘要一致"这件事
+/// 被测得严严实实，而"这串字节是不是 token 声明的那份内容"一条都没验到。
+fn site_key() -> [u8; 32] {
+    [0x5au8; 32]
+}
+
+fn site_key_b64() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(site_key())
+}
+
+/// 密文总长度（= 会话冻结的 `total_size`）。明文定长，所以每个用例都一样。
+fn total_size() -> u64 {
+    ac::sealed_len(PLAIN_SIZE, CHUNK_PLAIN_SIZE).expect("sealed_len")
+}
+
+/// 每个用例独立的明文：真库共享，同内容会在 converge_upload 里互相判重。
+fn plain_of(file_id: u64) -> Vec<u8> {
+    let mut v = vec![0u8; PLAIN_SIZE as usize];
+    v[..8].copy_from_slice(&file_id.to_le_bytes());
+    v
+}
+
+/// 真实封装出来的密文。9 MiB 的 AES-GCM 不便宜，按 file_id 缓存，一个用例里
+/// 反复取也只封一次。
+fn blob_of(file_id: u64) -> Arc<Vec<u8>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, Arc<Vec<u8>>>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(&file_id) {
+        return hit.clone();
+    }
+    let blob = Arc::new(
+        ac::encrypt_attachment_with_chunk_size(
+            &plain_of(file_id),
+            &site_key(),
+            KEY_ID,
+            CHUNK_PLAIN_SIZE,
+        )
+        .expect("封装测试密文"),
+    );
+    cache.lock().unwrap().insert(file_id, blob.clone());
+    blob
+}
+
+/// **另一个文件**的合法密文。
+///
+/// 🔴 这就是攻击形状本身：声明 A 的身份，交上 B 的密文。两份密文各自完全合法、
+/// 密文摘要也各自自洽——只有解密重算明文摘要才拦得住。用它替代上一版的
+/// `"ff".repeat(32)`：那种假摘要只能测出"摘要不等"，测不出"身份不符"。
+fn foreign_blob_of(file_id: u64) -> Arc<Vec<u8>> {
+    blob_of(file_id.wrapping_add(777))
+}
+
+fn plaintext_sha256_of(file_id: u64) -> String {
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(plain_of(file_id)))
+}
+
+/// 每个会话独立的 final key。
+///
+/// 🔴 不能所有用例共用一个路径：`privchat_attachment_objects` 对
+/// `(storage_source_id, file_path)` 有唯一索引，共用路径会让第二个用例撞上第一个
+/// 留下的对象行，表现成莫名其妙的"秒传命中"。生产里 final_key 由预留 file_id
+/// 生成，本来就是一上传一个。
+fn final_key_of(reserved_file_id: u64) -> String {
+    format!("files/s3-payload-{reserved_file_id}.bin")
+}
+
+/// 密文摘要 = 服务端回读整个对象算出来的那个（落进对象行的 `sealed_sha256`）。
 fn sealed_of(file_id: u64) -> String {
-    format!("aa{file_id:062x}")
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(blob_of(file_id).as_slice()))
 }
 
 fn size_of(n: u32) -> u64 {
     if n == TOTAL_PARTS {
-        TOTAL_SIZE - PART_SIZE * (TOTAL_PARTS as u64 - 1)
+        total_size() - PART_SIZE * (TOTAL_PARTS as u64 - 1)
     } else {
         PART_SIZE
     }
@@ -170,7 +246,9 @@ const FINAL_ETAG: &str = "etag-final-v1";
 struct FakeProbe {
     head_queue: Mutex<VecDeque<Result<Option<FinalObjectHead>, ProbeError>>>,
     head: Mutex<Result<Option<FinalObjectHead>, ProbeError>>,
-    sha256: Mutex<Result<String, ProbeError>>,
+    /// final key 上那个对象的**真实字节**（`open_stream` 交出去的东西）。
+    /// `Err` = 建流失败（连不上 / 超时 / 缺 Content-Length），必须可重试。
+    object: Mutex<Result<Vec<u8>, ProbeError>>,
     delete_result: Mutex<Result<(), ProbeError>>,
     delete_calls: AtomicU32,
     /// 对象当前真实 ETag：与入参不符即拒绝删除（模拟 HEAD 与删除之间对象被替换）。
@@ -182,7 +260,7 @@ impl FakeProbe {
         Self {
             head_queue: Mutex::new(VecDeque::new()),
             head: Mutex::new(Ok(None)),
-            sha256: Mutex::new(Ok(String::new())),
+            object: Mutex::new(Ok(Vec::new())),
             delete_result: Mutex::new(Ok(())),
             delete_calls: AtomicU32::new(0),
             current_etag: Mutex::new(FINAL_ETAG.to_string()),
@@ -211,8 +289,14 @@ impl FakeProbe {
         }));
         *self.current_etag.lock().unwrap() = FINAL_ETAG.to_string();
     }
-    fn set_sha256(&self, sha: &str) {
-        *self.sha256.lock().unwrap() = Ok(sha.to_string());
+    /// final key 上放一份**真密文**。
+    fn set_object(&self, bytes: &[u8]) {
+        *self.object.lock().unwrap() = Ok(bytes.to_vec());
+    }
+    /// 建流失败：连不上 / 超时 / 响应缺 Content-Length。字节可能好好地躺在桶里，
+    /// 所以这一类必须可重试，而且**绝不允许**顺手删对象。
+    fn fail_open_stream(&self) {
+        *self.object.lock().unwrap() = Err(ProbeError::Backend("GET 建流失败".into()));
     }
     /// 模拟 HEAD 之后对象被替换（TOCTOU）：HEAD 快照仍带旧 ETag，
     /// delete_if_match 必须因条件不符而拒绝。
@@ -238,8 +322,13 @@ impl FinalObjectProbe for FakeProbe {
         }
         self.head.lock().unwrap().clone()
     }
-    async fn sha256_of(&self, _reference: &UploadReference) -> Result<String, ProbeError> {
-        self.sha256.lock().unwrap().clone()
+    async fn open_stream(
+        &self,
+        _reference: &UploadReference,
+    ) -> Result<(u64, std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>), ProbeError> {
+        let bytes = self.object.lock().unwrap().clone()?;
+        // 长度与字节来自同一次"响应"，口径同真实后端。
+        Ok((bytes.len() as u64, Box::pin(std::io::Cursor::new(bytes))))
     }
     async fn delete_if_match(
         &self,
@@ -317,6 +406,8 @@ async fn make_rig() -> Rig {
             file_service: Arc::new(file_service),
             upload_token_service: Arc::new(UploadTokenService::new()),
             auth: None,
+            // 🔴 校验要解密：没有这把密钥，三条发布路径全部 fail-closed。
+            attachment_keys: AttachmentKeys(vec![(KEY_ID, site_key_b64())]),
             numbered_part_backend: Some(backend.clone()),
             final_object_probe: Some(probe.clone()),
         },
@@ -343,7 +434,57 @@ async fn cleanup(pool: &PgPool, uploader: u64) -> Result<(), String> {
     if remaining != 0 {
         return Err(format!("cleanup 后仍残留 {remaining} 行 uploader_id={uploader}"));
     }
+    // 🔴 对象行没有 uploader，按 uploader 清不到；留着会让下一个用例撞上
+    // `(storage_source_id, file_path)` 唯一索引，或者以同摘要判成秒传命中。
+    sqlx::query(
+        "DELETE FROM privchat_attachment_objects o WHERE NOT EXISTS \
+         (SELECT 1 FROM privchat_file_uploads u WHERE u.object_id = o.object_id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("cleanup 清理孤儿对象行失败: {e}"))?;
     Ok(())
+}
+
+/// 预置一条**已发布**的记录（对象行 + 文件行），模拟"别人先传过"或"崩溃窗口里
+/// PG 已提交"。口径同生产：文件行只引用对象行，身份字段都在对象行上。
+async fn seed_published_object(
+    pool: &PgPool,
+    file_id: i64,
+    uploader: i64,
+    file_path: &str,
+    storage_source_id: i32,
+    plaintext_sha256: &str,
+    sealed_sha256: &str,
+) {
+    let object_id: i64 = sqlx::query_scalar(
+        "INSERT INTO privchat_attachment_objects \
+         (plaintext_sha256, plaintext_size, sealed_sha256, sealed_size, file_path, \
+          storage_source_id, format_version, encryption_key_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING object_id",
+    )
+    .bind(plaintext_sha256)
+    .bind(PLAIN_SIZE as i64)
+    .bind(sealed_sha256)
+    .bind(total_size() as i64)
+    .bind(file_path)
+    .bind(storage_source_id)
+    .bind(i16::from(ac::FORMAT_VERSION))
+    .bind(i16::from(KEY_ID))
+    .fetch_one(pool)
+    .await
+    .expect("预置对象行");
+    sqlx::query(
+        "INSERT INTO privchat_file_uploads \
+         (file_id, original_filename, file_type, mime_type, object_id, uploader_id, business_type) \
+         VALUES ($1, 'seed.bin', 'file', 'application/octet-stream', $2, $3, 'message')",
+    )
+    .bind(file_id)
+    .bind(object_id)
+    .bind(uploader)
+    .execute(pool)
+    .await
+    .expect("预置文件行");
 }
 
 /// 按 file_id 删行（预置行属于别的 uploader，`cleanup` 按 uploader 清不掉）。
@@ -380,7 +521,6 @@ async fn create_s3_session(rig: &Rig, uploader: u64, reserved_file_id: u64) -> (
         rig,
         uploader,
         reserved_file_id,
-        sealed_of(reserved_file_id),
         Some(1),
         "privchat-e2e",
     )
@@ -393,7 +533,6 @@ async fn create_s3_session_full(
     rig: &Rig,
     uploader: u64,
     reserved_file_id: u64,
-    sealed: String,
     source_id: Option<u32>,
     bucket: &str,
 ) -> (ChunkedSession, String) {
@@ -402,13 +541,17 @@ async fn create_s3_session_full(
         &root,
         NewSession {
             uploader_id: uploader,
-            total_size: TOTAL_SIZE,
-            sealed_sha256: sealed,
+            total_size: total_size(),
+            // 🔴 token 冻结的身份：complete 只核对它，不从请求体里读。
+            plaintext_sha256: plaintext_sha256_of(reserved_file_id),
+            plaintext_size: PLAIN_SIZE,
+            format_version: ac::FORMAT_VERSION,
+            encryption_key_id: KEY_ID,
+            chunk_plain_size: CHUNK_PLAIN_SIZE,
             file_type: "file".into(),
             business_type: "message".into(),
             filename: "payload.bin".into(),
             mime_type: "application/octet-stream".into(),
-            transform_version: 0,
             reserved_file_id,
             transport: "s3_multipart_v1".to_string(),
             s3: None,
@@ -424,7 +567,7 @@ async fn create_s3_session_full(
     obj.insert("part_size".into(), serde_json::json!(PART_SIZE));
     obj.insert("total_parts".into(), serde_json::json!(TOTAL_PARTS));
     obj.insert("bucket".into(), serde_json::json!(bucket));
-    obj.insert("final_key".into(), serde_json::json!("files/s3-payload.bin"));
+    obj.insert("final_key".into(), serde_json::json!(final_key_of(reserved_file_id)));
     obj.insert("provider_upload_id".into(), serde_json::json!("mpu-abc-123"));
     // 🔴 第二十九轮：模拟 part-url 签发时持久化的逐片摘要声明（与 part(n) 的
     // checksum 同源）——Complete 体的逐片 checksum 取自这里而不是 ListParts 回读。
@@ -567,22 +710,22 @@ async fn s3_status_no_such_upload_head_recovery() {
     rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
 
     // HEAD 命中 + 归属 + 长度一致 → received=[0,total)、missing=[]、completed=false。
-    rig.probe.set_head(Some(&upload_id), TOTAL_SIZE);
+    rig.probe.set_head(Some(&upload_id), total_size());
     let (status, json) = call(&rig, get_status(&token)).await;
     assert_eq!(status, StatusCode::OK, "{json}");
     let data = &json["data"];
     assert_eq!(data["completed"], false, "status 不建行不写墓碑，completed 必须 false");
     assert_eq!(data["missing"].as_array().unwrap().len(), 0);
     assert_eq!(data["received"][0]["offset"], 0);
-    assert_eq!(data["received"][0]["length"], TOTAL_SIZE);
+    assert_eq!(data["received"][0]["length"], total_size());
 
     // 长度不符 → 可重试 5xx，绝不把不完整对象报成完整。
-    rig.probe.set_head(Some(&upload_id), TOTAL_SIZE - 1);
+    rig.probe.set_head(Some(&upload_id), total_size() - 1);
     let (status, _) = call(&rig, get_status(&token)).await;
     assert!(status.is_server_error(), "长度不符必须回可重试 5xx");
 
     // metadata 不属于本 session → 500 保留对象。
-    rig.probe.set_head(Some("another-session"), TOTAL_SIZE);
+    rig.probe.set_head(Some("another-session"), total_size());
     let (status, _) = call(&rig, get_status(&token)).await;
     assert!(status.is_server_error());
 
@@ -610,23 +753,28 @@ async fn happy_path_core(rig: &Rig) {
     const FILE_ID: u64 = 9_974_101_01;
     let (_, token) = create_s3_session(rig, UPLOADER, FILE_ID).await;
     // 回读摘要 = 会话声明的 sealed 才算身份一致（每个用例独立摘要）。
-    rig.probe.set_sha256(&sealed_of(FILE_ID));
+    rig.probe.set_object(blob_of(FILE_ID).as_slice());
 
     let (status, json) = call(rig, post_complete(&token)).await;
     assert_eq!(status, StatusCode::OK, "全链路必须成功：{json}");
     assert_eq!(json["data"]["file_id"], FILE_ID);
 
-    // PG 行已建：hash = 回读摘要、file_path = manifest 的 final_key。
-    let row: Option<(String, Option<String>, i32)> = sqlx::query_as(
-        "SELECT file_path, file_hash, storage_source_id FROM privchat_file_uploads WHERE file_id = $1",
+    // PG 行已建：身份字段都在对象行上——sealed 摘要 = 服务端回读算出来的那个，
+    // 明文摘要 = token 冻结的那个（解密重算核对过），file_path = manifest 的 final_key。
+    let row: Option<(String, String, String, i32)> = sqlx::query_as(
+        "SELECT o.file_path, o.sealed_sha256, o.plaintext_sha256, o.storage_source_id \
+         FROM privchat_file_uploads u \
+         JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
+         WHERE u.file_id = $1",
     )
     .bind(FILE_ID as i64)
     .fetch_optional(&*rig.pool)
     .await
     .expect("query row");
-    let (path, hash, source_id) = row.expect("PG 行必须存在");
-    assert_eq!(path, "files/s3-payload.bin");
-    assert_eq!(hash.as_deref(), Some(sealed_of(FILE_ID).as_str()));
+    let (path, hash, plaintext_hash, source_id) = row.expect("PG 行必须存在");
+    assert_eq!(path, final_key_of(FILE_ID));
+    assert_eq!(hash, sealed_of(FILE_ID));
+    assert_eq!(plaintext_hash, plaintext_sha256_of(FILE_ID), "落库的明文身份必须是校验过的那个");
     // 🔴 默认源切换门禁（第十五轮评审 P0）：默认存储源是 id=0（local），
     // 行必须指向 manifest 冻结的 id=1，而不是当前默认。
     assert_eq!(source_id, 1, "建行必须指向冻结的存储源，而不是当前默认源");
@@ -690,12 +838,12 @@ async fn s3_complete_works_when_list_parts_returns_no_checksums() {
             })
             .collect();
         rig.backend.set_list(cos_parts);
-        rig.probe.set_sha256(&sealed_of(FILE_ID));
+        rig.probe.set_object(blob_of(FILE_ID).as_slice());
 
         // status：几何证据照样报完整（判据 12/26 口径不变）。
         let (status, json) = call(&rig, get_status(&token)).await;
         assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json["data"]["received_bytes"], TOTAL_SIZE);
+        assert_eq!(json["data"]["received_bytes"], total_size());
         assert_eq!(json["data"]["missing"].as_array().unwrap().len(), 0);
 
         // complete：manifest 声明组装 → 回读一致 → 建行。
@@ -747,8 +895,8 @@ async fn head_hit_matching_core(rig: &Rig) {
     const UPLOADER: u64 = 9_974_102;
     const FILE_ID: u64 = 9_974_102_01;
     let (_, token) = create_s3_session(rig, UPLOADER, FILE_ID).await;
-    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
-    rig.probe.set_sha256(&sealed_of(FILE_ID));
+    rig.probe.set_head(Some(upload_id_of(&token)), total_size());
+    rig.probe.set_object(blob_of(FILE_ID).as_slice());
 
     let (status, json) = call(rig, post_complete(&token)).await;
     assert_eq!(status, StatusCode::OK, "{json}");
@@ -763,7 +911,7 @@ async fn head_hit_matching_core(rig: &Rig) {
 async fn s3_complete_head_hit_foreign_keeps_object_with_500() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_904).await;
-    rig.probe.set_head(Some("another-session"), TOTAL_SIZE);
+    rig.probe.set_head(Some("another-session"), total_size());
 
     let (status, json) = call(&rig, post_complete(&token)).await;
     assert!(status.is_server_error(), "身份不明必须 500：{json}");
@@ -778,8 +926,8 @@ async fn s3_complete_head_hit_foreign_keeps_object_with_500() {
 async fn s3_complete_head_hit_sha_mismatch_deletes_then_restarts_or_retries() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_905).await;
-    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
-    rig.probe.set_sha256(&"ff".repeat(32));
+    rig.probe.set_head(Some(upload_id_of(&token)), total_size());
+    rig.probe.set_object(foreign_blob_of(9_974_905).as_slice());
 
     // 删除成功 → 20618 RestartUpload。
     let (status, json) = call(&rig, post_complete(&token)).await;
@@ -827,8 +975,8 @@ async fn precondition_failed_core(rig: &Rig) {
     rig.backend.set_complete_result(NumberedPartError::PreconditionFailed);
     // 第 3 步 HEAD 为空，412 恢复时的 HEAD 才命中本 session 对象。
     rig.probe.queue_head_none();
-    rig.probe.queue_head(Some(upload_id_of(&token)), TOTAL_SIZE);
-    rig.probe.set_sha256(&sealed_of(FILE_ID));
+    rig.probe.queue_head(Some(upload_id_of(&token)), total_size());
+    rig.probe.set_object(blob_of(FILE_ID).as_slice());
 
     let (status, json) = call(rig, post_complete(&token)).await;
     assert_eq!(status, StatusCode::OK, "412 + 身份一致必须复用建行：{json}");
@@ -855,7 +1003,7 @@ async fn precondition_failed_core(rig: &Rig) {
     let (_, token2) = create_s3_session(&rig2, 9_974_200, 9_974_907).await;
     rig2.backend.set_complete_result(NumberedPartError::PreconditionFailed);
     rig2.probe.queue_head_none();
-    rig2.probe.queue_head(Some("another-session"), TOTAL_SIZE);
+    rig2.probe.queue_head(Some("another-session"), total_size());
     let (status, json) = call(&rig2, post_complete(&token2)).await;
     assert!(status.is_server_error(), "{json}");
     assert_eq!(rig2.probe.delete_calls(), 0);
@@ -869,9 +1017,9 @@ async fn precondition_failed_core(rig: &Rig) {
 async fn s3_complete_readback_mismatch_deletes_then_restarts_or_retries() {
     let rig = make_rig().await;
     let (session, token) = create_s3_session(&rig, 9_974_200, 9_974_908).await;
-    rig.probe.set_sha256(&"ee".repeat(32));
+    rig.probe.set_object(foreign_blob_of(9_974_908).as_slice());
     rig.probe.queue_head_none(); // 第 3 步 HEAD 空，放行到 Complete + 回读
-    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE); // 删除前 HEAD 命中本会话对象
+    rig.probe.set_head(Some(upload_id_of(&token)), total_size()); // 删除前 HEAD 命中本会话对象
 
     let (status, json) = call(&rig, post_complete(&token)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -908,33 +1056,32 @@ async fn dedup_hit_core(rig: &Rig) {
     const FILE_ID: u64 = 9_974_104_01;
     const EXISTING_FILE_ID: i64 = 9_974_104_02;
     // 预置一条同摘要的既有行（别人先传的同一份字节）。
-    sqlx::query(
-        "INSERT INTO privchat_file_uploads (file_id, original_filename, file_size, file_type, \
-         mime_type, file_path, storage_source_id, uploader_id, uploaded_at, file_hash, \
-         encryption_version) \
-         VALUES ($1, 'old.bin', $2, 'file', 'application/octet-stream', 'files/old.bin', 0, $3, \
-         extract(epoch from now())::bigint * 1000, $4, 0)",
+    // 🔴 判重键是**明文**摘要：同一份内容被另一个用户先传过。
+    seed_published_object(
+        &rig.pool,
+        EXISTING_FILE_ID,
+        9_999_999,
+        "files/old.bin",
+        0,
+        &plaintext_sha256_of(FILE_ID),
+        &sealed_of(FILE_ID),
     )
-    .bind(EXISTING_FILE_ID)
-    .bind(TOTAL_SIZE as i64)
-    .bind(9_999_999i64)
-    .bind(sealed_of(FILE_ID))
-    .execute(&*rig.pool)
-    .await
-    .expect("预置既有行");
+    .await;
 
     let (_, token) = create_s3_session(rig, UPLOADER, FILE_ID).await;
     // 第 3 步 HEAD 为空；秒传判重后删冗余对象前的归属核对 HEAD 命中。
     rig.probe.queue_head_none();
-    rig.probe.queue_head(Some(upload_id_of(&token)), TOTAL_SIZE);
-    rig.probe.set_sha256(&sealed_of(FILE_ID));
+    rig.probe.queue_head(Some(upload_id_of(&token)), total_size());
+    rig.probe.set_object(blob_of(FILE_ID).as_slice());
     let (status, json) = call(rig, post_complete(&token)).await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json["data"]["file_id"], FILE_ID);
     assert_eq!(rig.probe.delete_calls(), 1, "冗余 final 对象必须被删（归属已证明）");
     // 新行指向既有物理路径（秒传复用），不是 final_key。
-    let path: String =
-        sqlx::query_scalar("SELECT file_path FROM privchat_file_uploads WHERE file_id = $1")
+    let path: String = sqlx::query_scalar(
+        "SELECT o.file_path FROM privchat_file_uploads u \
+         JOIN privchat_attachment_objects o ON o.object_id = u.object_id WHERE u.file_id = $1",
+    )
             .bind(FILE_ID as i64)
             .fetch_one(&*rig.pool)
             .await
@@ -1025,7 +1172,7 @@ async fn sweep_s3_retains_dir_for_foreign_object() {
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_914).await;
     let dir = expire_session(&rig, &token);
     rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
-    rig.probe.set_head(Some("another-session"), TOTAL_SIZE);
+    rig.probe.set_head(Some("another-session"), total_size());
 
     assert_eq!(sweep_s3(&rig).await, 0);
     assert!(dir.exists(), "外属对象：目录保留作人工排查锚点");
@@ -1045,21 +1192,18 @@ async fn sweep_s3_keeps_object_when_pg_row_matches_identity() {
         let dir = expire_session(&rig, &token);
     rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
         // 模拟崩溃窗口：PG 行已提交、墓碑没写。
-        sqlx::query(
-            "INSERT INTO privchat_file_uploads (file_id, original_filename, file_size, file_type, \
-             mime_type, file_path, storage_source_id, uploader_id, uploaded_at, file_hash, \
-             encryption_version) \
-             VALUES ($1, 'payload.bin', $2, 'file', 'application/octet-stream', \
-             'files/s3-payload.bin', 1, $3, extract(epoch from now())::bigint * 1000, $4, 0)",
+        // 崩溃窗口：PG 行已提交、墓碑没写。行指向的正是这次会话的 final key。
+        seed_published_object(
+            &rig.pool,
+            FILE_ID as i64,
+            UPLOADER as i64,
+            &final_key_of(FILE_ID),
+            1,
+            &plaintext_sha256_of(FILE_ID),
+            &sealed_of(FILE_ID),
         )
-        .bind(FILE_ID as i64)
-        .bind(TOTAL_SIZE as i64)
-        .bind(UPLOADER as i64)
-        .bind(sealed_of(FILE_ID))
-        .execute(&*rig.pool)
-        .await
-        .expect("预置崩溃窗口行");
-        rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
+        .await;
+        rig.probe.set_head(Some(upload_id_of(&token)), total_size());
 
         assert_eq!(sweep_s3(&rig).await, 1);
         assert!(!dir.exists(), "PG 行已是正式数据：目录可删");
@@ -1082,7 +1226,7 @@ async fn sweep_s3_deletes_orphan_object_via_conditional_delete() {
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_915).await;
     let dir = expire_session(&rig, &token);
     rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
-    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
+    rig.probe.set_head(Some(upload_id_of(&token)), total_size());
 
     assert_eq!(sweep_s3(&rig).await, 1);
     assert!(!dir.exists());
@@ -1096,7 +1240,7 @@ async fn sweep_s3_retains_dir_when_conditional_delete_rejected() {
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_916).await;
     let dir = expire_session(&rig, &token);
     rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
-    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
+    rig.probe.set_head(Some(upload_id_of(&token)), total_size());
     rig.probe.mutate_etag("etag-replaced"); // HEAD 之后对象被替换
 
     assert_eq!(sweep_s3(&rig).await, 0);
@@ -1163,7 +1307,7 @@ async fn sweep_s3_retains_dir_when_parts_never_clear() {
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_924).await;
     let dir = expire_session(&rig, &token);
     rig.backend.set_list(all_parts()); // 确认后永远残留
-    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
+    rig.probe.set_head(Some(upload_id_of(&token)), total_size());
 
     assert_eq!(sweep_s3(&rig).await, 0);
     assert!(dir.exists(), "残留不清：目录保留等下一轮");
@@ -1228,7 +1372,7 @@ async fn sweep_s3_keeps_corrupt_manifest_dir_while_final_object_exists() {
     )
     .expect("写锚点");
     rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
-    rig.probe.set_head(Some(&upload_id), TOTAL_SIZE);
+    rig.probe.set_head(Some(&upload_id), total_size());
 
     assert_eq!(sweep_s3(&rig).await, 0);
     assert!(dir.exists(), "对象仍在：目录保留作人工排查锚点");
@@ -1302,12 +1446,16 @@ async fn sweep_s3_skips_live_and_proxy_sessions() {
         NewSession {
             uploader_id: 9_974_200,
             total_size: 16,
-            sealed_sha256: "0".repeat(64),
+            // 扫描器用例不走校验，冻结身份填成形即可。
+            plaintext_sha256: "0".repeat(64),
+            plaintext_size: 16,
+            format_version: ac::FORMAT_VERSION,
+            encryption_key_id: KEY_ID,
+            chunk_plain_size: CHUNK_PLAIN_SIZE,
             file_type: "file".into(),
             business_type: "message".into(),
             filename: "p.bin".into(),
             mime_type: "application/octet-stream".into(),
-            transform_version: 0,
             reserved_file_id: 9_974_919,
             transport: "proxy_offset_v1".into(),
             s3: None,
@@ -1368,13 +1516,12 @@ async fn s3_complete_rejects_missing_frozen_storage_source() {
             &rig,
             UPLOADER,
             FILE_ID,
-            sealed_of(FILE_ID),
             None,
             "privchat-e2e",
         )
         .await;
         // 回读放行，必须死在冻结值校验上。
-        rig.probe.set_sha256(&sealed_of(FILE_ID));
+        rig.probe.set_object(blob_of(FILE_ID).as_slice());
         let (status, _) = call(&rig, post_complete(&token)).await;
         assert!(status.is_server_error(), "缺冻结存储源必须拒绝建行");
         let count: i64 =
@@ -1401,12 +1548,11 @@ async fn s3_complete_rejects_bucket_drift_against_frozen_source() {
             &rig,
             UPLOADER,
             FILE_ID,
-            sealed_of(FILE_ID),
             Some(1),
             "another-bucket",
         )
         .await;
-        rig.probe.set_sha256(&sealed_of(FILE_ID));
+        rig.probe.set_object(blob_of(FILE_ID).as_slice());
         let (status, _) = call(&rig, post_complete(&token)).await;
         assert!(status.is_server_error(), "bucket 不符必须拒绝建行");
         let count: i64 =
@@ -1428,8 +1574,8 @@ async fn s3_complete_rejects_bucket_drift_against_frozen_source() {
 async fn s3_complete_branch3_rejects_delete_when_etag_changed() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_922).await;
-    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE);
-    rig.probe.set_sha256(&"ff".repeat(32)); // 摘要不符 → 分支三进删除
+    rig.probe.set_head(Some(upload_id_of(&token)), total_size());
+    rig.probe.set_object(foreign_blob_of(9_974_922).as_slice()); // 摘要不符 → 分支三进删除
     rig.probe.mutate_etag("etag-replaced");
 
     let (status, _) = call(&rig, post_complete(&token)).await;
@@ -1451,11 +1597,218 @@ async fn s3_complete_readback_mismatch_rejects_delete_when_etag_changed() {
     let rig = make_rig().await;
     let (_, token) = create_s3_session(&rig, 9_974_200, 9_974_923).await;
     rig.probe.queue_head_none(); // 第 3 步 HEAD 空，放行到 Complete
-    rig.probe.set_head(Some(upload_id_of(&token)), TOTAL_SIZE); // 第 6 步删除前 HEAD 命中
-    rig.probe.set_sha256(&"ee".repeat(32));
+    rig.probe.set_head(Some(upload_id_of(&token)), total_size()); // 第 6 步删除前 HEAD 命中
+    rig.probe.set_object(foreign_blob_of(9_974_923).as_slice());
     rig.probe.mutate_etag("etag-replaced");
 
     let (status, _) = call(&rig, post_complete(&token)).await;
     assert!(status.is_server_error(), "删除被拒必须回可重试 5xx，不得 20618");
     assert_eq!(rig.probe.delete_calls(), 0, "ETag 不符绝不删");
+}
+
+// ================= 首传校验门禁（第三十一轮）：三条发布路径都必须解密重算身份 =================
+//
+// 🔴 这一组是「S3 三条发布路径真的在校验」的唯一证据。
+//
+// 它们喂的不是"摘要对不上的字节"，而是**另一个文件的完全合法的密文**：密文自洽、
+// GCM tag 全部验得过、长度也一样。密文摘要那一层拦不住它——上一版的探测只交出一个
+// 摘要字符串，于是这类攻击在测试里根本无法表达，"回读一致"测得再严也没验到身份。
+//
+// 漏掉任何一条路径，那条就是完整的绕过入口：任何登录用户都能用「文件 A 的摘要 +
+// 文件 B 的密文」把 A 的秒传结果污染成 B。
+
+/// 正常 complete：声明 A 的身份、桶里躺着 B 的合法密文 → 拒绝 + 删对象 + 不建行。
+#[tokio::test]
+async fn s3_complete_rejects_a_valid_ciphertext_that_is_not_the_declared_file() {
+    const UPLOADER: u64 = 9_974_110;
+    let rig = make_rig().await;
+    cleanup(&rig.pool, UPLOADER).await.expect("用例前清库");
+    run_with_cleanup(&rig.pool, UPLOADER, async {
+        const FILE_ID: u64 = 9_974_110_01;
+        let (session, token) = create_s3_session(&rig, UPLOADER, FILE_ID).await;
+        rig.probe.queue_head_none(); // 第 3 步 HEAD 空，放行到 Complete + 回读
+        rig.probe.set_head(Some(upload_id_of(&token)), total_size()); // 删除前 HEAD 命中本会话对象
+        // 合法密文，但它是**另一个文件**的。
+        rig.probe.set_object(foreign_blob_of(FILE_ID).as_slice());
+
+        let (status, json) = call(&rig, post_complete(&token)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "身份不符必须拒绝: {json}");
+        assert_eq!(json["code"], 20618, "拒绝后要从头上传，不能留在原会话死循环");
+        assert_eq!(rig.probe.delete_calls(), 1, "归属已证明的坏对象必须删掉");
+        assert_eq!(file_row_count(&rig, FILE_ID).await, 0, "🔴 未通过校验的字节绝不建行");
+        assert!(
+            session.completed_file_id().unwrap().is_none(),
+            "没建行就不能写墓碑，否则重试会拿到一个不存在的 file_id"
+        );
+    })
+    .await;
+}
+
+/// §8.5 第 3 步分支二（HEAD 命中本会话对象 → 复用建行）同样要校验：
+/// 归属只回答"谁写的"，回答不了"写的是不是声明的那份"。
+#[tokio::test]
+async fn s3_complete_existing_object_recovery_still_verifies_identity() {
+    const UPLOADER: u64 = 9_974_111;
+    let rig = make_rig().await;
+    cleanup(&rig.pool, UPLOADER).await.expect("用例前清库");
+    run_with_cleanup(&rig.pool, UPLOADER, async {
+        const FILE_ID: u64 = 9_974_111_01;
+        let (_, token) = create_s3_session(&rig, UPLOADER, FILE_ID).await;
+        // 第 3 步 HEAD 就命中本会话对象 → 走恢复分支，不经过 Complete。
+        rig.probe.set_head(Some(upload_id_of(&token)), total_size());
+        rig.probe.set_object(foreign_blob_of(FILE_ID).as_slice());
+
+        let (status, json) = call(&rig, post_complete(&token)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+        assert_eq!(json["code"], 20618);
+        assert_eq!(rig.backend.complete_attempts(), 0, "恢复分支不发 Complete");
+        assert_eq!(rig.probe.delete_calls(), 1, "归属已证明 → 删掉坏对象");
+        assert_eq!(file_row_count(&rig, FILE_ID).await, 0, "🔴 未通过校验的字节绝不建行");
+    })
+    .await;
+}
+
+/// §8.5 第 5 步 412 恢复：身份不符 → 报冲突人工排查，**绝不删 final key**
+/// （那上面是此前已存在的对象，不归本会话处置）。
+#[tokio::test]
+async fn s3_complete_412_recovery_rejects_foreign_identity_without_deleting() {
+    const UPLOADER: u64 = 9_974_112;
+    let rig = make_rig().await;
+    cleanup(&rig.pool, UPLOADER).await.expect("用例前清库");
+    run_with_cleanup(&rig.pool, UPLOADER, async {
+        const FILE_ID: u64 = 9_974_112_01;
+        let (_, token) = create_s3_session(&rig, UPLOADER, FILE_ID).await;
+        rig.backend.set_complete_result(NumberedPartError::PreconditionFailed);
+        rig.probe.queue_head_none(); // 第 3 步 HEAD 空
+        rig.probe.queue_head(Some(upload_id_of(&token)), total_size()); // 412 恢复时命中
+        rig.probe.set_object(foreign_blob_of(FILE_ID).as_slice());
+
+        let (status, _) = call(&rig, post_complete(&token)).await;
+        assert!(status.is_server_error(), "412 + 身份不符 = 冲突，等人工排查");
+        assert_eq!(rig.probe.delete_calls(), 0, "🔴 412 路径绝不删 final key");
+        assert_eq!(rig.backend.abort_calls(), 1, "拒绝前必须 abort 当前 MPU");
+        assert_eq!(file_row_count(&rig, FILE_ID).await, 0, "🔴 未通过校验的字节绝不建行");
+    })
+    .await;
+}
+
+/// 回读**建流失败**（连不上 / 超时 / 缺 Content-Length）：字节可能好好地躺在桶里。
+/// 必须回可重试错误、保留会话、**绝不删对象**——把一次抖动判成内容错误，等于让
+/// 一份完好的上传永久作废。
+#[tokio::test]
+async fn s3_complete_open_stream_failure_is_retryable_and_deletes_nothing() {
+    const UPLOADER: u64 = 9_974_113;
+    let rig = make_rig().await;
+    cleanup(&rig.pool, UPLOADER).await.expect("用例前清库");
+    run_with_cleanup(&rig.pool, UPLOADER, async {
+        const FILE_ID: u64 = 9_974_113_01;
+        let (_, token) = create_s3_session(&rig, UPLOADER, FILE_ID).await;
+        rig.probe.queue_head_none();
+        rig.probe.set_head(Some(upload_id_of(&token)), total_size());
+        rig.probe.fail_open_stream();
+
+        let (status, json) = call(&rig, post_complete(&token)).await;
+        // 🔴 锁死**具体**的可重试形态，不是"某种 5xx"。
+        //
+        // 只断言 is_server_error 的话，实现从 ServiceUnavailable 退回 Internal 照样绿——
+        // 而 SDK 的可重试白名单并不覆盖所有 Internal，那正是"一次抖动把一份好好躺在
+        // 桶里的对象永久废掉"的复发路径。
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "存储读不动必须是可重试的 503，不是笼统的 5xx: {json}"
+        );
+        assert_eq!(json["code"], 3, "错误码必须是 ServiceUnavailable(3): {json}");
+        assert_ne!(json["code"], 20618, "🔴 不得把一次读取失败判成「从头重传」");
+        assert_eq!(rig.probe.delete_calls(), 0, "🔴 读不动就删对象 = 把抖动变成数据丢失");
+        assert_eq!(file_row_count(&rig, FILE_ID).await, 0);
+        assert!(
+            ChunkedSession::open(
+                &rig.state.file_service.upload_session_root().unwrap(),
+                &token
+            )
+            .is_ok(),
+            "会话必须保留等重试"
+        );
+
+        // 存储恢复之后，同一张 token 重试必须能走完（这才叫"可重试"）。
+        rig.probe.set_object(blob_of(FILE_ID).as_slice());
+        rig.probe.queue_head_none();
+        let (status, json) = call(&rig, post_complete(&token)).await;
+        assert_eq!(status, StatusCode::OK, "存储恢复后重试必须成功: {json}");
+        assert_eq!(json["data"]["file_id"], FILE_ID);
+    })
+    .await;
+}
+
+/// 🔴 校验不符、但 final key 上的对象**已经不是本会话的**（校验与 HEAD 之间被替换）：
+/// 一律不删。
+///
+/// ETag 条件删除只保证「删的是我 HEAD 到的那一个」，保证不了「那一个是我的」。
+/// 少了归属核对，一个被替换进来的、别人的对象会被条件删除干净利落地删掉。
+#[tokio::test]
+async fn s3_complete_readback_mismatch_never_deletes_a_foreign_object() {
+    const UPLOADER: u64 = 9_974_114;
+    let rig = make_rig().await;
+    cleanup(&rig.pool, UPLOADER).await.expect("用例前清库");
+    run_with_cleanup(&rig.pool, UPLOADER, async {
+        const FILE_ID: u64 = 9_974_114_01;
+        let (_, token) = create_s3_session(&rig, UPLOADER, FILE_ID).await;
+        rig.probe.queue_head_none(); // 第 3 步 HEAD 空，放行到 Complete + 回读
+        rig.probe.set_object(foreign_blob_of(FILE_ID).as_slice()); // 校验必然不过
+        // 删除前的 HEAD：对象已被替换成别人的（metadata 是另一个会话）。
+        rig.probe.set_head(Some("another-session"), total_size());
+
+        let (status, json) = call(&rig, post_complete(&token)).await;
+        assert!(status.is_server_error(), "归属证明不了 → 报冲突等人工排查: {json}");
+        assert_ne!(json["code"], 20618, "重申请仍是同一 final_key，回 20618 会死循环");
+        assert_eq!(rig.probe.delete_calls(), 0, "🔴 绝不删不属于本会话的对象");
+        assert_eq!(rig.backend.abort_calls(), 1, "拒绝前必须 abort 当前 MPU");
+        assert_eq!(file_row_count(&rig, FILE_ID).await, 0);
+    })
+    .await;
+}
+
+/// 🔴 秒传命中之后崩在墓碑之前：PG 行身份全对，但它引用的是**别人那份对象**。
+///
+/// 这条是路径比较的反例门禁。uploader、明文摘要、明文大小三项完全一致——只有
+/// `file_path` 不同（行指向先传者的路径，而 final_key 上躺着本会话刚发布的那份
+/// 冗余对象）。少了坐标比较，扫描器会把这个冗余对象当成"正在被引用"而留下，
+/// 于是每一次「秒传命中 + 崩在墓碑之前」都在桶里多一个永远没人引用的孤儿；
+/// 而且现有那 42 条用例一条都不会因此变红。
+#[tokio::test]
+async fn sweep_s3_deletes_the_redundant_object_when_the_row_points_elsewhere() {
+    const UPLOADER: u64 = 9_974_115;
+    const FILE_ID: u64 = 9_974_115_01;
+    let rig = make_rig().await;
+    cleanup(&rig.pool, UPLOADER).await.expect("用例前清库");
+    run_with_cleanup(&rig.pool, UPLOADER, async {
+        let (_, token) = create_s3_session(&rig, UPLOADER, FILE_ID).await;
+        let dir = expire_session(&rig, &token);
+        rig.backend.set_list_err(NumberedPartError::NoSuchUpload);
+        // 行是本人的、身份也全对，但物理坐标是**另一条路径**（秒传复用了先传者的对象）。
+        seed_published_object(
+            &rig.pool,
+            FILE_ID as i64,
+            UPLOADER as i64,
+            "files/somebody-elses-object.bin",
+            1,
+            &plaintext_sha256_of(FILE_ID),
+            &sealed_of(FILE_ID),
+        )
+        .await;
+        // final_key 上的对象归属本会话（是这次 MPU 刚发布的那份冗余对象）。
+        rig.probe.set_head(Some(upload_id_of(&token)), total_size());
+
+        assert_eq!(sweep_s3(&rig).await, 1);
+        assert_eq!(
+            rig.probe.delete_calls(),
+            1,
+            "🔴 final_key 上这份没人引用，必须条件删除，不能当成'正在被引用'留下"
+        );
+        assert!(!dir.exists(), "对象处置完毕，目录可删");
+        // PG 行本身完全正当，不该被牵连。
+        assert_eq!(file_row_count(&rig, FILE_ID).await, 1, "引用行必须保留");
+    })
+    .await;
 }

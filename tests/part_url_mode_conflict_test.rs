@@ -59,6 +59,8 @@ async fn rig() -> Rig {
             auth: None,
             numbered_part_backend: None,
             final_object_probe: None,
+            // 装配没配密钥 = 校验不可能成立，需要校验的发布路径一律拒绝（fail-closed）。
+            attachment_keys: Default::default(),
         },
         _dir: dir,
     }
@@ -71,12 +73,16 @@ async fn create_proxy_session(rig: &Rig) -> String {
         NewSession {
             uploader_id: UPLOADER,
             total_size: 4 << 20,
-            sealed_sha256: "ab".repeat(32),
+            // 冻结身份（S3 会话在本用例里不走校验，成形即可）。
+            plaintext_sha256: "0".repeat(64),
+            plaintext_size: 16,
+            format_version: privchat_protocol::attachment_crypto::FORMAT_VERSION,
+            encryption_key_id: 1,
+            chunk_plain_size: privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE,
             file_type: "file".into(),
             business_type: "message".into(),
             filename: "payload.bin".into(),
             mime_type: "application/octet-stream".into(),
-            transform_version: 0,
             reserved_file_id: 9_973_900,
             transport: "proxy_offset_v1".to_string(),
             s3: None,
