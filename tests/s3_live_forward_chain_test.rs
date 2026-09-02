@@ -54,6 +54,22 @@ fn live_env() -> Option<LiveEnv> {
         get("PRIVCHAT_S3_LIVE_SECRET_KEY"),
         get("PRIVCHAT_S3_LIVE_BUCKET"),
     ) else {
+        // 🔴 缺凭据时跳过，但**跳过不等于通过**。以前这里只 eprintln 一句就
+        // return，而 eprintln 默认被 cargo 吞掉——于是一套从没连过对象存储的
+        // 用例，在报告里和真跑过的一模一样绿。发布门禁要的是"执行过"，不是
+        // "定义过"。
+        //
+        // 所以给出一个显式开关：PRIVCHAT_S3_LIVE_REQUIRED=1 时跳过即失败。
+        // 发布门禁把它打开，本机开发不设就照常跳过。
+        let required = std::env::var("PRIVCHAT_S3_LIVE_REQUIRED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        assert!(
+            !required,
+            "PRIVCHAT_S3_LIVE_REQUIRED=1 但未配置 PRIVCHAT_S3_LIVE_ENDPOINT / \
+             _ACCESS_KEY / _SECRET_KEY / _BUCKET：正向链路验收没有真正执行，\
+             不能记为通过"
+        );
         eprintln!("跳过：未配置 PRIVCHAT_S3_LIVE_* 环境变量（正向链路验收未启用）");
         return None;
     };
