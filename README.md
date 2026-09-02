@@ -43,6 +43,27 @@ PrivChat aims to build a **secure, high-performance, feature-complete** modern i
 **Philosophy**:
 > Message immutability matters more than edit convenience. Prefer revoke-and-resend over giving attackers a way to tamper.
 
+## 💡 What you actually get today
+
+*Separate from the Vision above, which describes where this is going. Everything below
+is in the code now and can be checked by reading it.*
+
+| | Why it matters |
+|---|---|
+| **Single static binary** | Rust, no JVM or runtime to install. Migrations are compiled into the binary — `privchat migrate` cannot drift from the build. |
+| **Messages cannot be edited** | Not a missing feature, a deliberate one. Telegram's edit function was abused to swap USDT addresses after the fact; an immutable history removes that class of fraud outright. Use revoke-and-resend. |
+| **Attachments encrypted at rest** | Per-file content key, sealed objects. `file/get_url` releases the key only to members authorized for that channel, and every release is authorized against the message the file is bound to. |
+| **Resumable chunked upload with instant re-send** | Per-part digests and geometry-based accounting. Re-sending a file the server already has transfers zero bytes, claimed by content digest. |
+| **Telegram-style `pts` incremental sync** | Per-channel sequence numbers, gap detection, commit log. Clients resume from where they stopped instead of re-pulling history. |
+| **Bring your own storage** | Local FS plus anything speaking the S3 API — AWS S3, Aliyun OSS, Tencent COS, MinIO, Garage — through OpenDAL, configured per storage source. Not locked to one vendor. |
+| **9 push vendors out of the box** | APNs, FCM, HMS, Xiaomi, Oppo, Vivo, Lenovo, ZTE, Meizu — the ones that actually matter for Android in China, where FCM does not reach. |
+| **Three first-party SDKs** | Rust (core), TypeScript, Kotlin Multiplatform — sharing one protocol definition, so the wire format cannot drift per platform. |
+| **98 RPC routes** | Account, message, group, friend, channel, sync, file, device, presence, QR, sticker, blacklist, bot. |
+
+**Where it is not there yet**: dashboards and alerting, distributed tracing export,
+long-run soak testing, backup/DR runbooks, message-body E2EE, voice/video. See
+[Roadmap](#-roadmap) — the gap is operational, not functional.
+
 ## ✨ Features
 
 ### Core
@@ -464,7 +485,7 @@ kept conservative and reflects the current server code rather than the older
 | QR login      | ✅  | ✅         | Stable | unauth scene creation, scan/confirm/reject state machine, push pipeline |
 | Bot follow    | ✅  | ✅         | Stable | account/bot/follow and unfollow, relation persistence, server-event emit |
 | Channel transfer | ✅ | ✅      | Stable | wire-layer transfer relay via server-event dispatch |
-| Push          | ✅  | ✅         | Mostly done | planner/worker with APNS, FCM, HMS, Xiaomi, Oppo, Vivo, Honor, Lenovo, ZTE, Meizu |
+| Push          | ✅  | ✅         | Mostly done | planner/worker with APNs, FCM, HMS, Xiaomi, Oppo, Vivo, Lenovo, ZTE, Meizu (9 providers under `src/push/provider/`) |
 
 **Sync**:
 - Active routes: `sync/submit`, `sync/get_difference`, `sync/get_channel_pts`,
