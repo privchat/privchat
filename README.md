@@ -1,5 +1,7 @@
 # PrivChat
 
+[English](README.md) | [简体中文](README.zh-Hans.md)
+
 A high-performance, secure instant messaging server built with Rust.
 
 ## 🎯 Vision
@@ -547,6 +549,10 @@ kept conservative and reflects the current server code rather than the older
 
 #### File storage
 - Token management, URL validation ✅
+- **Attachment encryption (v1)** ✅ — per-file content key, sealed objects, and
+  `file/get_url` releasing the key only to authorized channel members
+  (`ATTACHMENT_ENCRYPTION_SPEC`). Legacy plaintext objects stay readable
+  (`encryption_version=0`, no key returned).
 - **Multi-backend**: local FS + S3/OSS/COS/MinIO/Garage (OpenDAL, `[[file.storage_sources]]`) ✅
 - **Resumable chunked upload** ✅ — `/api/app/files/chunk`, manifest with per-part
   digests, geometry-based part accounting, S3 multipart passthrough. Dedup ("instant
@@ -651,35 +657,53 @@ upstream (an edge nginx forwarding the bare-TCP gateway through `http {}` instea
 
 ## 🚀 Roadmap
 
+> Items are removed from here once shipped — a roadmap that still lists finished work
+> stops being usable for planning. Last reconciled against the source on 2026-08-25.
+
 ### Near-term (P0)
 1. Refresh failing tests/examples after FlatBuffers and transfer refactors
-2. Finish sync permission validation and online/offline cleanup tasks
-3. Add Grafana dashboard, alerts, tracing, and production scrape examples
-4. Run load tests and tune DB/query/cache/connection pools
+2. Grafana dashboard, alert rules, and production scrape examples.
+   **Start with `在线会话 = 0` sustained for 5 minutes** — see the 2026-08-24 note under
+   Project status for why a process-liveness check is not enough.
+3. Long-run load/soak and DB/query/cache/pool tuning
+   (harness exists: `scripts/pre-loadtest-check.sh`, `scripts/ci_gate.sh`)
+4. Distributed tracing export (OpenTelemetry) — `tracing` is wired, export is not
 
 ### Short-term (P1)
-5. Message pin, forward improvements, full-text search
+5. Message pin, forward improvements
 6. **Media**: ✅ Image (SDK thumbnails, optional compress; server S3/OSS); ✅ Video (SDK hook, auto-download thumb; server multi-backend); Voice (STT, progress); File preview (Office, PDF)
 7. Group: announcements, polls, files, sub-channels
+8. Sticker durable storage (RPC exists, backed by memory today)
+9. Upload quotas and callback enrichment
 
 ### Mid-term (P2)
-8. Voice/video (WebRTC), group calls, screen share, recording
-9. E2EE (Signal, X3DH, Double Ratchet, safety number, secret chat, disappearing)
-10. Bots: API, webhooks, /commands, auto-reply, scheduled, templates
-11. Enterprise: org, permissions, audit, SSO, export, admin UI
+10. Voice/video (WebRTC), group calls, screen share, recording
+11. **Message** E2EE (Signal, X3DH, Double Ratchet, safety number, secret chat,
+    disappearing). Note that **attachment encryption is already shipped** — per-file
+    content key, sealed objects, `file/get_url` hands the key only to authorized
+    members (see `ATTACHMENT_ENCRYPTION_SPEC`). What remains is the message body.
+12. Bots: webhooks, /commands, auto-reply, scheduled, templates
+    (follow/unfollow and the service protocol are done)
+13. Enterprise: org, permissions, audit, SSO, export, admin UI
 
 ### Long-term (P3)
-12. Multi-region, routing, sync, failover, CDN
-13. AI: translation, moderation, recommendations, assistant, STT, OCR
-14. Compression, connection pool, multi-level cache, load balancing, scaling
+14. Multi-region, routing, sync, failover, CDN
+15. AI: translation, moderation, recommendations, assistant, STT, OCR
+16. Compression, connection pool, multi-level cache, load balancing, scaling
 
-## 📊 Progress (2026-05-28)
+## 📊 Progress
 
-- **Core feature coverage**: high; core IM workflows, multi-device, persistence, sync, file storage, QR login, bot follow, transfer, Push and service APIs are present.
-- **Production readiness**: still in progress; monitoring basics exist, but alerting, tracing, load testing, backup and DR need completion.
-- **Tests**: `cargo test --lib` passes; full test suite currently has stale integration tests/examples after protocol and transfer refactors.
-- **Recent**: unified token API, QR login, user/group QR keys, server-event dispatch, bot follow, room tickets, channel transfer, multi-vendor Push.
-- **Next**: test refresh, sync/offline hardening, observability, load testing.
+*(This section used to carry a date and a "recent work" list that nobody updated. What
+belongs here is the shape of the gap, not a changelog — git already has that.)*
+
+- **RPC surface**: 98 routes registered (53 by literal + 45 via `routes::*` constants).
+  Account, message, group, friend, channel, sync, file, device, presence, QR, sticker,
+  blacklist, bot.
+- **Core feature coverage**: high. Core IM workflows, multi-device, persistence, sync,
+  file storage (incl. resumable chunked upload and attachment encryption), QR login,
+  bot follow, channel transfer, Push and service APIs are all present.
+- **Production readiness**: the gap is *operational*, not functional — alerting,
+  dashboards, tracing export, long-run soak, backup/DR. See Roadmap P0.
 
 ## 📚 Docs
 

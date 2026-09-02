@@ -1,5 +1,7 @@
 # PrivChat
 
+[English](README.md) | [简体中文](README.zh-Hans.md)
+
 基于 Rust 构建的高性能、安全的即时通讯服务器
 
 ## 🎯 愿景
@@ -582,7 +584,7 @@ privchat/
 | **存储层** | PostgreSQL + sqlx | 关系型数据库，强一致性 |
 | **缓存层** | Redis + 内存缓存 | 两级缓存，极致性能 |
 | **消息队列** | Redis Pub/Sub | 事件驱动，解耦模块 |
-| **监控** | Prometheus + Tracing | 指标采集，分布式追踪 |
+| **监控** | Prometheus + tracing | 指标采集、结构化日志（分布式追踪导出未接入）|
 
 ## 📋 功能列表
 
@@ -596,7 +598,7 @@ privchat/
 |-------------|---------|-------------|---------|------|
 | **账号管理** | ✅ | ✅ | 稳定 | register, login, refresh, 统一 Token API、设备会话 |
 | **消息发送** | ✅ | ✅ | 稳定 | 文本/附件发送、回显、去重、持久化 |
-| **消息查询** | ✅ | ✅ | 稳定 | history、read state、entity sync；全文搜索仍在规划 |
+| **消息查询** | ✅ | ✅ | 稳定 | history、read state、entity sync、全文搜索（`message/history/search`）|
 | **消息操作** | ✅ | ✅ | 稳定 | revoke、reaction add/remove/list/stats |
 | **会话管理** | ✅ | ✅ | 稳定 | entity/sync_entities + 客户端本地 get_channels；pin/hide/mute/direct |
 | **好友管理** | ✅ | ✅ | 稳定 | apply/accept/reject/recall/remove/alias/tombstone sync |
@@ -617,7 +619,10 @@ privchat/
 **同步机制说明**：
 - ✅ **核心已实现**：pts 分配、幂等性检查、间隙检测、Commit Log、缓存、fan-out、批量查询
 - ✅ **路由注册**：`sync/submit`, `sync/get_difference`, `sync/get_channel_pts`, `sync/batch_get_channel_pts`, `sync/session_ready`
-- ⚠️ **仍需收口**：`sync/submit` 频道权限校验、在线用户 Redis 移除、离线过期消息清理、集成测试刷新
+- ✅ **已收口**：`sync/submit` 频道权限校验（与 wire 发送路径共用 `authorize_send_to_channel`——
+  此前是手抄的一份子集，漏了角色权限、`allow_member_post`、拉黑、好友与隐私，
+  被拉黑的人能从这条路发出去）、离线过期消息清理（`offline_worker` 每 24h）
+- ⚠️ **仍需收口**：在线用户 Redis 移除、集成测试刷新
 
 **同步机制工作流程**：
 1. **客户端连接时**：SDK 自动触发初始同步（`batch_sync_channels`），拉取所有频道的差异
@@ -782,7 +787,7 @@ privchat/
 **RPC 接口**：
 - ✅ `sync/get_channel_pts` - 获取频道 pts（已注册，完整实现）
 - ✅ `sync/get_difference` - 获取差异（已注册，完整实现，带缓存优化）
-- ⚠️ `sync/submit` - 客户端提交命令（主流程已实现；频道权限校验仍需收口）
+- ✅ `sync/submit` - 客户端提交命令（含频道权限校验，与 wire 发送路径同一实现）
 - ✅ `sync/batch_get_channel_pts` - 批量获取频道 pts（已注册，批量查询优化）
 
 #### QR、服务 API 与跨服务集成
@@ -805,6 +810,11 @@ privchat/
 - ✅ 文件上传 Token 管理
 - ✅ 文件 URL 验证
 - ✅ **多存储源**：本地 FS + S3/OSS/COS/MinIO/Garage（OpenDAL，`[[file.storage_sources]]` 配置）
+- ✅ **分片续传上传**：`/api/app/files/chunk`，manifest 逐片摘要、按几何量对账、
+  S3 multipart 透传；秒传按内容摘要认领，重发已知文件不传字节
+- ✅ **附件加密 v1**：每文件独立内容密钥、密文对象，`file/get_url` 只把密钥交给
+  有权限的频道成员（见 `ATTACHMENT_ENCRYPTION_SPEC`）。旧明文对象仍可读
+  （`encryption_version=0`，不返回密钥）
 - ⚠️ 表情包存储：RPC 接口完成，存储功能缺失
 - ✅ **图片压缩与缩略图**：SDK 已实现（图片默认缩略图、视频钩子 Thumbnail/Compress，收到消息后自动下载缩略图）
 - ⚠️ 上传回调、用户配额、媒体后处理/内容审核 hook 仍需完善
@@ -872,7 +882,7 @@ privchat/
 - ⚠️ **同步机制**（主链路完成，仍需 hardening）
   - ✅ `sync/get_channel_pts` - 获取频道 pts（已注册，完整实现）
   - ✅ `sync/get_difference` - 获取差异（已注册，完整实现，带缓存优化）
-  - ⚠️ `sync/submit` - 客户端提交命令（主流程完成；频道权限校验待补）
+  - ✅ `sync/submit` - 客户端提交命令（含频道权限校验，与 wire 发送路径同一实现）
   - ✅ `sync/batch_get_channel_pts` - 批量获取频道 pts（已注册，批量查询优化）
   - ⚠️ 在线用户 Redis 移除、离线过期消息清理、集成测试刷新仍需处理
 
@@ -912,7 +922,6 @@ privchat/
    - ✅ 统一 Channel 模型 - 合并会话列表和频道信息字段
 
 3. **同步 hardening** ⭐⭐⭐⭐⭐
-   - 补齐 `sync/submit` 频道权限校验
    - 完成在线用户 Redis 移除与离线过期消息清理
 
 4. **读状态（read_pts）** ⭐⭐⭐⭐⭐ ✅ 已按正确模型实现
@@ -946,9 +955,22 @@ privchat/
 
 - **服务端核心功能覆盖度**: 高（核心 IM 能力处于 95%+ 区间，但不以 99% 标注）
 - **SDK 完成度**: 95% ✅ (所有核心功能完成，媒体预处理/缩略图已实现)
-- **生产就绪度**: 进行中（基础监控已完成；压测、告警、追踪、备份、容灾仍需补齐）
-- **测试状态**: `cargo test --lib` 通过（241 passed, 3 ignored）；完整 `cargo test --no-fail-fast` 仍有过期测试/示例需修复
-- **SDK-服务器对齐度**: 核心链路高度对齐，高级搜索/媒体/表情包/生产运维能力继续跟进
+- **生产就绪度**: 进行中。缺口是**运维侧**而非功能侧——`/metrics` 与结构化 tracing
+  （`tracing` + `tracing-subscriber` JSON + `tracing-appender`）已就位，待补的是 Grafana
+  面板、告警规则、分布式追踪导出（尚无 OpenTelemetry 依赖）、长时压测、备份与容灾。
+- **测试状态**: 单元测试跑 `cargo test --lib`；依赖数据库的集成测试（`tests/*_db_test.rs`）需要
+  `PRIVCHAT_TEST_DATABASE_URL` 或 `DATABASE_URL`，**缺库时是失败而不是跳过**——跳过却记
+  「通过」的绿灯证明不了 SQL 契约。完整 `cargo test --no-fail-fast` 仍有过期测试/示例需修复。
+  （此处刻意不写通过数：那种数字几天就过期，然后开始误导人。）
+- **SDK-服务器对齐度**: 核心链路高度对齐，媒体/表情包持久化/生产运维能力继续跟进
+- **RPC 路由面**: 已注册 98 条（53 条字面量 + 45 条 `routes::*` 常量），覆盖 account、
+  message、group、friend、channel、sync、file、device、presence、QR、sticker、blacklist、bot
+
+> **2026-08-24 的教训**：所有健康信号可以全绿而服务不可用——systemd `active`、端口
+> LISTEN、HTTP 登录都正常，却连续 13.4 小时没有任何会话能连上。只证明「进程还在」的
+> 存活检查不够用：服务端每分钟打一行 `📊 服务器统计: 在线会话=N`，**持续为 0 就该告警**。
+> 根因在上游（边缘 nginx 把裸 TCP 网关放在 `http {}` 而非 `stream {}` 转发，第一个包被
+> 污染），见 `privchat-docs/spec/06-ops/DEPLOYMENT_SPEC.md` §12.1.1。
 
 ### 各模块完成度
 
@@ -956,12 +978,12 @@ privchat/
 |------|------|------|
 | **核心消息功能** | 稳定 | 发送、接收、撤回、@提及、回复、Reaction、去重 |
 | **消息类型支持** | 大部分完成 | 常见类型已支持；富 payload 解析和高级类型待完善 |
-| **离线消息** | 大部分完成 | 队列与推送链路存在；过期清理和压测待补 |
+| **离线消息** | 大部分完成 | 队列、推送链路与 24h 过期清理均已完成；压测待补 |
 | **认证系统** | 稳定 | JWT、refresh token、设备管理、统一服务 Token API |
 | **会话管理** | 稳定 | entity sync、direct get/create、pin、hide、mute |
 | **已读回执** | 稳定 | `read_pts`、count、read_list、read_stats |
 | **群组管理** | 稳定 | 成员、角色、设置、二维码入群、审批 |
-| **文件存储** | 大部分完成 | 本地 + S3 兼容 OpenDAL；配额/回调 hook 待补 |
+| **文件存储** | 大部分完成 | 本地 + S3 兼容 OpenDAL、分片续传、附件加密 v1；配额/回调 hook 待补 |
 | **好友系统** | 稳定 | 申请生命周期、alias、黑名单、tombstone sync |
 | **在线状态** | 稳定 | user 聚合 + realtime delivery |
 | **输入状态** | 稳定 | 发送、接收、限频 |
@@ -970,7 +992,7 @@ privchat/
 | **Bot follow** | 稳定 | follow/unfollow、关系持久化、server-event |
 | **Channel Transfer** | 稳定 | wire 校验 + server-event dispatch |
 | **表情包** | 部分实现 | package/list/detail RPC；持久化存储待完善 |
-| **搜索功能** | 大部分完成 | 用户/二维码搜索；消息全文搜索待做 |
+| **搜索功能** | 稳定 | 用户/二维码搜索 + 消息全文搜索 |
 | **pts 同步机制** | 大部分完成 | 主链路完成；权限校验、清理和测试刷新待补 |
 | **消息去重** | 稳定 | 服务端 + SDK 双重去重 |
 | **持久化** | 大部分完成 | PostgreSQL + Repository + migrations；索引/查询调优待补 |
@@ -1035,7 +1057,7 @@ privchat/
 #### 4. 消息功能增强
 - [ ] **消息置顶** - 群组和私聊消息置顶
 - [ ] **消息转发优化** - 批量转发、转发链追踪
-- [ ] **消息搜索** - 全文搜索、高级过滤
+- [x] **消息搜索** - 全文搜索（`message/history/search`）；高级过滤待做
 
 #### 5. 媒体处理
 - [x] **图片处理** - SDK 已实现：图片缩略图生成（默认 0.25）、发送前可选压缩；服务端存储支持 S3/OSS
@@ -1117,7 +1139,7 @@ privchat/
   - 发送、接收、撤回、@提及、回复、Reaction
 - ✅ 好友系统（主链路完成）
 - ✅ 群组系统（主链路完成）
-- ⚠️ pts同步机制（主链路完成，权限校验和清理任务待收口）
+- ✅ pts同步机制（主链路 + 权限校验完成；集成测试刷新待补）
 - ✅ 数据持久化 (已完成 95%)
 - ✅ 在线状态管理（主链路完成）
 - ✅ 输入状态（主链路完成）
