@@ -446,17 +446,17 @@ kept conservative and reflects the current server code rather than the older
 |---------------|-----|------------|--------|-------|
 | Account       | ✅  | ✅         | Stable | register, login, refresh, unified token API, device sessions |
 | Send message  | ✅  | ✅         | Stable | send, attachments, echo, dedup, persistence |
-| Message query | ✅  | ✅         | Stable | history, read state, entity sync; full-text search still planned |
+| Message query | ✅  | ✅         | Stable | history, read state, entity sync, full-text search (`message/history/search`) |
 | Message ops   | ✅  | ✅         | Stable | revoke, add/remove/list/stats reactions |
 | Conversations | ✅  | ✅         | Stable | entity/sync_entities + local get_channels; pin, hide, mute, direct/get_or_create |
 | Friends       | ✅  | ✅         | Stable | apply, accept, reject, recall, remove, alias, tombstone sync |
 | Groups        | ✅  | ✅         | Stable | create, members, roles, settings, QR join, approval |
 | Presence      | ✅  | ✅         | Stable | current status and realtime `presence_changed` delivery |
 | Typing        | ✅  | ✅         | Stable | send typing with server-side rate limit |
-| File up/down  | ✅  | ✅         | Mostly done | upload token, HTTP upload/download, local + S3-compatible backends; quota/callback enrichment pending |
-| Sync          | ✅  | ✅         | Mostly done | pts, idempotency, gap detection, Commit Log, cache, fan-out; permission check cleanup still pending |
+| File up/down  | ✅  | ✅         | Mostly done | upload token, HTTP upload/download, resumable chunked upload, digest-based dedup, local + S3-compatible backends; quota/callback enrichment pending |
+| Sync          | ✅  | ✅         | Stable | pts, idempotency, gap detection, Commit Log, cache, fan-out, shared send-permission check |
 | Devices       | ✅  | ✅         | Stable | list, revoke, revoke_all, update_name, kick |
-| Search        | ✅  | ✅         | Mostly done | user and QR search; advanced/full-text message search pending |
+| Search        | ✅  | ✅         | Stable | user, QR, and full-text message search |
 | Privacy       | ✅  | ✅         | Stable | get/update privacy settings and source validation |
 | Blacklist     | ✅  | ✅         | Stable | add, remove, list, check |
 | QR login      | ✅  | ✅         | Stable | unauth scene creation, scan/confirm/reject state machine, push pipeline |
@@ -548,6 +548,9 @@ kept conservative and reflects the current server code rather than the older
 #### File storage
 - Token management, URL validation ✅
 - **Multi-backend**: local FS + S3/OSS/COS/MinIO/Garage (OpenDAL, `[[file.storage_sources]]`) ✅
+- **Resumable chunked upload** ✅ — `/api/app/files/chunk`, manifest with per-part
+  digests, geometry-based part accounting, S3 multipart passthrough. Dedup ("instant
+  upload") is claimed by content digest, so a re-send of a known file transfers no bytes.
 - Stickers: RPC done, storage TBD
 - **Image compression & thumbnails**: SDK (default thumbnail, video hook Thumbnail/Compress, auto-download thumb on receive) ✅
 - Upload callback, quotas, media post-processing and content review hooks still need hardening
@@ -557,16 +560,37 @@ kept conservative and reflects the current server code rather than the older
 - Index/query tuning TBD
 
 #### Sync and offline hardening
-- `sync/submit` still needs explicit channel permission validation
-- Online-user Redis removal and expired-offline-message cleanup need completion
+- `sync/submit` channel permission ✅ — shares `authorize_send_to_channel` with the
+  wire send path. It used to carry a hand-copied subset (membership + mute) that
+  missed role permissions, `allow_member_post`, blocking, friendship and privacy;
+  a blocked user could get through here but not over wire. One implementation now.
+- Expired offline message cleanup ✅ — `offline_worker` sweeps every 24h
+  (`cleanup_expired_messages`), with `messages_expired` in its stats line
 - Some older integration tests and examples still need protocol-shape updates
 
 ### ❌ Not implemented (planned)
 
-- **Monitoring** (P1): Grafana dashboard, alerts, tracing
-- **Network** (P1): connection quality, reconnect, backoff, weak network
-- **Perf** (P2): batch send, index/query, cache warmup, slow-query tuning
-- **Production ops** (P2): load test, backup, restore, DR runbooks
+Scoped to what is genuinely absent — pieces that exist but are unfinished live under
+**⚠️ Partial** above, so this list stays usable for planning.
+
+- **Dashboards & alerting** (P1): `/metrics` (Prometheus) and structured tracing
+  (`tracing` + `tracing-subscriber` JSON + `tracing-appender`) are in place; what is
+  missing is a Grafana dashboard, alert rules, and distributed tracing export
+  (no OpenTelemetry/Jaeger dependency yet).
+  **First alert to add**: the server logs `📊 服务器统计: 在线会话=N` every minute —
+  *online sessions = 0 for 5 minutes* must page someone. On 2026-08-24 that number sat
+  at 0 for 13.4 hours while systemd showed `active`, the port was listening and HTTP
+  login worked; it surfaced only when a user reported being unable to send messages.
+- **Perf** (P2): batch send, index/query tuning, cache warmup, slow-query analysis
+- **Backup / DR** (P2): backup, restore and disaster-recovery runbooks.
+  Load testing is *partially* covered — `scripts/pre-loadtest-check.sh` and
+  `scripts/ci_gate.sh` exist and gate results are tracked in
+  `privchat-docs/spec/06-ops/RELEASE_GATE.md`; the remaining gaps are the long-run
+  isolation soaks and socket-stall scenarios, not the harness itself.
+
+**Not on this list by design**: connection quality / reconnect / backoff / weak-network
+handling. Those live in the client SDK (`privchat-sdk`), not here — the server side is
+heartbeat + session lifecycle, which is implemented.
 
 ## 📊 Project status
 
@@ -575,7 +599,13 @@ kept conservative and reflects the current server code rather than the older
 - **Server feature coverage**: high, roughly mid/high-90s for core IM features; not a verified 99%
 - **SDK**: 95% ✅ (core + media preprocessing/thumbnails)
 - **Production readiness**: in progress (monitoring basics done; load test, alerting, DR and backup still pending)
-- **Tests**: library unit tests pass (`cargo test --lib`: 241 passed, 3 ignored); full `cargo test --no-fail-fast` currently needs test/example updates after protocol and transfer refactors
+- **Tests**: run `cargo test --lib` for the unit suite. DB-backed integration tests
+  (`tests/*_db_test.rs`, `tests/device_session_reactivate_test.rs`) need
+  `PRIVCHAT_TEST_DATABASE_URL` or `DATABASE_URL` and **fail rather than skip** without
+  it — a skipped test recorded as "passed" proves nothing about a SQL contract.
+  Full `cargo test --no-fail-fast` still needs test/example updates after the protocol
+  and transfer refactors. (No pass/fail counts here on purpose: they go stale within
+  days and then quietly misinform.)
 - **SDK–server alignment**: high for core workflows, with advanced search/media/sticker/storage gaps still tracked
 
 ### Module completion (summary)
@@ -584,12 +614,12 @@ kept conservative and reflects the current server code rather than the older
 |---------------|--------|-------|
 | Core messaging| Stable | Send, receive, revoke, mention, reply, reaction, dedup |
 | Message types | Mostly done | Common types supported; richer payload parsing and advanced types pending |
-| Offline       | Mostly done | Queue and push path exist; cleanup and load verification pending |
+| Offline       | Mostly done | Queue, push path and 24h expiry sweep done; load verification pending |
 | Auth          | Stable | JWT, refresh token repository, devices, unified service token API |
 | Conversations | Stable | entity sync, direct get/create, pin, hide, mute |
 | Read receipts | Stable | `read_pts`, count, list, stats |
 | Groups        | Stable | Members, roles, settings, QR join, approval |
-| File storage  | Mostly done | Local + S3-compatible OpenDAL; quota/callback hooks pending |
+| File storage  | Mostly done | Local + S3-compatible OpenDAL, resumable chunked upload; quota/callback hooks pending |
 | Friends       | Stable | Request lifecycle, alias, blacklist, tombstone sync |
 | Presence      | Stable | User aggregation and realtime delivery |
 | Push          | Mostly done | Planner/worker + multi-vendor providers; operational validation pending |
@@ -597,15 +627,25 @@ kept conservative and reflects the current server code rather than the older
 | Bot follow    | Stable | Follow relation and server-event emit |
 | Channel transfer | Stable | Wire validation and server-event dispatch path |
 | Stickers      | Partial | Package/list RPC exists; durable storage still TBD |
-| Search        | Mostly done | User/QR search; full-text message search pending |
-| pts sync      | Mostly done | Core path works; permission validation and test refresh pending |
+| Search        | Stable | User/QR search + full-text message search |
+| pts sync      | Mostly done | Core path + permission validation done; integration test refresh pending |
 | Persistence   | Mostly done | PostgreSQL + repositories + migrations; index/query tuning pending |
 
 ### Production checklist
 
 **Ready or mostly ready**: persistence, dedup, auth/session/device management, structured logging, `/metrics`, core IM workflows, QR login, transfer, Push pipeline.
 
-**Still required before production sign-off**: full integration test refresh, load testing, Grafana/alerts/tracing, backup/restore, DR plan, sync permission validation, offline cleanup.
+**Still required before production sign-off**: full integration test refresh, long-run
+load/soak, Grafana dashboard + alert rules, distributed tracing export, backup/restore,
+DR plan.
+
+**Learned the hard way (2026-08-24)**: every health signal can be green while the
+service is unusable — `systemd active`, port listening, HTTP login all fine, yet zero
+sessions could connect for 13.4 hours. Liveness checks that only prove the process
+exists are not enough; watch `在线会话` and alert on a sustained zero. Root cause was
+upstream (an edge nginx forwarding the bare-TCP gateway through `http {}` instead of
+`stream {}`, corrupting the first packet) — see
+`privchat-docs/spec/06-ops/DEPLOYMENT_SPEC.md` §12.1.1.
 
 **By design**: message editing is not implemented. Use revoke-and-resend.
 

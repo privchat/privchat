@@ -40,63 +40,49 @@ impl FileUploadRepository {
         self.pool.as_ref()
     }
 
-    /// 同一份内容的所有逻辑记录（有上限）。
+    /// 秒传预检：按**明文摘要**找物理对象。**不写任何东西。**
     ///
-    /// 一串字节可能已经被好几个用户各自记过一笔——物理对象一份，引用记录多条。
-    /// 判「这个人能不能取用」时必须逐条看：他有权读的可能不是最老那条。
-    ///
-    /// 🔴 判重键是 `dedup_id`（明文摘要的 HMAC），不是密文摘要。每个对象有自己的
-    /// 随机 salt，同一份明文由不同人封装会产出不同密文——按密文判重等于秒传只对
-    /// 「自己重发自己」生效。
-    pub async fn find_all_by_dedup_id(&self, dedup_id: &str) -> Result<Vec<FileMetadata>> {
-        let ids: Vec<(i64,)> = sqlx::query_as(
-            "SELECT u.file_id FROM privchat_file_uploads u \
-             JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
-             WHERE o.dedup_id = $1 AND o.status = 'published' \
-             ORDER BY u.file_id LIMIT 16",
-        )
-        .bind(dedup_id)
-        .fetch_all(self.pool.as_ref())
-        .await
-        .map_err(|e| ServerError::Database(format!("按内容查所有记录失败: {}", e)))?;
-        // 逐条取完整 metadata：`get_by_file_id` 是 file 表读取的唯一入口，
-        // 列的映射只维护一份。上限 16 条，N+1 的量是有界的。
-        let mut out = Vec::with_capacity(ids.len());
-        for (file_id,) in ids {
-            if let Some(meta) = self.get_by_file_id(file_id as u64).await? {
-                out.push(meta);
-            }
+    /// 🔴 返回的是对象，不是别人的引用行。claim 只需要 `object_id`——引用行上那些
+    /// 文件名、MIME 是第一个上传者的私事，不该出现在这条路径上。
+    pub async fn find_object_by_plaintext_sha256(
+        &self,
+        plaintext_sha256: &str,
+    ) -> Result<Option<AttachmentObject>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            object_id: i64,
+            plaintext_sha256: String,
+            plaintext_size: i64,
+            sealed_sha256: String,
+            sealed_size: i64,
+            file_path: String,
+            storage_source_id: i32,
+            format_version: i16,
+            encryption_key_id: i16,
         }
-        Ok(out)
-    }
-
-    /// 秒传探测：这份内容在不在。**不写任何东西。**
-    ///
-    /// 🔴 只认 `status = 'published'` 的对象。`pending` 的还没通过首传校验——
-    /// 让它被命中就等于「先发布再校验」：一份没验过的对象进了索引，后来者会拿到它。
-    pub async fn find_by_dedup_id(&self, dedup_id: &str) -> Result<Option<FileMetadata>> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT u.file_id FROM privchat_file_uploads u \
-             JOIN privchat_attachment_objects o ON o.object_id = u.object_id \
-             WHERE o.dedup_id = $1 AND o.status = 'published' \
-             ORDER BY u.file_id LIMIT 1",
+        let row = sqlx::query_as::<_, Row>(
+            "SELECT object_id, plaintext_sha256, plaintext_size, sealed_sha256, sealed_size, \
+                    file_path, storage_source_id, format_version, encryption_key_id \
+             FROM privchat_attachment_objects WHERE plaintext_sha256 = $1",
         )
-        .bind(dedup_id)
+        .bind(plaintext_sha256)
         .fetch_optional(self.pool.as_ref())
         .await
-        .map_err(|e| ServerError::Database(format!("查询同内容文件失败: {}", e)))?;
+        .map_err(|e| ServerError::Database(format!("按明文摘要查对象失败: {e}")))?;
 
-        match row {
-            Some((file_id,)) => self.get_by_file_id(file_id as u64).await,
-            None => Ok(None),
-        }
+        Ok(row.map(|r| AttachmentObject {
+            object_id: r.object_id as u64,
+            plaintext_sha256: r.plaintext_sha256,
+            plaintext_size: r.plaintext_size as u64,
+            sealed_sha256: r.sealed_sha256,
+            sealed_size: r.sealed_size as u64,
+            file_path: r.file_path,
+            storage_source_id: r.storage_source_id as u32,
+            format_version: r.format_version as u8,
+            encryption_key_id: r.encryption_key_id as u8,
+        }))
     }
 
-    /// 秒传取用：照着已有那行，给**当前用户**插一条新记录。
-    ///
-    /// 复制的是 `file_path` / 存储源 / 加密版本 / CEK —— 物理文件一份，两行指向它。
-    /// 🔴 新行的 `uploader_id` 是请求者自己，`business_id` 留空：他要把这个文件绑到
-    /// **他自己的**那条消息上。绝不返回别人的 `file_id`。
     /// 这个幂等键之前是不是已经成功取用过。
     ///
     /// 命中就直接把当时那个 `file_id` 还回去——响应丢了、客户端重试，拿到的仍是

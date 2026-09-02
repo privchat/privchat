@@ -126,18 +126,26 @@ pub async fn claim_existing_file(
     // 口子——跨用户秒传本身就允许任何登录用户探测「某份内容在不在系统里」，
     // 而摘要要么来自他自己持有的文件（那他本来就有内容），要么靠猜（SHA-256 猜不出来）。
     // 换来的是秒传真的生效。见 ATTACHMENT_ENCRYPTION_SPEC §6。
-    let source = file_service
-        .find_by_plaintext_sha256(&normalized)
+    let object = file_service
+        .find_object_by_plaintext_sha256(&normalized)
         .await?
         // 🔴 与「服务端没有这份内容」是同一句话，不区分「没有」和「有但……」：
         // 分开说的话，这个接口就成了文件存在性探测器。
-        .ok_or_else(|| {
-            ServerError::NotFound("服务端没有这份内容，请正常上传".to_string())
-        })?;
+        .ok_or_else(|| ServerError::NotFound("服务端没有这份内容，请正常上传".to_string()))?;
 
+    // 🔴 逻辑元数据全部取自**这次**的 token，一个字段都不从别人的记录复制。
+    //
+    // 复制过一版：第一个人上传 `离婚协议-张三李四.pdf`，第二个人按摘要秒传同一串
+    // 字节之后，记录上写着第一个人的文件名。物理对象能提供的只有 object_id。
+    let meta = crate::repository::file_upload_repo::ReferenceMetadata {
+        original_filename: token.filename.as_deref().unwrap_or_default(),
+        file_type: &token.file_type,
+        mime_type: token.mime_type.as_deref().unwrap_or("application/octet-stream"),
+        business_type: &token.business_type,
+    };
 
     let file_id = file_service
-        .copy_for_user(&source, user_id, &token.business_type, Some(&key))
+        .create_reference(object.object_id, user_id, &meta, Some(&key))
         .await?;
 
     // 🔴 **不再消费 token。**

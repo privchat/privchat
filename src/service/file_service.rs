@@ -1417,24 +1417,32 @@ impl FileService {
         self.file_upload_repo.find_by_content(sha256).await
     }
 
-    /// 同一份内容的所有逻辑记录（有上限）。授权按记录算，调用者能读的未必是最老那条。
-    pub async fn find_all_by_content(
+    /// 秒传预检：这份**明文**在不在。
+    ///
+    /// 🔴 判重键是明文摘要，不是密文摘要——每块都有独立的随机 nonce，同一份明文由
+    /// 不同人封装会产出不同密文，按密文判重等于秒传只对"自己重发自己"生效。
+    pub async fn find_object_by_plaintext_sha256(
         &self,
-        sha256: &str,
-    ) -> Result<Vec<crate::model::file_upload::FileMetadata>> {
-        self.file_upload_repo.find_all_by_content(sha256).await
+        plaintext_sha256: &str,
+    ) -> Result<Option<crate::model::file_upload::AttachmentObject>> {
+        self.file_upload_repo
+            .find_object_by_plaintext_sha256(plaintext_sha256)
+            .await
     }
 
-    /// 秒传取用：照着已有那行给当前用户插一条新记录，物理文件不动。
-    pub async fn copy_for_user(
+    /// 秒传取用：让当前用户多持有一条指向既有物理对象的引用，物理字节不动。
+    ///
+    /// 🔴 逻辑元数据来自**当前**这次 claim，不从源记录复制——复制会把第一个上传者的
+    /// 文件名泄露给按摘要秒传的陌生人。
+    pub async fn create_reference(
         &self,
-        source: &crate::model::file_upload::FileMetadata,
+        object_id: u64,
         uploader_id: u64,
-        business_type: &str,
+        meta: &crate::repository::file_upload_repo::ReferenceMetadata<'_>,
         claim_key_hash: Option<&str>,
     ) -> Result<u64> {
         self.file_upload_repo
-            .copy_for_user(source, uploader_id, business_type, claim_key_hash)
+            .create_reference(object_id, uploader_id, meta, claim_key_hash)
             .await
     }
 
