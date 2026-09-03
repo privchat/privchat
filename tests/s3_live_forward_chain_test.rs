@@ -462,13 +462,33 @@ async fn live_forward_chain_issue_to_pg_row() {
             .expect("删测试行");
         let reference = privchat::service::numbered_parts::UploadReference {
             bucket: env.bucket.clone(),
-            final_key: format!("{PREFIX}/{}", manifest_final_key(&rig, &upload_id)),
+            // 🔴 manifest 里的 final_key 已经是**完整对象 key**（`path_prefix` 在
+            // `object_key()` 那步就拼进去了）。这里再拼一次 PREFIX 会得到
+            // `files/files/files/...`，head 自然找不到——而原来的清理代码把
+            // 「找不到」当成「没什么可清」，静默跳过。
+            final_key: manifest_final_key(&rig, &upload_id),
             provider_upload_id: String::new(),
         };
-        if let Ok(Some(head)) = rig.backend.head(&reference).await {
-            let _ = rig.backend.delete_if_match(&reference, &head.etag).await;
-            assert!(rig.backend.head(&reference).await.unwrap().is_none(), "清理后对象消失");
-        }
+        // 🔴 清理必须是断言，不能是「拿得到就删」。
+        //
+        // 原来写成 `if let Ok(Some(head)) = head(...)`：head 报错或返回 None 时整段
+        // 连同后面的断言一起被跳过，测试照样绿，而 16MB 的对象留在桶里。实测就是
+        // 这样——三个用例全过，桶里多一个。测试自己漏掉的东西，没有第二道防线。
+        let head = rig
+            .backend
+            .head(&reference)
+            .await
+            .unwrap_or_else(|e| panic!("清理前 head 失败 key={} err={e}", reference.final_key))
+            .unwrap_or_else(|| panic!("清理前对象不存在 key={}", reference.final_key));
+        rig.backend
+            .delete_if_match(&reference, &head.etag)
+            .await
+            .unwrap_or_else(|e| panic!("删除失败 key={} err={e}", reference.final_key));
+        assert!(
+            rig.backend.head(&reference).await.unwrap().is_none(),
+            "清理后对象仍在 key={}",
+            reference.final_key
+        );
     })
     .await;
 }
