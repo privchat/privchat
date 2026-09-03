@@ -51,6 +51,19 @@ pub async fn handle(
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("qr_key is required".to_string()))?;
 
+    // 🔴 撤销前必须验归属：以前只凭 qr_key 就撤，任何人拿到（或撞到）一个
+    // key 就能把别人的码作废。
+    let caller = crate::rpc::get_current_user_id(&ctx)?.to_string();
+    let record = services
+        .qrcode_service
+        .get(qr_key)
+        .await
+        .ok_or_else(|| RpcError::not_found("QR Key 不存在".to_string()))?;
+    if record.creator_id != caller {
+        // 不回 403，避免把「这个 key 存在」告诉非owner。
+        return Err(RpcError::not_found("QR Key 不存在".to_string()));
+    }
+
     // 撤销 QR Key
     services
         .qrcode_service

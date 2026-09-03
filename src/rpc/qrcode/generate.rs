@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 /// {
 ///   "qr_type": "user",              // "user" | "group" | "auth" | "feature"
 ///   "target_id": "alice",           // 目标 ID（用户ID 或 群组ID）
-///   "creator_id": "alice",          // 创建者 ID
+///   // creator_id 不接受客户端传入，一律取自会话
 ///   "expire_seconds": 604800,       // 可选：过期时间（秒）
 ///   "max_usage": 100,               // 可选：最大使用次数
 ///   "one_time": false,              // 可选：是否一次性
@@ -70,10 +70,38 @@ pub async fn handle(
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("target_id is required".to_string()))?;
 
-    let creator_id = body
-        .get("creator_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("creator_id is required".to_string()))?;
+    // 🔴 创建者只认会话身份。以前是从 body 里读 creator_id，等于任何登录用户
+    // 都能以别人的名义建码；而 Rust SDK 压根不发这个字段（protocol 里 user_id
+    // 就注释着"服务器端填充"），这条路由对它一直是 validation 失败。
+    let creator_id = crate::rpc::get_current_user_id(&ctx)?.to_string();
+
+    // 用户名片码只能给自己建；群码要求调用者确实在群里。
+    match qr_type {
+        QRType::User => {
+            if target_id != creator_id {
+                return Err(RpcError::forbidden(
+                    "cannot create a user QR code for another user".to_string(),
+                ));
+            }
+        }
+        QRType::Group => {
+            let group_id = target_id.parse::<u64>().map_err(|_| {
+                RpcError::validation("target_id must be a group id".to_string())
+            })?;
+            let uid = crate::rpc::get_current_user_id(&ctx)?;
+            let is_member = services
+                .channel_service
+                .is_member_of_any(&[group_id], uid)
+                .await
+                .map_err(|e| RpcError::internal(format!("校验群成员失败: {}", e)))?;
+            if !is_member {
+                return Err(RpcError::forbidden(
+                    "only group members can create a group QR code".to_string(),
+                ));
+            }
+        }
+        QRType::Auth | QRType::Feature => {}
+    }
 
     // 可选参数
     let expire_seconds = body.get("expire_seconds").and_then(|v| v.as_i64());
@@ -106,7 +134,7 @@ pub async fn handle(
         .generate(
             qr_type,
             target_id.to_string(),
-            creator_id.to_string(),
+            creator_id.clone(),
             options,
         )
         .await

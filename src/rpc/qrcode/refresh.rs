@@ -65,15 +65,13 @@ pub async fn handle(
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::validation("target_id is required".to_string()))?;
 
-    let creator_id = body
-        .get("creator_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("creator_id is required".to_string()))?;
+    // 创建者取自会话，不接受客户端传入（见 generate.rs 同样的理由）。
+    let creator_id = crate::rpc::get_current_user_id(&ctx)?.to_string();
 
     // 刷新 QR Key
     let (old_qr_key, new_qr_key) = services
         .qrcode_service
-        .refresh(target_id, qr_type, creator_id)
+        .refresh(target_id, qr_type, &creator_id)
         .await
         .map_err(|e| RpcError::internal(format!("刷新 QR 码失败: {}", e)))?;
 

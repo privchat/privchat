@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rpc::error::{RpcError, RpcResult};
+use crate::rpc::error::RpcResult;
 use crate::rpc::RpcServiceContext;
 use serde_json::{json, Value};
 
@@ -56,10 +56,9 @@ pub async fn handle(
     tracing::debug!("🔧 处理 列出 QR 码 请求: {:?}", body);
 
     // 解析参数
-    let creator_id = body
-        .get("creator_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::validation("creator_id is required".to_string()))?;
+    // 只能列自己的码。以前读 body.creator_id，等于把别人的二维码枚举接口
+    // 开给了任何登录用户。
+    let creator_id = crate::rpc::get_current_user_id(&ctx)?.to_string();
 
     let include_revoked = body
         .get("include_revoked")
@@ -69,7 +68,7 @@ pub async fn handle(
     // 获取 QR Keys 列表
     let records = services
         .qrcode_service
-        .list_by_creator(creator_id, include_revoked)
+        .list_by_creator(&creator_id, include_revoked)
         .await;
 
     // 转换为响应格式
