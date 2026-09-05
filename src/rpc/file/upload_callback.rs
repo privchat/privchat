@@ -174,32 +174,23 @@ pub async fn upload_callback(
         .ok_or_else(|| RpcError::validation("缺少 file_id 参数".to_string()))?
         .to_string();
 
-    let _file_url = params["file_url"]
-        .as_str()
-        .ok_or_else(|| RpcError::validation("缺少 file_url 参数".to_string()))?
-        .to_string();
-
-    let _thumbnail_url = params["thumbnail_url"].as_str().map(|s| s.to_string());
-
-    let file_size = params["file_size"]
-        .as_u64()
-        .ok_or_else(|| RpcError::validation("缺少 file_size 参数".to_string()))?;
-
-    let _original_size = params["original_size"].as_u64();
-
-    let _mime_type = params["mime_type"]
-        .as_str()
-        .ok_or_else(|| RpcError::validation("缺少 mime_type 参数".to_string()))?
-        .to_string();
-
-    let width = params["width"].as_u64().map(|v| v as u32);
-    let height = params["height"].as_u64().map(|v| v as u32);
-
-    tracing::debug!(
-        "📤 文件上传完成回调: file_id={}, size={} bytes",
-        file_id,
-        file_size
-    );
+    // 🔴 这个回调只需要 `token` 和 `file_id`。
+    //
+    // 以前它还**强制要求** file_url / file_size / mime_type，另收 thumbnail_url /
+    // original_size / width / height——然后一个都不用（全是 `let _x = ...`，
+    // file_size 只进了一行 debug 日志）。两个问题：
+    //
+    // 1. 客户端被迫上报 `file_url`，也就是**文件落在哪里**。那是服务端的知识：
+    //    对象 key 由服务端按内容摘要算（`object_key()`），上传地址、分片地址都由
+    //    服务端签发。让客户端回报存储位置，等于把存储布局规则泄进客户端，还给了
+    //    它一个本不该有的话语权。
+    // 2. 必填却不读的字段是纯粹的耦合：改一次存储形态，所有客户端都得跟着改，
+    //    而改错了也没有任何东西会发现——因为服务端根本不看。
+    //
+    // 定位这次上传靠的是 token（前半段就是 upload_id）+ 会话墓碑 + 正式行身份核对，
+    // 见 `authorise_callback`。文件的大小、类型、尺寸在 complete 时由服务端自己
+    // 读回密文算出来，不采信客户端的说法。
+    tracing::debug!("📤 文件上传完成回调: file_id={}", file_id);
 
     // ---- 分片上传（RESUMABLE_UPLOAD_SPEC §3.3.1）：token 前半段就是 upload_id ----
     //
