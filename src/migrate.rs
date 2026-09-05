@@ -175,6 +175,9 @@ pub async fn apply_pending_with_hook(
     result
 }
 
+/// 合并基线的文件名。见 `migrations/001_baseline.sql` 顶部说明。
+const BASELINE: &str = "001_baseline";
+
 async fn apply_pending_locked(
     conn: &mut PgConnection,
     report: impl Fn(&str),
@@ -188,18 +191,51 @@ async fn apply_pending_locked(
             // 🔴 已执行的迁移文件是**不可变**的。改了它，这台机器会跳过、新机器会执行
             // 修改后的版本，于是同名的 `031` 在两台机器上是不同的 schema，而没有任何
             // 东西会发现。摘要对不上就拒绝启动，让人来解释这次改动。
-            if let Some(recorded) = recorded {
-                let current = digest_of(sql);
-                if *recorded != current {
-                    anyhow::bail!(
-                        "迁移 {name} 的内容与执行时不一致（账本 {recorded}，当前 {current}）。\
-                         已执行的迁移文件不可修改：要改行为请新增一条迁移。"
-                    );
-                }
+            let current = digest_of(sql);
+            match recorded {
+                Some(recorded) if *recorded == current => {}
+                Some(recorded) => anyhow::bail!(
+                    "迁移 {name} 的内容与执行时不一致（账本 {recorded}，当前 {current}）。\
+                     已执行的迁移文件不可修改：要改行为请新增一条迁移。"
+                ),
+                // 🔴 摘要为 NULL **不等于**校验通过。
+                //
+                // `content_sha256` 这一列是后加的，早于它的账本行都是 NULL。原来
+                // 这里写成 `if let Some(..)`，于是那些行**永远跳过校验**——一条已
+                // 执行的迁移被改成什么样都不会有人发现。2026-09 的 Weey 生产就是
+                // 这么中招的：新表被折进了已执行的 001，迁移器报「已是最新」，
+                // 表却从来没建出来，整个附件加密在生产上是死的。
+                None => anyhow::bail!(
+                    "迁移 {name} 在账本里没有内容摘要（这台库是在摘要列引入之前建的），\
+                     无法证明它执行的就是当前这份文件。本次发布不支持这种库原地升级：\
+                     请用全新数据库执行基线，或人工核对结构后手工补写摘要。"
+                ),
             }
             report(&format!("  ⏭ {name} (已执行，跳过)"));
             continue;
         }
+        // 🔴 基线只能落在**空库**上。
+        //
+        // 它是「跑完全部历史迁移之后」的结构快照，里面全是无条件的 CREATE。往一个
+        // 已经有表的库上跑，第一条 CREATE TABLE 就会撞名失败——那还算好的，怕的是
+        // 有人看到失败就去加 IF NOT EXISTS，从此这条基线在半新半旧的库上「成功」
+        // 执行，留下一个谁也说不清结构的数据库。
+        //
+        // 所以在这里明说：这个发布没有原地升级路径。
+        if *name == BASELINE && !applied.is_empty() {
+            let known = applied
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "拒绝在非空数据库上执行基线 {name}：账本里已经有 {} 条记录（{known}）。\
+                 基线是全新安装用的结构快照，不能往存量库上补跑。存量库请重建，\
+                 或者先人工把结构对齐到基线再手工写入账本。",
+                applied.len()
+            );
+        }
+
         report(&format!("  ▶ 执行 {name}..."));
 
         // SQL 与记账同一事务：中途崩溃只会整个回滚，不会留下"改了但没记"的库。

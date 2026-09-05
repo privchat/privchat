@@ -1,28 +1,43 @@
--- ==============================================================================
--- PrivChat Server 初始化 SQL
--- 由 pg_dump --schema-only 从 dev 库 (已应用过原 001..018) 导出, 重整为干净的
--- single-file initial schema. 后续 schema 变更走新的 002+ 增量迁移。
--- ==============================================================================
+--
+-- PrivChat server —— 1.0.0 beta1 合并基线。
+--
+-- 🔴 **这是给全新数据库用的基线，不是可以往存量库上补跑的迁移。**
+--
+-- 它由「跑完 001..027 全部历史迁移的库」`pg_dump --schema-only` 导出，所以结构
+-- 与逐条跑历史迁移的结果逐字节一致（合并时用两个库对拍验证过）。历史那 27 个
+-- 文件已删除：它们里有「先加列、后删列」这类互相抵消的步骤，留着只会让人以为
+-- 存量库还能靠补跑追上来。
+--
+-- 存量库怎么办：本次发布不提供从旧结构原地升级的路径（Weey 生产已按此重建）。
+-- runner 在库非空时会**拒绝**执行本基线，而不是装作成功——见 migrate.rs。
+--
+-- 为什么允许 pg_dump 风格（ATTACH PARTITION、写死的月分区）：原来的
+-- 001_create_tables.sql 本身就是这么生成的，这里沿用同一套约定。
+--
 
 --
--- PostgreSQL database dump
 --
 
--- Dumped from database version 16.9 (Homebrew)
--- Dumped by pg_dump version 16.9 (Homebrew)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
-SELECT pg_catalog.set_config('search_path', '', false);
 SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
 
--- pgcrypto extension 由 DBA 用 postgres 超管预先装好 (CREATE EXTENSION pgcrypto), 本文件不再 create.
+
+--
+-- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+
+
+
 --
 -- Name: assign_privchat_channel_entity_sync_version(); Type: FUNCTION; Schema: public; Owner: -
 --
@@ -35,6 +50,7 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
 
 
 --
@@ -51,6 +67,7 @@ END;
 $$;
 
 
+
 --
 -- Name: assign_privchat_group_member_sync_version(); Type: FUNCTION; Schema: public; Owner: -
 --
@@ -63,6 +80,7 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
 
 
 --
@@ -79,6 +97,7 @@ END;
 $$;
 
 
+
 --
 -- Name: assign_privchat_user_sync_version(); Type: FUNCTION; Schema: public; Owner: -
 --
@@ -93,6 +112,7 @@ END;
 $$;
 
 
+
 --
 -- Name: now_millis(); Type: FUNCTION; Schema: public; Owner: -
 --
@@ -102,6 +122,76 @@ CREATE FUNCTION public.now_millis() RETURNS bigint
     AS $$
     SELECT (extract(epoch from now()) * 1000)::BIGINT;
 $$;
+
+
+
+--
+-- Name: privchat_bump_group_membership_version(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.privchat_bump_group_membership_version() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    target_group_id BIGINT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        target_group_id := OLD.group_id;
+    ELSE
+        target_group_id := NEW.group_id;
+    END IF;
+    UPDATE privchat_channels
+    SET membership_version = membership_version + 1
+    WHERE channel_id = target_group_id AND channel_type = 1;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+
+--
+-- Name: privchat_search_tokens(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.privchat_search_tokens(input text) RETURNS tsvector
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+    AS $$
+DECLARE
+    run  text;
+    n    int;
+    toks text[] := '{}';
+BEGIN
+    IF input IS NULL OR btrim(input) = '' THEN
+        RETURN ''::tsvector;
+    END IF;
+
+    FOR run IN
+        SELECT (regexp_matches(
+                    lower(left(input, 4000)),
+                    '[0-9a-z一-鿿㐀-䶿぀-ヿ가-힣]+',
+                    'g'))[1]
+    LOOP
+        n := char_length(run);
+        IF n = 1 THEN
+            toks := toks || run;
+        ELSE
+            FOR i IN 1..(n - 1) LOOP
+                toks := toks || substr(run, i, 2);
+            END LOOP;
+        END IF;
+    END LOOP;
+
+    IF array_length(toks, 1) IS NULL THEN
+        RETURN ''::tsvector;
+    END IF;
+
+    RETURN to_tsvector('simple', array_to_string(toks, ' '));
+END;
+$$;
+
 
 
 --
@@ -116,6 +206,7 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
 
 
 --
@@ -136,6 +227,51 @@ SET default_tablespace = '';
 
 SET default_table_access_method = heap;
 
+
+--
+-- Name: privchat_attachment_objects; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.privchat_attachment_objects (
+    object_id bigint NOT NULL,
+    plaintext_sha256 text NOT NULL,
+    plaintext_size bigint NOT NULL,
+    sealed_sha256 text NOT NULL,
+    sealed_size bigint NOT NULL,
+    file_path text NOT NULL,
+    storage_source_id integer NOT NULL,
+    format_version smallint NOT NULL,
+    encryption_key_id smallint NOT NULL,
+    published_at bigint DEFAULT public.now_millis() NOT NULL,
+    CONSTRAINT privchat_attachment_objects_digests_are_sha256 CHECK (((plaintext_sha256 ~ '^[0-9a-f]{64}$'::text) AND (sealed_sha256 ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT privchat_attachment_objects_format_version_is_current CHECK ((format_version = 1)),
+    CONSTRAINT privchat_attachment_objects_key_id_in_range CHECK (((encryption_key_id >= 0) AND (encryption_key_id <= 255))),
+    CONSTRAINT privchat_attachment_objects_sizes_are_sane CHECK (((plaintext_size >= 0) AND (sealed_size >= 0) AND (storage_source_id >= 0)))
+);
+
+
+
+--
+-- Name: privchat_attachment_objects_object_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.privchat_attachment_objects_object_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+
+--
+-- Name: privchat_attachment_objects_object_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.privchat_attachment_objects_object_id_seq OWNED BY public.privchat_attachment_objects.object_id;
+
+
+
 --
 -- Name: privchat_blacklist; Type: TABLE; Schema: public; Owner: -
 --
@@ -143,15 +279,10 @@ SET default_table_access_method = heap;
 CREATE TABLE public.privchat_blacklist (
     user_id bigint NOT NULL,
     blocked_user_id bigint NOT NULL,
-    created_at bigint DEFAULT public.now_millis() NOT NULL
+    created_at bigint DEFAULT public.now_millis() NOT NULL,
+    reason character varying(256)
 );
 
-
---
--- Name: TABLE privchat_blacklist; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_blacklist IS '黑名单表：存储用户黑名单';
 
 
 --
@@ -171,6 +302,7 @@ CREATE TABLE public.privchat_bot_follow (
 );
 
 
+
 --
 -- Name: privchat_bot_follow_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
@@ -183,11 +315,13 @@ CREATE SEQUENCE public.privchat_bot_follow_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_bot_follow_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_bot_follow_id_seq OWNED BY public.privchat_bot_follow.id;
+
 
 
 --
@@ -200,6 +334,7 @@ CREATE SEQUENCE public.privchat_channel_entity_sync_version_seq
     NO MINVALUE
     NO MAXVALUE
     CACHE 1;
+
 
 
 --
@@ -218,12 +353,6 @@ CREATE TABLE public.privchat_channel_participants (
 );
 
 
---
--- Name: TABLE privchat_channel_participants; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_channel_participants IS '频道参与者表：存储频道参与者信息';
-
 
 --
 -- Name: privchat_channel_pts; Type: TABLE; Schema: public; Owner: -
@@ -236,12 +365,6 @@ CREATE TABLE public.privchat_channel_pts (
     updated_at bigint DEFAULT public.now_millis() NOT NULL
 );
 
-
---
--- Name: TABLE privchat_channel_pts; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_channel_pts IS '频道 pts 表：存储每个频道的当前 pts（per-channel 单调递增）';
 
 
 --
@@ -258,6 +381,7 @@ CREATE TABLE public.privchat_channel_read_cursor (
 );
 
 
+
 --
 -- Name: privchat_channel_read_cursor_sync_version_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
@@ -268,6 +392,7 @@ CREATE SEQUENCE public.privchat_channel_read_cursor_sync_version_seq
     NO MINVALUE
     NO MAXVALUE
     CACHE 1;
+
 
 
 --
@@ -288,29 +413,12 @@ CREATE TABLE public.privchat_channels (
     create_source character varying(64),
     create_source_id character varying(256),
     sync_version bigint DEFAULT nextval('public.privchat_channel_entity_sync_version_seq'::regclass) NOT NULL,
+    membership_version bigint DEFAULT 0 NOT NULL,
+    server_latest_message_pts bigint,
+    server_latest_message_id bigint,
     CONSTRAINT privchat_channels_check CHECK ((((channel_type = 0) AND (direct_user1_id IS NOT NULL) AND (direct_user2_id IS NOT NULL) AND (group_id IS NULL)) OR ((channel_type = 1) AND (group_id IS NOT NULL) AND (direct_user1_id IS NULL) AND (direct_user2_id IS NULL))))
 );
 
-
---
--- Name: TABLE privchat_channels; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_channels IS '频道表：存储频道基本信息（channel_id: BIGSERIAL）';
-
-
---
--- Name: COLUMN privchat_channels.create_source; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_channels.create_source IS '创建来源类型: search/phone/card_share/group/qrcode 等';
-
-
---
--- Name: COLUMN privchat_channels.create_source_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_channels.create_source_id IS '来源ID: 搜索会话id、群id、分享id、好友id 等';
 
 
 --
@@ -325,11 +433,13 @@ CREATE SEQUENCE public.privchat_channels_channel_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_channels_channel_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_channels_channel_id_seq OWNED BY public.privchat_channels.channel_id;
+
 
 
 --
@@ -344,15 +454,10 @@ CREATE TABLE public.privchat_client_msg_registry (
     channel_type smallint NOT NULL,
     sender_id bigint NOT NULL,
     decision character varying(20) DEFAULT 'accepted'::character varying NOT NULL,
-    created_at bigint DEFAULT public.now_millis() NOT NULL
+    created_at bigint DEFAULT public.now_millis() NOT NULL,
+    device_id character varying(128) DEFAULT ''::character varying NOT NULL
 );
 
-
---
--- Name: TABLE privchat_client_msg_registry; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_client_msg_registry IS '客户端消息号注册表：用于幂等性检查';
 
 
 --
@@ -371,15 +476,11 @@ CREATE TABLE public.privchat_commit_log (
     server_timestamp bigint NOT NULL,
     sender_id bigint NOT NULL,
     sender_username character varying(100),
-    created_at bigint DEFAULT public.now_millis() NOT NULL
+    created_at bigint DEFAULT public.now_millis() NOT NULL,
+    event_schema_version smallint,
+    canonical_event bytea
 );
 
-
---
--- Name: TABLE privchat_commit_log; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_commit_log IS 'Commit Log：权威事实，按 pts 严格递增';
 
 
 --
@@ -394,11 +495,13 @@ CREATE SEQUENCE public.privchat_commit_log_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_commit_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_commit_log_id_seq OWNED BY public.privchat_commit_log.id;
+
 
 
 --
@@ -414,12 +517,6 @@ CREATE TABLE public.privchat_device_sync_state (
     last_sync_at bigint DEFAULT public.now_millis() NOT NULL
 );
 
-
---
--- Name: TABLE privchat_device_sync_state; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_device_sync_state IS '设备同步状态表：存储设备的 pts 同步状态';
 
 
 --
@@ -446,135 +543,17 @@ CREATE TABLE public.privchat_devices (
 );
 
 
---
--- Name: TABLE privchat_devices; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_devices IS '设备表：存储用户设备信息（device_id: UUID）';
-
-
---
--- Name: COLUMN privchat_devices.session_version; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_devices.session_version IS '会话世代，只在安全事件时递增（登出、改密、被踢等）';
-
-
---
--- Name: COLUMN privchat_devices.session_state; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_devices.session_state IS '会话状态：0=活跃,1=被踢,2=冻结,3=撤销,4=待验证';
-
-
---
--- Name: COLUMN privchat_devices.kicked_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_devices.kicked_at IS '被踢时间（毫秒时间戳）';
-
-
---
--- Name: COLUMN privchat_devices.kicked_by_device_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_devices.kicked_by_device_id IS '由哪个设备踢出';
-
-
---
--- Name: COLUMN privchat_devices.kicked_reason; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_devices.kicked_reason IS '踢出原因或状态变更原因';
-
-
---
--- Name: COLUMN privchat_devices.last_ip; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_devices.last_ip IS '最后活跃IP地址';
-
 
 --
 -- Name: privchat_file_uploads; Type: TABLE; Schema: public; Owner: -
 --
 
---
--- 物理附件对象：桶里/磁盘上那串字节，以及解开它所需的一切。
---
--- 🔴 这是物理事实的**唯一真源**。用户的上传记录只按 object_id 引用它，自己说不出
--- 路径、大小、摘要和加密方式——两边各存一份的话它们可以独立漂移，代码约定拦不住。
---
--- 跨用户秒传要求「一个物理对象被多条用户记录引用」。分表之后：
---   · 「同一份内容只有一个物理对象」由 plaintext_sha256 的 UNIQUE 保证；
---   · 「引用不会指向已删除的对象」由外键保证；
---   · 「还有没有人在用」由 count(*) 回答，不必维护会漂移的手工计数；
---   · 秒传取用只复制 object_id，不逐列复制元数据（漏一列就造出「指向同一份字节却
---     描述不一致」的记录）。
---
--- 🔴 表里**只有已通过 complete 校验的对象**，没有状态字段。"还没验过"只存在于上传
--- 会话里，随会话消失。少一个状态就少一条"忘了过滤 pending"的读取路径，而那条路径的
--- 后果是把没核对过的内容当成秒传结果交给下一个用户。
---
-CREATE TABLE public.privchat_attachment_objects (
-    object_id bigserial PRIMARY KEY,
-
-    -- 🔴 跨用户秒传的判重键，就是**明文**的 SHA-256。
-    --
-    -- 不是密文摘要：每块都有独立的随机 nonce，同一份明文由不同人封装会产出不同密文
-    -- ——按密文判重等于秒传只对「自己重发自己」生效，而秒传的收益（省用户上行带宽
-    -- 和等待时间）几乎全在「别人已经传过这份文件」的场景。
-    --
-    -- 客户端申请 token 时声明它，服务端在 complete 时**解密重算**核对，否则任何登录
-    -- 用户都能用「文件 A 的摘要 + 文件 B 的密文」污染秒传映射。
-    plaintext_sha256 text NOT NULL UNIQUE,
-    plaintext_size bigint NOT NULL,
-
-    -- 服务端对**实际落盘字节**算出的 SHA-256。客户端声明的同名值只作预检。
-    sealed_sha256 text NOT NULL,
-    sealed_size bigint NOT NULL,
-
-    file_path text NOT NULL,
-    storage_source_id integer NOT NULL,
-
-    -- 与 privchat-protocol 的 attachment_crypto::FORMAT_VERSION 同源。
-    format_version smallint NOT NULL,
-    -- 用的是哪一把全站密钥。记在对象上，将来换密钥不影响存量：get_url 按它取出
-    -- **这一把**返回，既不必重新加密，也不必把全部密钥一起下发。
-    encryption_key_id smallint NOT NULL,
-
-    published_at bigint DEFAULT public.now_millis() NOT NULL,
-
-    CONSTRAINT privchat_attachment_objects_digests_are_sha256
-        CHECK (plaintext_sha256 ~ '^[0-9a-f]{64}$' AND sealed_sha256 ~ '^[0-9a-f]{64}$'),
-    CONSTRAINT privchat_attachment_objects_sizes_are_sane
-        CHECK (plaintext_size >= 0 AND sealed_size >= 0 AND storage_source_id >= 0),
-    CONSTRAINT privchat_attachment_objects_key_id_in_range
-        CHECK (encryption_key_id BETWEEN 0 AND 255),
-    -- 🔴 当前只有一种密文格式，就把它钉死。不加这条的话，任意版本号都能建行成功，
-    -- 一直到客户端下载解不开才暴露——而那时故障点离成因已经很远。
-    -- 将来真要加第二种格式，改这条约束是必经的一步，而不是"忘了改"。
-    CONSTRAINT privchat_attachment_objects_format_version_is_current
-        CHECK (format_version = 1)
-);
-
--- 同一条物理路径只能有一个对象行。没有它，一次失败重试就可能建出第二行指向同一份
--- 字节，而删除任一行都会把另一行的对象删掉。
-CREATE UNIQUE INDEX idx_privchat_attachment_objects_path
-    ON public.privchat_attachment_objects (storage_source_id, file_path);
-
---
--- 用户的一条上传记录：谁、什么时候、以什么名字引用了哪个物理对象。
---
 CREATE TABLE public.privchat_file_uploads (
     file_id bigint NOT NULL,
     original_filename character varying(512) NOT NULL,
     file_type character varying(32) NOT NULL,
     mime_type character varying(128) NOT NULL,
-    -- 🔴 不能级联删除：CASCADE 会让「清理一个物理对象」顺手删掉所有引用它的用户
-    -- 记录，那正好反了——有引用的时候本来就不该删对象。
-    object_id bigint NOT NULL
-        REFERENCES public.privchat_attachment_objects (object_id) ON DELETE RESTRICT,
+    object_id bigint NOT NULL,
     uploader_id bigint NOT NULL,
     uploader_ip character varying(45),
     uploaded_at bigint DEFAULT public.now_millis() NOT NULL,
@@ -582,20 +561,9 @@ CREATE TABLE public.privchat_file_uploads (
     height integer,
     business_type character varying(64),
     business_id character varying(128),
-    -- 秒传取用的幂等键：数据库提交了但响应丢了，客户端拿同一个 token 重试要拿回
-    -- 同一个 file_id。与那一行同事务写入，不放 Redis（跨存储的两步不是原子的）。
     claim_key_hash character varying(64)
 );
 
--- 引用是否归零由这条索引上的 count(*) 回答，**不维护手工计数**：那种计数在异常重试
--- 与事务回滚下会漂移，而漂移方向恰好是"以为还有人用"（泄漏）或"以为没人用了"
--- （删掉别人还在用的文件）。
-CREATE INDEX idx_privchat_file_uploads_object_id
-    ON public.privchat_file_uploads (object_id);
-
-CREATE UNIQUE INDEX uq_privchat_file_uploads_claim_key
-    ON public.privchat_file_uploads (uploader_id, claim_key_hash)
-    WHERE claim_key_hash IS NOT NULL;
 
 
 --
@@ -610,11 +578,13 @@ CREATE SEQUENCE public.privchat_file_uploads_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_file_uploads_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_file_uploads_id_seq OWNED BY public.privchat_file_uploads.file_id;
+
 
 
 --
@@ -627,6 +597,7 @@ CREATE SEQUENCE public.privchat_friend_sync_version_seq
     NO MINVALUE
     NO MAXVALUE
     CACHE 1;
+
 
 
 --
@@ -648,18 +619,26 @@ CREATE TABLE public.privchat_friendships (
 );
 
 
---
--- Name: TABLE privchat_friendships; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_friendships IS '好友关系表：存储用户之间的好友关系';
-
 
 --
--- Name: COLUMN privchat_friendships.source_id; Type: COMMENT; Schema: public; Owner: -
+-- Name: privchat_group_join_requests; Type: TABLE; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.privchat_friendships.source_id IS '来源ID，与 source 配套，可追溯';
+CREATE TABLE public.privchat_group_join_requests (
+    request_id text NOT NULL,
+    group_id bigint NOT NULL,
+    user_id bigint NOT NULL,
+    method_type text NOT NULL,
+    method_ref text,
+    status smallint DEFAULT 0 NOT NULL,
+    message text,
+    handler_id bigint,
+    reject_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone
+);
+
 
 
 --
@@ -672,6 +651,7 @@ CREATE SEQUENCE public.privchat_group_member_sync_version_seq
     NO MINVALUE
     NO MAXVALUE
     CACHE 1;
+
 
 
 --
@@ -692,11 +672,35 @@ CREATE TABLE public.privchat_group_members (
 );
 
 
+
 --
--- Name: TABLE privchat_group_members; Type: COMMENT; Schema: public; Owner: -
+-- Name: privchat_group_pinned_messages; Type: TABLE; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.privchat_group_members IS '群组成员表：存储群组成员信息';
+CREATE TABLE public.privchat_group_pinned_messages (
+    id bigint NOT NULL,
+    group_id bigint NOT NULL,
+    message_id bigint NOT NULL,
+    channel_id bigint NOT NULL,
+    pinned_by bigint NOT NULL,
+    pinned_at bigint DEFAULT public.now_millis() NOT NULL
+);
+
+
+
+--
+-- Name: privchat_group_pinned_messages_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.privchat_group_pinned_messages ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.privchat_group_pinned_messages_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
 
 
 --
@@ -711,12 +715,13 @@ CREATE SEQUENCE public.privchat_group_sync_version_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_groups; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.privchat_groups (
-    group_id bigint NOT NULL,
+    group_id bigint DEFAULT nextval('public.privchat_channels_channel_id_seq'::regclass) NOT NULL,
     name character varying(128) NOT NULL,
     description text,
     avatar_url text,
@@ -728,22 +733,16 @@ CREATE TABLE public.privchat_groups (
     created_at bigint DEFAULT public.now_millis() NOT NULL,
     updated_at bigint DEFAULT public.now_millis() NOT NULL,
     sync_version bigint DEFAULT nextval('public.privchat_group_sync_version_seq'::regclass) NOT NULL,
-    qr_key character varying(16) NOT NULL
+    qr_key character varying(16) NOT NULL,
+    allow_search boolean DEFAULT true NOT NULL,
+    join_policy smallint DEFAULT 1 NOT NULL,
+    allow_member_invite boolean DEFAULT true NOT NULL,
+    allow_member_add_friend boolean DEFAULT true NOT NULL,
+    all_muted boolean DEFAULT false NOT NULL,
+    forbid_forward boolean DEFAULT false NOT NULL,
+    allow_member_post boolean DEFAULT true NOT NULL
 );
 
-
---
--- Name: TABLE privchat_groups; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_groups IS '群组表：存储群组基本信息（group_id: BIGSERIAL）';
-
-
---
--- Name: COLUMN privchat_groups.qr_key; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_groups.qr_key IS 'QR_CODE_SPEC v1.3: 群二维码 opaque token, 16 chars base62, UNIQUE, 永久，Owner/Admin 可 refresh 旋转';
 
 
 --
@@ -758,11 +757,13 @@ CREATE SEQUENCE public.privchat_groups_group_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_groups_group_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_groups_group_id_seq OWNED BY public.privchat_groups.group_id;
+
 
 
 --
@@ -807,61 +808,6 @@ CREATE TABLE public.privchat_login_logs (
 );
 
 
---
--- Name: TABLE privchat_login_logs; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_login_logs IS '登录日志表：记录用户 token 首次认证的登录行为，关联到具体设备';
-
-
---
--- Name: COLUMN privchat_login_logs.device_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_login_logs.device_id IS '设备ID（强关联），可追溯该设备的所有登录历史';
-
-
---
--- Name: COLUMN privchat_login_logs.token_jti; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_login_logs.token_jti IS 'JWT ID，可用于关联 token 撤销记录和去重检测';
-
-
---
--- Name: COLUMN privchat_login_logs.token_first_used_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_login_logs.token_first_used_at IS 'Token 首次认证时间（真正的登录时间）';
-
-
---
--- Name: COLUMN privchat_login_logs.risk_score; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_login_logs.risk_score IS '风险评分 0-100，根据多种因素计算';
-
-
---
--- Name: COLUMN privchat_login_logs.risk_factors; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_login_logs.risk_factors IS '风险因素数组，如 ["new_location", "unusual_time", "proxy_or_vpn"]';
-
-
---
--- Name: COLUMN privchat_login_logs.is_new_device; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_login_logs.is_new_device IS '该设备是否为首次登录（device_id 首次出现）';
-
-
---
--- Name: COLUMN privchat_login_logs.is_new_location; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_login_logs.is_new_location IS '该用户是否从新地理位置登录';
-
 
 --
 -- Name: privchat_login_logs_log_id_seq; Type: SEQUENCE; Schema: public; Owner: -
@@ -875,11 +821,98 @@ CREATE SEQUENCE public.privchat_login_logs_log_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_login_logs_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_login_logs_log_id_seq OWNED BY public.privchat_login_logs.log_id;
+
+
+
+--
+-- Name: privchat_message_dedup; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.privchat_message_dedup (
+    dedup_key text NOT NULL,
+    message_id bigint NOT NULL,
+    created_at bigint NOT NULL
+);
+
+
+
+--
+-- Name: privchat_message_delivery_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.privchat_message_delivery_receipts (
+    server_message_id bigint NOT NULL,
+    receipt_type text NOT NULL,
+    channel_id bigint NOT NULL,
+    sender_id bigint NOT NULL,
+    recipient_user_id bigint NOT NULL,
+    ack_session_id bigint NOT NULL,
+    delivered_at bigint NOT NULL,
+    created_at bigint DEFAULT public.now_millis() NOT NULL
+);
+
+
+
+--
+-- Name: privchat_message_dispatch_outbox; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.privchat_message_dispatch_outbox (
+    event_id bigint NOT NULL,
+    channel_id bigint NOT NULL,
+    channel_type smallint NOT NULL,
+    pts bigint NOT NULL,
+    sender_id bigint NOT NULL,
+    event_kind smallint NOT NULL,
+    membership_version bigint NOT NULL,
+    status smallint DEFAULT 0 NOT NULL,
+    created_at bigint DEFAULT public.now_millis() NOT NULL,
+    dispatched_at bigint,
+    CONSTRAINT privchat_message_dispatch_outbox_event_kind_check CHECK ((event_kind = ANY (ARRAY[1, 2, 3]))),
+    CONSTRAINT privchat_message_dispatch_outbox_status_check CHECK ((status = ANY (ARRAY[0, 1, 2])))
+);
+
+
+
+--
+-- Name: privchat_message_dispatch_recipient; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.privchat_message_dispatch_recipient (
+    event_id bigint NOT NULL,
+    user_id bigint NOT NULL,
+    state smallint DEFAULT 0 NOT NULL,
+    lease_owner text,
+    lease_until bigint,
+    lease_token bigint DEFAULT 0 NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_attempt_at bigint DEFAULT 0 NOT NULL,
+    last_error text,
+    CONSTRAINT privchat_message_dispatch_recipient_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT privchat_message_dispatch_recipient_state_check CHECK ((state = ANY (ARRAY[0, 1, 2, 3])))
+);
+
+
+
+--
+-- Name: privchat_message_file_refs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.privchat_message_file_refs (
+    message_id bigint NOT NULL,
+    message_created_at bigint NOT NULL,
+    file_id bigint NOT NULL,
+    role smallint NOT NULL,
+    ordinal integer DEFAULT 0 NOT NULL,
+    created_at bigint DEFAULT public.now_millis() NOT NULL
+);
+
 
 
 --
@@ -893,6 +926,7 @@ CREATE TABLE public.privchat_message_reactions (
     created_at bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     updated_at bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL
 );
+
 
 
 --
@@ -920,12 +954,6 @@ CREATE TABLE public.privchat_messages (
 PARTITION BY RANGE (created_at);
 
 
---
--- Name: TABLE privchat_messages; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_messages IS '消息表：存储所有消息（message_id: Snowflake uint64，分区表，按月分区）';
-
 
 --
 -- Name: privchat_messages_2026_01; Type: TABLE; Schema: public; Owner: -
@@ -949,6 +977,7 @@ CREATE TABLE public.privchat_messages_2026_01 (
     revoked_at bigint,
     revoked_by bigint
 );
+
 
 
 --
@@ -975,6 +1004,7 @@ CREATE TABLE public.privchat_messages_2026_02 (
 );
 
 
+
 --
 -- Name: privchat_messages_2026_03; Type: TABLE; Schema: public; Owner: -
 --
@@ -997,6 +1027,7 @@ CREATE TABLE public.privchat_messages_2026_03 (
     revoked_at bigint,
     revoked_by bigint
 );
+
 
 
 --
@@ -1023,6 +1054,7 @@ CREATE TABLE public.privchat_messages_2026_04 (
 );
 
 
+
 --
 -- Name: privchat_messages_default; Type: TABLE; Schema: public; Owner: -
 --
@@ -1047,9 +1079,7 @@ CREATE TABLE public.privchat_messages_default (
 );
 
 
--- (privchat_migrations 表由 migrator 自管, 不在初始化 SQL 里建)
--- (privchat_migrations 表由 migrator 自管, 不在初始化 SQL 里建)
--- (privchat_migrations 表由 migrator 自管, 不在初始化 SQL 里建)
+
 --
 -- Name: privchat_offline_message_queue; Type: TABLE; Schema: public; Owner: -
 --
@@ -1068,12 +1098,6 @@ CREATE TABLE public.privchat_offline_message_queue (
 );
 
 
---
--- Name: TABLE privchat_offline_message_queue; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_offline_message_queue IS '离线消息队列：基于 pts 的轻量级队列';
-
 
 --
 -- Name: privchat_offline_message_queue_id_seq; Type: SEQUENCE; Schema: public; Owner: -
@@ -1087,11 +1111,25 @@ CREATE SEQUENCE public.privchat_offline_message_queue_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_offline_message_queue_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_offline_message_queue_id_seq OWNED BY public.privchat_offline_message_queue.id;
+
+
+
+--
+-- Name: privchat_platform_settings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.privchat_platform_settings (
+    key text NOT NULL,
+    value jsonb NOT NULL,
+    updated_at bigint NOT NULL
+);
+
 
 
 --
@@ -1105,12 +1143,6 @@ CREATE TABLE public.privchat_read_receipts (
     read_at bigint DEFAULT public.now_millis() NOT NULL
 );
 
-
---
--- Name: TABLE privchat_read_receipts; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_read_receipts IS '已读回执表：存储消息已读状态';
 
 
 --
@@ -1131,6 +1163,7 @@ CREATE TABLE public.privchat_refresh_tokens (
 );
 
 
+
 --
 -- Name: privchat_user_channels; Type: TABLE; Schema: public; Owner: -
 --
@@ -1148,12 +1181,6 @@ CREATE TABLE public.privchat_user_channels (
     is_hidden boolean DEFAULT false NOT NULL
 );
 
-
---
--- Name: TABLE privchat_user_channels; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_user_channels IS '用户频道列表表：存储用户的频道列表视图';
 
 
 --
@@ -1175,68 +1202,6 @@ CREATE TABLE public.privchat_user_devices (
 );
 
 
---
--- Name: TABLE privchat_user_devices; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_user_devices IS '用户设备推送信息表（Phase 3.5: 包含推送状态字段）';
-
-
---
--- Name: COLUMN privchat_user_devices.user_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_user_devices.user_id IS '用户ID';
-
-
---
--- Name: COLUMN privchat_user_devices.device_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_user_devices.device_id IS '设备ID';
-
-
---
--- Name: COLUMN privchat_user_devices.platform; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_user_devices.platform IS '平台：ios / android / desktop';
-
-
---
--- Name: COLUMN privchat_user_devices.vendor; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_user_devices.vendor IS '推送平台：apns / fcm';
-
-
---
--- Name: COLUMN privchat_user_devices.push_token; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_user_devices.push_token IS '推送令牌';
-
-
---
--- Name: COLUMN privchat_user_devices.apns_armed; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_user_devices.apns_armed IS '是否需要推送（客户端声明能力）';
-
-
---
--- Name: COLUMN privchat_user_devices.connected; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_user_devices.connected IS '是否存在可用长连接（QUIC/WebSocket/TCP，事实状态）';
-
-
---
--- Name: COLUMN privchat_user_devices.last_send_ts; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_user_devices.last_send_ts IS '最近一次发送成功时间';
-
 
 --
 -- Name: privchat_user_devices_id_seq; Type: SEQUENCE; Schema: public; Owner: -
@@ -1250,11 +1215,13 @@ CREATE SEQUENCE public.privchat_user_devices_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_user_devices_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_user_devices_id_seq OWNED BY public.privchat_user_devices.id;
+
 
 
 --
@@ -1269,6 +1236,7 @@ CREATE SEQUENCE public.privchat_user_entity_sync_version_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_user_last_seen; Type: TABLE; Schema: public; Owner: -
 --
@@ -1278,12 +1246,6 @@ CREATE TABLE public.privchat_user_last_seen (
     last_seen_at bigint NOT NULL
 );
 
-
---
--- Name: TABLE privchat_user_last_seen; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_user_last_seen IS '用户最后上线时间表：存储用户最后活跃时间，保留30天数据';
 
 
 --
@@ -1298,12 +1260,6 @@ CREATE TABLE public.privchat_user_settings (
     updated_at bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL
 );
 
-
---
--- Name: TABLE privchat_user_settings; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_user_settings IS '用户设置（ENTITY_SYNC_V1 user_settings），表为主';
 
 
 --
@@ -1330,19 +1286,6 @@ CREATE TABLE public.privchat_users (
 );
 
 
---
--- Name: TABLE privchat_users; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.privchat_users IS '用户表：存储用户基本信息（user_id: BIGSERIAL）';
-
-
---
--- Name: COLUMN privchat_users.qr_key; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.privchat_users.qr_key IS 'QR_CODE_SPEC v1.3: 个人名片码 opaque token, 16 chars base62, UNIQUE, 永久，用户可主动 refresh 旋转';
-
 
 --
 -- Name: privchat_users_user_id_seq; Type: SEQUENCE; Schema: public; Owner: -
@@ -1356,18 +1299,13 @@ CREATE SEQUENCE public.privchat_users_user_id_seq
     CACHE 1;
 
 
+
 --
 -- Name: privchat_users_user_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.privchat_users_user_id_seq OWNED BY public.privchat_users.user_id;
 
-
---
--- Name: SEQUENCE privchat_users_user_id_seq; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON SEQUENCE public.privchat_users_user_id_seq IS '用户 ID 序列：从 100000000 开始，1~99 保留给系统功能用户';
 
 
 --
@@ -1377,11 +1315,13 @@ COMMENT ON SEQUENCE public.privchat_users_user_id_seq IS '用户 ID 序列：从
 ALTER TABLE ONLY public.privchat_messages ATTACH PARTITION public.privchat_messages_2026_01 FOR VALUES FROM ('1767196800000') TO ('1769875200000');
 
 
+
 --
 -- Name: privchat_messages_2026_02; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_messages ATTACH PARTITION public.privchat_messages_2026_02 FOR VALUES FROM ('1769875200000') TO ('1772294400000');
+
 
 
 --
@@ -1391,11 +1331,13 @@ ALTER TABLE ONLY public.privchat_messages ATTACH PARTITION public.privchat_messa
 ALTER TABLE ONLY public.privchat_messages ATTACH PARTITION public.privchat_messages_2026_03 FOR VALUES FROM ('1772294400000') TO ('1774972800000');
 
 
+
 --
 -- Name: privchat_messages_2026_04; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_messages ATTACH PARTITION public.privchat_messages_2026_04 FOR VALUES FROM ('1774972800000') TO ('1777564800000');
+
 
 
 --
@@ -1405,11 +1347,21 @@ ALTER TABLE ONLY public.privchat_messages ATTACH PARTITION public.privchat_messa
 ALTER TABLE ONLY public.privchat_messages ATTACH PARTITION public.privchat_messages_default DEFAULT;
 
 
+
+--
+-- Name: privchat_attachment_objects object_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_attachment_objects ALTER COLUMN object_id SET DEFAULT nextval('public.privchat_attachment_objects_object_id_seq'::regclass);
+
+
+
 --
 -- Name: privchat_bot_follow id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_bot_follow ALTER COLUMN id SET DEFAULT nextval('public.privchat_bot_follow_id_seq'::regclass);
+
 
 
 --
@@ -1419,11 +1371,13 @@ ALTER TABLE ONLY public.privchat_bot_follow ALTER COLUMN id SET DEFAULT nextval(
 ALTER TABLE ONLY public.privchat_channels ALTER COLUMN channel_id SET DEFAULT nextval('public.privchat_channels_channel_id_seq'::regclass);
 
 
+
 --
 -- Name: privchat_commit_log id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_commit_log ALTER COLUMN id SET DEFAULT nextval('public.privchat_commit_log_id_seq'::regclass);
+
 
 
 --
@@ -1433,12 +1387,6 @@ ALTER TABLE ONLY public.privchat_commit_log ALTER COLUMN id SET DEFAULT nextval(
 ALTER TABLE ONLY public.privchat_file_uploads ALTER COLUMN file_id SET DEFAULT nextval('public.privchat_file_uploads_id_seq'::regclass);
 
 
---
--- Name: privchat_groups group_id; Type: DEFAULT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.privchat_groups ALTER COLUMN group_id SET DEFAULT nextval('public.privchat_groups_group_id_seq'::regclass);
-
 
 --
 -- Name: privchat_login_logs log_id; Type: DEFAULT; Schema: public; Owner: -
@@ -1447,12 +1395,13 @@ ALTER TABLE ONLY public.privchat_groups ALTER COLUMN group_id SET DEFAULT nextva
 ALTER TABLE ONLY public.privchat_login_logs ALTER COLUMN log_id SET DEFAULT nextval('public.privchat_login_logs_log_id_seq'::regclass);
 
 
--- (privchat_migrations 表由 migrator 自管, 不在初始化 SQL 里建)
+
 --
 -- Name: privchat_offline_message_queue id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_offline_message_queue ALTER COLUMN id SET DEFAULT nextval('public.privchat_offline_message_queue_id_seq'::regclass);
+
 
 
 --
@@ -1462,11 +1411,31 @@ ALTER TABLE ONLY public.privchat_offline_message_queue ALTER COLUMN id SET DEFAU
 ALTER TABLE ONLY public.privchat_user_devices ALTER COLUMN id SET DEFAULT nextval('public.privchat_user_devices_id_seq'::regclass);
 
 
+
 --
 -- Name: privchat_users user_id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_users ALTER COLUMN user_id SET DEFAULT nextval('public.privchat_users_user_id_seq'::regclass);
+
+
+
+--
+-- Name: privchat_attachment_objects privchat_attachment_objects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_attachment_objects
+    ADD CONSTRAINT privchat_attachment_objects_pkey PRIMARY KEY (object_id);
+
+
+
+--
+-- Name: privchat_attachment_objects privchat_attachment_objects_plaintext_sha256_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_attachment_objects
+    ADD CONSTRAINT privchat_attachment_objects_plaintext_sha256_key UNIQUE (plaintext_sha256);
+
 
 
 --
@@ -1477,12 +1446,14 @@ ALTER TABLE ONLY public.privchat_blacklist
     ADD CONSTRAINT privchat_blacklist_pkey PRIMARY KEY (user_id, blocked_user_id);
 
 
+
 --
 -- Name: privchat_bot_follow privchat_bot_follow_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_bot_follow
     ADD CONSTRAINT privchat_bot_follow_pkey PRIMARY KEY (id);
+
 
 
 --
@@ -1493,12 +1464,14 @@ ALTER TABLE ONLY public.privchat_channel_participants
     ADD CONSTRAINT privchat_channel_participants_pkey PRIMARY KEY (channel_id, user_id);
 
 
+
 --
 -- Name: privchat_channel_pts privchat_channel_pts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_channel_pts
     ADD CONSTRAINT privchat_channel_pts_pkey PRIMARY KEY (channel_id);
+
 
 
 --
@@ -1509,6 +1482,7 @@ ALTER TABLE ONLY public.privchat_channel_read_cursor
     ADD CONSTRAINT privchat_channel_read_cursor_pkey PRIMARY KEY (user_id, channel_id);
 
 
+
 --
 -- Name: privchat_channels privchat_channels_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
@@ -1517,12 +1491,14 @@ ALTER TABLE ONLY public.privchat_channels
     ADD CONSTRAINT privchat_channels_pkey PRIMARY KEY (channel_id);
 
 
+
 --
 -- Name: privchat_client_msg_registry privchat_client_msg_registry_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_client_msg_registry
-    ADD CONSTRAINT privchat_client_msg_registry_pkey PRIMARY KEY (local_message_id);
+    ADD CONSTRAINT privchat_client_msg_registry_pkey PRIMARY KEY (sender_id, device_id, local_message_id);
+
 
 
 --
@@ -1533,12 +1509,14 @@ ALTER TABLE ONLY public.privchat_commit_log
     ADD CONSTRAINT privchat_commit_log_channel_id_pts_key UNIQUE (channel_id, pts);
 
 
+
 --
 -- Name: privchat_commit_log privchat_commit_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_commit_log
     ADD CONSTRAINT privchat_commit_log_pkey PRIMARY KEY (id);
+
 
 
 --
@@ -1549,12 +1527,23 @@ ALTER TABLE ONLY public.privchat_device_sync_state
     ADD CONSTRAINT privchat_device_sync_state_pkey PRIMARY KEY (user_id, device_id, channel_id);
 
 
+
 --
 -- Name: privchat_devices privchat_devices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_devices
     ADD CONSTRAINT privchat_devices_pkey PRIMARY KEY (user_id, device_id);
+
+
+
+--
+-- Name: privchat_devices privchat_devices_session_state_check; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.privchat_devices
+    ADD CONSTRAINT privchat_devices_session_state_check CHECK ((session_state = ANY (ARRAY[0, 1, 2, 3, 4]))) NOT VALID;
+
 
 
 --
@@ -1565,12 +1554,23 @@ ALTER TABLE ONLY public.privchat_file_uploads
     ADD CONSTRAINT privchat_file_uploads_pkey PRIMARY KEY (file_id);
 
 
+
 --
 -- Name: privchat_friendships privchat_friendships_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_friendships
     ADD CONSTRAINT privchat_friendships_pkey PRIMARY KEY (user_id, friend_id);
+
+
+
+--
+-- Name: privchat_group_join_requests privchat_group_join_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_group_join_requests
+    ADD CONSTRAINT privchat_group_join_requests_pkey PRIMARY KEY (request_id);
+
 
 
 --
@@ -1581,12 +1581,23 @@ ALTER TABLE ONLY public.privchat_group_members
     ADD CONSTRAINT privchat_group_members_pkey PRIMARY KEY (group_id, user_id);
 
 
+
+--
+-- Name: privchat_group_pinned_messages privchat_group_pinned_messages_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_group_pinned_messages
+    ADD CONSTRAINT privchat_group_pinned_messages_pkey PRIMARY KEY (id);
+
+
+
 --
 -- Name: privchat_groups privchat_groups_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_groups
     ADD CONSTRAINT privchat_groups_pkey PRIMARY KEY (group_id);
+
 
 
 --
@@ -1597,12 +1608,59 @@ ALTER TABLE ONLY public.privchat_login_logs
     ADD CONSTRAINT privchat_login_logs_pkey PRIMARY KEY (log_id);
 
 
+
+--
+-- Name: privchat_message_dedup privchat_message_dedup_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_message_dedup
+    ADD CONSTRAINT privchat_message_dedup_pkey PRIMARY KEY (dedup_key);
+
+
+
+--
+-- Name: privchat_message_delivery_receipts privchat_message_delivery_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_message_delivery_receipts
+    ADD CONSTRAINT privchat_message_delivery_receipts_pkey PRIMARY KEY (server_message_id, receipt_type);
+
+
+
+--
+-- Name: privchat_message_dispatch_outbox privchat_message_dispatch_outbox_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_message_dispatch_outbox
+    ADD CONSTRAINT privchat_message_dispatch_outbox_pkey PRIMARY KEY (event_id);
+
+
+
+--
+-- Name: privchat_message_dispatch_recipient privchat_message_dispatch_recipient_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_message_dispatch_recipient
+    ADD CONSTRAINT privchat_message_dispatch_recipient_pkey PRIMARY KEY (event_id, user_id);
+
+
+
+--
+-- Name: privchat_message_file_refs privchat_message_file_refs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_message_file_refs
+    ADD CONSTRAINT privchat_message_file_refs_pkey PRIMARY KEY (message_id, role, ordinal);
+
+
+
 --
 -- Name: privchat_message_reactions privchat_message_reactions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_message_reactions
     ADD CONSTRAINT privchat_message_reactions_pkey PRIMARY KEY (message_id, user_id);
+
 
 
 --
@@ -1613,12 +1671,14 @@ ALTER TABLE ONLY public.privchat_messages
     ADD CONSTRAINT privchat_messages_pkey PRIMARY KEY (message_id, created_at);
 
 
+
 --
 -- Name: privchat_messages_2026_01 privchat_messages_2026_01_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_messages_2026_01
     ADD CONSTRAINT privchat_messages_2026_01_pkey PRIMARY KEY (message_id, created_at);
+
 
 
 --
@@ -1629,12 +1689,14 @@ ALTER TABLE ONLY public.privchat_messages_2026_02
     ADD CONSTRAINT privchat_messages_2026_02_pkey PRIMARY KEY (message_id, created_at);
 
 
+
 --
 -- Name: privchat_messages_2026_03 privchat_messages_2026_03_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_messages_2026_03
     ADD CONSTRAINT privchat_messages_2026_03_pkey PRIMARY KEY (message_id, created_at);
+
 
 
 --
@@ -1645,6 +1707,7 @@ ALTER TABLE ONLY public.privchat_messages_2026_04
     ADD CONSTRAINT privchat_messages_2026_04_pkey PRIMARY KEY (message_id, created_at);
 
 
+
 --
 -- Name: privchat_messages_default privchat_messages_default_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
@@ -1653,14 +1716,23 @@ ALTER TABLE ONLY public.privchat_messages_default
     ADD CONSTRAINT privchat_messages_default_pkey PRIMARY KEY (message_id, created_at);
 
 
--- (privchat_migrations 表由 migrator 自管, 不在初始化 SQL 里建)
--- (privchat_migrations 表由 migrator 自管, 不在初始化 SQL 里建)
+
 --
 -- Name: privchat_offline_message_queue privchat_offline_message_queue_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_offline_message_queue
     ADD CONSTRAINT privchat_offline_message_queue_pkey PRIMARY KEY (id);
+
+
+
+--
+-- Name: privchat_platform_settings privchat_platform_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_platform_settings
+    ADD CONSTRAINT privchat_platform_settings_pkey PRIMARY KEY (key);
+
 
 
 --
@@ -1671,12 +1743,14 @@ ALTER TABLE ONLY public.privchat_read_receipts
     ADD CONSTRAINT privchat_read_receipts_pkey PRIMARY KEY (message_id, user_id);
 
 
+
 --
 -- Name: privchat_refresh_tokens privchat_refresh_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_refresh_tokens
     ADD CONSTRAINT privchat_refresh_tokens_pkey PRIMARY KEY (jti);
+
 
 
 --
@@ -1687,12 +1761,14 @@ ALTER TABLE ONLY public.privchat_refresh_tokens
     ADD CONSTRAINT privchat_refresh_tokens_token_hash_key UNIQUE (token_hash);
 
 
+
 --
 -- Name: privchat_user_channels privchat_user_channels_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_user_channels
     ADD CONSTRAINT privchat_user_channels_pkey PRIMARY KEY (user_id, channel_id);
+
 
 
 --
@@ -1703,12 +1779,14 @@ ALTER TABLE ONLY public.privchat_user_devices
     ADD CONSTRAINT privchat_user_devices_pkey PRIMARY KEY (id);
 
 
+
 --
 -- Name: privchat_user_devices privchat_user_devices_user_id_device_id_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_user_devices
     ADD CONSTRAINT privchat_user_devices_user_id_device_id_key UNIQUE (user_id, device_id);
+
 
 
 --
@@ -1719,12 +1797,14 @@ ALTER TABLE ONLY public.privchat_user_last_seen
     ADD CONSTRAINT privchat_user_last_seen_pkey PRIMARY KEY (user_id);
 
 
+
 --
 -- Name: privchat_user_settings privchat_user_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_user_settings
     ADD CONSTRAINT privchat_user_settings_pkey PRIMARY KEY (user_id, setting_key);
+
 
 
 --
@@ -1735,12 +1815,14 @@ ALTER TABLE ONLY public.privchat_users
     ADD CONSTRAINT privchat_users_email_key UNIQUE (email);
 
 
+
 --
 -- Name: privchat_users privchat_users_phone_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_users
     ADD CONSTRAINT privchat_users_phone_key UNIQUE (phone);
+
 
 
 --
@@ -1751,12 +1833,23 @@ ALTER TABLE ONLY public.privchat_users
     ADD CONSTRAINT privchat_users_pkey PRIMARY KEY (user_id);
 
 
+
 --
 -- Name: privchat_users privchat_users_username_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_users
     ADD CONSTRAINT privchat_users_username_key UNIQUE (username);
+
+
+
+--
+-- Name: privchat_group_pinned_messages uq_group_pinned_message; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_group_pinned_messages
+    ADD CONSTRAINT uq_group_pinned_message UNIQUE (group_id, message_id);
+
 
 
 --
@@ -1766,11 +1859,29 @@ ALTER TABLE ONLY public.privchat_users
 CREATE INDEX idx_bot_follow_bot ON public.privchat_bot_follow USING btree (bot_user_id, status);
 
 
+
 --
 -- Name: idx_bot_follow_user; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_bot_follow_user ON public.privchat_bot_follow USING btree (user_id, status);
+
+
+
+--
+-- Name: idx_group_pinned_messages_group; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_group_pinned_messages_group ON public.privchat_group_pinned_messages USING btree (group_id, pinned_at DESC);
+
+
+
+--
+-- Name: idx_message_dedup_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_message_dedup_created_at ON public.privchat_message_dedup USING btree (created_at);
+
 
 
 --
@@ -1780,11 +1891,37 @@ CREATE INDEX idx_bot_follow_user ON public.privchat_bot_follow USING btree (user
 CREATE INDEX idx_message_reactions_message_id ON public.privchat_message_reactions USING btree (message_id);
 
 
+
 --
 -- Name: idx_message_reactions_user_id; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_message_reactions_user_id ON public.privchat_message_reactions USING btree (user_id);
+
+
+
+--
+-- Name: idx_pgjr_group_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pgjr_group_status ON public.privchat_group_join_requests USING btree (group_id, status);
+
+
+
+--
+-- Name: idx_pgjr_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pgjr_user ON public.privchat_group_join_requests USING btree (user_id);
+
+
+
+--
+-- Name: idx_privchat_attachment_objects_path; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_privchat_attachment_objects_path ON public.privchat_attachment_objects USING btree (storage_source_id, file_path);
+
 
 
 --
@@ -1794,11 +1931,13 @@ CREATE INDEX idx_message_reactions_user_id ON public.privchat_message_reactions 
 CREATE INDEX idx_privchat_blacklist_user ON public.privchat_blacklist USING btree (user_id);
 
 
+
 --
 -- Name: idx_privchat_channel_participants_channel; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_channel_participants_channel ON public.privchat_channel_participants USING btree (channel_id) WHERE (left_at IS NULL);
+
 
 
 --
@@ -1808,11 +1947,13 @@ CREATE INDEX idx_privchat_channel_participants_channel ON public.privchat_channe
 CREATE INDEX idx_privchat_channel_participants_role ON public.privchat_channel_participants USING btree (channel_id, role) WHERE (left_at IS NULL);
 
 
+
 --
 -- Name: idx_privchat_channel_participants_user; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_channel_participants_user ON public.privchat_channel_participants USING btree (user_id) WHERE (left_at IS NULL);
+
 
 
 --
@@ -1822,11 +1963,13 @@ CREATE INDEX idx_privchat_channel_participants_user ON public.privchat_channel_p
 CREATE INDEX idx_privchat_channel_pts_updated ON public.privchat_channel_pts USING btree (updated_at);
 
 
+
 --
 -- Name: idx_privchat_channel_read_cursor_channel_sync_version; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_channel_read_cursor_channel_sync_version ON public.privchat_channel_read_cursor USING btree (channel_id, sync_version);
+
 
 
 --
@@ -1836,11 +1979,13 @@ CREATE INDEX idx_privchat_channel_read_cursor_channel_sync_version ON public.pri
 CREATE INDEX idx_privchat_channel_read_cursor_channel_updated ON public.privchat_channel_read_cursor USING btree (channel_id, updated_at DESC);
 
 
+
 --
 -- Name: idx_privchat_channel_read_cursor_user_sync_version; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_channel_read_cursor_user_sync_version ON public.privchat_channel_read_cursor USING btree (user_id, sync_version);
+
 
 
 --
@@ -1850,11 +1995,13 @@ CREATE INDEX idx_privchat_channel_read_cursor_user_sync_version ON public.privch
 CREATE INDEX idx_privchat_channel_read_cursor_user_updated ON public.privchat_channel_read_cursor USING btree (user_id, updated_at DESC);
 
 
+
 --
 -- Name: idx_privchat_channels_direct; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_channels_direct ON public.privchat_channels USING btree (direct_user1_id, direct_user2_id) WHERE (channel_type = 0);
+
 
 
 --
@@ -1864,11 +2011,13 @@ CREATE INDEX idx_privchat_channels_direct ON public.privchat_channels USING btre
 CREATE UNIQUE INDEX idx_privchat_channels_direct_unique ON public.privchat_channels USING btree (LEAST(direct_user1_id, direct_user2_id), GREATEST(direct_user1_id, direct_user2_id)) WHERE ((channel_type = 0) AND (direct_user1_id IS NOT NULL) AND (direct_user2_id IS NOT NULL));
 
 
+
 --
 -- Name: idx_privchat_channels_group; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_channels_group ON public.privchat_channels USING btree (group_id) WHERE (channel_type = 1);
+
 
 
 --
@@ -1878,11 +2027,13 @@ CREATE INDEX idx_privchat_channels_group ON public.privchat_channels USING btree
 CREATE INDEX idx_privchat_channels_last_message ON public.privchat_channels USING btree (last_message_at DESC);
 
 
+
 --
 -- Name: idx_privchat_channels_sync_version; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_channels_sync_version ON public.privchat_channels USING btree (sync_version);
+
 
 
 --
@@ -1892,11 +2043,13 @@ CREATE INDEX idx_privchat_channels_sync_version ON public.privchat_channels USIN
 CREATE INDEX idx_privchat_channels_type ON public.privchat_channels USING btree (channel_type);
 
 
+
 --
 -- Name: idx_privchat_client_msg_reg_created; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_client_msg_reg_created ON public.privchat_client_msg_registry USING btree (created_at);
+
 
 
 --
@@ -1906,11 +2059,13 @@ CREATE INDEX idx_privchat_client_msg_reg_created ON public.privchat_client_msg_r
 CREATE INDEX idx_privchat_client_msg_reg_server_id ON public.privchat_client_msg_registry USING btree (server_msg_id);
 
 
+
 --
 -- Name: idx_privchat_commit_log_channel_pts; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_commit_log_channel_pts ON public.privchat_commit_log USING btree (channel_id, pts);
+
 
 
 --
@@ -1920,11 +2075,21 @@ CREATE INDEX idx_privchat_commit_log_channel_pts ON public.privchat_commit_log U
 CREATE INDEX idx_privchat_commit_log_local_message_id ON public.privchat_commit_log USING btree (local_message_id) WHERE (local_message_id IS NOT NULL);
 
 
+
 --
 -- Name: idx_privchat_commit_log_timestamp; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_commit_log_timestamp ON public.privchat_commit_log USING btree (server_timestamp);
+
+
+
+--
+-- Name: idx_privchat_delivery_receipts_sender; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_privchat_delivery_receipts_sender ON public.privchat_message_delivery_receipts USING btree (sender_id, delivered_at DESC);
+
 
 
 --
@@ -1934,11 +2099,13 @@ CREATE INDEX idx_privchat_commit_log_timestamp ON public.privchat_commit_log USI
 CREATE INDEX idx_privchat_devices_device ON public.privchat_devices USING btree (device_id);
 
 
+
 --
 -- Name: idx_privchat_devices_kicked; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_devices_kicked ON public.privchat_devices USING btree (kicked_at DESC) WHERE (session_state = 1);
+
 
 
 --
@@ -1948,11 +2115,13 @@ CREATE INDEX idx_privchat_devices_kicked ON public.privchat_devices USING btree 
 CREATE INDEX idx_privchat_devices_session ON public.privchat_devices USING btree (user_id, session_state);
 
 
+
 --
 -- Name: idx_privchat_devices_session_version; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_devices_session_version ON public.privchat_devices USING btree (user_id, session_version);
+
 
 
 --
@@ -1962,11 +2131,29 @@ CREATE INDEX idx_privchat_devices_session_version ON public.privchat_devices USI
 CREATE INDEX idx_privchat_devices_user ON public.privchat_devices USING btree (user_id);
 
 
+
 --
 -- Name: idx_privchat_devices_user_active; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_devices_user_active ON public.privchat_devices USING btree (user_id, last_active_at DESC);
+
+
+
+--
+-- Name: idx_privchat_dispatch_outbox_retention; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_privchat_dispatch_outbox_retention ON public.privchat_message_dispatch_outbox USING btree (status, created_at);
+
+
+
+--
+-- Name: idx_privchat_dispatch_recipient_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_privchat_dispatch_recipient_claim ON public.privchat_message_dispatch_recipient USING btree (next_attempt_at, event_id, user_id) WHERE (state = 0);
+
 
 
 --
@@ -1976,11 +2163,21 @@ CREATE INDEX idx_privchat_devices_user_active ON public.privchat_devices USING b
 CREATE INDEX idx_privchat_file_uploads_business ON public.privchat_file_uploads USING btree (business_type, business_id);
 
 
+
+--
+-- Name: idx_privchat_file_uploads_object_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_privchat_file_uploads_object_id ON public.privchat_file_uploads USING btree (object_id);
+
+
+
 --
 -- Name: idx_privchat_file_uploads_uploaded_at; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_file_uploads_uploaded_at ON public.privchat_file_uploads USING btree (uploaded_at);
+
 
 
 --
@@ -1990,11 +2187,13 @@ CREATE INDEX idx_privchat_file_uploads_uploaded_at ON public.privchat_file_uploa
 CREATE INDEX idx_privchat_file_uploads_uploader_id ON public.privchat_file_uploads USING btree (uploader_id);
 
 
+
 --
 -- Name: idx_privchat_friendships_accepted; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_friendships_accepted ON public.privchat_friendships USING btree (user_id, friend_id) WHERE (status = 1);
+
 
 
 --
@@ -2004,11 +2203,13 @@ CREATE INDEX idx_privchat_friendships_accepted ON public.privchat_friendships US
 CREATE INDEX idx_privchat_friendships_friend ON public.privchat_friendships USING btree (friend_id, status);
 
 
+
 --
 -- Name: idx_privchat_friendships_user; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_friendships_user ON public.privchat_friendships USING btree (user_id, status);
+
 
 
 --
@@ -2018,11 +2219,13 @@ CREATE INDEX idx_privchat_friendships_user ON public.privchat_friendships USING 
 CREATE INDEX idx_privchat_friendships_user_sync_version ON public.privchat_friendships USING btree (user_id, sync_version DESC);
 
 
+
 --
 -- Name: idx_privchat_group_members_group; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_group_members_group ON public.privchat_group_members USING btree (group_id) WHERE (left_at IS NULL);
+
 
 
 --
@@ -2032,11 +2235,13 @@ CREATE INDEX idx_privchat_group_members_group ON public.privchat_group_members U
 CREATE INDEX idx_privchat_group_members_group_sync_version ON public.privchat_group_members USING btree (group_id, sync_version DESC);
 
 
+
 --
 -- Name: idx_privchat_group_members_role; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_group_members_role ON public.privchat_group_members USING btree (group_id, role) WHERE (left_at IS NULL);
+
 
 
 --
@@ -2046,11 +2251,13 @@ CREATE INDEX idx_privchat_group_members_role ON public.privchat_group_members US
 CREATE INDEX idx_privchat_group_members_user ON public.privchat_group_members USING btree (user_id) WHERE (left_at IS NULL);
 
 
+
 --
 -- Name: idx_privchat_groups_owner; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_groups_owner ON public.privchat_groups USING btree (owner_id);
+
 
 
 --
@@ -2060,11 +2267,13 @@ CREATE INDEX idx_privchat_groups_owner ON public.privchat_groups USING btree (ow
 CREATE INDEX idx_privchat_groups_settings_gin ON public.privchat_groups USING gin (settings);
 
 
+
 --
 -- Name: idx_privchat_groups_status; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_groups_status ON public.privchat_groups USING btree (status) WHERE (status = 0);
+
 
 
 --
@@ -2074,11 +2283,13 @@ CREATE INDEX idx_privchat_groups_status ON public.privchat_groups USING btree (s
 CREATE INDEX idx_privchat_groups_sync_version ON public.privchat_groups USING btree (sync_version DESC);
 
 
+
 --
 -- Name: idx_privchat_login_logs_created; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_login_logs_created ON public.privchat_login_logs USING btree (created_at DESC);
+
 
 
 --
@@ -2088,11 +2299,13 @@ CREATE INDEX idx_privchat_login_logs_created ON public.privchat_login_logs USING
 CREATE INDEX idx_privchat_login_logs_device ON public.privchat_login_logs USING btree (device_id, token_first_used_at DESC);
 
 
+
 --
 -- Name: idx_privchat_login_logs_ip; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_login_logs_ip ON public.privchat_login_logs USING btree (ip_address);
+
 
 
 --
@@ -2102,11 +2315,13 @@ CREATE INDEX idx_privchat_login_logs_ip ON public.privchat_login_logs USING btre
 CREATE INDEX idx_privchat_login_logs_new_device ON public.privchat_login_logs USING btree (user_id, created_at DESC) WHERE (is_new_device = true);
 
 
+
 --
 -- Name: idx_privchat_login_logs_notification; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_login_logs_notification ON public.privchat_login_logs USING btree (user_id, notification_sent) WHERE (notification_sent = false);
+
 
 
 --
@@ -2116,11 +2331,13 @@ CREATE INDEX idx_privchat_login_logs_notification ON public.privchat_login_logs 
 CREATE INDEX idx_privchat_login_logs_risk ON public.privchat_login_logs USING btree (user_id, risk_score DESC) WHERE (risk_score > 50);
 
 
+
 --
 -- Name: idx_privchat_login_logs_risk_factors; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_login_logs_risk_factors ON public.privchat_login_logs USING gin (risk_factors);
+
 
 
 --
@@ -2130,11 +2347,13 @@ CREATE INDEX idx_privchat_login_logs_risk_factors ON public.privchat_login_logs 
 CREATE INDEX idx_privchat_login_logs_status ON public.privchat_login_logs USING btree (user_id, status);
 
 
+
 --
 -- Name: idx_privchat_login_logs_token_jti; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_login_logs_token_jti ON public.privchat_login_logs USING btree (token_jti);
+
 
 
 --
@@ -2144,11 +2363,21 @@ CREATE INDEX idx_privchat_login_logs_token_jti ON public.privchat_login_logs USI
 CREATE INDEX idx_privchat_login_logs_user_time ON public.privchat_login_logs USING btree (user_id, token_first_used_at DESC);
 
 
+
+--
+-- Name: idx_privchat_message_file_refs_file; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_privchat_message_file_refs_file ON public.privchat_message_file_refs USING btree (file_id);
+
+
+
 --
 -- Name: idx_privchat_messages_channel_id; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_messages_channel_id ON ONLY public.privchat_messages USING btree (channel_id, message_id DESC);
+
 
 
 --
@@ -2158,11 +2387,36 @@ CREATE INDEX idx_privchat_messages_channel_id ON ONLY public.privchat_messages U
 CREATE INDEX idx_privchat_messages_channel_pts ON ONLY public.privchat_messages USING btree (channel_id, pts);
 
 
+
 --
 -- Name: idx_privchat_messages_channel_time; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_messages_channel_time ON ONLY public.privchat_messages USING btree (channel_id, created_at DESC);
+
+
+
+--
+-- Name: idx_privchat_messages_content_trgm; Type: INDEX; Schema: public; Owner: -
+--
+
+-- 🔴 pg_trgm 属于 contrib，托管 PostgreSQL 常常没装（Weey 生产库
+-- pg_available_extensions 里只有 plpgsql）。无条件 CREATE EXTENSION 会让整条
+-- 基线在这里断掉，而这条索引只是 admin 后台子串搜索的**性能优化**：客户端搜索
+-- 走的是下面 privchat_search_tokens 的 bigram 索引，不依赖任何扩展。
+-- 缺了就跳过，但要**明确告警**，不能装作没事发生。
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_trgm') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+        CREATE INDEX idx_privchat_messages_content_trgm
+            ON ONLY public.privchat_messages USING gin (content public.gin_trgm_ops);
+    ELSE
+        RAISE WARNING '这台库没有 pg_trgm，跳过 admin 子串搜索的 GIN 索引：admin 消息搜索会退化为顺序扫描。客户端搜索不受影响。要恢复请在数据库主机安装 postgresql-contrib 后手工建此索引。';
+    END IF;
+END
+$$;
+
 
 
 --
@@ -2172,11 +2426,13 @@ CREATE INDEX idx_privchat_messages_channel_time ON ONLY public.privchat_messages
 CREATE INDEX idx_privchat_messages_deleted ON ONLY public.privchat_messages USING btree (channel_id, created_at DESC) WHERE (deleted = false);
 
 
+
 --
 -- Name: idx_privchat_messages_local_message_id; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_messages_local_message_id ON ONLY public.privchat_messages USING btree (channel_id, local_message_id) WHERE (local_message_id IS NOT NULL);
+
 
 
 --
@@ -2186,11 +2442,13 @@ CREATE INDEX idx_privchat_messages_local_message_id ON ONLY public.privchat_mess
 CREATE INDEX idx_privchat_messages_metadata_gin ON ONLY public.privchat_messages USING gin (metadata);
 
 
+
 --
 -- Name: idx_privchat_messages_pts; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_messages_pts ON ONLY public.privchat_messages USING btree (sender_id, pts);
+
 
 
 --
@@ -2200,11 +2458,21 @@ CREATE INDEX idx_privchat_messages_pts ON ONLY public.privchat_messages USING bt
 CREATE INDEX idx_privchat_messages_reply ON ONLY public.privchat_messages USING btree (reply_to_message_id) WHERE (reply_to_message_id IS NOT NULL);
 
 
+
 --
 -- Name: idx_privchat_messages_revoked; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_messages_revoked ON ONLY public.privchat_messages USING btree (channel_id, revoked_at) WHERE (revoked = true);
+
+
+
+--
+-- Name: idx_privchat_messages_search_tokens; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_privchat_messages_search_tokens ON ONLY public.privchat_messages USING gin (public.privchat_search_tokens(content));
+
 
 
 --
@@ -2214,11 +2482,21 @@ CREATE INDEX idx_privchat_messages_revoked ON ONLY public.privchat_messages USIN
 CREATE INDEX idx_privchat_messages_sender ON ONLY public.privchat_messages USING btree (sender_id, created_at DESC);
 
 
+
+--
+-- Name: idx_privchat_messages_sender_time; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_privchat_messages_sender_time ON ONLY public.privchat_messages USING btree (sender_id, created_at DESC);
+
+
+
 --
 -- Name: idx_privchat_offline_queue_expires; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_offline_queue_expires ON public.privchat_offline_message_queue USING btree (expires_at);
+
 
 
 --
@@ -2228,11 +2506,13 @@ CREATE INDEX idx_privchat_offline_queue_expires ON public.privchat_offline_messa
 CREATE INDEX idx_privchat_offline_queue_user ON public.privchat_offline_message_queue USING btree (user_id, delivered, created_at);
 
 
+
 --
 -- Name: idx_privchat_read_receipts_channel; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_read_receipts_channel ON public.privchat_read_receipts USING btree (channel_id);
+
 
 
 --
@@ -2242,11 +2522,13 @@ CREATE INDEX idx_privchat_read_receipts_channel ON public.privchat_read_receipts
 CREATE INDEX idx_privchat_read_receipts_user_channel ON public.privchat_read_receipts USING btree (user_id, channel_id);
 
 
+
 --
 -- Name: idx_privchat_refresh_tokens_expires_at; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_refresh_tokens_expires_at ON public.privchat_refresh_tokens USING btree (expires_at);
+
 
 
 --
@@ -2256,11 +2538,13 @@ CREATE INDEX idx_privchat_refresh_tokens_expires_at ON public.privchat_refresh_t
 CREATE INDEX idx_privchat_refresh_tokens_revoked_at ON public.privchat_refresh_tokens USING btree (revoked_at);
 
 
+
 --
 -- Name: idx_privchat_refresh_tokens_user_device; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_refresh_tokens_user_device ON public.privchat_refresh_tokens USING btree (user_id, device_id);
+
 
 
 --
@@ -2270,11 +2554,13 @@ CREATE INDEX idx_privchat_refresh_tokens_user_device ON public.privchat_refresh_
 CREATE INDEX idx_privchat_sync_state_channel ON public.privchat_device_sync_state USING btree (channel_id);
 
 
+
 --
 -- Name: idx_privchat_sync_state_user_device; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_sync_state_user_device ON public.privchat_device_sync_state USING btree (user_id, device_id);
+
 
 
 --
@@ -2284,11 +2570,13 @@ CREATE INDEX idx_privchat_sync_state_user_device ON public.privchat_device_sync_
 CREATE INDEX idx_privchat_user_channels_unread ON public.privchat_user_channels USING btree (user_id, unread_count) WHERE (unread_count > 0);
 
 
+
 --
 -- Name: idx_privchat_user_channels_user_pinned; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_user_channels_user_pinned ON public.privchat_user_channels USING btree (user_id, is_pinned DESC, updated_at DESC);
+
 
 
 --
@@ -2298,11 +2586,13 @@ CREATE INDEX idx_privchat_user_channels_user_pinned ON public.privchat_user_chan
 CREATE INDEX idx_privchat_user_channels_user_sync_version ON public.privchat_user_channels USING btree (user_id, sync_version DESC);
 
 
+
 --
 -- Name: idx_privchat_user_channels_user_updated; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_user_channels_user_updated ON public.privchat_user_channels USING btree (user_id, updated_at DESC);
+
 
 
 --
@@ -2312,11 +2602,13 @@ CREATE INDEX idx_privchat_user_channels_user_updated ON public.privchat_user_cha
 CREATE INDEX idx_privchat_user_devices_apns_armed ON public.privchat_user_devices USING btree (apns_armed) WHERE (apns_armed = true);
 
 
+
 --
 -- Name: idx_privchat_user_devices_connected; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_user_devices_connected ON public.privchat_user_devices USING btree (connected) WHERE (connected = true);
+
 
 
 --
@@ -2326,11 +2618,13 @@ CREATE INDEX idx_privchat_user_devices_connected ON public.privchat_user_devices
 CREATE INDEX idx_privchat_user_devices_user_id ON public.privchat_user_devices USING btree (user_id);
 
 
+
 --
 -- Name: idx_privchat_user_last_seen_time; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_user_last_seen_time ON public.privchat_user_last_seen USING btree (last_seen_at);
+
 
 
 --
@@ -2340,11 +2634,13 @@ CREATE INDEX idx_privchat_user_last_seen_time ON public.privchat_user_last_seen 
 CREATE INDEX idx_privchat_user_settings_user_version ON public.privchat_user_settings USING btree (user_id, version);
 
 
+
 --
 -- Name: idx_privchat_users_email; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_users_email ON public.privchat_users USING btree (email) WHERE (email IS NOT NULL);
+
 
 
 --
@@ -2354,11 +2650,13 @@ CREATE INDEX idx_privchat_users_email ON public.privchat_users USING btree (emai
 CREATE INDEX idx_privchat_users_last_active ON public.privchat_users USING btree (last_active_at DESC) WHERE (status = 0);
 
 
+
 --
 -- Name: idx_privchat_users_phone; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_users_phone ON public.privchat_users USING btree (phone) WHERE (phone IS NOT NULL);
+
 
 
 --
@@ -2368,11 +2666,13 @@ CREATE INDEX idx_privchat_users_phone ON public.privchat_users USING btree (phon
 CREATE INDEX idx_privchat_users_status ON public.privchat_users USING btree (status) WHERE (status = 0);
 
 
+
 --
 -- Name: idx_privchat_users_sync_version; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_users_sync_version ON public.privchat_users USING btree (sync_version);
+
 
 
 --
@@ -2382,11 +2682,13 @@ CREATE INDEX idx_privchat_users_sync_version ON public.privchat_users USING btre
 CREATE INDEX idx_privchat_users_type ON public.privchat_users USING btree (user_type);
 
 
+
 --
 -- Name: idx_privchat_users_username; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_privchat_users_username ON public.privchat_users USING btree (username);
+
 
 
 --
@@ -2396,11 +2698,13 @@ CREATE INDEX idx_privchat_users_username ON public.privchat_users USING btree (u
 CREATE INDEX privchat_messages_2026_01_channel_id_created_at_idx ON public.privchat_messages_2026_01 USING btree (channel_id, created_at DESC);
 
 
+
 --
 -- Name: privchat_messages_2026_01_channel_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_01_channel_id_created_at_idx1 ON public.privchat_messages_2026_01 USING btree (channel_id, created_at DESC) WHERE (deleted = false);
+
 
 
 --
@@ -2410,11 +2714,13 @@ CREATE INDEX privchat_messages_2026_01_channel_id_created_at_idx1 ON public.priv
 CREATE INDEX privchat_messages_2026_01_channel_id_local_message_id_idx ON public.privchat_messages_2026_01 USING btree (channel_id, local_message_id) WHERE (local_message_id IS NOT NULL);
 
 
+
 --
 -- Name: privchat_messages_2026_01_channel_id_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_01_channel_id_message_id_idx ON public.privchat_messages_2026_01 USING btree (channel_id, message_id DESC);
+
 
 
 --
@@ -2424,11 +2730,21 @@ CREATE INDEX privchat_messages_2026_01_channel_id_message_id_idx ON public.privc
 CREATE INDEX privchat_messages_2026_01_channel_id_pts_idx ON public.privchat_messages_2026_01 USING btree (channel_id, pts);
 
 
+
 --
 -- Name: privchat_messages_2026_01_channel_id_revoked_at_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_01_channel_id_revoked_at_idx ON public.privchat_messages_2026_01 USING btree (channel_id, revoked_at) WHERE (revoked = true);
+
+
+
+--
+-- Name: privchat_messages_2026_01_content_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_01_content_idx ON public.privchat_messages_2026_01 USING gin (content public.gin_trgm_ops);
+
 
 
 --
@@ -2438,11 +2754,21 @@ CREATE INDEX privchat_messages_2026_01_channel_id_revoked_at_idx ON public.privc
 CREATE INDEX privchat_messages_2026_01_metadata_idx ON public.privchat_messages_2026_01 USING gin (metadata);
 
 
+
+--
+-- Name: privchat_messages_2026_01_privchat_search_tokens_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_01_privchat_search_tokens_idx ON public.privchat_messages_2026_01 USING gin (public.privchat_search_tokens(content));
+
+
+
 --
 -- Name: privchat_messages_2026_01_reply_to_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_01_reply_to_message_id_idx ON public.privchat_messages_2026_01 USING btree (reply_to_message_id) WHERE (reply_to_message_id IS NOT NULL);
+
 
 
 --
@@ -2452,11 +2778,21 @@ CREATE INDEX privchat_messages_2026_01_reply_to_message_id_idx ON public.privcha
 CREATE INDEX privchat_messages_2026_01_sender_id_created_at_idx ON public.privchat_messages_2026_01 USING btree (sender_id, created_at DESC);
 
 
+
+--
+-- Name: privchat_messages_2026_01_sender_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_01_sender_id_created_at_idx1 ON public.privchat_messages_2026_01 USING btree (sender_id, created_at DESC);
+
+
+
 --
 -- Name: privchat_messages_2026_01_sender_id_pts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_01_sender_id_pts_idx ON public.privchat_messages_2026_01 USING btree (sender_id, pts);
+
 
 
 --
@@ -2466,11 +2802,13 @@ CREATE INDEX privchat_messages_2026_01_sender_id_pts_idx ON public.privchat_mess
 CREATE INDEX privchat_messages_2026_02_channel_id_created_at_idx ON public.privchat_messages_2026_02 USING btree (channel_id, created_at DESC);
 
 
+
 --
 -- Name: privchat_messages_2026_02_channel_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_02_channel_id_created_at_idx1 ON public.privchat_messages_2026_02 USING btree (channel_id, created_at DESC) WHERE (deleted = false);
+
 
 
 --
@@ -2480,11 +2818,13 @@ CREATE INDEX privchat_messages_2026_02_channel_id_created_at_idx1 ON public.priv
 CREATE INDEX privchat_messages_2026_02_channel_id_local_message_id_idx ON public.privchat_messages_2026_02 USING btree (channel_id, local_message_id) WHERE (local_message_id IS NOT NULL);
 
 
+
 --
 -- Name: privchat_messages_2026_02_channel_id_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_02_channel_id_message_id_idx ON public.privchat_messages_2026_02 USING btree (channel_id, message_id DESC);
+
 
 
 --
@@ -2494,11 +2834,21 @@ CREATE INDEX privchat_messages_2026_02_channel_id_message_id_idx ON public.privc
 CREATE INDEX privchat_messages_2026_02_channel_id_pts_idx ON public.privchat_messages_2026_02 USING btree (channel_id, pts);
 
 
+
 --
 -- Name: privchat_messages_2026_02_channel_id_revoked_at_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_02_channel_id_revoked_at_idx ON public.privchat_messages_2026_02 USING btree (channel_id, revoked_at) WHERE (revoked = true);
+
+
+
+--
+-- Name: privchat_messages_2026_02_content_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_02_content_idx ON public.privchat_messages_2026_02 USING gin (content public.gin_trgm_ops);
+
 
 
 --
@@ -2508,11 +2858,21 @@ CREATE INDEX privchat_messages_2026_02_channel_id_revoked_at_idx ON public.privc
 CREATE INDEX privchat_messages_2026_02_metadata_idx ON public.privchat_messages_2026_02 USING gin (metadata);
 
 
+
+--
+-- Name: privchat_messages_2026_02_privchat_search_tokens_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_02_privchat_search_tokens_idx ON public.privchat_messages_2026_02 USING gin (public.privchat_search_tokens(content));
+
+
+
 --
 -- Name: privchat_messages_2026_02_reply_to_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_02_reply_to_message_id_idx ON public.privchat_messages_2026_02 USING btree (reply_to_message_id) WHERE (reply_to_message_id IS NOT NULL);
+
 
 
 --
@@ -2522,11 +2882,21 @@ CREATE INDEX privchat_messages_2026_02_reply_to_message_id_idx ON public.privcha
 CREATE INDEX privchat_messages_2026_02_sender_id_created_at_idx ON public.privchat_messages_2026_02 USING btree (sender_id, created_at DESC);
 
 
+
+--
+-- Name: privchat_messages_2026_02_sender_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_02_sender_id_created_at_idx1 ON public.privchat_messages_2026_02 USING btree (sender_id, created_at DESC);
+
+
+
 --
 -- Name: privchat_messages_2026_02_sender_id_pts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_02_sender_id_pts_idx ON public.privchat_messages_2026_02 USING btree (sender_id, pts);
+
 
 
 --
@@ -2536,11 +2906,13 @@ CREATE INDEX privchat_messages_2026_02_sender_id_pts_idx ON public.privchat_mess
 CREATE INDEX privchat_messages_2026_03_channel_id_created_at_idx ON public.privchat_messages_2026_03 USING btree (channel_id, created_at DESC);
 
 
+
 --
 -- Name: privchat_messages_2026_03_channel_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_03_channel_id_created_at_idx1 ON public.privchat_messages_2026_03 USING btree (channel_id, created_at DESC) WHERE (deleted = false);
+
 
 
 --
@@ -2550,11 +2922,13 @@ CREATE INDEX privchat_messages_2026_03_channel_id_created_at_idx1 ON public.priv
 CREATE INDEX privchat_messages_2026_03_channel_id_local_message_id_idx ON public.privchat_messages_2026_03 USING btree (channel_id, local_message_id) WHERE (local_message_id IS NOT NULL);
 
 
+
 --
 -- Name: privchat_messages_2026_03_channel_id_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_03_channel_id_message_id_idx ON public.privchat_messages_2026_03 USING btree (channel_id, message_id DESC);
+
 
 
 --
@@ -2564,11 +2938,21 @@ CREATE INDEX privchat_messages_2026_03_channel_id_message_id_idx ON public.privc
 CREATE INDEX privchat_messages_2026_03_channel_id_pts_idx ON public.privchat_messages_2026_03 USING btree (channel_id, pts);
 
 
+
 --
 -- Name: privchat_messages_2026_03_channel_id_revoked_at_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_03_channel_id_revoked_at_idx ON public.privchat_messages_2026_03 USING btree (channel_id, revoked_at) WHERE (revoked = true);
+
+
+
+--
+-- Name: privchat_messages_2026_03_content_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_03_content_idx ON public.privchat_messages_2026_03 USING gin (content public.gin_trgm_ops);
+
 
 
 --
@@ -2578,11 +2962,21 @@ CREATE INDEX privchat_messages_2026_03_channel_id_revoked_at_idx ON public.privc
 CREATE INDEX privchat_messages_2026_03_metadata_idx ON public.privchat_messages_2026_03 USING gin (metadata);
 
 
+
+--
+-- Name: privchat_messages_2026_03_privchat_search_tokens_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_03_privchat_search_tokens_idx ON public.privchat_messages_2026_03 USING gin (public.privchat_search_tokens(content));
+
+
+
 --
 -- Name: privchat_messages_2026_03_reply_to_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_03_reply_to_message_id_idx ON public.privchat_messages_2026_03 USING btree (reply_to_message_id) WHERE (reply_to_message_id IS NOT NULL);
+
 
 
 --
@@ -2592,11 +2986,21 @@ CREATE INDEX privchat_messages_2026_03_reply_to_message_id_idx ON public.privcha
 CREATE INDEX privchat_messages_2026_03_sender_id_created_at_idx ON public.privchat_messages_2026_03 USING btree (sender_id, created_at DESC);
 
 
+
+--
+-- Name: privchat_messages_2026_03_sender_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_03_sender_id_created_at_idx1 ON public.privchat_messages_2026_03 USING btree (sender_id, created_at DESC);
+
+
+
 --
 -- Name: privchat_messages_2026_03_sender_id_pts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_03_sender_id_pts_idx ON public.privchat_messages_2026_03 USING btree (sender_id, pts);
+
 
 
 --
@@ -2606,11 +3010,13 @@ CREATE INDEX privchat_messages_2026_03_sender_id_pts_idx ON public.privchat_mess
 CREATE INDEX privchat_messages_2026_04_channel_id_created_at_idx ON public.privchat_messages_2026_04 USING btree (channel_id, created_at DESC);
 
 
+
 --
 -- Name: privchat_messages_2026_04_channel_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_04_channel_id_created_at_idx1 ON public.privchat_messages_2026_04 USING btree (channel_id, created_at DESC) WHERE (deleted = false);
+
 
 
 --
@@ -2620,11 +3026,13 @@ CREATE INDEX privchat_messages_2026_04_channel_id_created_at_idx1 ON public.priv
 CREATE INDEX privchat_messages_2026_04_channel_id_local_message_id_idx ON public.privchat_messages_2026_04 USING btree (channel_id, local_message_id) WHERE (local_message_id IS NOT NULL);
 
 
+
 --
 -- Name: privchat_messages_2026_04_channel_id_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_04_channel_id_message_id_idx ON public.privchat_messages_2026_04 USING btree (channel_id, message_id DESC);
+
 
 
 --
@@ -2634,11 +3042,21 @@ CREATE INDEX privchat_messages_2026_04_channel_id_message_id_idx ON public.privc
 CREATE INDEX privchat_messages_2026_04_channel_id_pts_idx ON public.privchat_messages_2026_04 USING btree (channel_id, pts);
 
 
+
 --
 -- Name: privchat_messages_2026_04_channel_id_revoked_at_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_04_channel_id_revoked_at_idx ON public.privchat_messages_2026_04 USING btree (channel_id, revoked_at) WHERE (revoked = true);
+
+
+
+--
+-- Name: privchat_messages_2026_04_content_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_04_content_idx ON public.privchat_messages_2026_04 USING gin (content public.gin_trgm_ops);
+
 
 
 --
@@ -2648,11 +3066,21 @@ CREATE INDEX privchat_messages_2026_04_channel_id_revoked_at_idx ON public.privc
 CREATE INDEX privchat_messages_2026_04_metadata_idx ON public.privchat_messages_2026_04 USING gin (metadata);
 
 
+
+--
+-- Name: privchat_messages_2026_04_privchat_search_tokens_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_04_privchat_search_tokens_idx ON public.privchat_messages_2026_04 USING gin (public.privchat_search_tokens(content));
+
+
+
 --
 -- Name: privchat_messages_2026_04_reply_to_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_04_reply_to_message_id_idx ON public.privchat_messages_2026_04 USING btree (reply_to_message_id) WHERE (reply_to_message_id IS NOT NULL);
+
 
 
 --
@@ -2662,11 +3090,21 @@ CREATE INDEX privchat_messages_2026_04_reply_to_message_id_idx ON public.privcha
 CREATE INDEX privchat_messages_2026_04_sender_id_created_at_idx ON public.privchat_messages_2026_04 USING btree (sender_id, created_at DESC);
 
 
+
+--
+-- Name: privchat_messages_2026_04_sender_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_2026_04_sender_id_created_at_idx1 ON public.privchat_messages_2026_04 USING btree (sender_id, created_at DESC);
+
+
+
 --
 -- Name: privchat_messages_2026_04_sender_id_pts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_2026_04_sender_id_pts_idx ON public.privchat_messages_2026_04 USING btree (sender_id, pts);
+
 
 
 --
@@ -2676,11 +3114,13 @@ CREATE INDEX privchat_messages_2026_04_sender_id_pts_idx ON public.privchat_mess
 CREATE INDEX privchat_messages_default_channel_id_created_at_idx ON public.privchat_messages_default USING btree (channel_id, created_at DESC);
 
 
+
 --
 -- Name: privchat_messages_default_channel_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_default_channel_id_created_at_idx1 ON public.privchat_messages_default USING btree (channel_id, created_at DESC) WHERE (deleted = false);
+
 
 
 --
@@ -2690,11 +3130,13 @@ CREATE INDEX privchat_messages_default_channel_id_created_at_idx1 ON public.priv
 CREATE INDEX privchat_messages_default_channel_id_local_message_id_idx ON public.privchat_messages_default USING btree (channel_id, local_message_id) WHERE (local_message_id IS NOT NULL);
 
 
+
 --
 -- Name: privchat_messages_default_channel_id_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_default_channel_id_message_id_idx ON public.privchat_messages_default USING btree (channel_id, message_id DESC);
+
 
 
 --
@@ -2704,11 +3146,21 @@ CREATE INDEX privchat_messages_default_channel_id_message_id_idx ON public.privc
 CREATE INDEX privchat_messages_default_channel_id_pts_idx ON public.privchat_messages_default USING btree (channel_id, pts);
 
 
+
 --
 -- Name: privchat_messages_default_channel_id_revoked_at_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_default_channel_id_revoked_at_idx ON public.privchat_messages_default USING btree (channel_id, revoked_at) WHERE (revoked = true);
+
+
+
+--
+-- Name: privchat_messages_default_content_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_default_content_idx ON public.privchat_messages_default USING gin (content public.gin_trgm_ops);
+
 
 
 --
@@ -2718,11 +3170,21 @@ CREATE INDEX privchat_messages_default_channel_id_revoked_at_idx ON public.privc
 CREATE INDEX privchat_messages_default_metadata_idx ON public.privchat_messages_default USING gin (metadata);
 
 
+
+--
+-- Name: privchat_messages_default_privchat_search_tokens_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_default_privchat_search_tokens_idx ON public.privchat_messages_default USING gin (public.privchat_search_tokens(content));
+
+
+
 --
 -- Name: privchat_messages_default_reply_to_message_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_default_reply_to_message_id_idx ON public.privchat_messages_default USING btree (reply_to_message_id) WHERE (reply_to_message_id IS NOT NULL);
+
 
 
 --
@@ -2732,11 +3194,21 @@ CREATE INDEX privchat_messages_default_reply_to_message_id_idx ON public.privcha
 CREATE INDEX privchat_messages_default_sender_id_created_at_idx ON public.privchat_messages_default USING btree (sender_id, created_at DESC);
 
 
+
+--
+-- Name: privchat_messages_default_sender_id_created_at_idx1; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX privchat_messages_default_sender_id_created_at_idx1 ON public.privchat_messages_default USING btree (sender_id, created_at DESC);
+
+
+
 --
 -- Name: privchat_messages_default_sender_id_pts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX privchat_messages_default_sender_id_pts_idx ON public.privchat_messages_default USING btree (sender_id, pts);
+
 
 
 --
@@ -2746,11 +3218,29 @@ CREATE INDEX privchat_messages_default_sender_id_pts_idx ON public.privchat_mess
 CREATE UNIQUE INDEX uk_bot_follow_user_bot ON public.privchat_bot_follow USING btree (user_id, bot_user_id);
 
 
+
+--
+-- Name: uq_pgjr_active_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_pgjr_active_pending ON public.privchat_group_join_requests USING btree (group_id, user_id) WHERE (status = 0);
+
+
+
+--
+-- Name: uq_privchat_file_uploads_claim_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_privchat_file_uploads_claim_key ON public.privchat_file_uploads USING btree (uploader_id, claim_key_hash) WHERE (claim_key_hash IS NOT NULL);
+
+
+
 --
 -- Name: ux_privchat_groups_qr_key; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX ux_privchat_groups_qr_key ON public.privchat_groups USING btree (qr_key);
+
 
 
 --
@@ -2760,11 +3250,13 @@ CREATE UNIQUE INDEX ux_privchat_groups_qr_key ON public.privchat_groups USING bt
 CREATE UNIQUE INDEX ux_privchat_users_qr_key ON public.privchat_users USING btree (qr_key);
 
 
+
 --
 -- Name: privchat_messages_2026_01_channel_id_created_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_channel_time ATTACH PARTITION public.privchat_messages_2026_01_channel_id_created_at_idx;
+
 
 
 --
@@ -2774,11 +3266,13 @@ ALTER INDEX public.idx_privchat_messages_channel_time ATTACH PARTITION public.pr
 ALTER INDEX public.idx_privchat_messages_deleted ATTACH PARTITION public.privchat_messages_2026_01_channel_id_created_at_idx1;
 
 
+
 --
 -- Name: privchat_messages_2026_01_channel_id_local_message_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_local_message_id ATTACH PARTITION public.privchat_messages_2026_01_channel_id_local_message_id_idx;
+
 
 
 --
@@ -2788,11 +3282,13 @@ ALTER INDEX public.idx_privchat_messages_local_message_id ATTACH PARTITION publi
 ALTER INDEX public.idx_privchat_messages_channel_id ATTACH PARTITION public.privchat_messages_2026_01_channel_id_message_id_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_01_channel_id_pts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_channel_pts ATTACH PARTITION public.privchat_messages_2026_01_channel_id_pts_idx;
+
 
 
 --
@@ -2802,11 +3298,27 @@ ALTER INDEX public.idx_privchat_messages_channel_pts ATTACH PARTITION public.pri
 ALTER INDEX public.idx_privchat_messages_revoked ATTACH PARTITION public.privchat_messages_2026_01_channel_id_revoked_at_idx;
 
 
+
+--
+-- Name: privchat_messages_2026_01_content_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+DO $$
+BEGIN
+    IF to_regclass('public.idx_privchat_messages_content_trgm') IS NOT NULL THEN
+        EXECUTE 'ALTER INDEX public.idx_privchat_messages_content_trgm ATTACH PARTITION public.privchat_messages_2026_01_content_idx';
+    END IF;
+END
+$$;
+
+
+
 --
 -- Name: privchat_messages_2026_01_metadata_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_metadata_gin ATTACH PARTITION public.privchat_messages_2026_01_metadata_idx;
+
 
 
 --
@@ -2816,11 +3328,21 @@ ALTER INDEX public.idx_privchat_messages_metadata_gin ATTACH PARTITION public.pr
 ALTER INDEX public.privchat_messages_pkey ATTACH PARTITION public.privchat_messages_2026_01_pkey;
 
 
+
+--
+-- Name: privchat_messages_2026_01_privchat_search_tokens_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_search_tokens ATTACH PARTITION public.privchat_messages_2026_01_privchat_search_tokens_idx;
+
+
+
 --
 -- Name: privchat_messages_2026_01_reply_to_message_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_reply ATTACH PARTITION public.privchat_messages_2026_01_reply_to_message_id_idx;
+
 
 
 --
@@ -2830,11 +3352,21 @@ ALTER INDEX public.idx_privchat_messages_reply ATTACH PARTITION public.privchat_
 ALTER INDEX public.idx_privchat_messages_sender ATTACH PARTITION public.privchat_messages_2026_01_sender_id_created_at_idx;
 
 
+
+--
+-- Name: privchat_messages_2026_01_sender_id_created_at_idx1; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_sender_time ATTACH PARTITION public.privchat_messages_2026_01_sender_id_created_at_idx1;
+
+
+
 --
 -- Name: privchat_messages_2026_01_sender_id_pts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_pts ATTACH PARTITION public.privchat_messages_2026_01_sender_id_pts_idx;
+
 
 
 --
@@ -2844,11 +3376,13 @@ ALTER INDEX public.idx_privchat_messages_pts ATTACH PARTITION public.privchat_me
 ALTER INDEX public.idx_privchat_messages_channel_time ATTACH PARTITION public.privchat_messages_2026_02_channel_id_created_at_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_02_channel_id_created_at_idx1; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_deleted ATTACH PARTITION public.privchat_messages_2026_02_channel_id_created_at_idx1;
+
 
 
 --
@@ -2858,11 +3392,13 @@ ALTER INDEX public.idx_privchat_messages_deleted ATTACH PARTITION public.privcha
 ALTER INDEX public.idx_privchat_messages_local_message_id ATTACH PARTITION public.privchat_messages_2026_02_channel_id_local_message_id_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_02_channel_id_message_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_channel_id ATTACH PARTITION public.privchat_messages_2026_02_channel_id_message_id_idx;
+
 
 
 --
@@ -2872,11 +3408,27 @@ ALTER INDEX public.idx_privchat_messages_channel_id ATTACH PARTITION public.priv
 ALTER INDEX public.idx_privchat_messages_channel_pts ATTACH PARTITION public.privchat_messages_2026_02_channel_id_pts_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_02_channel_id_revoked_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_revoked ATTACH PARTITION public.privchat_messages_2026_02_channel_id_revoked_at_idx;
+
+
+
+--
+-- Name: privchat_messages_2026_02_content_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+DO $$
+BEGIN
+    IF to_regclass('public.idx_privchat_messages_content_trgm') IS NOT NULL THEN
+        EXECUTE 'ALTER INDEX public.idx_privchat_messages_content_trgm ATTACH PARTITION public.privchat_messages_2026_02_content_idx';
+    END IF;
+END
+$$;
+
 
 
 --
@@ -2886,11 +3438,21 @@ ALTER INDEX public.idx_privchat_messages_revoked ATTACH PARTITION public.privcha
 ALTER INDEX public.idx_privchat_messages_metadata_gin ATTACH PARTITION public.privchat_messages_2026_02_metadata_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_02_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.privchat_messages_pkey ATTACH PARTITION public.privchat_messages_2026_02_pkey;
+
+
+
+--
+-- Name: privchat_messages_2026_02_privchat_search_tokens_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_search_tokens ATTACH PARTITION public.privchat_messages_2026_02_privchat_search_tokens_idx;
+
 
 
 --
@@ -2900,11 +3462,21 @@ ALTER INDEX public.privchat_messages_pkey ATTACH PARTITION public.privchat_messa
 ALTER INDEX public.idx_privchat_messages_reply ATTACH PARTITION public.privchat_messages_2026_02_reply_to_message_id_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_02_sender_id_created_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_sender ATTACH PARTITION public.privchat_messages_2026_02_sender_id_created_at_idx;
+
+
+
+--
+-- Name: privchat_messages_2026_02_sender_id_created_at_idx1; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_sender_time ATTACH PARTITION public.privchat_messages_2026_02_sender_id_created_at_idx1;
+
 
 
 --
@@ -2914,11 +3486,13 @@ ALTER INDEX public.idx_privchat_messages_sender ATTACH PARTITION public.privchat
 ALTER INDEX public.idx_privchat_messages_pts ATTACH PARTITION public.privchat_messages_2026_02_sender_id_pts_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_03_channel_id_created_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_channel_time ATTACH PARTITION public.privchat_messages_2026_03_channel_id_created_at_idx;
+
 
 
 --
@@ -2928,11 +3502,13 @@ ALTER INDEX public.idx_privchat_messages_channel_time ATTACH PARTITION public.pr
 ALTER INDEX public.idx_privchat_messages_deleted ATTACH PARTITION public.privchat_messages_2026_03_channel_id_created_at_idx1;
 
 
+
 --
 -- Name: privchat_messages_2026_03_channel_id_local_message_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_local_message_id ATTACH PARTITION public.privchat_messages_2026_03_channel_id_local_message_id_idx;
+
 
 
 --
@@ -2942,11 +3518,13 @@ ALTER INDEX public.idx_privchat_messages_local_message_id ATTACH PARTITION publi
 ALTER INDEX public.idx_privchat_messages_channel_id ATTACH PARTITION public.privchat_messages_2026_03_channel_id_message_id_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_03_channel_id_pts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_channel_pts ATTACH PARTITION public.privchat_messages_2026_03_channel_id_pts_idx;
+
 
 
 --
@@ -2956,11 +3534,27 @@ ALTER INDEX public.idx_privchat_messages_channel_pts ATTACH PARTITION public.pri
 ALTER INDEX public.idx_privchat_messages_revoked ATTACH PARTITION public.privchat_messages_2026_03_channel_id_revoked_at_idx;
 
 
+
+--
+-- Name: privchat_messages_2026_03_content_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+DO $$
+BEGIN
+    IF to_regclass('public.idx_privchat_messages_content_trgm') IS NOT NULL THEN
+        EXECUTE 'ALTER INDEX public.idx_privchat_messages_content_trgm ATTACH PARTITION public.privchat_messages_2026_03_content_idx';
+    END IF;
+END
+$$;
+
+
+
 --
 -- Name: privchat_messages_2026_03_metadata_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_metadata_gin ATTACH PARTITION public.privchat_messages_2026_03_metadata_idx;
+
 
 
 --
@@ -2970,11 +3564,21 @@ ALTER INDEX public.idx_privchat_messages_metadata_gin ATTACH PARTITION public.pr
 ALTER INDEX public.privchat_messages_pkey ATTACH PARTITION public.privchat_messages_2026_03_pkey;
 
 
+
+--
+-- Name: privchat_messages_2026_03_privchat_search_tokens_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_search_tokens ATTACH PARTITION public.privchat_messages_2026_03_privchat_search_tokens_idx;
+
+
+
 --
 -- Name: privchat_messages_2026_03_reply_to_message_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_reply ATTACH PARTITION public.privchat_messages_2026_03_reply_to_message_id_idx;
+
 
 
 --
@@ -2984,11 +3588,21 @@ ALTER INDEX public.idx_privchat_messages_reply ATTACH PARTITION public.privchat_
 ALTER INDEX public.idx_privchat_messages_sender ATTACH PARTITION public.privchat_messages_2026_03_sender_id_created_at_idx;
 
 
+
+--
+-- Name: privchat_messages_2026_03_sender_id_created_at_idx1; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_sender_time ATTACH PARTITION public.privchat_messages_2026_03_sender_id_created_at_idx1;
+
+
+
 --
 -- Name: privchat_messages_2026_03_sender_id_pts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_pts ATTACH PARTITION public.privchat_messages_2026_03_sender_id_pts_idx;
+
 
 
 --
@@ -2998,11 +3612,13 @@ ALTER INDEX public.idx_privchat_messages_pts ATTACH PARTITION public.privchat_me
 ALTER INDEX public.idx_privchat_messages_channel_time ATTACH PARTITION public.privchat_messages_2026_04_channel_id_created_at_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_04_channel_id_created_at_idx1; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_deleted ATTACH PARTITION public.privchat_messages_2026_04_channel_id_created_at_idx1;
+
 
 
 --
@@ -3012,11 +3628,13 @@ ALTER INDEX public.idx_privchat_messages_deleted ATTACH PARTITION public.privcha
 ALTER INDEX public.idx_privchat_messages_local_message_id ATTACH PARTITION public.privchat_messages_2026_04_channel_id_local_message_id_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_04_channel_id_message_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_channel_id ATTACH PARTITION public.privchat_messages_2026_04_channel_id_message_id_idx;
+
 
 
 --
@@ -3026,11 +3644,27 @@ ALTER INDEX public.idx_privchat_messages_channel_id ATTACH PARTITION public.priv
 ALTER INDEX public.idx_privchat_messages_channel_pts ATTACH PARTITION public.privchat_messages_2026_04_channel_id_pts_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_04_channel_id_revoked_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_revoked ATTACH PARTITION public.privchat_messages_2026_04_channel_id_revoked_at_idx;
+
+
+
+--
+-- Name: privchat_messages_2026_04_content_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+DO $$
+BEGIN
+    IF to_regclass('public.idx_privchat_messages_content_trgm') IS NOT NULL THEN
+        EXECUTE 'ALTER INDEX public.idx_privchat_messages_content_trgm ATTACH PARTITION public.privchat_messages_2026_04_content_idx';
+    END IF;
+END
+$$;
+
 
 
 --
@@ -3040,11 +3674,21 @@ ALTER INDEX public.idx_privchat_messages_revoked ATTACH PARTITION public.privcha
 ALTER INDEX public.idx_privchat_messages_metadata_gin ATTACH PARTITION public.privchat_messages_2026_04_metadata_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_04_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.privchat_messages_pkey ATTACH PARTITION public.privchat_messages_2026_04_pkey;
+
+
+
+--
+-- Name: privchat_messages_2026_04_privchat_search_tokens_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_search_tokens ATTACH PARTITION public.privchat_messages_2026_04_privchat_search_tokens_idx;
+
 
 
 --
@@ -3054,11 +3698,21 @@ ALTER INDEX public.privchat_messages_pkey ATTACH PARTITION public.privchat_messa
 ALTER INDEX public.idx_privchat_messages_reply ATTACH PARTITION public.privchat_messages_2026_04_reply_to_message_id_idx;
 
 
+
 --
 -- Name: privchat_messages_2026_04_sender_id_created_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_sender ATTACH PARTITION public.privchat_messages_2026_04_sender_id_created_at_idx;
+
+
+
+--
+-- Name: privchat_messages_2026_04_sender_id_created_at_idx1; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_sender_time ATTACH PARTITION public.privchat_messages_2026_04_sender_id_created_at_idx1;
+
 
 
 --
@@ -3068,11 +3722,13 @@ ALTER INDEX public.idx_privchat_messages_sender ATTACH PARTITION public.privchat
 ALTER INDEX public.idx_privchat_messages_pts ATTACH PARTITION public.privchat_messages_2026_04_sender_id_pts_idx;
 
 
+
 --
 -- Name: privchat_messages_default_channel_id_created_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_channel_time ATTACH PARTITION public.privchat_messages_default_channel_id_created_at_idx;
+
 
 
 --
@@ -3082,11 +3738,13 @@ ALTER INDEX public.idx_privchat_messages_channel_time ATTACH PARTITION public.pr
 ALTER INDEX public.idx_privchat_messages_deleted ATTACH PARTITION public.privchat_messages_default_channel_id_created_at_idx1;
 
 
+
 --
 -- Name: privchat_messages_default_channel_id_local_message_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_local_message_id ATTACH PARTITION public.privchat_messages_default_channel_id_local_message_id_idx;
+
 
 
 --
@@ -3096,11 +3754,13 @@ ALTER INDEX public.idx_privchat_messages_local_message_id ATTACH PARTITION publi
 ALTER INDEX public.idx_privchat_messages_channel_id ATTACH PARTITION public.privchat_messages_default_channel_id_message_id_idx;
 
 
+
 --
 -- Name: privchat_messages_default_channel_id_pts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_channel_pts ATTACH PARTITION public.privchat_messages_default_channel_id_pts_idx;
+
 
 
 --
@@ -3110,11 +3770,27 @@ ALTER INDEX public.idx_privchat_messages_channel_pts ATTACH PARTITION public.pri
 ALTER INDEX public.idx_privchat_messages_revoked ATTACH PARTITION public.privchat_messages_default_channel_id_revoked_at_idx;
 
 
+
+--
+-- Name: privchat_messages_default_content_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+DO $$
+BEGIN
+    IF to_regclass('public.idx_privchat_messages_content_trgm') IS NOT NULL THEN
+        EXECUTE 'ALTER INDEX public.idx_privchat_messages_content_trgm ATTACH PARTITION public.privchat_messages_default_content_idx';
+    END IF;
+END
+$$;
+
+
+
 --
 -- Name: privchat_messages_default_metadata_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_metadata_gin ATTACH PARTITION public.privchat_messages_default_metadata_idx;
+
 
 
 --
@@ -3124,11 +3800,21 @@ ALTER INDEX public.idx_privchat_messages_metadata_gin ATTACH PARTITION public.pr
 ALTER INDEX public.privchat_messages_pkey ATTACH PARTITION public.privchat_messages_default_pkey;
 
 
+
+--
+-- Name: privchat_messages_default_privchat_search_tokens_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_search_tokens ATTACH PARTITION public.privchat_messages_default_privchat_search_tokens_idx;
+
+
+
 --
 -- Name: privchat_messages_default_reply_to_message_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_reply ATTACH PARTITION public.privchat_messages_default_reply_to_message_id_idx;
+
 
 
 --
@@ -3138,11 +3824,21 @@ ALTER INDEX public.idx_privchat_messages_reply ATTACH PARTITION public.privchat_
 ALTER INDEX public.idx_privchat_messages_sender ATTACH PARTITION public.privchat_messages_default_sender_id_created_at_idx;
 
 
+
+--
+-- Name: privchat_messages_default_sender_id_created_at_idx1; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.idx_privchat_messages_sender_time ATTACH PARTITION public.privchat_messages_default_sender_id_created_at_idx1;
+
+
+
 --
 -- Name: privchat_messages_default_sender_id_pts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
 ALTER INDEX public.idx_privchat_messages_pts ATTACH PARTITION public.privchat_messages_default_sender_id_pts_idx;
+
 
 
 --
@@ -3152,11 +3848,13 @@ ALTER INDEX public.idx_privchat_messages_pts ATTACH PARTITION public.privchat_me
 CREATE TRIGGER privchat_channels_sync_version_trigger BEFORE UPDATE ON public.privchat_channels FOR EACH ROW EXECUTE FUNCTION public.assign_privchat_channel_entity_sync_version();
 
 
+
 --
 -- Name: privchat_friendships privchat_friendships_sync_version_trigger; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER privchat_friendships_sync_version_trigger BEFORE UPDATE ON public.privchat_friendships FOR EACH ROW EXECUTE FUNCTION public.assign_privchat_friend_sync_version();
+
 
 
 --
@@ -3166,11 +3864,13 @@ CREATE TRIGGER privchat_friendships_sync_version_trigger BEFORE UPDATE ON public
 CREATE TRIGGER privchat_group_members_sync_version_trigger BEFORE UPDATE ON public.privchat_group_members FOR EACH ROW EXECUTE FUNCTION public.assign_privchat_group_member_sync_version();
 
 
+
 --
 -- Name: privchat_groups privchat_groups_sync_version_trigger; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER privchat_groups_sync_version_trigger BEFORE UPDATE ON public.privchat_groups FOR EACH ROW EXECUTE FUNCTION public.assign_privchat_group_sync_version();
+
 
 
 --
@@ -3180,11 +3880,13 @@ CREATE TRIGGER privchat_groups_sync_version_trigger BEFORE UPDATE ON public.priv
 CREATE TRIGGER privchat_user_channels_sync_version_trigger BEFORE UPDATE ON public.privchat_user_channels FOR EACH ROW EXECUTE FUNCTION public.assign_privchat_channel_entity_sync_version();
 
 
+
 --
 -- Name: privchat_users privchat_users_sync_version_trigger; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER privchat_users_sync_version_trigger BEFORE UPDATE ON public.privchat_users FOR EACH ROW EXECUTE FUNCTION public.assign_privchat_user_sync_version();
+
 
 
 --
@@ -3194,11 +3896,21 @@ CREATE TRIGGER privchat_users_sync_version_trigger BEFORE UPDATE ON public.privc
 CREATE TRIGGER trg_privchat_channel_read_cursor_sync_version BEFORE INSERT OR UPDATE ON public.privchat_channel_read_cursor FOR EACH ROW EXECUTE FUNCTION public.privchat_set_channel_read_cursor_sync_version();
 
 
+
+--
+-- Name: privchat_group_members trg_privchat_group_membership_version; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_privchat_group_membership_version AFTER INSERT OR DELETE OR UPDATE OF left_at ON public.privchat_group_members FOR EACH ROW EXECUTE FUNCTION public.privchat_bump_group_membership_version();
+
+
+
 --
 -- Name: privchat_channel_pts update_privchat_channel_pts_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER update_privchat_channel_pts_updated_at BEFORE UPDATE ON public.privchat_channel_pts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
 
 
 --
@@ -3208,11 +3920,13 @@ CREATE TRIGGER update_privchat_channel_pts_updated_at BEFORE UPDATE ON public.pr
 CREATE TRIGGER update_privchat_devices_updated_at BEFORE UPDATE ON public.privchat_devices FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
 
+
 --
 -- Name: privchat_group_members update_privchat_group_members_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER update_privchat_group_members_updated_at BEFORE UPDATE ON public.privchat_group_members FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
 
 
 --
@@ -3223,12 +3937,14 @@ ALTER TABLE ONLY public.privchat_blacklist
     ADD CONSTRAINT privchat_blacklist_blocked_user_id_fkey FOREIGN KEY (blocked_user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_blacklist privchat_blacklist_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_blacklist
     ADD CONSTRAINT privchat_blacklist_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3239,12 +3955,14 @@ ALTER TABLE ONLY public.privchat_channel_participants
     ADD CONSTRAINT privchat_channel_participants_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.privchat_channels(channel_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_channel_participants privchat_channel_participants_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_channel_participants
     ADD CONSTRAINT privchat_channel_participants_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3255,12 +3973,14 @@ ALTER TABLE ONLY public.privchat_channels
     ADD CONSTRAINT privchat_channels_direct_user1_id_fkey FOREIGN KEY (direct_user1_id) REFERENCES public.privchat_users(user_id);
 
 
+
 --
 -- Name: privchat_channels privchat_channels_direct_user2_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_channels
     ADD CONSTRAINT privchat_channels_direct_user2_id_fkey FOREIGN KEY (direct_user2_id) REFERENCES public.privchat_users(user_id);
+
 
 
 --
@@ -3271,12 +3991,14 @@ ALTER TABLE ONLY public.privchat_channels
     ADD CONSTRAINT privchat_channels_group_id_fkey FOREIGN KEY (group_id) REFERENCES public.privchat_groups(group_id);
 
 
+
 --
 -- Name: privchat_client_msg_registry privchat_client_msg_registry_sender_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_client_msg_registry
     ADD CONSTRAINT privchat_client_msg_registry_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES public.privchat_users(user_id);
+
 
 
 --
@@ -3287,12 +4009,14 @@ ALTER TABLE ONLY public.privchat_commit_log
     ADD CONSTRAINT privchat_commit_log_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES public.privchat_users(user_id);
 
 
+
 --
 -- Name: privchat_device_sync_state privchat_device_sync_state_channel_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_device_sync_state
     ADD CONSTRAINT privchat_device_sync_state_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.privchat_channels(channel_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3303,12 +4027,14 @@ ALTER TABLE ONLY public.privchat_device_sync_state
     ADD CONSTRAINT privchat_device_sync_state_user_id_device_id_fkey FOREIGN KEY (user_id, device_id) REFERENCES public.privchat_devices(user_id, device_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_device_sync_state privchat_device_sync_state_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_device_sync_state
     ADD CONSTRAINT privchat_device_sync_state_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3319,12 +4045,23 @@ ALTER TABLE ONLY public.privchat_devices
     ADD CONSTRAINT privchat_devices_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
 
 
+
+--
+-- Name: privchat_file_uploads privchat_file_uploads_object_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_file_uploads
+    ADD CONSTRAINT privchat_file_uploads_object_id_fkey FOREIGN KEY (object_id) REFERENCES public.privchat_attachment_objects(object_id) ON DELETE RESTRICT;
+
+
+
 --
 -- Name: privchat_friendships privchat_friendships_friend_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_friendships
     ADD CONSTRAINT privchat_friendships_friend_id_fkey FOREIGN KEY (friend_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3335,12 +4072,14 @@ ALTER TABLE ONLY public.privchat_friendships
     ADD CONSTRAINT privchat_friendships_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_group_members privchat_group_members_group_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_group_members
     ADD CONSTRAINT privchat_group_members_group_id_fkey FOREIGN KEY (group_id) REFERENCES public.privchat_groups(group_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3351,12 +4090,14 @@ ALTER TABLE ONLY public.privchat_group_members
     ADD CONSTRAINT privchat_group_members_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_groups privchat_groups_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_groups
     ADD CONSTRAINT privchat_groups_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.privchat_users(user_id);
+
 
 
 --
@@ -3367,12 +4108,41 @@ ALTER TABLE ONLY public.privchat_login_logs
     ADD CONSTRAINT privchat_login_logs_user_id_device_id_fkey FOREIGN KEY (user_id, device_id) REFERENCES public.privchat_devices(user_id, device_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_login_logs privchat_login_logs_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_login_logs
     ADD CONSTRAINT privchat_login_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
+
+
+
+--
+-- Name: privchat_message_dispatch_outbox privchat_message_dispatch_outbox_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_message_dispatch_outbox
+    ADD CONSTRAINT privchat_message_dispatch_outbox_event_id_fkey FOREIGN KEY (event_id) REFERENCES public.privchat_commit_log(id) ON DELETE CASCADE;
+
+
+
+--
+-- Name: privchat_message_dispatch_recipient privchat_message_dispatch_recipient_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_message_dispatch_recipient
+    ADD CONSTRAINT privchat_message_dispatch_recipient_event_id_fkey FOREIGN KEY (event_id) REFERENCES public.privchat_message_dispatch_outbox(event_id) ON DELETE CASCADE;
+
+
+
+--
+-- Name: privchat_message_file_refs privchat_message_file_refs_message_id_message_created_at_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.privchat_message_file_refs
+    ADD CONSTRAINT privchat_message_file_refs_message_id_message_created_at_fkey FOREIGN KEY (message_id, message_created_at) REFERENCES public.privchat_messages(message_id, created_at) ON DELETE CASCADE;
+
 
 
 --
@@ -3383,12 +4153,14 @@ ALTER TABLE ONLY public.privchat_message_reactions
     ADD CONSTRAINT privchat_message_reactions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_messages privchat_messages_channel_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE public.privchat_messages
     ADD CONSTRAINT privchat_messages_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.privchat_channels(channel_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3399,12 +4171,14 @@ ALTER TABLE public.privchat_messages
     ADD CONSTRAINT privchat_messages_revoked_by_fkey FOREIGN KEY (revoked_by) REFERENCES public.privchat_users(user_id);
 
 
+
 --
 -- Name: privchat_messages privchat_messages_sender_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE public.privchat_messages
     ADD CONSTRAINT privchat_messages_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES public.privchat_users(user_id);
+
 
 
 --
@@ -3415,12 +4189,14 @@ ALTER TABLE ONLY public.privchat_offline_message_queue
     ADD CONSTRAINT privchat_offline_message_queue_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_read_receipts privchat_read_receipts_channel_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_read_receipts
     ADD CONSTRAINT privchat_read_receipts_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.privchat_channels(channel_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3431,12 +4207,14 @@ ALTER TABLE ONLY public.privchat_read_receipts
     ADD CONSTRAINT privchat_read_receipts_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_user_channels privchat_user_channels_channel_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_user_channels
     ADD CONSTRAINT privchat_user_channels_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.privchat_channels(channel_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3447,12 +4225,14 @@ ALTER TABLE ONLY public.privchat_user_channels
     ADD CONSTRAINT privchat_user_channels_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
 
 
+
 --
 -- Name: privchat_user_last_seen privchat_user_last_seen_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.privchat_user_last_seen
     ADD CONSTRAINT privchat_user_last_seen_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.privchat_users(user_id) ON DELETE CASCADE;
+
 
 
 --
@@ -3467,18 +4247,3 @@ ALTER TABLE ONLY public.privchat_user_settings
 -- PostgreSQL database dump complete
 --
 
-
--- ==============================================================================
--- 用户 ID 序列起始值
---   1 ~ 99: 系统功能用户保留 (系统消息 / 文件助手等, 不在表里)
---   100000000+: 普通用户 + 机器人 (用 user_type 区分)
--- ==============================================================================
-DO $$
-DECLARE user_count INTEGER;
-BEGIN
-    SELECT COUNT(*) INTO user_count FROM public.privchat_users;
-    IF user_count = 0 THEN
-        PERFORM setval('public.privchat_users_user_id_seq', 100000000, false);
-        RAISE NOTICE 'privchat_users_user_id_seq starts at 100000000';
-    END IF;
-END$$;

@@ -185,8 +185,12 @@ async fn a_failure_between_the_sql_and_the_ledger_rolls_the_sql_back() {
     let db = scratch!("rollback");
     let mut conn = db.connect().await;
 
-    // 在第二条迁移的注入点失败：第一条已提交，第二条必须整个消失。
-    let target = privchat::migrate::MIGRATIONS[1].0;
+    // 在最后一条迁移的注入点失败：它必须整个消失（合并成单条基线之后，
+    // "最后一条"就是基线本身，回滚要求不变）。
+    let target = privchat::migrate::MIGRATIONS
+        .last()
+        .expect("至少要有一条迁移")
+        .0;
     let err = privchat::migrate::apply_pending_with_hook(
         &mut conn,
         |_| {},
@@ -205,15 +209,11 @@ async fn a_failure_between_the_sql_and_the_ledger_rolls_the_sql_back() {
         .await
         .expect("ledger");
     assert!(
-        recorded.iter().any(|n| n == privchat::migrate::MIGRATIONS[0].0),
-        "注入点之前的迁移应该已经提交"
-    );
-    assert!(
         !recorded.iter().any(|n| n == target),
         "崩在中途的那条不该留下账"
     );
 
-    // 002 给 privchat_file_uploads 加了 encryption_version 列。回滚之后它必须不存在——
+    // 基线里 privchat_file_uploads 带 encryption_version 列。回滚之后它必须不存在——
     // 只查账本的话，"SQL 生效了但账没记"和"两者都没发生"看起来一模一样。
     let column_exists: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns \
@@ -240,7 +240,10 @@ async fn a_modified_migration_file_is_refused_rather_than_skipped() {
         .expect("first run");
 
     // 模拟"文件被改过"：把账本里的摘要换成别的值。
-    let target = privchat::migrate::MIGRATIONS[1].0;
+    let target = privchat::migrate::MIGRATIONS
+        .last()
+        .expect("至少要有一条迁移")
+        .0;
     sqlx::query("UPDATE public.privchat_migrations SET content_sha256 = $1 WHERE name = $2")
         .bind("0".repeat(64))
         .bind(target)
@@ -306,4 +309,67 @@ async fn waiting_for_the_lock_gives_up_instead_of_hanging_forever() {
         .execute(&mut holder)
         .await
         .expect("release");
+}
+
+/// 🔴 账本里摘要为 NULL **不等于**校验通过。
+///
+/// `content_sha256` 是后加的列，早于它的账本行都是 NULL。原来的判断写成
+/// `if let Some(..)`，于是那些行永远跳过校验——一条已执行的迁移被改成什么样都
+/// 没人发现。2026-09 的 Weey 生产就是这么中招的：新表被折进了已执行的基线，
+/// 迁移器报「已是最新」，表却从来没建出来。
+#[tokio::test]
+async fn a_null_digest_is_refused_rather_than_trusted() {
+    let db = scratch!("nulldigest");
+    let mut conn = db.connect().await;
+
+    privchat::migrate::apply_pending(&mut conn, |_| {})
+        .await
+        .expect("first run");
+
+    // 模拟"这台库建于摘要列引入之前"。
+    sqlx::query("UPDATE public.privchat_migrations SET content_sha256 = NULL")
+        .execute(&mut conn)
+        .await
+        .expect("clear the digests");
+
+    let err = privchat::migrate::apply_pending(&mut conn, |_| {})
+        .await
+        .expect_err("缺摘要必须拒绝，而不是当作通过");
+    let text = format!("{err:#}");
+    assert!(text.contains("没有内容摘要"), "{text}");
+}
+
+/// 🔴 合并基线只能落在空库上。
+///
+/// 它是「跑完全部历史迁移之后」的结构快照，全是无条件的 CREATE。往存量库上补跑
+/// 没有意义，而失败信息必须说清"这个发布没有原地升级路径"，否则下一个人会去给
+/// 基线加 IF NOT EXISTS，从此留下一个谁也说不清结构的库。
+#[tokio::test]
+async fn the_baseline_refuses_a_database_that_already_has_migrations() {
+    let db = scratch!("baseline_guard");
+    let mut conn = db.connect().await;
+
+    // 伪造一台"跑过旧迁移"的库：账本里有记录，但没有基线那一条。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS public.privchat_migrations (\
+             id bigserial PRIMARY KEY, name text UNIQUE NOT NULL, content_sha256 text)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("ledger");
+    sqlx::query(
+        "INSERT INTO public.privchat_migrations (name, content_sha256) VALUES ($1, $2)",
+    )
+    .bind("001_create_tables")
+    .bind("f".repeat(64))
+    .execute(&mut conn)
+    .await
+    .expect("seed an old ledger row");
+
+    let err = privchat::migrate::apply_pending(&mut conn, |_| {})
+        .await
+        .expect_err("非空库必须拒绝基线");
+    let text = format!("{err:#}");
+    assert!(text.contains("拒绝在非空数据库上执行基线"), "{text}");
+    assert!(text.contains("001_create_tables"), "{text}");
 }
