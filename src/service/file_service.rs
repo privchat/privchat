@@ -1798,7 +1798,7 @@ impl FileService {
         // 密文语料也能留着等将来密钥或算法出问题时再解。
         let (file_url, expires_at) = self
             .presigned_read_url(&metadata.file_path(), metadata.storage_source_id())
-            .await;
+            .await?;
 
         Ok(FileUrlResponse {
             file_url,
@@ -1842,50 +1842,55 @@ impl FileService {
     /// 保持原来的直链。S3/COS 源签一条短期 URL：过期后直链自然失效，
     /// 顺序枚举也就拿不到东西。
     ///
-    /// 签名失败时回落到未签名直链并告警，不让取 URL 这条路直接挂掉——
-    /// 但那意味着可枚举窗口重新打开，所以是 warn 级别，要能在日志里看见。
-    async fn presigned_read_url(&self, file_path: &str, storage_source_id: u32) -> (String, i64) {
-        let unsigned = || {
-            (
-                self.build_access_url(file_path, storage_source_id),
-                Utc::now().timestamp() + SIGNED_URL_TTL.as_secs() as i64,
-            )
-        };
-
+    /// 🔴 **对象存储签名失败就报错，不回落到未签名直链。**
+    ///
+    /// 原来失败时会发一条未签名地址并打 warn。那在两种桶上都是错的：私有桶下它注定
+    /// 403——客户端拿到一个"成功"的响应，然后下载失败，故障点离成因很远（8-31 生产
+    /// 那次就是这个形态）；公共读桶下它绕开了访问限制，把本该短期有效的地址变成长期
+    /// 直链，可枚举窗口重新打开。
+    ///
+    /// 两种情况下"发一个用不了或不该发的地址"都比"明确失败"更糟：前者是静默的。
+    ///
+    /// 本地文件源没有签名概念（由我们自己的 HTTP 服务出，走同一套鉴权），保持直链。
+    async fn presigned_read_url(
+        &self,
+        file_path: &str,
+        storage_source_id: u32,
+    ) -> Result<(String, i64)> {
         let is_object_store = self
             .sources_by_id
             .get(&storage_source_id)
             .map(|s| s.storage_type != "local")
             .unwrap_or(false);
         if !is_object_store {
-            return unsigned();
+            return Ok((
+                self.build_access_url(file_path, storage_source_id),
+                Utc::now().timestamp() + SIGNED_URL_TTL.as_secs() as i64,
+            ));
         }
 
-        let op = match self.operator_for_source(storage_source_id).await {
-            Ok(op) => op,
-            Err(e) => {
-                tracing::warn!(
-                    "对象存储签名不可用，回落未签名直链 source_id={storage_source_id}: {e}"
-                );
-                return unsigned();
-            }
-        };
+        let op = self.operator_for_source(storage_source_id).await.map_err(|e| {
+            tracing::error!("对象存储签名不可用 source_id={storage_source_id}: {e}");
+            ServerError::ServiceUnavailable(
+                "暂时无法生成下载地址，请稍后重试".to_string(),
+            )
+        })?;
         // 🔴 库里存的是**完整对象 key**（S3 直传那条路径由 `object_key()` 把
         // path_prefix 拼了进去），而 operator 的 `root` 已经是同一个前缀——原样交给
         // presign 会得到 `prefix/prefix/...`，签出来的地址指向一个不存在的 key。
         // 交给 operator 的必须是**相对 root 的路径**。
         let relative = self.storage_relative_path(file_path, storage_source_id);
         match op.presign_read(&relative, SIGNED_URL_TTL).await {
-            Ok(signed) => (
+            Ok(signed) => Ok((
                 signed.uri().to_string(),
                 Utc::now().timestamp() + SIGNED_URL_TTL.as_secs() as i64,
-            ),
+            )),
             Err(e) => {
                 // 地址本身不进日志（含签名串），只记来源。
-                tracing::warn!(
-                    "签名读地址失败，回落未签名直链 source_id={storage_source_id}: {e}"
-                );
-                unsigned()
+                tracing::error!("签名读地址失败 source_id={storage_source_id}: {e}");
+                Err(ServerError::ServiceUnavailable(
+                    "暂时无法生成下载地址，请稍后重试".to_string(),
+                ))
             }
         }
     }
