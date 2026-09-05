@@ -27,7 +27,7 @@ path = "examples/media_ref_prod_sweep.rs"
 # generate-config 要产出可直接启动的最小环境，需真实签发自签证书
 rcgen = "0.14"
 # 传输层
-msgtrans = { version = "2.0.0-alpha.5", path = "../msgtrans" }
+msgtrans = { version = "2.0.0-beta.1", path = "../msgtrans" }
 
 # 协议
 privchat-protocol = { git = "https://github.com/privchat/privchat-protocol.git", rev = "c85937d3a325ea76c105b8166916e45b67ee53d7" }
