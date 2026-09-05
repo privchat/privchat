@@ -30,11 +30,8 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 
---
--- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
---
-
-CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+-- pg_trgm 不在这里无条件建：它属于 contrib，托管 PostgreSQL 常常没装。
+-- 建扩展与依赖它的索引都收在下面同一个 DO 块里，缺了就整体跳过并告警。
 
 
 
@@ -2743,7 +2740,13 @@ CREATE INDEX privchat_messages_2026_01_channel_id_revoked_at_idx ON public.privc
 -- Name: privchat_messages_2026_01_content_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX privchat_messages_2026_01_content_idx ON public.privchat_messages_2026_01 USING gin (content public.gin_trgm_ops);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_trgm') THEN
+        EXECUTE 'CREATE INDEX privchat_messages_2026_01_content_idx ON public.privchat_messages_2026_01 USING gin (content public.gin_trgm_ops)';
+    END IF;
+END
+$$;
 
 
 
@@ -2847,7 +2850,13 @@ CREATE INDEX privchat_messages_2026_02_channel_id_revoked_at_idx ON public.privc
 -- Name: privchat_messages_2026_02_content_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX privchat_messages_2026_02_content_idx ON public.privchat_messages_2026_02 USING gin (content public.gin_trgm_ops);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_trgm') THEN
+        EXECUTE 'CREATE INDEX privchat_messages_2026_02_content_idx ON public.privchat_messages_2026_02 USING gin (content public.gin_trgm_ops)';
+    END IF;
+END
+$$;
 
 
 
@@ -2951,7 +2960,13 @@ CREATE INDEX privchat_messages_2026_03_channel_id_revoked_at_idx ON public.privc
 -- Name: privchat_messages_2026_03_content_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX privchat_messages_2026_03_content_idx ON public.privchat_messages_2026_03 USING gin (content public.gin_trgm_ops);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_trgm') THEN
+        EXECUTE 'CREATE INDEX privchat_messages_2026_03_content_idx ON public.privchat_messages_2026_03 USING gin (content public.gin_trgm_ops)';
+    END IF;
+END
+$$;
 
 
 
@@ -3055,7 +3070,13 @@ CREATE INDEX privchat_messages_2026_04_channel_id_revoked_at_idx ON public.privc
 -- Name: privchat_messages_2026_04_content_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX privchat_messages_2026_04_content_idx ON public.privchat_messages_2026_04 USING gin (content public.gin_trgm_ops);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_trgm') THEN
+        EXECUTE 'CREATE INDEX privchat_messages_2026_04_content_idx ON public.privchat_messages_2026_04 USING gin (content public.gin_trgm_ops)';
+    END IF;
+END
+$$;
 
 
 
@@ -3159,7 +3180,13 @@ CREATE INDEX privchat_messages_default_channel_id_revoked_at_idx ON public.privc
 -- Name: privchat_messages_default_content_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX privchat_messages_default_content_idx ON public.privchat_messages_default USING gin (content public.gin_trgm_ops);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_trgm') THEN
+        EXECUTE 'CREATE INDEX privchat_messages_default_content_idx ON public.privchat_messages_default USING gin (content public.gin_trgm_ops)';
+    END IF;
+END
+$$;
 
 
 
