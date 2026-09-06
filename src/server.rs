@@ -925,7 +925,8 @@ impl ChatServer {
                 Some(redis_client.clone()),
                 Arc::clone(&intent_state),
                 connection_manager.clone(),
-            ),
+            )
+            .with_device_repo(Arc::clone(&user_device_repo)),
         );
         let planner_event_bus = Arc::clone(&event_bus);
         let planner_tx = push_tx.clone();

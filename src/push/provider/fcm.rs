@@ -267,10 +267,30 @@ impl PushProvider for FcmProvider {
                 "[FCM] Push failed: task_id={}, status={}, error={}",
                 task.task_id, status, error_text
             );
-            Err(ServerError::Internal(format!(
-                "FCM push failed: status={}, error={}",
-                status, error_text
-            )))
+
+            // FCM v1 用 error.status 表达失败原因：
+            // - UNREGISTERED：App 被卸载 / token 轮换过，这个 token 已经死了
+            // - INVALID_ARGUMENT + 404：token 格式非法或不属于本项目
+            // 其余（UNAVAILABLE / INTERNAL / 限流）是临时故障，token 还是好的。
+            let fcm_status = serde_json::from_str::<serde_json::Value>(&error_text)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.get("status"))
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                });
+            let token_dead = matches!(fcm_status.as_deref(), Some("UNREGISTERED"))
+                || (status.as_u16() == 404)
+                || (status.as_u16() == 400
+                    && matches!(fcm_status.as_deref(), Some("INVALID_ARGUMENT")));
+
+            let message = format!("FCM push failed: status={}, error={}", status, error_text);
+            if token_dead {
+                Err(ServerError::PushTokenInvalid(message))
+            } else {
+                Err(ServerError::Internal(message))
+            }
         }
     }
 
@@ -316,6 +336,27 @@ mod tests {
         assert_eq!(message["data"]["channel_type"], "2");
         assert_eq!(message["data"]["content_preview"], "hi");
         assert_eq!(message["android"]["priority"], "high");
+    }
+
+    /// UNREGISTERED = App 已卸载 / token 轮换过，必须清库；
+    /// UNAVAILABLE 是 Google 侧临时故障，清掉的话用户会平白丢掉推送能力。
+    #[test]
+    fn only_unregistered_is_treated_as_dead_token() {
+        let dead = r#"{"error":{"status":"UNREGISTERED","message":"..."}}"#;
+        let transient = r#"{"error":{"status":"UNAVAILABLE","message":"..."}}"#;
+        assert!(fcm_status_of(dead).as_deref() == Some("UNREGISTERED"));
+        assert!(fcm_status_of(transient).as_deref() == Some("UNAVAILABLE"));
+    }
+
+    fn fcm_status_of(body: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("status"))
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
     }
 
     /// FCM 的 data 值必须全是字符串——传数字会被 FCM 直接拒掉整条请求。

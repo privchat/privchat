@@ -39,6 +39,8 @@ pub struct PushPlanner {
     redis: Option<Arc<RedisClient>>,
     connection_manager: Option<Arc<ConnectionManager>>,
     intent_state: Arc<IntentStateManager>, // Phase 3: 共享状态管理器
+    /// 查会话免打扰用。None（单测/降级）时不做免打扰过滤。
+    device_repo: Option<Arc<crate::repository::UserDeviceRepository>>,
 }
 
 impl PushPlanner {
@@ -47,6 +49,7 @@ impl PushPlanner {
             redis: None,
             connection_manager: None,
             intent_state: Arc::new(IntentStateManager::new()),
+            device_repo: None,
         }
     }
 
@@ -56,6 +59,7 @@ impl PushPlanner {
             redis: Some(redis),
             connection_manager: None,
             intent_state: Arc::new(IntentStateManager::new()),
+            device_repo: None,
         }
     }
 
@@ -68,6 +72,7 @@ impl PushPlanner {
             redis,
             connection_manager: None,
             intent_state,
+            device_repo: None,
         }
     }
 
@@ -81,7 +86,17 @@ impl PushPlanner {
             redis,
             connection_manager: Some(connection_manager),
             intent_state,
+            device_repo: None,
         }
+    }
+
+    /// 注入设备仓库（用于会话免打扰判定）。构造后链式调用。
+    pub fn with_device_repo(
+        mut self,
+        device_repo: Arc<crate::repository::UserDeviceRepository>,
+    ) -> Self {
+        self.device_repo = Some(device_repo);
+        self
     }
 
     /// 获取 Intent 状态管理器（供 Worker 使用）
@@ -192,6 +207,18 @@ impl PushPlanner {
             "[PUSH PLANNER] Received MessageCommitted: message_id={}, recipient_id={}, sender_id={}, device_id={:?}",
             message_id, recipient_id, sender_id, device_id
         );
+
+        // 免打扰的会话不推。放在在线判定之前：这个判断与设备无关，两条路径
+        // （设备级 / 用户级 intent）都要走，写在这里就不会漏掉其中一条。
+        if let Some(repo) = &self.device_repo {
+            if repo.is_conversation_muted(recipient_id, conversation_id).await {
+                debug!(
+                    "[PUSH PLANNER] 会话 {} 对 user {} 免打扰，跳过推送",
+                    conversation_id, recipient_id
+                );
+                return Ok(());
+            }
+        }
 
         // ✨ Phase 3.5: 如果指定了 device_id，只为该设备生成 Intent
         if let Some(device_id) = device_id {

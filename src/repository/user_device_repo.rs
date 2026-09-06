@@ -42,6 +42,80 @@ impl UserDeviceRepository {
         Self { pool }
     }
 
+    /// 清掉一个已被 provider 判定为失效的 push token。
+    ///
+    /// 只清 token 并把 apns_armed 置 false，不删设备行：设备的其它状态（platform、
+    /// 上次连接时间）还有用，而且用户重装 App 后会带着新 token 再来 upsert 同一行。
+    ///
+    /// 带上 `push_token = $3` 的条件是防止竞态：провайдер 报失效和客户端上报新 token
+    /// 可能同时发生，不加这个条件就会把刚拿到的新 token 抹掉。
+    pub async fn invalidate_push_token(
+        &self,
+        user_id: u64,
+        device_id: &str,
+        stale_token: &str,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            UPDATE privchat_user_devices
+            SET push_token = NULL,
+                apns_armed = false,
+                updated_at = NOW()
+            WHERE user_id = $1 AND device_id = $2 AND push_token = $3
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(device_id)
+        .bind(stale_token)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("清理失效 push token 失败: {}", e)))?;
+
+        if result.rows_affected() > 0 {
+            tracing::info!(
+                "已清理失效 push token: user={} device={}",
+                user_id,
+                device_id
+            );
+        }
+        Ok(())
+    }
+
+    /// 这个会话对这个用户是不是免打扰。
+    ///
+    /// 免打扰的语义就是"别来吵我"——只在 App 内不弹本地通知、离线却照样推到锁屏，
+    /// 等于没设。没有记录（从没设置过）视为不免打扰。
+    ///
+    /// 查询失败时返回 `false`（照常推送）：宁可多推一条，也不要因为数据库抖动
+    /// 把所有人的推送都静音掉。
+    pub async fn is_conversation_muted(&self, user_id: u64, channel_id: u64) -> bool {
+        let muted = sqlx::query_scalar::<_, Option<bool>>(
+            r#"
+            SELECT is_muted
+            FROM privchat_user_channels
+            WHERE user_id = $1 AND channel_id = $2
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(channel_id as i64)
+        .fetch_optional(&self.pool)
+        .await;
+
+        match muted {
+            Ok(Some(Some(true))) => true,
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "查询会话免打扰失败(user={} channel={}): {}，按未免打扰处理",
+                    user_id,
+                    channel_id,
+                    e
+                );
+                false
+            }
+        }
+    }
+
     /// 获取用户的所有设备
     pub async fn get_user_devices(&self, user_id: u64) -> Result<Vec<UserDevice>> {
         #[derive(sqlx::FromRow)]
@@ -69,6 +143,11 @@ impl UserDeviceRepository {
                 connected
             FROM privchat_user_devices
             WHERE user_id = $1
+              -- apns_armed = false 是用户/客户端明确表示"这台设备现在不要推送"：
+              -- 关了系统通知权限、退出登录、切到别的账号都会把它置 false。
+              -- 这个字段以前只是被读出来放进结构体，没有任何人看，于是登出之后
+              -- 照样收推送。
+              AND apns_armed = true
             "#,
         )
         .bind(user_id as i64)

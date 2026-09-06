@@ -197,13 +197,31 @@ impl PushWorker {
                         }
 
                         // 生成 PushTask
+                        // 设备级 intent 走 get_device，那条查询不带 apns_armed 过滤
+                        // （它还要服务于"这台设备当前什么状态"的读取），所以在这里判。
+                        if !device.apns_armed {
+                            debug!(
+                                "[PUSH WORKER] Device {} 未开启推送（apns_armed=false），跳过",
+                                intent.device_id
+                            );
+                            return Ok(());
+                        }
+                        let Some(push_token) =
+                            device.push_token.filter(|it| !it.trim().is_empty())
+                        else {
+                            debug!(
+                                "[PUSH WORKER] Device {} 没有 push_token，跳过",
+                                intent.device_id
+                            );
+                            return Ok(());
+                        };
                         let task = PushTask {
                             task_id: Uuid::new_v4().to_string(),
                             intent_id: intent.intent_id.clone(),
                             user_id: intent.user_id,
                             device_id: device.device_id.clone(),
                             vendor: device.vendor.clone(),
-                            push_token: device.push_token.unwrap(),
+                            push_token,
                             payload: intent.payload.clone(),
                         };
 
@@ -270,7 +288,11 @@ impl PushWorker {
                 user_id: intent.user_id,
                 device_id: device.device_id.clone(),
                 vendor: device.vendor.clone(),
-                push_token: device.push_token.clone().unwrap_or_default(),
+                // 空 token 发出去只会换来 provider 的 BadDeviceToken，白白占一次配额。
+                push_token: match device.push_token.clone().filter(|it| !it.trim().is_empty()) {
+                    Some(token) => token,
+                    None => continue,
+                },
                 payload: intent.payload.clone(),
             };
 
@@ -302,6 +324,7 @@ impl PushWorker {
                 }
                 Err(e) => {
                     failed_count += 1;
+                    self.handle_invalid_token(&e, &task).await;
                     error!("[PUSH WORKER] Failed to send task {}: {}", task.task_id, e);
                     // [TRACE] Node 4: push_failed
                     {
@@ -326,6 +349,23 @@ impl PushWorker {
         Ok(())
     }
 
+
+
+    /// provider 说这个 token 已经死了 → 从库里清掉，别再对它重试。
+    ///
+    /// 只对 `PushTokenInvalid` 动手：网络抖动、限流、5xx 都不该导致用户丢掉推送能力。
+    async fn handle_invalid_token(&self, error: &crate::error::ServerError, task: &PushTask) {
+        if !matches!(error, crate::error::ServerError::PushTokenInvalid(_)) {
+            return;
+        }
+        let Some(repo) = &self.device_repo else { return };
+        if let Err(e) = repo
+            .invalidate_push_token(task.user_id, &task.device_id, &task.push_token)
+            .await
+        {
+            warn!("[PUSH WORKER] 清理失效 push token 失败: {}", e);
+        }
+    }
 
     /// vendor → provider。**没配就是没配**：返回 None，由调用方计入失败并留日志。
     ///
@@ -390,6 +430,7 @@ impl PushWorker {
                     "[PUSH WORKER] Failed to send device-level task {}: {}",
                     task.task_id, e
                 );
+                self.handle_invalid_token(&e, task).await;
                 // [TRACE] Node 4: push_failed (device-level)
                 {
                     use crate::infra::delivery_trace::{global_trace_store, stages};

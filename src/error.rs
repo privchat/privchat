@@ -105,6 +105,11 @@ pub enum ServerError {
     InvalidDeviceType,
     /// 重复条目
     DuplicateEntry(String),
+    /// 推送 token 已失效（设备卸载 / 重装 / token 轮换）。
+    ///
+    /// 与其它推送失败的处理方式完全不同：这种 token 再推一万次也不会成功，
+    /// 必须从库里清掉。混在 `Internal` 里的话，只能靠匹配错误文案来区分。
+    PushTokenInvalid(String),
     /// 需要按 channel 做 scoped resync
     ChannelResyncRequired(String),
     /// 需要按 entity family 做 scoped resync
@@ -151,6 +156,7 @@ impl fmt::Display for ServerError {
             ServerError::InvalidDeviceId => write!(f, "Invalid device ID"),
             ServerError::InvalidDeviceType => write!(f, "Invalid device type"),
             ServerError::DuplicateEntry(msg) => write!(f, "Duplicate entry: {}", msg),
+            ServerError::PushTokenInvalid(msg) => write!(f, "Push token invalid: {}", msg),
             ServerError::ChannelResyncRequired(msg) => {
                 write!(f, "Channel resync required: {}", msg)
             }
@@ -209,6 +215,8 @@ impl ServerError {
             ServerError::DuplicateEntry(msg) => {
                 subcode_from_message(msg).unwrap_or(P::OperationConflict)
             }
+            // 纯服务端内部信号：永远不会回给客户端，映射到内部错误即可。
+            ServerError::PushTokenInvalid(_) => P::InternalError,
             ServerError::ChannelResyncRequired(_) => P::SyncChannelResyncRequired,
             ServerError::EntityResyncRequired(_) => P::SyncEntityResyncRequired,
             ServerError::FullRebuildRequired(_) => P::SyncFullRebuildRequired,
@@ -444,6 +452,7 @@ impl From<&ServerError> for ErrorCode {
             ServerError::InvalidDeviceId => ErrorCode::InvalidDeviceId,
             ServerError::InvalidDeviceType => ErrorCode::InvalidDeviceType,
             ServerError::DuplicateEntry(_) => ErrorCode::DuplicateEntry,
+            ServerError::PushTokenInvalid(_) => ErrorCode::Internal,
             ServerError::ChannelResyncRequired(_) => ErrorCode::Duplicate,
             ServerError::EntityResyncRequired(_) => ErrorCode::Duplicate,
             ServerError::FullRebuildRequired(_) => ErrorCode::Duplicate,

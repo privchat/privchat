@@ -191,18 +191,33 @@ impl PushProvider for ApnsProvider {
             );
 
             // 解析 APNs 错误码
-            let error_msg =
-                if let Ok(error_json) = serde_json::from_str::<serde_json::Value>(&error_text) {
-                    if let Some(reason) = error_json.get("reason").and_then(|r| r.as_str()) {
-                        format!("APNs error: {} ({})", reason, status)
-                    } else {
-                        format!("APNs push failed: status={}", status)
-                    }
-                } else {
-                    format!("APNs push failed: status={}, error={}", status, error_text)
-                };
+            let reason = serde_json::from_str::<serde_json::Value>(&error_text)
+                .ok()
+                .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string));
 
-            Err(ServerError::Internal(error_msg))
+            // 这几种是「这个 token 永远不会再成功」：设备卸载了、token 属于别的
+            // 环境/bundle、或者压根不是个合法 token。继续留着它，只会每来一条消息
+            // 就再撞一次 Apple 的限流。
+            //
+            // 410 Unregistered 是最常见的一种：用户卸载 App 之后 Apple 就这么回。
+            let token_dead = matches!(
+                reason.as_deref(),
+                Some("BadDeviceToken")
+                    | Some("Unregistered")
+                    | Some("DeviceTokenNotForTopic")
+                    | Some("ExpiredToken")
+            ) || status.as_u16() == 410;
+
+            let error_msg = match &reason {
+                Some(reason) => format!("APNs error: {} ({})", reason, status),
+                None => format!("APNs push failed: status={}, error={}", status, error_text),
+            };
+
+            if token_dead {
+                Err(ServerError::PushTokenInvalid(error_msg))
+            } else {
+                Err(ServerError::Internal(error_msg))
+            }
         }
     }
 
