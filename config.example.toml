@@ -130,20 +130,36 @@ base_url = "http://127.0.0.1:8000"
 # storage_root = "/data/privchat/files-us"
 # base_url = "https://files-us.example.com/files"
 
+# 离线推送。用户在线时不会走这里（PushPlanner 查到有活连接就跳过），
+# 只有收件人所有设备都不在线时才生成推送意图。
 [push]
 enabled = false
 
 [push.apns]
 enabled = false
+# 必须与 App 的 CFBundleIdentifier 完全一致（白标包各自不同，如 com.netonstream.weey）。
 bundle_id = "com.netonstream.privchat"
+# Apple Developer 账号的 Team ID。
 team_id = ""
+# APNs Auth Key 的 Key ID（.p8 文件名里的那串）。
 key_id = ""
+# .p8 私钥路径。文件权限建议 600，不要进版本库。
 private_key_path = ""
+# 🔴 必须与 App 的构建配置一致：
+#   Xcode Debug 直接装的包 → aps-environment=development → 这里 true
+#   TestFlight / App Store 包 → aps-environment=production → 这里 false
+# 配错的表现是 BadDeviceToken，而不是任何提示"环境不对"的错误。
 use_sandbox = true
 
 [push.fcm]
 enabled = false
+# 服务账号 JSON（Firebase 控制台 → 项目设置 → 服务账号 → 生成新的私钥）。
+# 配了它服务端就自己签 JWT 换 OAuth2 token 并自动续期——生产用这个。
+service_account_path = ""
+# project_id 留空时取服务账号文件里的值。
 project_id = ""
+# 手工粘贴的 OAuth2 access token：**1 小时后失效且不会自愈**，仅供本地联调。
+# 同时配了 service_account_path 时以后者为准。
 access_token = ""
 
 [push.hms]
