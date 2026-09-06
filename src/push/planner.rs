@@ -158,6 +158,7 @@ impl PushPlanner {
             sender_id,
             recipient_id,
             content_preview,
+            channel_type,
             timestamp,
             device_id,
         ) = match event {
@@ -167,6 +168,7 @@ impl PushPlanner {
                 sender_id,
                 recipient_id,
                 content_preview,
+                channel_type,
                 timestamp,
                 device_id, // ✨ Phase 3.5: 可选的设备ID
                 ..
@@ -176,6 +178,7 @@ impl PushPlanner {
                 sender_id,
                 recipient_id,
                 content_preview,
+                channel_type,
                 timestamp,
                 device_id,
             ),
@@ -203,6 +206,7 @@ impl PushPlanner {
                 PushPayload {
                     r#type: "new_message".to_string(),
                     conversation_id,
+                    channel_type,
                     message_id,
                     sender_id,
                     content_preview,
@@ -255,6 +259,7 @@ impl PushPlanner {
             PushPayload {
                 r#type: "new_message".to_string(),
                 conversation_id,
+                channel_type,
                 message_id,
                 sender_id,
                 content_preview,

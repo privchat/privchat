@@ -203,28 +203,28 @@ impl FcmProvider {
         })
     }
 
+    /// FCM 只发 **data-only** 消息，不带 `notification` 块。
+    ///
+    /// 带 notification 的话，App 在后台时由系统直接弹通知、进程完全不参与：点击只能拉起
+    /// 启动页，落不到具体会话，也没法跟本地通知合并成同一条。data-only 则始终走
+    /// `onMessageReceived`，由客户端复用既有的 NotificationPresenter（channel、会话合并、
+    /// 点击回流都是现成的）。代价是 App 被用户强杀后收不到——那属于厂商通道的范畴。
     fn build_fcm_payload(&self, task: &PushTask) -> serde_json::Value {
         json!({
             "message": {
                 "token": task.push_token,
-                "notification": {
-                    // 与 APNs 侧保持同一份文案；带发送者昵称的标题需要 payload 扩字段，另议。
-                    "title": "新消息",
-                    "body": task.payload.content_preview
-                },
                 "data": {
                     "type": task.payload.r#type,
                     "conversation_id": task.payload.conversation_id.to_string(),
+                    "channel_type": task.payload.channel_type.to_string(),
                     "message_id": task.payload.message_id.to_string(),
                     "sender_id": task.payload.sender_id.to_string(),
+                    "content_preview": task.payload.content_preview.clone(),
                 },
                 "android": {
                     // high 才能在 Doze 下即时唤醒；normal 会被系统攒着批量投递。
-                    "priority": "high",
-                    "notification": {
-                        "channel_id": "privchat_messages",
-                        "default_sound": true
-                    }
+                    // data-only 消息也只有 high 优先级才保证唤醒进程。
+                    "priority": "high"
                 }
             }
         })

@@ -134,6 +134,7 @@ impl ApnsProvider {
             "data": {
                 "type": task.payload.r#type,
                 "conversation_id": task.payload.conversation_id.to_string(),
+                "channel_type": task.payload.channel_type.to_string(),
                 "message_id": task.payload.message_id.to_string(),
                 "sender_id": task.payload.sender_id.to_string(),
             }

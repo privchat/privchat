@@ -1378,6 +1378,13 @@ impl MessageHandler for SendMessageHandler {
                     sender_id: from_uid,
                     recipient_id,
                     content_preview: content.chars().take(50).collect(),
+                    channel_type: if channel.channel_type
+                        == crate::model::channel::ChannelType::Direct
+                    {
+                        1
+                    } else {
+                        2
+                    },
                     message_type: content_message_type.as_str().to_string(),
                     timestamp: message_record.created_at.timestamp(),
                     device_id: None,

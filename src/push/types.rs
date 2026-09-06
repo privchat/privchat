@@ -70,6 +70,8 @@ impl PushVendor {
 pub struct PushPayload {
     pub r#type: String, // "new_message"
     pub conversation_id: u64,
+    /// 会话类型（客户端语义：1=单聊，2=群聊）。通知点击回流要用它选对会话页。
+    pub channel_type: i32,
     pub message_id: u64,
     pub sender_id: u64,
     pub content_preview: String,

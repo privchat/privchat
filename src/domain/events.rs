@@ -29,6 +29,12 @@ pub enum DomainEvent {
         sender_id: u64,
         recipient_id: u64,       // 接收者 ID
         content_preview: String, // 内容预览（用于推送显示）
+        /// 会话类型，**客户端语义**：1=单聊，2=群聊。
+        ///
+        /// 服务端内部的 `ChannelType` 是 Direct=0/Group=1/Room=2，与客户端差一位。
+        /// 推送要能点回正确的会话，发出去的必须是客户端认得的那套值，映射只做一次、
+        /// 就在事件发布处。
+        channel_type: i32,
         message_type: String,
         timestamp: i64,
         device_id: Option<String>, // ✨ Phase 3.5: 可选的设备ID（设备级 Intent）
