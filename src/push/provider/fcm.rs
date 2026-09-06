@@ -15,43 +15,200 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 use crate::error::{Result, ServerError};
 use crate::push::provider::provider_trait::PushProvider;
 use crate::push::types::{PushTask, PushVendor};
 use async_trait::async_trait;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::json;
-use tracing::{error, info};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
-/// FCM (Firebase Cloud Messaging) Provider
+/// FCM 服务账号（Firebase 控制台 → 项目设置 → 服务账号 → 生成新的私钥）。
 ///
-/// 使用 FCM HTTP v1 API
+/// 只取签名换 token 用得到的四个字段；文件里其余字段忽略。
+#[derive(Debug, Clone, Deserialize)]
+struct ServiceAccount {
+    project_id: String,
+    client_email: String,
+    private_key: String,
+    #[serde(default = "default_token_uri")]
+    token_uri: String,
+}
+
+fn default_token_uri() -> String {
+    "https://oauth2.googleapis.com/token".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    expires_in: u64,
+}
+
+/// 缓存的 OAuth2 access token。`expires_at` 是绝对 epoch 秒。
+#[derive(Debug, Clone)]
+struct CachedToken {
+    value: String,
+    expires_at: u64,
+}
+
+/// 凭据来源。
+enum Credentials {
+    /// 服务账号：自己签 JWT 换 access token，到期自动续。生产唯一正确形态。
+    ServiceAccount {
+        account: ServiceAccount,
+        key: EncodingKey,
+        cache: Mutex<Option<CachedToken>>,
+    },
+    /// 手工粘贴的 access token。**一小时后必然失效且不会自愈**，只用于本地联调，
+    /// 启动时会打警告。
+    StaticToken(String),
+}
+
 pub struct FcmProvider {
     client: Client,
     project_id: String,
-    access_token: String, // OAuth 2.0 access token
+    credentials: Arc<Credentials>,
 }
 
 impl FcmProvider {
-    /// 创建新的 FCM Provider
-    ///
-    /// # 参数
-    /// - project_id: Firebase 项目 ID
-    /// - access_token: OAuth 2.0 access token（从 service account 获取）
+    /// 从服务账号 JSON 文件构造（推荐）。`project_id` 缺省时取文件里的。
+    pub fn from_service_account_file(path: &str, project_id_override: Option<String>) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            ServerError::Internal(format!("读取 FCM 服务账号文件失败 ({}): {}", path, e))
+        })?;
+        let account: ServiceAccount = serde_json::from_str(&raw).map_err(|e| {
+            ServerError::Internal(format!("解析 FCM 服务账号 JSON 失败 ({}): {}", path, e))
+        })?;
+        // 服务账号私钥是 PKCS#8 RSA。密钥坏掉要在启动期就炸，不能拖到第一条推送。
+        let key = EncodingKey::from_rsa_pem(account.private_key.as_bytes()).map_err(|e| {
+            ServerError::Internal(format!("解析 FCM 服务账号私钥失败: {}", e))
+        })?;
+        let project_id = project_id_override
+            .map(|it| it.trim().to_string())
+            .filter(|it| !it.is_empty())
+            .unwrap_or_else(|| account.project_id.clone());
+        Ok(Self {
+            client: Client::new(),
+            project_id,
+            credentials: Arc::new(Credentials::ServiceAccount {
+                account,
+                key,
+                cache: Mutex::new(None),
+            }),
+        })
+    }
+
+    /// 用现成的 access token 构造（仅联调）。
     pub fn new(project_id: String, access_token: String) -> Self {
+        warn!(
+            "[FCM] 使用静态 access_token：OAuth2 token 有效期只有 1 小时，过期后推送会持续 401 \
+             且不会自动恢复。生产请改配 push.fcm.service_account_path"
+        );
         Self {
             client: Client::new(),
             project_id,
-            access_token,
+            credentials: Arc::new(Credentials::StaticToken(access_token)),
         }
     }
 
-    /// 构建 FCM 消息 payload
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// 取当前可用的 access token。服务账号模式下按需换取并缓存，
+    /// 过期前 120s 就提前续，避免"刚拿到就过期"的边界。
+    async fn access_token(&self) -> Result<String> {
+        match &*self.credentials {
+            Credentials::StaticToken(token) => Ok(token.clone()),
+            Credentials::ServiceAccount { account, key, cache } => {
+                let now = Self::now_secs();
+                {
+                    let guard = cache.lock().await;
+                    if let Some(cached) = guard.as_ref() {
+                        if cached.expires_at > now + 120 {
+                            return Ok(cached.value.clone());
+                        }
+                    }
+                }
+                // 锁外发网络请求会让并发推送各换一次 token；这里持锁换取，
+                // 后到的协程醒来时缓存已经新鲜，直接复用。
+                let mut guard = cache.lock().await;
+                if let Some(cached) = guard.as_ref() {
+                    if cached.expires_at > now + 120 {
+                        return Ok(cached.value.clone());
+                    }
+                }
+                let fetched = self.fetch_access_token(account, key).await?;
+                let value = fetched.value.clone();
+                *guard = Some(fetched);
+                Ok(value)
+            }
+        }
+    }
+
+    /// 用服务账号私钥签一个 JWT，向 Google OAuth2 换 access token。
+    async fn fetch_access_token(
+        &self,
+        account: &ServiceAccount,
+        key: &EncodingKey,
+    ) -> Result<CachedToken> {
+        let now = Self::now_secs();
+        let claims = json!({
+            "iss": account.client_email,
+            "scope": "https://www.googleapis.com/auth/firebase.messaging",
+            "aud": account.token_uri,
+            "iat": now,
+            "exp": now + 3600,
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.typ = Some("JWT".to_string());
+        let assertion = encode(&header, &claims, key)
+            .map_err(|e| ServerError::Internal(format!("FCM JWT 签名失败: {}", e)))?;
+
+        let response = self
+            .client
+            .post(&account.token_uri)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", assertion.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| ServerError::Internal(format!("FCM token 请求失败: {}", e)))?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(ServerError::Internal(format!(
+                "FCM token 获取失败: status={}, error={}",
+                status, text
+            )));
+        }
+        let parsed: TokenResponse = serde_json::from_str(&text)
+            .map_err(|e| ServerError::Internal(format!("FCM token 响应解析失败: {}", e)))?;
+        info!("[FCM] OAuth2 access token 已刷新，{}s 后过期", parsed.expires_in);
+        Ok(CachedToken {
+            value: parsed.access_token,
+            expires_at: Self::now_secs() + parsed.expires_in,
+        })
+    }
+
     fn build_fcm_payload(&self, task: &PushTask) -> serde_json::Value {
         json!({
             "message": {
                 "token": task.push_token,
                 "notification": {
+                    // 与 APNs 侧保持同一份文案；带发送者昵称的标题需要 payload 扩字段，另议。
                     "title": "新消息",
                     "body": task.payload.content_preview
                 },
@@ -62,11 +219,11 @@ impl FcmProvider {
                     "sender_id": task.payload.sender_id.to_string(),
                 },
                 "android": {
-                    "priority": "high"
-                },
-                "apns": {
-                    "headers": {
-                        "apns-priority": "10"
+                    // high 才能在 Doze 下即时唤醒；normal 会被系统攒着批量投递。
+                    "priority": "high",
+                    "notification": {
+                        "channel_id": "privchat_messages",
+                        "default_sound": true
                     }
                 }
             }
@@ -82,6 +239,7 @@ impl PushProvider for FcmProvider {
             self.project_id
         );
 
+        let access_token = self.access_token().await?;
         let payload = self.build_fcm_payload(task);
 
         info!(
@@ -92,7 +250,7 @@ impl PushProvider for FcmProvider {
         let response = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()

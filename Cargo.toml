@@ -107,7 +107,10 @@ axum-extra = { version = "0.12.5", features = ["multipart"] }
 multer = "3.1.0"  # multipart/form-data 解析
 
 # HTTP 客户端（Push Provider）
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# http2 是 APNs 的硬性要求：Apple 的 /3/device 端点只接受 HTTP/2，
+# default-features = false 会把它关掉，ALPN 只报 http/1.1 → 每一条 APNs 推送
+# 都在连接层被拒。FCM v1 走 h2 也更省连接。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
 
 # 数据库
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }

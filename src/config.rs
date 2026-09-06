@@ -704,6 +704,9 @@ impl ServerConfig {
         if let Ok(access_token) = env::var("PUSH_FCM_ACCESS_TOKEN") {
             self.push.fcm.access_token = Some(access_token);
         }
+        if let Ok(service_account_path) = env::var("PUSH_FCM_SERVICE_ACCOUNT_PATH") {
+            self.push.fcm.service_account_path = Some(service_account_path);
+        }
 
         // HMS
         if let Ok(v) = env::var("PUSH_HMS_ENABLED") {
@@ -2345,6 +2348,10 @@ impl Default for PushApnsConfig {
 pub struct PushFcmConfig {
     pub enabled: bool,
     pub project_id: Option<String>,
+    /// Firebase 服务账号 JSON 路径（控制台 → 项目设置 → 服务账号 → 生成新的私钥）。
+    /// 配了它就由服务端自己签 JWT 换 access token 并自动续期——生产用这个。
+    pub service_account_path: Option<String>,
+    /// 手工粘贴的 OAuth2 access token。**1 小时后失效且不会自愈**，仅供本地联调。
     pub access_token: Option<String>,
 }
 
@@ -2353,6 +2360,7 @@ impl Default for PushFcmConfig {
         Self {
             enabled: false,
             project_id: None,
+            service_account_path: None,
             access_token: None,
         }
     }

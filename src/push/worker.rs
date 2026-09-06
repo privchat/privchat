@@ -275,121 +275,13 @@ impl PushWorker {
             };
 
             // 3. 根据 vendor 选择 Provider
-            let provider: Arc<dyn PushProvider> = match task.vendor {
-                PushVendor::Fcm => {
-                    // 如果配置了 FCM Provider，使用它；否则降级到 Mock
-                    if let Some(ref fcm) = self.fcm_provider {
-                        fcm.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] FCM Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Apns => {
-                    // Phase 3: 如果配置了 APNs Provider，使用它；否则降级到 Mock
-                    if let Some(ref apns) = self.apns_provider {
-                        apns.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] APNs Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Hms => {
-                    if let Some(ref hms) = self.hms_provider {
-                        hms.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] HMS Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Xiaomi => {
-                    if let Some(ref xiaomi) = self.xiaomi_provider {
-                        xiaomi.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] Xiaomi Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Oppo => {
-                    if let Some(ref oppo) = self.oppo_provider {
-                        oppo.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] OPPO Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Vivo => {
-                    if let Some(ref vivo) = self.vivo_provider {
-                        vivo.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] Vivo Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Honor => {
-                    if let Some(ref honor) = self.honor_provider {
-                        honor.clone() as Arc<dyn PushProvider>
-                    } else if let Some(ref hms) = self.hms_provider {
-                        hms.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] Honor/HMS Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Lenovo => {
-                    if let Some(ref lenovo) = self.lenovo_provider {
-                        lenovo.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] Lenovo Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Zte => {
-                    if let Some(ref zte) = self.zte_provider {
-                        zte.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] ZTE Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
-                PushVendor::Meizu => {
-                    if let Some(ref meizu) = self.meizu_provider {
-                        meizu.clone() as Arc<dyn PushProvider>
-                    } else {
-                        warn!(
-                            "[PUSH WORKER] Meizu Provider not configured, using mock for task {}",
-                            task.task_id
-                        );
-                        self.mock_provider.clone() as Arc<dyn PushProvider>
-                    }
-                }
+            let Some(provider) = self.resolve_provider(&task.vendor) else {
+                error!(
+                    "[PUSH WORKER] {:?} provider 未配置，跳过 device={}（intent {}）",
+                    task.vendor, task.device_id, intent.intent_id
+                );
+                failed_count += 1;
+                continue;
             };
 
             match provider.send(&task).await {
@@ -434,122 +326,44 @@ impl PushWorker {
         Ok(())
     }
 
+
+    /// vendor → provider。**没配就是没配**：返回 None，由调用方计入失败并留日志。
+    ///
+    /// 这里以前会在 provider 缺失时退回 MockProvider，于是 push_sent 照常打印、
+    /// trace 照常记成功，而手机上什么都没有——排查时先看到的是一串"发送成功"。
+    /// 假成功比不发更贵。
+    fn resolve_provider(&self, vendor: &PushVendor) -> Option<Arc<dyn PushProvider>> {
+        match vendor {
+            PushVendor::Fcm => self.fcm_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+            PushVendor::Apns => self.apns_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+            PushVendor::Hms => self.hms_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+            // Honor 复用 HMS 协议：优先用独立凭证，没有就退回 HMS 凭证。
+            PushVendor::Honor => self
+                .honor_provider
+                .clone()
+                .or_else(|| self.hms_provider.clone())
+                .map(|p| p as Arc<dyn PushProvider>),
+            PushVendor::Xiaomi => self.xiaomi_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+            PushVendor::Oppo => self.oppo_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+            PushVendor::Vivo => self.vivo_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+            PushVendor::Lenovo => self.lenovo_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+            PushVendor::Zte => self.zte_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+            PushVendor::Meizu => self.meizu_provider.clone().map(|p| p as Arc<dyn PushProvider>),
+        }
+    }
+
     /// ✨ Phase 3.5: 处理单个 Task（设备级 Intent）
     async fn process_single_task(&self, task: &PushTask) -> Result<()> {
         // 根据 vendor 选择 Provider
-        let provider: Arc<dyn PushProvider> = match task.vendor {
-            PushVendor::Fcm => {
-                if let Some(ref fcm) = self.fcm_provider {
-                    fcm.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] FCM Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Apns => {
-                if let Some(ref apns) = self.apns_provider {
-                    apns.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] APNs Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Hms => {
-                if let Some(ref hms) = self.hms_provider {
-                    hms.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] HMS Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Xiaomi => {
-                if let Some(ref xiaomi) = self.xiaomi_provider {
-                    xiaomi.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] Xiaomi Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Oppo => {
-                if let Some(ref oppo) = self.oppo_provider {
-                    oppo.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] OPPO Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Vivo => {
-                if let Some(ref vivo) = self.vivo_provider {
-                    vivo.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] Vivo Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Honor => {
-                if let Some(ref honor) = self.honor_provider {
-                    honor.clone() as Arc<dyn PushProvider>
-                } else if let Some(ref hms) = self.hms_provider {
-                    hms.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] Honor/HMS Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Lenovo => {
-                if let Some(ref lenovo) = self.lenovo_provider {
-                    lenovo.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] Lenovo Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Zte => {
-                if let Some(ref zte) = self.zte_provider {
-                    zte.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] ZTE Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
-            PushVendor::Meizu => {
-                if let Some(ref meizu) = self.meizu_provider {
-                    meizu.clone() as Arc<dyn PushProvider>
-                } else {
-                    warn!(
-                        "[PUSH WORKER] Meizu Provider not configured, using mock for task {}",
-                        task.task_id
-                    );
-                    self.mock_provider.clone() as Arc<dyn PushProvider>
-                }
-            }
+        let Some(provider) = self.resolve_provider(&task.vendor) else {
+            error!(
+                "[PUSH WORKER] {:?} provider 未配置，task {} 未发送（device={}）",
+                task.vendor, task.task_id, task.device_id
+            );
+            return Err(crate::error::ServerError::Internal(format!(
+                "push provider not configured for vendor {:?}",
+                task.vendor
+            )));
         };
 
         match provider.send(task).await {
@@ -592,19 +406,17 @@ impl PushWorker {
         }
     }
 
-    /// 处理 Mock Task（降级方案）
+    /// 设备仓库不可用时的处理。
+    ///
+    /// 以前这里会伪造一条 `mock_device` 任务发给 MockProvider 并返回成功——数据库抖一下，
+    /// 日志就多一条"推送成功"，而那条消息谁也没收到。查不到设备就是发不出去，如实报错。
     async fn process_mock_task(&self, intent: PushIntent) -> Result<()> {
-        let task = PushTask {
-            task_id: Uuid::new_v4().to_string(),
-            intent_id: intent.intent_id.clone(),
-            user_id: intent.user_id,
-            device_id: "mock_device".to_string(),
-            vendor: PushVendor::Apns,
-            push_token: "mock_token".to_string(),
-            payload: intent.payload,
-        };
-
-        self.mock_provider.send(&task).await?;
-        Ok(())
+        error!(
+            "[PUSH WORKER] 设备仓库不可用，intent {} (user={}) 未推送",
+            intent.intent_id, intent.user_id
+        );
+        Err(crate::error::ServerError::Internal(
+            "device repository unavailable, push not sent".to_string(),
+        ))
     }
 }

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::Client;
 use serde_json::json;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 
@@ -35,6 +36,11 @@ pub struct ApnsProvider {
     key_id: String,
     private_key: EncodingKey,
     use_sandbox: bool,
+    /// 缓存的 provider token 与它的签发时刻（epoch 秒）。
+    ///
+    /// Apple 要求同一个 provider token 至少复用 20 分钟、最多 60 分钟：每条推送都重签
+    /// 会撞上 429 `TooManyProviderTokenUpdates`，那时**所有**推送一起失败。
+    cached_token: Mutex<Option<(String, u64)>>,
 }
 
 impl ApnsProvider {
@@ -70,6 +76,7 @@ impl ApnsProvider {
             key_id,
             private_key,
             use_sandbox,
+            cached_token: Mutex::new(None),
         })
     }
 
@@ -84,16 +91,33 @@ impl ApnsProvider {
             .unwrap()
             .as_secs();
 
+        // 复用窗口取 50 分钟：低于 Apple 的 60 分钟上限，高于 20 分钟下限。
+        const REUSE_WINDOW_SECS: u64 = 50 * 60;
+        if let Ok(guard) = self.cached_token.lock() {
+            if let Some((token, issued_at)) = guard.as_ref() {
+                if now.saturating_sub(*issued_at) < REUSE_WINDOW_SECS {
+                    return Ok(token.clone());
+                }
+            }
+        }
+
         // APNs JWT Claims
         let claims = json!({
             "iss": self.team_id,
             "iat": now
         });
 
-        let header = Header::new(Algorithm::ES256);
+        let mut header = Header::new(Algorithm::ES256);
+        // 🔴 kid 不是可选的：header 里没有它，Apple 一律回 403 InvalidProviderToken，
+        // 且错误里不会告诉你少的是哪一项。
+        header.kid = Some(self.key_id.clone());
 
-        encode(&header, &claims, &self.private_key)
-            .map_err(|e| ServerError::Internal(format!("Failed to generate APNs JWT: {}", e)))
+        let token = encode(&header, &claims, &self.private_key)
+            .map_err(|e| ServerError::Internal(format!("Failed to generate APNs JWT: {}", e)))?;
+        if let Ok(mut guard) = self.cached_token.lock() {
+            *guard = Some((token.clone(), now));
+        }
+        Ok(token)
     }
 
     /// 构建 APNs 消息 payload

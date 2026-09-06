@@ -954,16 +954,40 @@ impl ChatServer {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(str::to_string);
-            match (project_id, access_token) {
-                (Some(project_id), Some(access_token)) => {
-                    info!("✅ FCM Provider 已启用");
+            let service_account_path = config
+                .push
+                .fcm
+                .service_account_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+
+            // 服务账号优先：它能自动续期。静态 access_token 只是联调兜底。
+            match (service_account_path, project_id, access_token) {
+                (Some(path), project_id, _) => {
+                    match crate::push::provider::FcmProvider::from_service_account_file(
+                        &path, project_id,
+                    ) {
+                        Ok(provider) => {
+                            info!("✅ FCM Provider 已启用（service account）");
+                            Some(Arc::new(provider))
+                        }
+                        Err(e) => {
+                            warn!("⚠️ FCM Provider 初始化失败，已降级为禁用: {}", e);
+                            None
+                        }
+                    }
+                }
+                (None, Some(project_id), Some(access_token)) => {
+                    info!("✅ FCM Provider 已启用（静态 access_token，仅联调）");
                     Some(Arc::new(crate::push::provider::FcmProvider::new(
                         project_id,
                         access_token,
                     )))
                 }
                 _ => {
-                    warn!("⚠️ FCM Provider 已配置启用但缺少 project_id/access_token，已降级为禁用");
+                    warn!("⚠️ FCM Provider 已配置启用但缺少 service_account_path（或 project_id+access_token），已降级为禁用");
                     None
                 }
             }
