@@ -224,7 +224,13 @@ impl FcmProvider {
                 "android": {
                     // high 才能在 Doze 下即时唤醒；normal 会被系统攒着批量投递。
                     // data-only 消息也只有 high 优先级才保证唤醒进程。
-                    "priority": "high"
+                    "priority": "high",
+                    // 与 APNs 的 apns-expiration 同义：离线一天以上的消息不再补投，
+                    // 否则用户开机会被隔夜通知淹没。
+                    "ttl": "86400s",
+                    // 同会话折叠，FCM 只保留最后一条。设备离线期间同一个会话来了
+                    // 十条消息，上线时不该收到十条通知。
+                    "collapse_key": format!("conv-{}", task.payload.conversation_id)
                 }
             }
         })
@@ -318,6 +324,7 @@ mod tests {
                 message_id: 99,
                 sender_id: 5,
                 content_preview: "hi".into(),
+                unread_total: 7,
             },
         }
     }
@@ -336,6 +343,8 @@ mod tests {
         assert_eq!(message["data"]["channel_type"], "2");
         assert_eq!(message["data"]["content_preview"], "hi");
         assert_eq!(message["android"]["priority"], "high");
+        assert_eq!(message["android"]["collapse_key"], "conv-1234");
+        assert_eq!(message["android"]["ttl"], "86400s");
     }
 
     /// UNREGISTERED = App 已卸载 / token 轮换过，必须清库；

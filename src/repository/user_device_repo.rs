@@ -42,6 +42,29 @@ impl UserDeviceRepository {
         Self { pool }
     }
 
+    /// 用户当前的未读消息总数（跨所有会话），用于 iOS 角标。
+    ///
+    /// 走 `idx_privchat_user_channels_unread` 这个部分索引（只覆盖 unread_count > 0），
+    /// 扫的是"这个用户有未读的那几个会话"，不是全部会话。
+    ///
+    /// 查询失败返回 0：角标数字不对是小事，为它把整条推送挡掉才是大事。iOS 侧
+    /// badge=0 会清掉角标——这一点在下面调用处有兜底（0 时不带 badge 字段）。
+    pub async fn total_unread_count(&self, user_id: u64) -> i64 {
+        sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+            SELECT COALESCE(SUM(unread_count), 0)::bigint
+            FROM privchat_user_channels
+            WHERE user_id = $1 AND unread_count > 0
+            "#,
+        )
+        .bind(user_id as i64)
+        .fetch_one(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+    }
+
     /// 清掉一个已被 provider 判定为失效的 push token。
     ///
     /// 只清 token 并把 apns_armed 置 false，不删设备行：设备的其它状态（platform、

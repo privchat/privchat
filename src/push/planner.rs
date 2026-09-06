@@ -208,6 +208,13 @@ impl PushPlanner {
             message_id, recipient_id, sender_id, device_id
         );
 
+        // 角标数在这里算一次，两条 intent 路径共用。查不到就是 0（不下发 badge），
+        // 不因为它失败而挡下整条推送。
+        let unread_total = match &self.device_repo {
+            Some(repo) => repo.total_unread_count(recipient_id).await,
+            None => 0,
+        };
+
         // 免打扰的会话不推。放在在线判定之前：这个判断与设备无关，两条路径
         // （设备级 / 用户级 intent）都要走，写在这里就不会漏掉其中一条。
         if let Some(repo) = &self.device_repo {
@@ -234,6 +241,7 @@ impl PushPlanner {
                     r#type: "new_message".to_string(),
                     conversation_id,
                     channel_type,
+                    unread_total,
                     message_id,
                     sender_id,
                     content_preview,
@@ -287,6 +295,7 @@ impl PushPlanner {
                 r#type: "new_message".to_string(),
                 conversation_id,
                 channel_type,
+                unread_total,
                 message_id,
                 sender_id,
                 content_preview,

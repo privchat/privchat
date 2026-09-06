@@ -29,6 +29,9 @@ use tracing::{error, info};
 /// APNs (Apple Push Notification service) Provider
 ///
 /// 使用 APNs HTTP/2 API
+/// 推送的存活时间：一天。超过这个时间还没送达的消息，补投的价值已经低于打扰。
+const PUSH_TTL_SECS: u64 = 24 * 60 * 60;
+
 pub struct ApnsProvider {
     client: Client,
     bundle_id: String,
@@ -122,15 +125,22 @@ impl ApnsProvider {
 
     /// 构建 APNs 消息 payload
     fn build_apns_payload(task: &PushTask) -> serde_json::Value {
-        json!({
-            "aps": {
-                "alert": {
-                    "title": "新消息",
-                    "body": task.payload.content_preview
-                },
-                "badge": 1,
-                "sound": "default"
+        let mut aps = json!({
+            "alert": {
+                "title": "新消息",
+                "body": task.payload.content_preview
             },
+            "sound": "default",
+            // 同一个会话的多条推送在锁屏上折叠成一条，而不是堆成一列。
+            "thread-id": task.payload.conversation_id.to_string(),
+        });
+        // badge 以前写死 1：手机上有 20 条未读，角标也只显示 1。
+        // 未知（0）时干脆不带这个字段——带 0 会把角标清掉，比不准更糟。
+        if task.payload.unread_total > 0 {
+            aps["badge"] = json!(task.payload.unread_total);
+        }
+        json!({
+            "aps": aps,
             "data": {
                 "type": task.payload.r#type,
                 "conversation_id": task.payload.conversation_id.to_string(),
@@ -160,6 +170,13 @@ impl PushProvider for ApnsProvider {
 
         // 3. 构建 payload
         let payload = Self::build_apns_payload(task);
+        let expiration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + PUSH_TTL_SECS;
+        // collapse-id 上限 64 字节，会话 id 远在其内。
+        let collapse_id = format!("conv-{}", task.payload.conversation_id);
 
         info!(
             "[APNs] Sending push: task_id={}, user_id={}, device_id={}",
@@ -174,6 +191,12 @@ impl PushProvider for ApnsProvider {
             .header("apns-topic", &self.bundle_id)
             .header("apns-priority", "10")
             .header("apns-push-type", "alert")
+            // 一条消息只有一次机会：设备离线超过一天再上线时，补投一堆隔夜通知
+            // 只会淹掉当下真正要看的东西。到点 Apple 自己丢弃。
+            .header("apns-expiration", expiration.to_string())
+            // 同会话去重：Apple 只保留同一个 collapse-id 的最后一条。锁屏上因此
+            // 是"这个会话有新消息"，而不是同一个人刷屏刷出二十条通知。
+            .header("apns-collapse-id", collapse_id)
             .json(&payload)
             .send()
             .await
@@ -245,6 +268,7 @@ mod tests {
                 message_id: 99,
                 sender_id: 5,
                 content_preview: "hi".into(),
+                unread_total: 7,
             },
         }
     }
@@ -256,5 +280,22 @@ mod tests {
         assert_eq!(payload["data"]["conversation_id"], "1234");
         assert_eq!(payload["data"]["channel_type"], "2");
         assert_eq!(payload["aps"]["alert"]["body"], "hi");
+        assert_eq!(payload["aps"]["thread-id"], "1234");
+    }
+
+    /// badge 写死 1 时，手机上二十条未读也只显示 1。
+    #[test]
+    fn apns_badge_uses_real_unread_total() {
+        let payload = ApnsProvider::build_apns_payload(&task(1));
+        assert_eq!(payload["aps"]["badge"], 7);
+    }
+
+    /// 未知未读数（0）时**不能**下发 badge：带 0 会把角标清掉，比不准更糟。
+    #[test]
+    fn apns_omits_badge_when_unread_unknown() {
+        let mut t = task(1);
+        t.payload.unread_total = 0;
+        let payload = ApnsProvider::build_apns_payload(&t);
+        assert!(payload["aps"].get("badge").is_none());
     }
 }

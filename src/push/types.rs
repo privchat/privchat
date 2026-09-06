@@ -72,6 +72,8 @@ pub struct PushPayload {
     pub conversation_id: u64,
     /// 会话类型（客户端语义：1=单聊，2=群聊）。通知点击回流要用它选对会话页。
     pub channel_type: i32,
+    /// 收件人当前的未读总数，用于 iOS 角标。0 = 未知/无未读，此时不下发 badge。
+    pub unread_total: i64,
     pub message_id: u64,
     pub sender_id: u64,
     pub content_preview: String,
