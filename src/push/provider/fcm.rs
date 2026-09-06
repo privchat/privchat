@@ -209,7 +209,7 @@ impl FcmProvider {
     /// 启动页，落不到具体会话，也没法跟本地通知合并成同一条。data-only 则始终走
     /// `onMessageReceived`，由客户端复用既有的 NotificationPresenter（channel、会话合并、
     /// 点击回流都是现成的）。代价是 App 被用户强杀后收不到——那属于厂商通道的范畴。
-    fn build_fcm_payload(&self, task: &PushTask) -> serde_json::Value {
+    fn build_fcm_payload(task: &PushTask) -> serde_json::Value {
         json!({
             "message": {
                 "token": task.push_token,
@@ -240,7 +240,7 @@ impl PushProvider for FcmProvider {
         );
 
         let access_token = self.access_token().await?;
-        let payload = self.build_fcm_payload(task);
+        let payload = Self::build_fcm_payload(task);
 
         info!(
             "[FCM] Sending push: task_id={}, user_id={}, device_id={}",
@@ -276,5 +276,54 @@ impl PushProvider for FcmProvider {
 
     fn vendor(&self) -> PushVendor {
         PushVendor::Fcm
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(channel_type: i32) -> PushTask {
+        PushTask {
+            task_id: "t1".into(),
+            intent_id: "i1".into(),
+            user_id: 7,
+            device_id: "d1".into(),
+            vendor: PushVendor::Fcm,
+            push_token: "tok".into(),
+            payload: crate::push::types::PushPayload {
+                r#type: "new_message".into(),
+                conversation_id: 1234,
+                channel_type,
+                message_id: 99,
+                sender_id: 5,
+                content_preview: "hi".into(),
+            },
+        }
+    }
+
+    /// data-only 是刻意的：带 notification 块时后台推送由系统直接展示，
+    /// 客户端拿不到 conversation_id，点击只能落在启动页。
+    #[test]
+    fn fcm_payload_is_data_only() {
+        let payload = FcmProvider::build_fcm_payload(&task(2));
+        let message = &payload["message"];
+        assert!(
+            message.get("notification").is_none(),
+            "FCM payload 不该带 notification 块，否则点击回流会失效"
+        );
+        assert_eq!(message["data"]["conversation_id"], "1234");
+        assert_eq!(message["data"]["channel_type"], "2");
+        assert_eq!(message["data"]["content_preview"], "hi");
+        assert_eq!(message["android"]["priority"], "high");
+    }
+
+    /// FCM 的 data 值必须全是字符串——传数字会被 FCM 直接拒掉整条请求。
+    #[test]
+    fn fcm_data_values_are_all_strings() {
+        let payload = FcmProvider::build_fcm_payload(&task(1));
+        for (key, value) in payload["message"]["data"].as_object().unwrap() {
+            assert!(value.is_string(), "data.{} 不是字符串: {}", key, value);
+        }
     }
 }

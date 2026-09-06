@@ -121,7 +121,7 @@ impl ApnsProvider {
     }
 
     /// 构建 APNs 消息 payload
-    fn build_apns_payload(&self, task: &PushTask) -> serde_json::Value {
+    fn build_apns_payload(task: &PushTask) -> serde_json::Value {
         json!({
             "aps": {
                 "alert": {
@@ -159,7 +159,7 @@ impl PushProvider for ApnsProvider {
         let url = format!("{}/3/device/{}", endpoint, task.push_token);
 
         // 3. 构建 payload
-        let payload = self.build_apns_payload(task);
+        let payload = Self::build_apns_payload(task);
 
         info!(
             "[APNs] Sending push: task_id={}, user_id={}, device_id={}",
@@ -208,5 +208,38 @@ impl PushProvider for ApnsProvider {
 
     fn vendor(&self) -> PushVendor {
         PushVendor::Apns
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(channel_type: i32) -> PushTask {
+        PushTask {
+            task_id: "t1".into(),
+            intent_id: "i1".into(),
+            user_id: 7,
+            device_id: "d1".into(),
+            vendor: PushVendor::Apns,
+            push_token: "tok".into(),
+            payload: crate::push::types::PushPayload {
+                r#type: "new_message".into(),
+                conversation_id: 1234,
+                channel_type,
+                message_id: 99,
+                sender_id: 5,
+                content_preview: "hi".into(),
+            },
+        }
+    }
+
+    /// 点击回流靠 `data.conversation_id` + `data.channel_type`；少一个就跳不到会话。
+    #[test]
+    fn apns_payload_carries_navigation_fields() {
+        let payload = ApnsProvider::build_apns_payload(&task(2));
+        assert_eq!(payload["data"]["conversation_id"], "1234");
+        assert_eq!(payload["data"]["channel_type"], "2");
+        assert_eq!(payload["aps"]["alert"]["body"], "hi");
     }
 }
