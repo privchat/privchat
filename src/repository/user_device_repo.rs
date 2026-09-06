@@ -30,6 +30,8 @@ pub struct UserDevice {
     pub push_token: Option<String>,
     pub apns_armed: bool, // ✨ Phase 3.5: 是否需要推送
     pub connected: bool,  // ✨ Phase 3.5: 是否已连接
+    /// 设备语言（BCP-47）。None = 老客户端没上报，按简体中文兜底。
+    pub locale: Option<String>,
 }
 
 /// 用户设备 Repository
@@ -151,6 +153,7 @@ impl UserDeviceRepository {
             push_token: Option<String>,
             apns_armed: Option<bool>, // ✨ Phase 3.5
             connected: Option<bool>,  // ✨ Phase 3.5
+            locale: Option<String>,
         }
 
         let rows = sqlx::query_as::<_, Row>(
@@ -163,7 +166,8 @@ impl UserDeviceRepository {
                 vendor,
                 push_token,
                 apns_armed,
-                connected
+                connected,
+                locale
             FROM privchat_user_devices
             WHERE user_id = $1
               -- apns_armed = false 是用户/客户端明确表示"这台设备现在不要推送"：
@@ -203,6 +207,7 @@ impl UserDeviceRepository {
                     push_token: row.push_token,
                     apns_armed: row.apns_armed.unwrap_or(false), // ✨ Phase 3.5
                     connected: row.connected.unwrap_or(false),   // ✨ Phase 3.5
+                    locale: row.locale,
                 })
             })
             .collect();
@@ -222,6 +227,7 @@ impl UserDeviceRepository {
             push_token: Option<String>,
             apns_armed: Option<bool>,
             connected: Option<bool>,
+            locale: Option<String>,
         }
 
         let row = sqlx::query_as::<_, Row>(
@@ -234,7 +240,8 @@ impl UserDeviceRepository {
                 vendor,
                 push_token,
                 apns_armed,
-                connected
+                connected,
+                locale
             FROM privchat_user_devices
             WHERE user_id = $1 AND device_id = $2
             "#,
@@ -258,6 +265,7 @@ impl UserDeviceRepository {
                 push_token: row.push_token,
                 apns_armed: row.apns_armed.unwrap_or(false),
                 connected: row.connected.unwrap_or(false),
+                locale: row.locale,
             }))
         } else {
             Ok(None)
@@ -272,6 +280,7 @@ impl UserDeviceRepository {
         apns_armed: bool,
         push_token: Option<&str>,
         vendor: Option<&str>,
+        locale: Option<&str>,
     ) -> Result<()> {
         let platform = self
             .query_platform(user_id, device_id)
@@ -283,14 +292,16 @@ impl UserDeviceRepository {
         // 使用 UPSERT，避免设备首次上报时行不存在导致更新无效。
         sqlx::query(
             r#"
-            INSERT INTO privchat_user_devices (user_id, device_id, platform, vendor, push_token, apns_armed, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            INSERT INTO privchat_user_devices (user_id, device_id, platform, vendor, push_token, apns_armed, locale, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
             ON CONFLICT (user_id, device_id)
             DO UPDATE SET
                 platform = EXCLUDED.platform,
                 vendor = EXCLUDED.vendor,
                 push_token = COALESCE(EXCLUDED.push_token, privchat_user_devices.push_token),
                 apns_armed = EXCLUDED.apns_armed,
+                -- 老客户端不报 locale，别把之前存好的值抹成 NULL。
+                locale = COALESCE(EXCLUDED.locale, privchat_user_devices.locale),
                 updated_at = NOW()
             "#,
         )
@@ -300,6 +311,7 @@ impl UserDeviceRepository {
         .bind(inferred_vendor.as_str())
         .bind(token)
         .bind(apns_armed)
+        .bind(locale.map(str::trim).filter(|it| !it.is_empty()))
         .execute(&self.pool)
         .await
         .map_err(|e| ServerError::Database(format!("更新设备推送状态失败: {}", e)))?;

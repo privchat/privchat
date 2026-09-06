@@ -222,6 +222,7 @@ impl PushWorker {
                             device_id: device.device_id.clone(),
                             vendor: device.vendor.clone(),
                             push_token,
+                            locale: device.locale.clone(),
                             payload: intent.payload.clone(),
                         };
 
@@ -293,6 +294,7 @@ impl PushWorker {
                     Some(token) => token,
                     None => continue,
                 },
+                locale: device.locale.clone(),
                 payload: intent.payload.clone(),
             };
 

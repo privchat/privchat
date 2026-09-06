@@ -125,10 +125,18 @@ impl ApnsProvider {
 
     /// 构建 APNs 消息 payload
     fn build_apns_payload(task: &PushTask) -> serde_json::Value {
+        // 语言由设备上报（privchat_user_devices.locale）。iOS 的 alert 是系统直接
+        // 展示的，App 没有机会本地化，所以只能在这里定。
+        let locale = crate::push::types::locale::PushLocale::parse(task.locale.as_deref());
+        let body = if task.payload.content_preview.trim().is_empty() {
+            locale.default_body().to_string()
+        } else {
+            task.payload.content_preview.clone()
+        };
         let mut aps = json!({
             "alert": {
-                "title": "新消息",
-                "body": task.payload.content_preview
+                "title": locale.default_title(),
+                "body": body
             },
             "sound": "default",
             // 同一个会话的多条推送在锁屏上折叠成一条，而不是堆成一列。
@@ -261,6 +269,7 @@ mod tests {
             device_id: "d1".into(),
             vendor: PushVendor::Apns,
             push_token: "tok".into(),
+            locale: Some("zh-Hans".into()),
             payload: crate::push::types::PushPayload {
                 r#type: "new_message".into(),
                 conversation_id: 1234,
@@ -281,6 +290,29 @@ mod tests {
         assert_eq!(payload["data"]["channel_type"], "2");
         assert_eq!(payload["aps"]["alert"]["body"], "hi");
         assert_eq!(payload["aps"]["thread-id"], "1234");
+    }
+
+    /// iOS 的 alert 由系统展示，App 没机会本地化：语言必须在服务端定。
+    #[test]
+    fn apns_title_follows_device_locale() {
+        let mut t = task(1);
+        t.locale = Some("vi".into());
+        let payload = ApnsProvider::build_apns_payload(&t);
+        assert_eq!(payload["aps"]["alert"]["title"], "Tin nhắn mới");
+
+        t.locale = Some("zh-TW".into());
+        let payload = ApnsProvider::build_apns_payload(&t);
+        assert_eq!(payload["aps"]["alert"]["title"], "新訊息");
+    }
+
+    /// 空正文（比如纯附件消息）不能推出一条空白通知。
+    #[test]
+    fn apns_body_falls_back_when_preview_empty() {
+        let mut t = task(1);
+        t.locale = Some("en".into());
+        t.payload.content_preview = "   ".into();
+        let payload = ApnsProvider::build_apns_payload(&t);
+        assert_eq!(payload["aps"]["alert"]["body"], "You have a new message");
     }
 
     /// badge 写死 1 时，手机上二十条未读也只显示 1。

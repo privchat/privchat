@@ -220,6 +220,9 @@ impl FcmProvider {
                     "message_id": task.payload.message_id.to_string(),
                     "sender_id": task.payload.sender_id.to_string(),
                     "content_preview": task.payload.content_preview.clone(),
+                    // Android 是 data-only，文案由客户端自己的 i18n 渲染；这里带上
+                    // 只是为了两端 payload 对齐、排查时能看出服务端认为的语言是什么。
+                    "locale": task.locale.clone().unwrap_or_default(),
                 },
                 "android": {
                     // high 才能在 Doze 下即时唤醒；normal 会被系统攒着批量投递。
@@ -317,6 +320,7 @@ mod tests {
             device_id: "d1".into(),
             vendor: PushVendor::Fcm,
             push_token: "tok".into(),
+            locale: Some("zh-Hans".into()),
             payload: crate::push::types::PushPayload {
                 r#type: "new_message".into(),
                 conversation_id: 1234,

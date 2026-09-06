@@ -137,5 +137,101 @@ pub struct PushTask {
     pub device_id: String,
     pub vendor: PushVendor,
     pub push_token: String,
+    /// 设备语言（BCP-47）。None = 老客户端没上报，provider 按简体中文兜底。
+    pub locale: Option<String>,
     pub payload: PushPayload,
+}
+
+/// 推送文案的服务端本地化。
+///
+/// iOS 的 APNs alert 由系统直接展示，App 完全不参与，所以"用哪种语言"只能在
+/// 服务端决定——客户端上报 locale（`privchat_user_devices.locale`），这里按它选词。
+///
+/// 只有兜底文案需要翻译：消息正文（content_preview）是用户自己发的原文，
+/// 不做任何处理。
+pub mod locale {
+    /// 支持的语言。与客户端 i18n 的四个语言包一一对应。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PushLocale {
+        ZhHans,
+        ZhHant,
+        English,
+        Vietnamese,
+    }
+
+    impl PushLocale {
+        /// 解析 BCP-47 标签。未知/缺失一律回落简体中文——那是当前的主要用户群，
+        /// 也是老客户端（根本不上报 locale）的实际语言。
+        ///
+        /// 繁体的判定看 script 或地区子标签：`zh-Hant`、`zh-TW`、`zh-HK`、`zh-MO`。
+        /// 只看前两位的话，香港用户会拿到简体文案。
+        pub fn parse(tag: Option<&str>) -> Self {
+            let tag = match tag.map(str::trim).filter(|it| !it.is_empty()) {
+                Some(t) => t.to_ascii_lowercase(),
+                None => return Self::ZhHans,
+            };
+            if tag.starts_with("vi") {
+                return Self::Vietnamese;
+            }
+            if tag.starts_with("en") {
+                return Self::English;
+            }
+            if tag.starts_with("zh") {
+                let hant = tag.contains("hant")
+                    || tag.contains("-tw")
+                    || tag.contains("-hk")
+                    || tag.contains("-mo");
+                return if hant { Self::ZhHant } else { Self::ZhHans };
+            }
+            Self::ZhHans
+        }
+
+        /// 通知标题（没有会话名时的兜底，与客户端 `pushDefaultTitle` 保持一致）。
+        pub fn default_title(self) -> &'static str {
+            match self {
+                Self::ZhHans => "新消息",
+                Self::ZhHant => "新訊息",
+                Self::English => "New message",
+                Self::Vietnamese => "Tin nhắn mới",
+            }
+        }
+
+        /// 通知正文兜底（content_preview 为空时用，与 `pushDefaultBody` 一致）。
+        pub fn default_body(self) -> &'static str {
+            match self {
+                Self::ZhHans => "你收到一条新消息",
+                Self::ZhHant => "你收到一則新訊息",
+                Self::English => "You have a new message",
+                Self::Vietnamese => "Bạn có một tin nhắn mới",
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::PushLocale;
+
+        #[test]
+        fn parses_language_tags() {
+            assert_eq!(PushLocale::parse(Some("en-US")), PushLocale::English);
+            assert_eq!(PushLocale::parse(Some("vi")), PushLocale::Vietnamese);
+            assert_eq!(PushLocale::parse(Some("zh-Hans-CN")), PushLocale::ZhHans);
+        }
+
+        /// 只看前两位的话香港/台湾用户会拿到简体文案。
+        #[test]
+        fn traditional_chinese_is_detected_by_script_and_region() {
+            for tag in ["zh-Hant", "zh-TW", "zh-HK", "zh-MO", "zh-hant-tw"] {
+                assert_eq!(PushLocale::parse(Some(tag)), PushLocale::ZhHant, "{}", tag);
+            }
+        }
+
+        /// 老客户端不上报 locale，不能因此就没有文案。
+        #[test]
+        fn unknown_and_missing_fall_back_to_simplified_chinese() {
+            assert_eq!(PushLocale::parse(None), PushLocale::ZhHans);
+            assert_eq!(PushLocale::parse(Some("")), PushLocale::ZhHans);
+            assert_eq!(PushLocale::parse(Some("ko-KR")), PushLocale::ZhHans);
+        }
+    }
 }
