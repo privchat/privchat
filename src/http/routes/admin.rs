@@ -37,6 +37,7 @@
 //! - 登录日志：查询登录记录
 //! - 统计报表：系统统计数据
 
+use base64::Engine as _;
 use crate::auth::{IssueTokenRequest, IssueTokenResponse};
 use crate::error::{Result, ServerError};
 use crate::http::dto::admin as dto;
@@ -1033,7 +1034,15 @@ async fn room_broadcast(
     let sessions = state.subscribe_manager.get_channel_sessions(channel_id);
     let online_count = sessions.len();
 
-    let message_content = payload.content.clone();
+    let message_bytes: Vec<u8> = match payload.content_base64.as_deref() {
+        Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(ServerError::BadRequest(format!("invalid content_base64: {e}")));
+            }
+        },
+        None => payload.content.clone().into_bytes(),
+    };
     let publisher = payload.sender_id.map(|id| id.to_string());
     let server_msg_id = crate::infra::next_message_id();
 
@@ -1045,7 +1054,7 @@ async fn room_broadcast(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
-        payload: message_content.into_bytes(),
+        payload: message_bytes,
         publisher,
         server_message_id: Some(server_msg_id),
     };

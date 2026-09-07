@@ -573,6 +573,12 @@ pub struct CreateRoomChannelRequest {
 /// Room 频道广播请求
 #[derive(Debug, Deserialize)]
 pub struct RoomBroadcastRequest {
+    /// 文本载荷(UTF-8)。与 `content_base64` 二选一;两者都给时以 `content_base64` 为准。
+    #[serde(default)]
     pub content: String,
+    /// 二进制载荷(base64)。进入 wire 后是**原始字节**(PublishRequest.payload),
+    /// 不再是 base64——FlatBuffers 等二进制协议走这里(MMO_ARCHITECTURE_SPEC §7.6)。
+    #[serde(default)]
+    pub content_base64: Option<String>,
     pub sender_id: Option<u64>,
 }
