@@ -264,10 +264,22 @@ impl UnifiedTokenService {
     /// device_id 一致 / session_version 仍是 DB 当前值。
     pub async fn refresh(&self, refresh_token: &str, device_id: &str) -> Result<IssueResult> {
         // 1) RS256 验签 + typ=refresh
+        // refresh token 本身验不过（过期 / 验签失败 / kid 未知）同样是"会话没了"，
+        // 要给会话失效码；`verify_to_error` 那份笼统的 Unauthorized 留给 access token 路径。
         let claims = self
             .rsa
             .verify(refresh_token, TOKEN_TYPE_REFRESH)
-            .map_err(verify_to_error)?;
+            .map_err(|e| match e {
+                VerifyError::Expired => ServerError::Coded {
+                    code: privchat_protocol::ErrorCode::RefreshTokenExpired,
+                    status: 401,
+                    message: "refresh token 已过期".to_string(),
+                },
+                VerifyError::UnknownKid | VerifyError::Invalid => {
+                    tracing::warn!("refresh 拒绝：refresh token 验签失败/kid 未知");
+                    ServerError::InvalidToken
+                }
+            })?;
 
         // 2) device_id 一致（防止换设备复用 refresh）
         // 🔴 这里的失败都必须带**会话失效**的协议码（InvalidToken / TokenRevoked），
@@ -307,9 +319,12 @@ impl UnifiedTokenService {
         }
         let now_ms = Utc::now().timestamp_millis();
         if record.is_expired(now_ms) {
-            return Err(ServerError::Unauthorized(
-                "refresh token 已过期".to_string(),
-            ));
+            tracing::info!("refresh 拒绝：refresh token 已过期 jti={}", claims.jti);
+            return Err(ServerError::Coded {
+                code: privchat_protocol::ErrorCode::RefreshTokenExpired,
+                status: 401,
+                message: "refresh token 已过期".to_string(),
+            });
         }
 
         // 6) device + session_version 真值
