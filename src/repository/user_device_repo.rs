@@ -485,8 +485,8 @@ impl UserDeviceRepository {
             .query_platform(user_id, device_id)
             .await?
             .unwrap_or_else(|| "unknown".to_string());
-        let inferred_vendor = Self::resolve_vendor(vendor, &platform)?;
         let token = push_token.map(|it| it.trim()).filter(|it| !it.is_empty());
+        let inferred_vendor = Self::resolve_vendor(vendor, &platform, token)?;
 
         // 使用 UPSERT，避免设备首次上报时行不存在导致更新无效。
         sqlx::query(
@@ -555,19 +555,62 @@ impl UserDeviceRepository {
         Ok(device_type)
     }
 
-    fn resolve_vendor(vendor: Option<&str>, platform: &str) -> Result<PushVendor> {
+    /// 判定这台设备走哪个推送通道。
+    ///
+    /// 优先级：客户端显式上报 > platform > **push_token 的形态**。
+    ///
+    /// 🔴 最后这一档不是锦上添花。生产上 `privchat_devices.device_type` 全是
+    /// `unknown`（它取自 token 的 `app_id` claim，而 application 签发的 token 里
+    /// 没带平台），于是 platform 一路是 `unknown`，旧的实现直接默认 Fcm——**所有
+    /// iOS 设备都会被拿去调 FCM**，凭据配好之后一条都发不出去，而错误信息是
+    /// "token 无效"，指不到真正的原因。
+    ///
+    /// token 形态是可靠的旁证：APNs 的 device token 是纯十六进制（32 字节 = 64 字符，
+    /// 新格式更长但仍是 hex）；FCM 的 registration token 一定含 `:`（形如
+    /// `<instance>:APA91b...`）。两者不会互相误判。
+    fn resolve_vendor(
+        vendor: Option<&str>,
+        platform: &str,
+        push_token: Option<&str>,
+    ) -> Result<PushVendor> {
         if let Some(raw_vendor) = vendor.map(str::trim).filter(|it| !it.is_empty()) {
             return PushVendor::from_str(raw_vendor).ok_or_else(|| {
                 ServerError::BadRequest(format!("不支持的推送 vendor: {}", raw_vendor))
             });
         }
 
-        let resolved = match platform.to_ascii_lowercase().as_str() {
-            "ios" | "macos" => PushVendor::Apns,
-            "android" => PushVendor::Fcm,
-            _ => PushVendor::Fcm, // 默认按 Android/GMS 处理，后续客户端可显式上报 vendor 覆盖
-        };
-        Ok(resolved)
+        match platform.to_ascii_lowercase().as_str() {
+            "ios" | "macos" => return Ok(PushVendor::Apns),
+            "android" => return Ok(PushVendor::Fcm),
+            _ => {}
+        }
+
+        if let Some(token) = push_token.map(str::trim).filter(|it| !it.is_empty()) {
+            if let Some(guessed) = Self::guess_vendor_from_token(token) {
+                return Ok(guessed);
+            }
+        }
+
+        // 既没有平台也没有可辨认的 token：只能给一个默认值，但要留下痕迹——
+        // 猜错的表现是推送静默失败，日志里没这一行就无从查起。
+        tracing::warn!(
+            "无法判定推送 vendor（platform={}，token 形态不可辨认），暂按 FCM 处理",
+            platform
+        );
+        Ok(PushVendor::Fcm)
+    }
+
+    /// 从 token 形态猜通道。判不出来返回 None，不硬猜。
+    fn guess_vendor_from_token(token: &str) -> Option<PushVendor> {
+        // FCM registration token 一定有这个分隔符，APNs token 里不可能出现。
+        if token.contains(':') {
+            return Some(PushVendor::Fcm);
+        }
+        // APNs：纯 hex 且足够长（标准 64 字符；留一点余量以防格式变化）。
+        if token.len() >= 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(PushVendor::Apns);
+        }
+        None
     }
 
     /// ✨ Phase 3.5: 检查用户是否所有设备都需要推送
@@ -713,6 +756,44 @@ mod push_preference_tests {
         .execute(pool)
         .await
         .expect("预置用户行");
+    }
+
+    /// 🔴 生产上 platform 全是 unknown，这一档是 iOS 设备唯一能被认出来的途径。
+    /// 判错的后果是拿 APNs token 去调 FCM——一条都发不出去，错误还指向"token 无效"。
+    #[test]
+    fn vendor_falls_back_to_token_shape_when_platform_is_unknown() {
+        let apns = "a".repeat(64);
+        let fcm = "cXyZ:APA91bH-abcdef_1234";
+
+        assert_eq!(
+            UserDeviceRepository::resolve_vendor(None, "unknown", Some(&apns)).unwrap(),
+            PushVendor::Apns
+        );
+        assert_eq!(
+            UserDeviceRepository::resolve_vendor(None, "unknown", Some(fcm)).unwrap(),
+            PushVendor::Fcm
+        );
+    }
+
+    /// 客户端显式说了走哪个通道就听它的——接了厂商通道之后，形态判别不成立。
+    #[test]
+    fn explicit_vendor_wins_over_token_shape() {
+        let apns_shaped = "b".repeat(64);
+        assert_eq!(
+            UserDeviceRepository::resolve_vendor(Some("xiaomi"), "unknown", Some(&apns_shaped))
+                .unwrap(),
+            PushVendor::Xiaomi
+        );
+    }
+
+    /// platform 有值时不必看 token。
+    #[test]
+    fn platform_still_wins_over_token_shape() {
+        let fcm_shaped = "cXyZ:APA91b";
+        assert_eq!(
+            UserDeviceRepository::resolve_vendor(None, "ios", Some(fcm_shaped)).unwrap(),
+            PushVendor::Apns
+        );
     }
 
     /// 没有记录 = 用户没设置过，用产品默认值（显示预览、不静音）。
