@@ -270,10 +270,15 @@ impl UnifiedTokenService {
             .map_err(verify_to_error)?;
 
         // 2) device_id 一致（防止换设备复用 refresh）
+        // 🔴 这里的失败都必须带**会话失效**的协议码（InvalidToken / TokenRevoked），
+        // 不能用笼统的 `Unauthorized`：那会映射成 AuthRequired(10000)，和"服务端
+        // X-Service-Key 配错"同一个码。application 层只把会话失效码翻译成
+        // REFRESH_TOKEN_EXPIRED(401)，其余 401 一律当运维故障抛 500——于是一个合法
+        // 过期/被撤销的 refresh token 会让客户端收到 500，既看不出原因也没法按
+        // "请重新登录"处理。
         if claims.device_id != device_id {
-            return Err(ServerError::Unauthorized(
-                "device_id 与 refresh token 不一致".to_string(),
-            ));
+            tracing::warn!("refresh 拒绝：device_id 与 refresh token 不一致");
+            return Err(ServerError::InvalidToken);
         }
 
         // 3) 查 refresh 记录
@@ -282,21 +287,23 @@ impl UnifiedTokenService {
             .find_by_jti(&claims.jti)
             .await
             .map_err(|e| ServerError::Internal(format!("查询 refresh token 失败: {}", e)))?
-            .ok_or_else(|| ServerError::Unauthorized("refresh token 已撤销或不存在".to_string()))?;
+            .ok_or_else(|| {
+                // 数据被重置 / 记录被清理 / 从未签发过：对客户端都是"这个会话没了"。
+                tracing::info!("refresh 拒绝：refresh token 已撤销或不存在 jti={}", claims.jti);
+                ServerError::TokenRevoked
+            })?;
 
         // 4) token_hash 匹配（防止 jti 已知但拿伪造的明文）
         let provided_hash = hash_refresh_token(refresh_token);
         if !ct_eq(provided_hash.as_bytes(), record.token_hash.as_bytes()) {
-            return Err(ServerError::Unauthorized(
-                "refresh token 校验失败".to_string(),
-            ));
+            tracing::warn!("refresh 拒绝：refresh token 校验失败 jti={}", claims.jti);
+            return Err(ServerError::InvalidToken);
         }
 
         // 5) revoked / expired
         if record.is_revoked() {
-            return Err(ServerError::Unauthorized(
-                "refresh token 已撤销".to_string(),
-            ));
+            tracing::info!("refresh 拒绝：refresh token 已撤销 jti={}", claims.jti);
+            return Err(ServerError::TokenRevoked);
         }
         let now_ms = Utc::now().timestamp_millis();
         if record.is_expired(now_ms) {
