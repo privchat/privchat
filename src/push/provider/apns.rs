@@ -140,10 +140,15 @@ impl ApnsProvider {
                 "title": locale.default_title(),
                 "body": body
             },
-            "sound": "default",
+
             // 同一个会话的多条推送在锁屏上折叠成一条，而不是堆成一列。
             "thread-id": task.payload.conversation_id.to_string(),
         });
+        // 声音开关必须在这里生效：通知由 iOS 展示，App 拦不住自己的远程通知。
+        // 不带 sound 字段 = 静默通知（仍然显示横幅，只是不响）。
+        if task.push_sound {
+            aps["sound"] = json!("default");
+        }
         // badge 以前写死 1：手机上有 20 条未读，角标也只显示 1。
         // 未知（0）时干脆不带这个字段——带 0 会把角标清掉，比不准更糟。
         if task.payload.unread_total > 0 {
@@ -272,6 +277,7 @@ mod tests {
             vendor: PushVendor::Apns,
             push_token: "tok".into(),
             locale: Some("zh-Hans".into()),
+            push_sound: true,
             payload: crate::push::types::PushPayload {
                 r#type: "new_message".into(),
                 conversation_id: 1234,
@@ -317,6 +323,24 @@ mod tests {
         t.payload.content_preview = "   ".into();
         let payload = ApnsProvider::build_apns_payload(&t);
         assert_eq!(payload["aps"]["alert"]["body"], "You have a new message");
+    }
+
+    /// 声音开关在 payload 里：通知由 iOS 展示，App 拦不住自己的远程通知，
+    /// 所以"关掉声音"只能靠服务端不下发 sound 字段。
+    #[test]
+    fn apns_omits_sound_when_device_muted_it() {
+        let mut t = task(1);
+        assert_eq!(ApnsProvider::build_apns_payload(&t)["aps"]["sound"], "default");
+
+        t.push_sound = false;
+        let payload = ApnsProvider::build_apns_payload(&t);
+        assert!(
+            payload["aps"].get("sound").is_none(),
+            "设备关掉了提示音，payload 里仍带 sound: {}",
+            payload
+        );
+        // 静音不等于不显示：横幅还是要有的。
+        assert_eq!(payload["aps"]["alert"]["body"], "hi");
     }
 
     /// 非文本消息不能把原始 content 塞进通知：那可能是 caption、URL 或结构化 JSON。

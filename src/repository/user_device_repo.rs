@@ -32,6 +32,8 @@ pub struct UserDevice {
     pub connected: bool,  // ✨ Phase 3.5: 是否已连接
     /// 设备语言（BCP-47）。None = 老客户端没上报，按简体中文兜底。
     pub locale: Option<String>,
+    /// 这台设备的远程通知是否带提示音。
+    pub push_sound: bool,
 }
 
 /// 推送偏好在 `privchat_user_settings` 里的 key。
@@ -173,7 +175,17 @@ impl UserDeviceRepository {
     /// 以前是三次独立往返（免打扰、未读总数、推送偏好），而这条路径对**每个离线
     /// 收件人**都要走一遍——群聊里就是每人三次。合成一次之后，判定所依据的也是
     /// 同一时刻的快照，不会出现"读到的免打扰是新的、未读数是旧的"。
-    pub async fn load_push_context(&self, user_id: u64, channel_id: u64) -> PushContext {
+    ///
+    /// 🔴 **查询失败返回 Err，调用方必须放弃这次推送。**
+    ///
+    /// "查不到就按默认值推"是错的：默认值是"显示预览、不静音"，于是数据库抖一下，
+    /// 一个已经关掉预览的用户就会在锁屏上看到消息正文，一个开了全局免打扰的用户
+    /// 就会被吵醒。这两件事都不可撤销。
+    ///
+    /// 注意区分**没有设置记录**和**读不到**：前者是"用户没设置过"，用产品默认值是对的
+    /// （在 [PushPreference::from_json] 里处理）；后者是"我们不知道用户设了什么"，
+    /// 唯一安全的动作是不推。
+    pub async fn load_push_context(&self, user_id: u64, channel_id: u64) -> Result<PushContext> {
         #[derive(sqlx::FromRow)]
         struct Row {
             muted: Option<bool>,
@@ -196,30 +208,23 @@ impl UserDeviceRepository {
         .bind(channel_id as i64)
         .bind(PUSH_PREFERENCE_KEY)
         .fetch_one(&self.pool)
-        .await;
+        .await
+        .map_err(|e| {
+            ServerError::Database(format!(
+                "查询推送上下文失败(user={} channel={}): {}",
+                user_id, channel_id, e
+            ))
+        })?;
 
-        match row {
-            Ok(row) => {
-                let preference = PushPreference::from_json(row.preference.as_ref());
-                PushContext {
-                    muted: row.muted.unwrap_or(false),
-                    unread_total: row.unread_total.unwrap_or(0),
-                    show_preview: preference.show_preview,
-                    global_mute: preference.global_mute,
-                }
-            }
-            Err(e) => {
-                // 查不到就按默认推：宁可多推一条，也不要因为数据库抖动把所有人的
-                // 推送静音掉。唯一的例外是 show_preview——它涉及隐私，见下。
-                tracing::warn!(
-                    "查询推送上下文失败(user={} channel={}): {}，按默认值处理",
-                    user_id,
-                    channel_id,
-                    e
-                );
-                PushContext::default()
-            }
-        }
+        // 这里的 None 是"这个用户没有这条记录"，不是"查不到"——查不到在上面就返回
+        // Err 了。没记录就是没设置过，用产品默认值。
+        let preference = PushPreference::from_json(row.preference.as_ref());
+        Ok(PushContext {
+            muted: row.muted.unwrap_or(false),
+            unread_total: row.unread_total.unwrap_or(0),
+            show_preview: preference.show_preview,
+            global_mute: preference.global_mute,
+        })
     }
 
     /// 读取推送偏好。
@@ -239,34 +244,58 @@ impl UserDeviceRepository {
         Ok(PushPreference::from_json(value.as_ref()))
     }
 
-    /// 写入推送偏好（整体覆盖）。
-    pub async fn set_push_preference(
+    /// 原子合并推送偏好，返回合并后的值。
+    ///
+    /// `None` 的字段保持库里的原值。**必须在一条 SQL 里完成**：先 SELECT 再整体
+    /// UPDATE 的话，两台设备同时改不同开关时，两边都读到旧值，后写的那次会把对方的
+    /// 改动撤销掉——"字段可选"本身不解决并发，只是把竞态从客户端搬到了服务端。
+    ///
+    /// jsonb 的 `||` 是右侧覆盖左侧，所以按 `默认值 → 库里的值 → 本次改动` 依次叠加：
+    /// 没有记录时得到产品默认值 + 本次改动，有记录时保留未提及的字段。
+    pub async fn merge_push_preference(
         &self,
         user_id: u64,
-        preference: &PushPreference,
-    ) -> Result<()> {
-        let value = serde_json::json!({
-            "showPreview": preference.show_preview,
-            "globalMute": preference.global_mute,
+        show_preview: Option<bool>,
+        global_mute: Option<bool>,
+    ) -> Result<PushPreference> {
+        let defaults = PushPreference::default();
+        let base = serde_json::json!({
+            "showPreview": defaults.show_preview,
+            "globalMute": defaults.global_mute,
         });
-        sqlx::query(
+        // 只把请求里出现的字段拼进 patch；缺席的字段不在 jsonb 里，自然不会覆盖。
+        let mut patch = serde_json::Map::new();
+        if let Some(v) = show_preview {
+            patch.insert("showPreview".to_string(), serde_json::Value::Bool(v));
+        }
+        if let Some(v) = global_mute {
+            patch.insert("globalMute".to_string(), serde_json::Value::Bool(v));
+        }
+        let patch = serde_json::Value::Object(patch);
+
+        let merged = sqlx::query_scalar::<_, serde_json::Value>(
             r#"
             INSERT INTO privchat_user_settings (user_id, setting_key, value_json, version, updated_at)
-            VALUES ($1, $2, $3, 1, (EXTRACT(epoch FROM now()) * 1000)::bigint)
+            VALUES ($1, $2, $3::jsonb || $4::jsonb, 1, (EXTRACT(epoch FROM now()) * 1000)::bigint)
             ON CONFLICT (user_id, setting_key)
             DO UPDATE SET
-                value_json = EXCLUDED.value_json,
+                -- 读改写发生在数据库内部的这一行里，两个并发事务会被行锁串起来，
+                -- 后到的那个看到的是前一个写完的结果。
+                value_json = privchat_user_settings.value_json || $4::jsonb,
                 version = privchat_user_settings.version + 1,
-                updated_at = EXCLUDED.updated_at
+                updated_at = (EXTRACT(epoch FROM now()) * 1000)::bigint
+            RETURNING value_json
             "#,
         )
         .bind(user_id as i64)
         .bind(PUSH_PREFERENCE_KEY)
-        .bind(value)
-        .execute(&self.pool)
+        .bind(&base)
+        .bind(&patch)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| ServerError::Database(format!("保存推送偏好失败: {}", e)))?;
-        Ok(())
+
+        Ok(PushPreference::from_json(Some(&merged)))
     }
 
     /// 这个会话对这个用户是不是免打扰。
@@ -317,6 +346,7 @@ impl UserDeviceRepository {
             apns_armed: Option<bool>, // ✨ Phase 3.5
             connected: Option<bool>,  // ✨ Phase 3.5
             locale: Option<String>,
+            push_sound: Option<bool>,
         }
 
         let rows = sqlx::query_as::<_, Row>(
@@ -330,7 +360,8 @@ impl UserDeviceRepository {
                 push_token,
                 apns_armed,
                 connected,
-                locale
+                locale,
+                push_sound
             FROM privchat_user_devices
             WHERE user_id = $1
               -- apns_armed = false 是用户/客户端明确表示"这台设备现在不要推送"：
@@ -371,6 +402,7 @@ impl UserDeviceRepository {
                     apns_armed: row.apns_armed.unwrap_or(false), // ✨ Phase 3.5
                     connected: row.connected.unwrap_or(false),   // ✨ Phase 3.5
                     locale: row.locale,
+                    push_sound: row.push_sound.unwrap_or(true),
                 })
             })
             .collect();
@@ -391,6 +423,7 @@ impl UserDeviceRepository {
             apns_armed: Option<bool>,
             connected: Option<bool>,
             locale: Option<String>,
+            push_sound: Option<bool>,
         }
 
         let row = sqlx::query_as::<_, Row>(
@@ -404,7 +437,8 @@ impl UserDeviceRepository {
                 push_token,
                 apns_armed,
                 connected,
-                locale
+                locale,
+                push_sound
             FROM privchat_user_devices
             WHERE user_id = $1 AND device_id = $2
             "#,
@@ -429,6 +463,7 @@ impl UserDeviceRepository {
                 apns_armed: row.apns_armed.unwrap_or(false),
                 connected: row.connected.unwrap_or(false),
                 locale: row.locale,
+                push_sound: row.push_sound.unwrap_or(true),
             }))
         } else {
             Ok(None)
@@ -444,6 +479,7 @@ impl UserDeviceRepository {
         push_token: Option<&str>,
         vendor: Option<&str>,
         locale: Option<&str>,
+        push_sound: Option<bool>,
     ) -> Result<()> {
         let platform = self
             .query_platform(user_id, device_id)
@@ -455,8 +491,8 @@ impl UserDeviceRepository {
         // 使用 UPSERT，避免设备首次上报时行不存在导致更新无效。
         sqlx::query(
             r#"
-            INSERT INTO privchat_user_devices (user_id, device_id, platform, vendor, push_token, apns_armed, locale, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            INSERT INTO privchat_user_devices (user_id, device_id, platform, vendor, push_token, apns_armed, locale, push_sound, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, true), NOW())
             ON CONFLICT (user_id, device_id)
             DO UPDATE SET
                 platform = EXCLUDED.platform,
@@ -465,6 +501,8 @@ impl UserDeviceRepository {
                 apns_armed = EXCLUDED.apns_armed,
                 -- 老客户端不报 locale，别把之前存好的值抹成 NULL。
                 locale = COALESCE(EXCLUDED.locale, privchat_user_devices.locale),
+                -- push_sound 同理：不报就保持原值，而不是被 default 顶回 true。
+                push_sound = COALESCE($8, privchat_user_devices.push_sound),
                 updated_at = NOW()
             "#,
         )
@@ -475,6 +513,7 @@ impl UserDeviceRepository {
         .bind(token)
         .bind(apns_armed)
         .bind(locale.map(str::trim).filter(|it| !it.is_empty()))
+        .bind(push_sound)
         .execute(&self.pool)
         .await
         .map_err(|e| ServerError::Database(format!("更新设备推送状态失败: {}", e)))?;
@@ -634,5 +673,140 @@ impl UserDeviceRepository {
         .map_err(|e| ServerError::Database(format!("注销设备失败: {}", e)))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod push_preference_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn pool() -> Option<PgPool> {
+        let url = crate::require_test_database_url()?;
+        Some(
+            PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&url)
+                .await
+                .expect("连接测试库"),
+        )
+    }
+
+    /// 清掉偏好，并保证用户行存在（`privchat_user_settings.user_id` 有外键）。
+    async fn reset(pool: &PgPool, user_id: i64) {
+        sqlx::query("DELETE FROM privchat_user_settings WHERE user_id = $1 AND setting_key = $2")
+            .bind(user_id)
+            .bind(PUSH_PREFERENCE_KEY)
+            .execute(pool)
+            .await
+            .expect("清理偏好");
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_users (user_id, username, display_name, qr_key)
+            VALUES ($1, $2, $2, $3)
+            ON CONFLICT (user_id) DO NOTHING
+            "#,
+        )
+        .bind(user_id)
+        .bind(format!("pushpref{user_id}"))
+        .bind(format!("qk{user_id}"))
+        .execute(pool)
+        .await
+        .expect("预置用户行");
+    }
+
+    /// 没有记录 = 用户没设置过，用产品默认值（显示预览、不静音）。
+    #[tokio::test]
+    async fn missing_record_falls_back_to_product_defaults() {
+        let Some(pool) = pool().await else { return };
+        let uid = 990_001_i64;
+        reset(&pool, uid).await;
+
+        let repo = UserDeviceRepository::new(pool.clone());
+        let preference = repo.get_push_preference(uid as u64).await.expect("读取偏好");
+        assert!(preference.show_preview);
+        assert!(!preference.global_mute);
+    }
+
+    /// 🔴 两台设备同时改**不同**字段，两项改动都要保留。
+    ///
+    /// 先 SELECT 再整体 UPDATE 的实现会在这里挂：两个请求都读到初始值，
+    /// 后写的那个把对方刚改的字段写回了旧值。
+    #[tokio::test]
+    async fn concurrent_updates_to_different_fields_both_survive() {
+        let Some(pool) = pool().await else { return };
+        let uid = 990_002_i64;
+        reset(&pool, uid).await;
+
+        let repo = std::sync::Arc::new(UserDeviceRepository::new(pool.clone()));
+        // 先落一条初始记录，让两个并发请求都走 ON CONFLICT 分支（真正的竞态点）。
+        repo.merge_push_preference(uid as u64, Some(true), Some(false))
+            .await
+            .expect("初始化偏好");
+
+        let a = {
+            let repo = repo.clone();
+            tokio::spawn(async move { repo.merge_push_preference(uid as u64, Some(false), None).await })
+        };
+        let b = {
+            let repo = repo.clone();
+            tokio::spawn(async move { repo.merge_push_preference(uid as u64, None, Some(true)).await })
+        };
+        a.await.expect("join a").expect("设备 A 更新");
+        b.await.expect("join b").expect("设备 B 更新");
+
+        let final_state = repo.get_push_preference(uid as u64).await.expect("读取偏好");
+        assert!(
+            !final_state.show_preview,
+            "设备 A 关闭预览的改动被覆盖了: {:?}",
+            final_state
+        );
+        assert!(
+            final_state.global_mute,
+            "设备 B 开启免打扰的改动被覆盖了: {:?}",
+            final_state
+        );
+    }
+
+    /// 只提供一个字段时，另一个字段保持库里的原值——不能被默认值顶掉。
+    #[tokio::test]
+    async fn partial_update_keeps_the_other_field() {
+        let Some(pool) = pool().await else { return };
+        let uid = 990_003_i64;
+        reset(&pool, uid).await;
+
+        let repo = UserDeviceRepository::new(pool.clone());
+        repo.merge_push_preference(uid as u64, Some(false), Some(true))
+            .await
+            .expect("初始化偏好");
+
+        // 只改 global_mute，show_preview 必须还是 false（而不是回到默认的 true）。
+        let merged = repo
+            .merge_push_preference(uid as u64, None, Some(false))
+            .await
+            .expect("部分更新");
+        assert!(!merged.show_preview);
+        assert!(!merged.global_mute);
+    }
+
+    /// 🔴 读不到偏好时必须报错，不能返回"显示预览、不静音"的默认值：
+    /// 那会让数据库抖动直接翻译成隐私泄露 + 免打扰失效。
+    #[tokio::test]
+    async fn load_push_context_fails_loudly_when_query_fails() {
+        let Some(url) = crate::require_test_database_url() else { return };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("连接测试库");
+        // 关掉连接池再查：模拟数据库不可达。
+        pool.close().await;
+
+        let repo = UserDeviceRepository::new(pool);
+        let result = repo.load_push_context(990_004, 1).await;
+        assert!(
+            result.is_err(),
+            "查询失败时返回了默认值，这会把正文推给关掉预览的用户"
+        );
     }
 }

@@ -339,6 +339,7 @@ mod tests {
             vendor: PushVendor::Fcm,
             push_token: "tok".into(),
             locale: Some("zh-Hans".into()),
+            push_sound: true,
             payload: crate::push::types::PushPayload {
                 r#type: "new_message".into(),
                 conversation_id: 1234,

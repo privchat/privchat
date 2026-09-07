@@ -19,7 +19,6 @@
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcContext;
 use crate::rpc::RpcServiceContext;
-use crate::repository::user_device_repo::PushPreference;
 use privchat_protocol::rpc::device::{
     DevicePushPreferenceResponse, DevicePushPreferenceUpdateRequest,
 };
@@ -47,9 +46,11 @@ pub async fn handle_get(
 
 /// `device/push/preference/update`
 ///
-/// 两个字段都可选：只带要改的那个。读改写在服务端完成——客户端如果得先 get 再
-/// 把整份 preference 送回来，两台设备同时改不同开关时，后写的那次会把对方的改动
-/// 覆盖掉。
+/// 两个字段都可选：只带要改的那个。合并在**数据库内部**一条 UPSERT 里完成——
+/// 先 SELECT 再整体 UPDATE 的话，两台设备同时改不同开关时两边都读到旧值，
+/// 后写的那次会撤销对方的改动。字段可选本身不解决并发，只是把竞态挪了个位置。
+///
+/// 返回合并后的完整偏好：客户端按返回值落地，不用自己猜合并结果。
 pub async fn handle_update(
     body: Value,
     services: RpcServiceContext,
@@ -65,19 +66,10 @@ pub async fn handle_update(
     }
 
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
-    let repo = services.user_device_repo.as_ref();
-
-    let current = repo
-        .get_push_preference(user_id)
-        .await
-        .map_err(|e| RpcError::internal(format!("查询推送偏好失败: {}", e)))?;
-
-    let updated = PushPreference {
-        show_preview: request.show_preview.unwrap_or(current.show_preview),
-        global_mute: request.global_mute.unwrap_or(current.global_mute),
-    };
-
-    repo.set_push_preference(user_id, &updated)
+    let updated = services
+        .user_device_repo
+        .as_ref()
+        .merge_push_preference(user_id, request.show_preview, request.global_mute)
         .await
         .map_err(|e| RpcError::internal(format!("保存推送偏好失败: {}", e)))?;
 

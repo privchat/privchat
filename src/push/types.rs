@@ -144,6 +144,8 @@ pub struct PushTask {
     pub push_token: String,
     /// 设备语言（BCP-47）。None = 老客户端没上报，provider 按简体中文兜底。
     pub locale: Option<String>,
+    /// 这台设备的远程通知是否带提示音。
+    pub push_sound: bool,
     pub payload: PushPayload,
 }
 

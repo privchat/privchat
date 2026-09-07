@@ -45,6 +45,7 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
             request.push_token.as_deref(),
             request.vendor.as_deref(),
             request.locale.as_deref(),
+            request.push_sound,
         )
         .await
         .map_err(|e| RpcError::internal(format!("更新设备推送状态失败: {}", e)))?;

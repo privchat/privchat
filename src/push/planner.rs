@@ -214,7 +214,21 @@ impl PushPlanner {
         // 收件人侧状态一次取齐：免打扰、未读总数、推送偏好。放在在线判定之前，
         // 因为这些判断与设备无关，两条 intent 路径（设备级 / 用户级）都要走。
         let ctx = match &self.device_repo {
-            Some(repo) => repo.load_push_context(recipient_id, conversation_id).await,
+            Some(repo) => match repo.load_push_context(recipient_id, conversation_id).await {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    // 读不到收件人的免打扰/隐私设置就**不推**。按默认值推的话，
+                    // 数据库抖一下就会把正文推到一个关掉了预览的用户的锁屏上，
+                    // 或者吵醒一个开了全局免打扰的用户——两件事都不可撤销，
+                    // 而少推一条消息是可恢复的（用户打开 App 就看到了）。
+                    error!(
+                        "[PUSH PLANNER] 读取 user {} 的推送上下文失败，放弃本次推送: {}",
+                        recipient_id, e
+                    );
+                    return Ok(());
+                }
+            },
+            // repo 未注入只出现在单测里：生产装配一定带 repo（见 server.rs）。
             None => crate::repository::user_device_repo::PushContext::default(),
         };
 
