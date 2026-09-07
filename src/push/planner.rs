@@ -174,6 +174,7 @@ impl PushPlanner {
             recipient_id,
             content_preview,
             channel_type,
+            message_type,
             timestamp,
             device_id,
         ) = match event {
@@ -184,6 +185,7 @@ impl PushPlanner {
                 recipient_id,
                 content_preview,
                 channel_type,
+                message_type,
                 timestamp,
                 device_id, // ✨ Phase 3.5: 可选的设备ID
                 ..
@@ -194,6 +196,7 @@ impl PushPlanner {
                 recipient_id,
                 content_preview,
                 channel_type,
+                message_type,
                 timestamp,
                 device_id,
             ),
@@ -208,24 +211,28 @@ impl PushPlanner {
             message_id, recipient_id, sender_id, device_id
         );
 
-        // 角标数在这里算一次，两条 intent 路径共用。查不到就是 0（不下发 badge），
-        // 不因为它失败而挡下整条推送。
-        let unread_total = match &self.device_repo {
-            Some(repo) => repo.total_unread_count(recipient_id).await,
-            None => 0,
+        // 收件人侧状态一次取齐：免打扰、未读总数、推送偏好。放在在线判定之前，
+        // 因为这些判断与设备无关，两条 intent 路径（设备级 / 用户级）都要走。
+        let ctx = match &self.device_repo {
+            Some(repo) => repo.load_push_context(recipient_id, conversation_id).await,
+            None => crate::repository::user_device_repo::PushContext::default(),
         };
 
-        // 免打扰的会话不推。放在在线判定之前：这个判断与设备无关，两条路径
-        // （设备级 / 用户级 intent）都要走，写在这里就不会漏掉其中一条。
-        if let Some(repo) = &self.device_repo {
-            if repo.is_conversation_muted(recipient_id, conversation_id).await {
-                debug!(
-                    "[PUSH PLANNER] 会话 {} 对 user {} 免打扰，跳过推送",
-                    conversation_id, recipient_id
-                );
-                return Ok(());
-            }
+        if ctx.global_mute {
+            debug!(
+                "[PUSH PLANNER] user {} 开启了全局免打扰，跳过推送",
+                recipient_id
+            );
+            return Ok(());
         }
+        if ctx.muted {
+            debug!(
+                "[PUSH PLANNER] 会话 {} 对 user {} 免打扰，跳过推送",
+                conversation_id, recipient_id
+            );
+            return Ok(());
+        }
+        let unread_total = ctx.unread_total;
 
         // ✨ Phase 3.5: 如果指定了 device_id，只为该设备生成 Intent
         if let Some(device_id) = device_id {
@@ -242,6 +249,8 @@ impl PushPlanner {
                     conversation_id,
                     channel_type,
                     unread_total,
+                    message_type: message_type.clone(),
+                    show_preview: ctx.show_preview,
                     message_id,
                     sender_id,
                     content_preview,
@@ -296,6 +305,8 @@ impl PushPlanner {
                 conversation_id,
                 channel_type,
                 unread_total,
+                message_type: message_type.clone(),
+                show_preview: ctx.show_preview,
                 message_id,
                 sender_id,
                 content_preview,

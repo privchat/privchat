@@ -210,6 +210,20 @@ impl FcmProvider {
     /// `onMessageReceived`，由客户端复用既有的 NotificationPresenter（channel、会话合并、
     /// 点击回流都是现成的）。代价是 App 被用户强杀后收不到——那属于厂商通道的范畴。
     fn build_fcm_payload(task: &PushTask) -> serde_json::Value {
+        // 已按类型和隐私设置渲染好的正文。Android 拿到 message_type 后可以用本端
+        // i18n 重新渲染（用户刚改语言、还没上报时更准）。
+        let locale = crate::push::types::locale::PushLocale::parse(task.locale.as_deref());
+        let body = locale.render_body(
+            &task.payload.message_type,
+            &task.payload.content_preview,
+            task.payload.show_preview,
+        );
+        // 隐私模式下连类型都不给：知道"来了张图片"本身也是信息。
+        let message_type = if task.payload.show_preview {
+            task.payload.message_type.clone()
+        } else {
+            "hidden".to_string()
+        };
         json!({
             "message": {
                 "token": task.push_token,
@@ -219,7 +233,11 @@ impl FcmProvider {
                     "channel_type": task.payload.channel_type.to_string(),
                     "message_id": task.payload.message_id.to_string(),
                     "sender_id": task.payload.sender_id.to_string(),
-                    "content_preview": task.payload.content_preview.clone(),
+                    // 已按类型和隐私设置渲染好的正文。Android 拿到 message_type 后
+                    // 可以用本端 i18n 重新渲染（用户刚改语言、还没上报时更准），
+                    // 但 show_preview=false 的裁剪服务端已经做掉了，客户端拿不到原文。
+                    "content_preview": body,
+                    "message_type": message_type,
                     // Android 是 data-only，文案由客户端自己的 i18n 渲染；这里带上
                     // 只是为了两端 payload 对齐、排查时能看出服务端认为的语言是什么。
                     "locale": task.locale.clone().unwrap_or_default(),
@@ -329,6 +347,8 @@ mod tests {
                 sender_id: 5,
                 content_preview: "hi".into(),
                 unread_total: 7,
+                message_type: "text".into(),
+                show_preview: true,
             },
         }
     }
@@ -349,6 +369,21 @@ mod tests {
         assert_eq!(message["android"]["priority"], "high");
         assert_eq!(message["android"]["collapse_key"], "conv-1234");
         assert_eq!(message["android"]["ttl"], "86400s");
+    }
+
+    /// 隐私模式下连 message_type 都不给：知道"来了张图片"本身也是信息。
+    #[test]
+    fn fcm_hides_content_and_type_when_preview_disabled() {
+        let mut t = task(1);
+        t.payload.show_preview = false;
+        t.payload.message_type = "image".into();
+        t.payload.content_preview = "体检报告".into();
+
+        let payload = FcmProvider::build_fcm_payload(&t);
+        let data = &payload["message"]["data"];
+        assert_eq!(data["message_type"], "hidden");
+        assert_eq!(data["content_preview"], "你收到一条新消息");
+        assert!(!payload.to_string().contains("体检报告"));
     }
 
     /// UNREGISTERED = App 已卸载 / token 轮换过，必须清库；

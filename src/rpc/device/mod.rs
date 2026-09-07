@@ -87,5 +87,29 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    tracing::debug!("📋 Device 系统路由注册完成 (list, kick_other_devices, kick_device, push/update, push/status)");
+    // 账号级推送偏好（是否显示预览 / 全局免打扰）
+    GLOBAL_RPC_ROUTER
+        .register(routes::device::PUSH_PREFERENCE_GET, {
+            let services = services.clone();
+            move |body: serde_json::Value, ctx: crate::rpc::RpcContext| {
+                let services = services.clone();
+                async move { push::handle_push_preference_get(body, services, ctx).await }
+            }
+        })
+        .await;
+
+    GLOBAL_RPC_ROUTER
+        .register(routes::device::PUSH_PREFERENCE_UPDATE, {
+            let services = services.clone();
+            move |body: serde_json::Value, ctx: crate::rpc::RpcContext| {
+                let services = services.clone();
+                async move { push::handle_push_preference_update(body, services, ctx).await }
+            }
+        })
+        .await;
+
+    tracing::debug!(
+        "📋 Device 系统路由注册完成 (list, kick_other_devices, kick_device, \
+         push/update, push/status, push/preference/get, push/preference/update)"
+    );
 }

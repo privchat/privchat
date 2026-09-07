@@ -15,8 +15,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod preference;
 pub mod status;
 pub mod update;
 
+pub use preference::handle_get as handle_push_preference_get;
+pub use preference::handle_update as handle_push_preference_update;
 pub use status::handle as handle_push_status;
 pub use update::handle as handle_push_update;

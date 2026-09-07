@@ -128,11 +128,13 @@ impl ApnsProvider {
         // 语言由设备上报（privchat_user_devices.locale）。iOS 的 alert 是系统直接
         // 展示的，App 没有机会本地化，所以只能在这里定。
         let locale = crate::push::types::locale::PushLocale::parse(task.locale.as_deref());
-        let body = if task.payload.content_preview.trim().is_empty() {
-            locale.default_body().to_string()
-        } else {
-            task.payload.content_preview.clone()
-        };
+        // 非文本消息渲染成 `[图片]` 这类占位符；用户关掉预览时只给通用文案。
+        // 裁剪必须在这里做完——alert 一旦发出去就已经在设备上了。
+        let body = locale.render_body(
+            &task.payload.message_type,
+            &task.payload.content_preview,
+            task.payload.show_preview,
+        );
         let mut aps = json!({
             "alert": {
                 "title": locale.default_title(),
@@ -278,6 +280,8 @@ mod tests {
                 sender_id: 5,
                 content_preview: "hi".into(),
                 unread_total: 7,
+                message_type: "text".into(),
+                show_preview: true,
             },
         }
     }
@@ -313,6 +317,49 @@ mod tests {
         t.payload.content_preview = "   ".into();
         let payload = ApnsProvider::build_apns_payload(&t);
         assert_eq!(payload["aps"]["alert"]["body"], "You have a new message");
+    }
+
+    /// 非文本消息不能把原始 content 塞进通知：那可能是 caption、URL 或结构化 JSON。
+    #[test]
+    fn apns_renders_type_placeholder_for_non_text() {
+        let mut t = task(1);
+        t.payload.message_type = "file".into();
+        t.payload.content_preview = "s3://bucket/secret-contract.pdf".into();
+
+        t.locale = Some("zh-Hans".into());
+        assert_eq!(
+            ApnsProvider::build_apns_payload(&t)["aps"]["alert"]["body"],
+            "[文件]"
+        );
+        t.locale = Some("en".into());
+        assert_eq!(
+            ApnsProvider::build_apns_payload(&t)["aps"]["alert"]["body"],
+            "[File]"
+        );
+        t.locale = Some("vi".into());
+        assert_eq!(
+            ApnsProvider::build_apns_payload(&t)["aps"]["alert"]["body"],
+            "[Tệp]"
+        );
+    }
+
+    /// 关掉"显示消息预览"之后，正文里不能留下任何原文痕迹——APNs 的 alert 由系统
+    /// 展示，发出去就已经在设备上了，客户端没有事后隐藏的机会。
+    #[test]
+    fn apns_hides_content_when_preview_disabled() {
+        let mut t = task(1);
+        t.payload.show_preview = false;
+        t.payload.content_preview = "明天上午十点开会".into();
+        let payload = ApnsProvider::build_apns_payload(&t);
+        assert_eq!(payload["aps"]["alert"]["body"], "你收到一条新消息");
+
+        // 整个 payload 里都不该出现原文。
+        let serialized = payload.to_string();
+        assert!(
+            !serialized.contains("明天上午十点开会"),
+            "隐私模式下 payload 仍然带了原文: {}",
+            serialized
+        );
     }
 
     /// badge 写死 1 时，手机上二十条未读也只显示 1。

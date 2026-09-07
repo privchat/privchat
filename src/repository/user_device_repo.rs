@@ -34,6 +34,68 @@ pub struct UserDevice {
     pub locale: Option<String>,
 }
 
+/// 推送偏好在 `privchat_user_settings` 里的 key。
+pub const PUSH_PREFERENCE_KEY: &str = "notifications.push";
+
+/// 账号级推送偏好。跨设备一致，所以存用户设置而不是设备表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushPreference {
+    /// 通知里是否显示消息内容。false = 只显示"你收到一条新消息"。
+    pub show_preview: bool,
+    /// 全局免打扰：所有会话都不推。
+    pub global_mute: bool,
+}
+
+impl Default for PushPreference {
+    fn default() -> Self {
+        // 默认显示预览、不全局静音——与客户端本地通知设置的默认值一致，
+        // 两边不一致的话用户会看到"App 内不显示预览、锁屏却显示"。
+        Self {
+            show_preview: true,
+            global_mute: false,
+        }
+    }
+}
+
+impl PushPreference {
+    /// 从 `value_json` 解析。缺字段/解析失败一律回默认值——没设置过就是默认。
+    pub fn from_json(value: Option<&serde_json::Value>) -> Self {
+        let default = Self::default();
+        let Some(value) = value else { return default };
+        Self {
+            show_preview: value
+                .get("showPreview")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(default.show_preview),
+            global_mute: value
+                .get("globalMute")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(default.global_mute),
+        }
+    }
+}
+
+/// 生成推送时需要的收件人侧状态快照。
+#[derive(Debug, Clone, Copy)]
+pub struct PushContext {
+    pub muted: bool,
+    pub unread_total: i64,
+    pub show_preview: bool,
+    pub global_mute: bool,
+}
+
+impl Default for PushContext {
+    fn default() -> Self {
+        let preference = PushPreference::default();
+        Self {
+            muted: false,
+            unread_total: 0,
+            show_preview: preference.show_preview,
+            global_mute: preference.global_mute,
+        }
+    }
+}
+
 /// 用户设备 Repository
 pub struct UserDeviceRepository {
     pool: PgPool,
@@ -103,6 +165,107 @@ impl UserDeviceRepository {
                 device_id
             );
         }
+        Ok(())
+    }
+
+    /// 生成一条推送需要的全部收件人侧状态，一次查询取回。
+    ///
+    /// 以前是三次独立往返（免打扰、未读总数、推送偏好），而这条路径对**每个离线
+    /// 收件人**都要走一遍——群聊里就是每人三次。合成一次之后，判定所依据的也是
+    /// 同一时刻的快照，不会出现"读到的免打扰是新的、未读数是旧的"。
+    pub async fn load_push_context(&self, user_id: u64, channel_id: u64) -> PushContext {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            muted: Option<bool>,
+            unread_total: Option<i64>,
+            preference: Option<serde_json::Value>,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT
+                (SELECT is_muted FROM privchat_user_channels
+                  WHERE user_id = $1 AND channel_id = $2) AS muted,
+                (SELECT COALESCE(SUM(unread_count), 0)::bigint FROM privchat_user_channels
+                  WHERE user_id = $1 AND unread_count > 0) AS unread_total,
+                (SELECT value_json FROM privchat_user_settings
+                  WHERE user_id = $1 AND setting_key = $3) AS preference
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(channel_id as i64)
+        .bind(PUSH_PREFERENCE_KEY)
+        .fetch_one(&self.pool)
+        .await;
+
+        match row {
+            Ok(row) => {
+                let preference = PushPreference::from_json(row.preference.as_ref());
+                PushContext {
+                    muted: row.muted.unwrap_or(false),
+                    unread_total: row.unread_total.unwrap_or(0),
+                    show_preview: preference.show_preview,
+                    global_mute: preference.global_mute,
+                }
+            }
+            Err(e) => {
+                // 查不到就按默认推：宁可多推一条，也不要因为数据库抖动把所有人的
+                // 推送静音掉。唯一的例外是 show_preview——它涉及隐私，见下。
+                tracing::warn!(
+                    "查询推送上下文失败(user={} channel={}): {}，按默认值处理",
+                    user_id,
+                    channel_id,
+                    e
+                );
+                PushContext::default()
+            }
+        }
+    }
+
+    /// 读取推送偏好。
+    pub async fn get_push_preference(&self, user_id: u64) -> Result<PushPreference> {
+        let value = sqlx::query_scalar::<_, serde_json::Value>(
+            r#"
+            SELECT value_json FROM privchat_user_settings
+            WHERE user_id = $1 AND setting_key = $2
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(PUSH_PREFERENCE_KEY)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("查询推送偏好失败: {}", e)))?;
+
+        Ok(PushPreference::from_json(value.as_ref()))
+    }
+
+    /// 写入推送偏好（整体覆盖）。
+    pub async fn set_push_preference(
+        &self,
+        user_id: u64,
+        preference: &PushPreference,
+    ) -> Result<()> {
+        let value = serde_json::json!({
+            "showPreview": preference.show_preview,
+            "globalMute": preference.global_mute,
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_user_settings (user_id, setting_key, value_json, version, updated_at)
+            VALUES ($1, $2, $3, 1, (EXTRACT(epoch FROM now()) * 1000)::bigint)
+            ON CONFLICT (user_id, setting_key)
+            DO UPDATE SET
+                value_json = EXCLUDED.value_json,
+                version = privchat_user_settings.version + 1,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(PUSH_PREFERENCE_KEY)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("保存推送偏好失败: {}", e)))?;
         Ok(())
     }
 
