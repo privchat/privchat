@@ -689,12 +689,8 @@ impl FriendService {
         .await
         .map_err(|e| ServerError::Database(format!("Failed to query friend sync page: {}", e)))?;
 
-        let has_more = rows.len() > limit as usize;
+        let has_more_rows = rows.len() > limit as usize;
         let page: Vec<_> = rows.into_iter().take(limit as usize).collect();
-        let next_version = page
-            .last()
-            .map(|row| row.sync_version as u64)
-            .unwrap_or(since_v);
 
         let me = user_id as i64;
         // Profile reads for a sync page go to the database, never to the profile
@@ -718,22 +714,28 @@ impl FriendService {
                 }
             })
             .collect();
+        // A failed profile query is an error, not an empty page. Swallowing it here
+        // would return `items: []` with an advanced cursor — the client would record
+        // the new cursor and those friends would never appear in a later delta. A
+        // retryable error costs one round trip; silent loss is permanent.
         let peer_profiles: HashMap<u64, (CachedUserProfile, u64)> = user_repository
             .find_related_since(&peer_ids, 0, peer_ids.len().max(1) as u32)
             .await
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|entry| {
-                        let version = entry.sync_version;
-                        let profile = crate::rpc::helpers::user_to_cached_profile(&entry.user);
-                        (entry.user.id, (profile, version))
-                    })
-                    .collect()
+            .map_err(|e| {
+                ServerError::Database(format!("Failed to load friend sync profiles: {}", e))
+            })?
+            .into_iter()
+            .map(|entry| {
+                let version = entry.sync_version;
+                let profile = crate::rpc::helpers::user_to_cached_profile(&entry.user);
+                (entry.user.id, (profile, version))
             })
-            .unwrap_or_default();
+            .collect();
 
         let mut items = Vec::with_capacity(page.len());
+        // 只推进到**确实发出去**的那一行；中途停下时游标停在断点之前。
+        let mut next_version = since_v;
+        let mut stopped_early = false;
         for row in &page {
             // 谁是 viewer 视角下的"对端"？— 当前 viewer 是 me，对端就是另一侧。
             let (peer_id_i64, is_outgoing) = if row.row_user_id == me {
@@ -752,13 +754,25 @@ impl FriendService {
                     deleted: true,
                     payload: None,
                 });
+                next_version = row.sync_version as u64;
                 continue;
             }
 
             // 加载对端 profile（accepted / pending / rejected / recalled / expired
-            // 都需要展示头像 + 昵称）。拉不到则跳过这一项——下次 sync 会再来。
+            // 都需要展示头像 + 昵称）。
+            //
+            // 拉不到就**停在这一行**，而不是跳过它继续往后发。rows 按 sync_version 升序，
+            // 停下来意味着游标不会越过这一行，客户端下次还会拿到它。原来的 `continue`
+            // 会把这一行连同它的版本一起留在 next_version 里推给客户端——一次异常就
+            // 让这个好友从此不再出现在任何增量里。
             let Some((profile, profile_version)) = peer_profiles.get(&peer_id).cloned() else {
-                continue;
+                warn!(
+                    viewer = user_id,
+                    peer = peer_id,
+                    "friend sync stopped: peer profile row missing"
+                );
+                stopped_early = true;
+                break;
             };
 
             let user_block = FriendSyncUserPayload {
@@ -835,7 +849,11 @@ impl FriendService {
                 deleted: false,
                 payload: Some(payload),
             });
+            next_version = row.sync_version as u64;
         }
+
+        // 提前停下 ⇒ 这一页没发完，必须告诉客户端还有内容，否则它会以为同步到头了。
+        let has_more = has_more_rows || stopped_early;
 
         Ok(SyncEntitiesResponse {
             items,

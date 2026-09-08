@@ -101,7 +101,7 @@ pub async fn handle(
     {
         Ok(verdict) => {
             // 权限验证通过，从数据库读取用户资料
-            match helpers::get_user_profile_with_fallback(
+            match helpers::get_user_profile_fresh(
                 user_id,
                 &services.user_repository,
                 &services.cache_manager,

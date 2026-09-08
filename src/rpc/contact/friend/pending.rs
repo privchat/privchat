@@ -37,7 +37,7 @@ pub async fn handle(
 
             for req in requests {
                 // 获取申请者用户资料
-                let user = match helpers::get_user_profile_with_fallback(
+                let user = match helpers::get_user_profile_fresh(
                     req.from_user_id,
                     &services.user_repository,
                     &services.cache_manager,

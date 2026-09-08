@@ -73,7 +73,7 @@ pub async fn handle(
                 })?;
 
             // 通过 user_id 获取用户资料（从数据库读取）
-            match helpers::get_user_profile_with_fallback(
+            match helpers::get_user_profile_fresh(
                 user_id,
                 &services.user_repository,
                 &services.cache_manager,

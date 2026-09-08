@@ -67,6 +67,35 @@ pub async fn get_user_profile_with_fallback(
     }
 }
 
+/// 直接读数据库的资料查询，并顺手刷新缓存。
+///
+/// 用在**客户端明确要一个人的身份**的地方：查看资料页、扫码查人、好友申请列表。
+/// AVATAR_CACHE_SPEC §2 规定查看资料页要强制远端校准——如果那次校准读到的是缓存，
+/// 校准就没有发生。`get_user_profile_with_fallback` 留给顺带取名字的批量路径。
+///
+/// 2026-09-09 生产故障就是这条边界没划清：资料写入不失效缓存，于是所有读缓存的路径
+/// 一起返回旧昵称，客户端怎么刷新都收敛不了。
+pub async fn get_user_profile_fresh(
+    user_id: u64,
+    user_repository: &crate::repository::UserRepository,
+    cache_manager: &crate::infra::CacheManager,
+) -> Result<Option<CachedUserProfile>, crate::error::ServerError> {
+    let user = user_repository
+        .find_by_id(user_id)
+        .await
+        .map_err(|e| crate::error::ServerError::Internal(format!("查询用户失败: {}", e)))?;
+    match user {
+        Some(user) => {
+            let profile = user_to_cached_profile(&user);
+            // 顺手把缓存刷成新值：让走缓存的展示路径也尽快跟上。失败不影响本次返回,
+            // 因为本次返回的已经是权威值。
+            let _ = cache_manager.set_user_profile(user.id, profile.clone()).await;
+            Ok(Some(profile))
+        }
+        None => Ok(None),
+    }
+}
+
 /// 查 user_type（0=普通 / 1=系统 / 2=机器人）。
 ///
 /// 顺序：1~99 区段直接判内置 System User；缓存命中读 `CachedUserProfile.user_type`；
