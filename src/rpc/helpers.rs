@@ -80,17 +80,34 @@ pub async fn get_user_profile_fresh(
     user_repository: &crate::repository::UserRepository,
     cache_manager: &crate::infra::CacheManager,
 ) -> Result<Option<CachedUserProfile>, crate::error::ServerError> {
-    let user = user_repository
-        .find_by_id(user_id)
+    Ok(get_user_profile_fresh_versioned(user_id, user_repository, cache_manager)
+        .await?
+        .map(|(profile, _)| profile))
+}
+
+/// 同上，但一并返回这份资料在 `user` 实体序列里的位置。
+///
+/// 版本必须和字段来自**同一次读取**：分两次读会拼出「旧内容 + 新版本」的快照，
+/// 客户端按版本比较后就再也不会用真正的新资料覆盖它。
+pub async fn get_user_profile_fresh_versioned(
+    user_id: u64,
+    user_repository: &crate::repository::UserRepository,
+    cache_manager: &crate::infra::CacheManager,
+) -> Result<Option<(CachedUserProfile, u64)>, crate::error::ServerError> {
+    let mut entries = user_repository
+        .find_related_since(&[user_id], 0, 1)
         .await
         .map_err(|e| crate::error::ServerError::Internal(format!("查询用户失败: {}", e)))?;
-    match user {
-        Some(user) => {
-            let profile = user_to_cached_profile(&user);
+    match entries.pop() {
+        Some(entry) => {
+            let sync_version = entry.sync_version;
+            let profile = user_to_cached_profile(&entry.user);
             // 顺手把缓存刷成新值：让走缓存的展示路径也尽快跟上。失败不影响本次返回,
             // 因为本次返回的已经是权威值。
-            let _ = cache_manager.set_user_profile(user.id, profile.clone()).await;
-            Ok(Some(profile))
+            let _ = cache_manager
+                .set_user_profile(entry.user.id, profile.clone())
+                .await;
+            Ok(Some((profile, sync_version)))
         }
         None => Ok(None),
     }

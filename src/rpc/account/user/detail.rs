@@ -101,14 +101,14 @@ pub async fn handle(
     {
         Ok(verdict) => {
             // 权限验证通过，从数据库读取用户资料
-            match helpers::get_user_profile_fresh(
+            match helpers::get_user_profile_fresh_versioned(
                 user_id,
                 &services.user_repository,
                 &services.cache_manager,
             )
             .await
             {
-                Ok(Some(user_profile)) => {
+                Ok(Some((user_profile, profile_sync_version))) => {
                     // ✨ 检查好友关系和发消息权限
                     let is_friend = services
                         .friend_service
@@ -224,6 +224,9 @@ pub async fn handle(
                         "is_follow": is_follow, // ✨ 是否已关注 Bot（仅 user_type=2 有意义）
                         "source_type": source_str, // 本次查看的来源类型
                         "source_id": source_id, // 本次查看的来源 ID
+                        // 这份资料在 user 实体序列里的位置,与上面字段同一次读取。
+                        // 客户端据此把详情放进和实体增量同一条版本轴比较。
+                        "sync_version": profile_sync_version,
                     }))
                 }
                 Ok(None) => Err(RpcError::not_found(format!("User '{}' not found", user_id))),

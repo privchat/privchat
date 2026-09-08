@@ -766,10 +766,23 @@ impl FriendService {
             // 会把这一行连同它的版本一起留在 next_version 里推给客户端——一次异常就
             // 让这个好友从此不再出现在任何增量里。
             let Some((profile, profile_version)) = peer_profiles.get(&peer_id).cloned() else {
+                // 这一页第一行就解析不了 ⇒ 本次调用**无法推进任何进度**。返回
+                // `has_more=true` + 原地不动的游标，是拿一个成功响应表达一个走不通的
+                // 状态：客户端会立刻翻下一页，再次停在同一行，转成热循环，而它后面
+                // 的好友永远同步不到。这种情况必须以可重试错误结束，让客户端退避。
+                //
+                // 已经发出去几条了，就停在这里：进度是真实的，游标停在断点之前，
+                // 下次从这一行继续。
+                if items.is_empty() {
+                    return Err(ServerError::Database(format!(
+                        "friend sync cannot progress: profile row for user {} is missing",
+                        peer_id
+                    )));
+                }
                 warn!(
                     viewer = user_id,
                     peer = peer_id,
-                    "friend sync stopped: peer profile row missing"
+                    "friend sync page truncated: peer profile row missing"
                 );
                 stopped_early = true;
                 break;
