@@ -1184,6 +1184,30 @@ async fn create_friendship(
     )
     .await;
 
+    // 🔴 好友关系成立必须走**通用失效控制面**，与 `friend/accept` 同一条路
+    // （`rpc/contact/friend/accept.rs`）。
+    //
+    // 上面那条 `friend.request.status_changed` 是老的专用 topic：Rust SDK 收到它
+    // 只当提醒，TS SDK 根本不认这个 topic。于是这条 admin 路径（邀请码注册自动加好友
+    // 用的就是它）建好的好友关系，客户端要等下一次冷启动 resume sync 才知道——
+    // 真机表现是新 DM 的标题一直停在「加载中」。
+    //
+    // entity invalidation 两端 SDK 都会真的去拉 friend 增量，而 friend payload 里
+    // 内嵌了对端的 user 实体，会话标题因此一次到位。
+    let publisher =
+        crate::service::EntityInvalidationPublisher::new(state.connection_manager.clone());
+    if let Err(error) = publisher
+        .publish_friend_pair_change(
+            user1_id,
+            user2_id,
+            privchat_protocol::EntityMutationHint::Upsert,
+        )
+        .await
+    {
+        // 推送是尽力而为：客户端下次 resume sync 仍会收敛，不能因此让建好友失败。
+        warn!(user1_id, user2_id, %error, "friend invalidation dispatch failed");
+    }
+
     Ok(ApiEnvelope::ok(dto::CreateFriendshipResponse {
         success: true,
         user1_id,
