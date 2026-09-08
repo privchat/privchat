@@ -116,6 +116,33 @@ impl EntityInvalidationPublisher {
             .await
     }
 
+    /// 新建的 DM 频道要通知双方。
+    ///
+    /// 建好友时顺带建出 direct channel（`channel_service::create_friendship`），但只发了
+    /// `friend` 失效。客户端于是学到了这个好友、**学不到这条会话**：它的会话列表按已知
+    /// 频道增量同步，一个从没听说过的 channel_id 不会凭空出现。生产实测（2026-09-09）：
+    /// 对方绑邀请码后，好友数当场 +1，会话却要等冷启动全量同步才冒出来。
+    ///
+    /// 群路径早就发了 `channel`（见 [`publish_group_projection_change`]）；DM 漏了。
+    pub async fn publish_direct_channel_created(
+        &self,
+        first_user_id: u64,
+        second_user_id: u64,
+        channel_id: u64,
+    ) -> Result<()> {
+        self.publish_to_users(
+            [first_user_id, second_user_id],
+            vec![EntityInvalidation {
+                entity_type: "channel".to_string(),
+                entity_id: Some(channel_id.to_string()),
+                scope: None,
+                target_version: 0,
+                mutation_hint: EntityMutationHint::Upsert,
+            }],
+        )
+        .await
+    }
+
     pub async fn publish_group_projection_change(
         &self,
         user_ids: impl IntoIterator<Item = u64>,
