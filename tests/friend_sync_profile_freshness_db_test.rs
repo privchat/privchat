@@ -164,3 +164,58 @@ async fn friend_sync_serves_the_database_profile_even_when_the_cache_is_stale() 
 
     cleanup(&pool, &[viewer, peer]).await;
 }
+
+/// A channel invalidation can be lost — the recipient may be offline, the push may be
+/// dropped, the process may die between commit and dispatch. §6.3 makes reconnect and
+/// foreground resume run entity sync with no hint at all, so an unheard-of channel has
+/// to be discoverable by that pull alone.
+///
+/// This is the property the earlier verification could not show: the client reports PTS
+/// only for channels it already knows, so watching that traffic can never prove it can
+/// find a new one. Here the channel is created with no invalidation published, and the
+/// unscoped channel sync must still return it.
+#[tokio::test]
+async fn an_unannounced_channel_is_still_found_by_an_unscoped_sync() {
+    let Some(pool) = open_test_pool().await else {
+        eprintln!("skipping: no PRIVCHAT_TEST_DATABASE_URL/DATABASE_URL");
+        return;
+    };
+
+    let viewer: i64 = 990_201;
+    let peer: i64 = 990_202;
+    cleanup(&pool, &[viewer, peer]).await;
+    ensure_user(&pool, viewer, "silentviewer", "SilentViewer").await;
+    ensure_user(&pool, peer, "silentpeer", "SilentPeer").await;
+
+    let pool_arc = std::sync::Arc::new(pool.clone());
+    let channel_repository = std::sync::Arc::new(
+        privchat::repository::PgChannelRepository::new(pool_arc.clone()),
+    );
+    let channel_service =
+        privchat::service::ChannelService::new_with_repository(channel_repository);
+
+    // No transport is wired, so nothing is published — exactly the dropped-hint case.
+    let (channel_id, created) = channel_service
+        .get_or_create_direct_channel(viewer as u64, peer as u64, None, None)
+        .await
+        .expect("create direct channel");
+    assert!(created, "expected a fresh channel for this pair");
+
+    let page = channel_service
+        .sync_entities_page_for_channels(viewer as u64, Some(0), None, 200)
+        .await
+        .expect("channel sync page");
+
+    assert!(
+        page.items
+            .iter()
+            .any(|item| item.entity_id == channel_id.to_string()),
+        "an unscoped channel sync must surface a channel the client never heard about",
+    );
+
+    let _ = sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+        .bind(channel_id as i64)
+        .execute(&pool)
+        .await;
+    cleanup(&pool, &[viewer, peer]).await;
+}

@@ -133,6 +133,15 @@ pub struct ChannelService {
     hidden_channels: Arc<RwLock<HashSet<(u64, u64)>>>,
     /// 最后消息预览缓存 channel_id -> LastMessagePreview
     last_message_cache: Arc<RwLock<HashMap<u64, LastMessagePreview>>>,
+    /// 新建 DM 后向双方发 `channel` 失效（ENTITY_INVALIDATION_SYNC_SPEC §8）。
+    ///
+    /// 放在这里而不是各调用点：DM 有五个创建入口（好友 accept、admin 建好友、扫码、
+    /// 主动开会话、连接期补建），逐个去接就是在赌没人漏。会话列表按**已知**频道做
+    /// 增量，客户端没听说过的 channel_id 不会自己冒出来——漏一个入口，那条路创建的
+    /// 会话就要等下一次冷启动全量同步才出现。
+    ///
+    /// `None` = 未装配（单元测试、离线工具），只是不发通知，不影响建频道。
+    entity_invalidation_publisher: Arc<RwLock<Option<Arc<crate::infra::ConnectionManager>>>>,
 }
 
 /// server 模型/DB 角色 → 协议权威枚举。
@@ -165,6 +174,7 @@ impl ChannelService {
             muted_channels: Arc::new(RwLock::new(HashSet::new())),
             hidden_channels: Arc::new(RwLock::new(HashSet::new())),
             last_message_cache: Arc::new(RwLock::new(HashMap::new())),
+            entity_invalidation_publisher: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -3569,6 +3579,38 @@ impl ChannelService {
 
     /// 获取或创建私聊会话（RPC channel/direct/get_or_create 使用）
     /// 返回 (channel_id, 是否本次新创建)。source/source_id 与添加好友规范一致。
+    /// 装配失效发布通道。服务器启动时调用一次。
+    pub async fn set_entity_invalidation_transport(&self, connection_manager: Arc<crate::infra::ConnectionManager>) {
+        *self.entity_invalidation_publisher.write().await = Some(connection_manager);
+    }
+
+    /// 新建 DM 后通知双方。失败只记日志：频道已经建好了，通知是加速手段，
+    /// 客户端重连 / 前台恢复的补拉仍会发现它（spec §6.3）。
+    async fn announce_direct_channel_created(
+        &self,
+        user_id: u64,
+        target_user_id: u64,
+        channel_id: u64,
+    ) {
+        let transport = { self.entity_invalidation_publisher.read().await.clone() };
+        let Some(connection_manager) = transport else {
+            return;
+        };
+        let publisher = crate::service::EntityInvalidationPublisher::new(connection_manager);
+        if let Err(error) = publisher
+            .publish_direct_channel_created(user_id, target_user_id, channel_id)
+            .await
+        {
+            tracing::warn!(
+                user_id,
+                target_user_id,
+                channel_id,
+                %error,
+                "direct channel invalidation dispatch failed"
+            );
+        }
+    }
+
     pub async fn get_or_create_direct_channel(
         &self,
         user_id: u64,
@@ -3595,6 +3637,8 @@ impl ChannelService {
                     channel_id
                 );
             }
+            self.announce_direct_channel_created(user_id, target_user_id, channel_id)
+                .await;
         } else if self.get_channel_opt(channel_id).await.is_none() {
             self.ensure_user_channel_rows(channel_id, &[user_id, target_user_id])
                 .await?;

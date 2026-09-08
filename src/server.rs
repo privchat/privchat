@@ -620,6 +620,10 @@ impl ChatServer {
         let channel_service = Arc::new(crate::service::ChannelService::new_with_repository(
             channel_repository.clone(),
         ));
+        // 新建 DM 的 channel 失效由 ChannelService 统一发（五个创建入口共用一条出口）。
+        channel_service
+            .set_entity_invalidation_transport(connection_manager.clone())
+            .await;
         info!("✅ 会话服务初始化完成");
 
         // 创建通知服务（欢迎消息等推送，未来可扩展更多联系用户能力）

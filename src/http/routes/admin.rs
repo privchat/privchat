@@ -1202,15 +1202,6 @@ async fn create_friendship(
     // 内嵌了对端的 user 实体，会话标题因此一次到位。
     let publisher =
         crate::service::EntityInvalidationPublisher::new(state.connection_manager.clone());
-    // 建好友顺带建出了 DM 频道,也必须告诉双方——只发 friend 的话,客户端学到了好友、
-    // 学不到会话:会话列表按**已知**频道做增量,一个没听说过的 channel_id 不会自己冒出来。
-    // 生产实测(2026-09-09):对方绑邀请码后好友数当场 +1,会话要等冷启动才出现。
-    if let Err(error) = publisher
-        .publish_direct_channel_created(user1_id, user2_id, channel_id)
-        .await
-    {
-        warn!(user1_id, user2_id, channel_id, %error, "direct channel invalidation dispatch failed");
-    }
     if let Err(error) = publisher
         .publish_friend_pair_change(
             user1_id,
