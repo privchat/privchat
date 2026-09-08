@@ -511,6 +511,23 @@ impl CacheManager {
         Ok(())
     }
 
+    /// 丢弃一个用户的资料缓存（L1 + L2）。
+    ///
+    /// 资料写入必须调用它。少了这一步，缓存里的旧昵称/头像会被当成权威值一直发下去
+    /// ——2026-09-09 生产上正是如此：DB 里昵称已更新、`sync_version` 也 bump 了，但
+    /// 好友同步读到的仍是填缓存那一刻的空昵称，客户端怎么重连重装都收敛不了。
+    ///
+    /// L1 是**进程内**缓存：多实例部署时这里只清得掉本实例那一份。所以同步的权威读
+    /// 路径不走这份缓存（见 `friend_service::sync_entities_page`），这里的失效只是让
+    /// 普通展示接口尽快跟上，不是同步正确性的依赖项。
+    pub async fn invalidate_user_profile(&self, user_id: u64) -> Result<(), ServerError> {
+        self.l1_user_profiles.invalidate(&user_id).await;
+        let redis_key = Self::user_profile_cache_key(user_id);
+        self.delete_from_redis(&redis_key).await?;
+        debug!("Invalidated user profile cache: {}", user_id);
+        Ok(())
+    }
+
     /// 通过 qrcode 查找用户ID
     pub async fn find_user_by_qrcode(&self, qrcode: &str) -> Result<Option<u64>, ServerError> {
         // 先查 L1 缓存（qrcode 本身就是字符串）

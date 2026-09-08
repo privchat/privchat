@@ -119,6 +119,8 @@ pub struct AdminServerState {
     pub room_ticket: Option<Arc<crate::config::RoomTicketConfig>>,
     /// 隐私服务(PROFILE_VISIBILITY P2:平台级开关 admin 读写)。
     pub privacy_service: Arc<crate::service::PrivacyService>,
+    /// 资料写入后失效这份缓存（ENTITY_INVALIDATION_SYNC §4.1）。
+    pub cache_manager: Arc<crate::infra::CacheManager>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -222,6 +224,7 @@ impl AdminHttpServer {
         unified_token_service: Arc<crate::auth::UnifiedTokenService>,
         room_ticket: Option<Arc<crate::config::RoomTicketConfig>>,
         privacy_service: Arc<crate::service::PrivacyService>,
+        cache_manager: Arc<crate::infra::CacheManager>,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -252,6 +255,7 @@ impl AdminHttpServer {
                 unified_token_service,
                 room_ticket,
                 privacy_service,
+                cache_manager,
             },
             port,
         }

@@ -711,6 +711,12 @@ async fn update_user(
         )
         .await?;
 
+    // 清缓存与发失效通知**成对**出现：只发通知不清缓存，等于把客户端叫醒来重读
+    // 同一份旧数据（2026-09-09 生产故障）。清缓存放在前面——先让权威读干净，
+    // 再让别人来读。
+    if let Err(error) = state.cache_manager.invalidate_user_profile(user_id).await {
+        warn!(user_id, %error, "profile cache invalidation failed");
+    }
     publish_user_profile_invalidation(&state, user_id).await;
 
     Ok(ApiEnvelope::ok(json!({

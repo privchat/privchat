@@ -23,12 +23,13 @@ use sqlx::PgPool;
 /// - 好友列表管理
 /// - 好友关系状态
 /// - entity/sync_entities 业务逻辑（好友分页与 payload 构建）
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::{info, warn};
 
 use crate::error::{Result, ServerError};
-use crate::infra::CacheManager;
+use crate::infra::{CacheManager, CachedUserProfile};
 use crate::model::friend::*;
 use crate::model::privacy::FriendRequestSource;
 use crate::repository::UserRepository;
@@ -639,8 +640,7 @@ impl FriendService {
         user_repository: &Arc<UserRepository>,
         cache_manager: &Arc<CacheManager>,
     ) -> Result<privchat_protocol::rpc::sync::SyncEntitiesResponse> {
-        use crate::rpc::helpers::get_user_profile_with_fallback;
-        use privchat_protocol::rpc::sync::{
+            use privchat_protocol::rpc::sync::{
             FriendSyncFriendPayload, FriendSyncPayload, FriendSyncUserPayload,
             SyncEntitiesResponse, SyncEntityItem,
         };
@@ -697,6 +697,42 @@ impl FriendService {
             .unwrap_or(since_v);
 
         let me = user_id as i64;
+        // Profile reads for a sync page go to the database, never to the profile
+        // cache. ENTITY_INVALIDATION_SYNC_SPEC §2.1 makes pull the authority: if the
+        // authoritative read can serve a stale cache entry, no client-side retry,
+        // reconnect or reinstall can ever converge. That is exactly what happened on
+        // 2026-09-09 — a nickname set moments after the friendship was created stayed
+        // invisible to the friend, because the cache had been filled while the nickname
+        // was still empty and no mutation path invalidates it.
+        //
+        // The batch also carries each user's own `sync_version`, so an embedded profile
+        // can be ordered against the `user` entity stream instead of being compared
+        // against an unrelated friendship version.
+        let peer_ids: Vec<u64> = page
+            .iter()
+            .map(|row| {
+                if row.row_user_id == me {
+                    row.row_friend_id as u64
+                } else {
+                    row.row_user_id as u64
+                }
+            })
+            .collect();
+        let peer_profiles: HashMap<u64, (CachedUserProfile, u64)> = user_repository
+            .find_related_since(&peer_ids, 0, peer_ids.len().max(1) as u32)
+            .await
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        let version = entry.sync_version;
+                        let profile = crate::rpc::helpers::user_to_cached_profile(&entry.user);
+                        (entry.user.id, (profile, version))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut items = Vec::with_capacity(page.len());
         for row in &page {
             // 谁是 viewer 视角下的"对端"？— 当前 viewer 是 me，对端就是另一侧。
@@ -721,14 +757,8 @@ impl FriendService {
 
             // 加载对端 profile（accepted / pending / rejected / recalled / expired
             // 都需要展示头像 + 昵称）。拉不到则跳过这一项——下次 sync 会再来。
-            let profile_opt =
-                get_user_profile_with_fallback(peer_id, user_repository, cache_manager)
-                    .await
-                    .ok()
-                    .flatten();
-            let profile = match profile_opt {
-                Some(p) => p,
-                None => continue,
+            let Some((profile, profile_version)) = peer_profiles.get(&peer_id).cloned() else {
+                continue;
             };
 
             let user_block = FriendSyncUserPayload {
@@ -742,7 +772,11 @@ impl FriendService {
                 user_type: Some(i32::from(profile.user_type)),
                 type_field: Some(i32::from(profile.user_type)),
                 updated_at: None,
-                version: None,
+                // The user's own entity version, not the friendship's. A client that
+                // orders an embedded profile against its stored user row has to be
+                // comparing points on the same sequence; friendship versions come from
+                // a different one and would mask newer profiles at random.
+                version: Some(profile_version as i64),
             };
 
             let payload_typed = if row.status == 1 {

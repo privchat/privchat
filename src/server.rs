@@ -2387,6 +2387,7 @@ impl ChatServer {
             self.unified_token_service.clone(),
             self.config.room_ticket.clone().map(Arc::new),
             self.privacy_service.clone(),
+            self.cache_manager.clone(),
             self.config.admin_api_port,
         );
 
