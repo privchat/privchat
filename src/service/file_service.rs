@@ -1901,23 +1901,32 @@ impl FileService {
     /// 拼进了 key，代理路径存的是不带前缀的 `generate_file_path()`。读取侧只能兼容
     /// 两种，否则总有一半对象取不到。
     fn storage_relative_path(&self, file_path: &str, storage_source_id: u32) -> String {
-        let prefix = self
-            .sources_by_id
+        strip_storage_prefix(self.path_prefix_of(storage_source_id), file_path)
+    }
+
+    fn path_prefix_of(&self, storage_source_id: u32) -> Option<&str> {
+        self.sources_by_id
             .get(&storage_source_id)
             .and_then(|s| s.path_prefix.as_deref())
             .map(str::trim)
             .map(|p| p.trim_matches('/'))
-            .filter(|p| !p.is_empty());
-        match prefix {
-            Some(p) => file_path
-                .strip_prefix(p)
-                .map(|rest| rest.trim_start_matches('/').to_string())
-                .unwrap_or_else(|| file_path.to_string()),
-            None => file_path.to_string(),
-        }
+            .filter(|p| !p.is_empty())
+    }
+
+    /// 把库里存的 key 补成**桶内完整路径**（含 path_prefix）。
+    ///
+    /// 与 [`Self::storage_relative_path`] 互为反向：那个是给 operator 用的（root 已经
+    /// 是前缀，要去掉），这个是给拼绝对 URL 用的（base_url 指向桶根，要带上）。
+    ///
+    /// 两条上传路径存进库的形状不一致——S3 直传把前缀拼进了 key，代理路径没有——所以
+    /// 两边都得判一次。少了这一步，配上 path_prefix 之后老行拼出来的地址会指向搬走
+    /// 之前的位置：对象还在，地址却 404，而且上传、发送、入库全程不报错。
+    fn storage_absolute_path(&self, file_path: &str, storage_source_id: u32) -> String {
+        apply_storage_prefix(self.path_prefix_of(storage_source_id), file_path)
     }
 
     pub fn build_access_url(&self, file_path: &str, storage_source_id: u32) -> String {
+        let file_path = &self.storage_absolute_path(file_path, storage_source_id);
         if let Some(src) = self.sources_by_id.get(&storage_source_id) {
             if let Some(base_url) = &src.base_url {
                 let base = base_url.trim_end_matches('/');
@@ -2949,5 +2958,68 @@ mod storage_layout_tests {
         assert!(!p.starts_with('/'), "必须是相对路径，否则挂不到存储根下: {p}");
         assert!(!p.contains(".."), "不得含上跳段: {p}");
         assert_eq!(p, format!("images/73/bf/{H}.png"));
+    }
+}
+
+/// 去掉桶内前缀，得到**相对 operator root** 的路径。
+///
+/// OpenDAL 的 `root` 已经是前缀，交给它的必须是相对路径，否则签出 `prefix/prefix/...`。
+pub(crate) fn strip_storage_prefix(prefix: Option<&str>, file_path: &str) -> String {
+    match prefix {
+        Some(p) => file_path
+            .strip_prefix(p)
+            .map(|rest| rest.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| file_path.to_string()),
+        None => file_path.to_string(),
+    }
+}
+
+/// 补上桶内前缀，得到**桶内完整路径**。用于拼绝对 URL（base_url 指向桶根）。
+pub(crate) fn apply_storage_prefix(prefix: Option<&str>, file_path: &str) -> String {
+    match prefix {
+        Some(p) if !file_path.starts_with(&format!("{p}/")) => {
+            format!("{p}/{}", file_path.trim_start_matches('/'))
+        }
+        _ => file_path.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod storage_prefix_tests {
+    use super::{apply_storage_prefix, strip_storage_prefix};
+
+    /// 库里存着两种形状：S3 直传把前缀拼进了 key，代理上传没有。两条读路径都必须
+    /// 同时吃下这两种，否则总有一半对象取不到。
+    ///
+    /// 生产实测（2026-09-09）：给 server 配上 `path_prefix = "chat"` 并把对象搬进
+    /// `chat/` 之后，两种形状的行同时存在于同一张表里。
+    #[test]
+    fn both_stored_shapes_resolve_to_the_same_object() {
+        let prefix = Some("chat");
+        let bare = "images/95/a7/95a7.webp";
+        let prefixed = "chat/images/95/a7/95a7.webp";
+
+        // operator 侧：root 已是 chat，两者都要还原成相对路径
+        assert_eq!(strip_storage_prefix(prefix, bare), bare);
+        assert_eq!(strip_storage_prefix(prefix, prefixed), bare);
+
+        // URL 侧：base_url 指向桶根，两者都要补成完整路径
+        assert_eq!(apply_storage_prefix(prefix, bare), prefixed);
+        assert_eq!(apply_storage_prefix(prefix, prefixed), prefixed);
+    }
+
+    /// 没配前缀时两个函数都必须是恒等变换——否则未启用前缀的部署会被平白改坏。
+    #[test]
+    fn without_a_prefix_both_directions_are_identity() {
+        let p = "images/95/a7/95a7.webp";
+        assert_eq!(strip_storage_prefix(None, p), p);
+        assert_eq!(apply_storage_prefix(None, p), p);
+    }
+
+    /// 前缀是完整的一段，不能靠字符串前缀误伤同名开头的目录。
+    #[test]
+    fn a_prefix_matches_whole_segments_only() {
+        // `chatty/` 不是 `chat/` 下的东西,补前缀时必须当成没带前缀处理
+        assert_eq!(apply_storage_prefix(Some("chat"), "chatty/x.png"), "chat/chatty/x.png");
     }
 }
