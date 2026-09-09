@@ -44,6 +44,21 @@ pub async fn handle(
     let description = request.description.as_deref().unwrap_or("");
     let creator_id = request.creator_id;
 
+    // 单次邀请人数上限（CHANNEL_SPEC §7.1.1）。上限值取自 protocol 常量，
+    // 不在这里另写一个数字——客户端提示读的是同一个来源。
+    if let Some(initial_members) = request.member_ids.as_deref() {
+        if initial_members.len() > privchat_protocol::rpc::group::group::GROUP_INVITE_BATCH_LIMIT {
+            return Err(RpcError::from_code(
+                ErrorCode::GroupInviteBatchTooLarge,
+                format!(
+                    "one invite may carry at most {} members, got {}",
+                    privchat_protocol::rpc::group::group::GROUP_INVITE_BATCH_LIMIT,
+                    initial_members.len()
+                ),
+            ));
+        }
+    }
+
     // System User (user_type=1) 禁止入群——spec 07-application/SYSTEM_USER_SPEC §4
     // + 02-server/CHANNEL_SPEC §10.5。这里前置校验 initial_members，避免后续
     // add_participant / add_member_to_group 写入再回滚。
