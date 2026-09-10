@@ -160,6 +160,23 @@ impl Message {
         }
     }
 
+    /// 落库时用的截止时间：消息上有就用它，没有就按当前配置现算一次。
+    ///
+    /// 🔴 入库时必须有值，不能留空等查询时再算。
+    ///
+    /// 构造 `Message` 的地方有好几处（handler、sync submit 兜底、admin 发信…），
+    /// 靠"每个构造点都记得 stamp"必漏——第一版就漏了 sync submit 这条**主**路径，
+    /// 结果整库的 read_detail_expires_at 全是 NULL，配置调大就会把旧名单重新放出来。
+    /// 所以固定动作放在唯一的写库口。
+    pub fn read_detail_expires_at_for_insert(&self) -> i64 {
+        self.read_detail_expires_at
+            .unwrap_or_else(|| {
+                self.created_at
+                    + chrono::Duration::days(crate::config::read_detail_retention_days_global())
+            })
+            .timestamp_millis()
+    }
+
     /// 把群已读明细的可查截止时间**固定**在消息上。
     ///
     /// 不能在查询时按"当前配置"现算：把保留期从 7 天调到 30 天会让早已过期的

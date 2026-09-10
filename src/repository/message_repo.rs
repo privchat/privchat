@@ -590,7 +590,7 @@ impl PgMessageRepository {
         .bind(revoked_at)
         .bind(revoked_by)
         // 明细截止时间在发送时固定，见 READ_STATUS_SPEC §6.5.4。
-        .bind(message.read_detail_expires_at.map(|t| t.timestamp_millis()))
+        .bind(message.read_detail_expires_at_for_insert())
         .execute(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
@@ -1541,7 +1541,7 @@ impl MessageRepository for PgMessageRepository {
         .bind(revoked_at)
         .bind(revoked_by)
         // 明细截止时间在发送时固定，见 READ_STATUS_SPEC §6.5.4。
-        .bind(message.read_detail_expires_at.map(|t| t.timestamp_millis()))
+        .bind(message.read_detail_expires_at_for_insert())
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
@@ -1643,7 +1643,7 @@ impl MessageRepository for PgMessageRepository {
         .bind(revoked_at)
         .bind(revoked_by)
         // 明细截止时间在发送时固定，见 READ_STATUS_SPEC §6.5.4。
-        .bind(message.read_detail_expires_at.map(|t| t.timestamp_millis()))
+        .bind(message.read_detail_expires_at_for_insert())
         .execute(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;

@@ -1860,6 +1860,11 @@ impl TryFrom<TomlConfig> for ServerConfig {
                 // 允许 0 表示不限制时效；负数归一化为 0。
                 config.message.recall_time_limit_secs = limit.max(0);
             }
+            // 🔴 这个镜像结构体是配置的真实入口：`MessageConfig` 上加了字段但这里
+            // 不加，config.toml 里写的值会被**静默忽略**，服务端照用默认值。
+            if let Some(days) = message.read_detail_retention_days {
+                config.message.read_detail_retention_days = days.max(0);
+            }
         }
 
         if let Some(push) = toml.push {
@@ -2715,6 +2720,7 @@ impl Default for MessageConfig {
 #[derive(Debug, Deserialize)]
 struct TomlMessageConfig {
     recall_time_limit_secs: Option<i64>,
+    read_detail_retention_days: Option<i64>,
 }
 
 // =====================================================
