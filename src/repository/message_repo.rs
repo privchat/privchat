@@ -1072,26 +1072,33 @@ impl PgMessageRepository {
     ) -> Result<(Vec<serde_json::Value>, u32), DatabaseError> {
         let offset = (page - 1) * page_size;
 
+        // JOIN privchat_users 把发送方展示名一并带回：admin 的会话视图否则只能
+        // 显示 sender_id，或者反过来先把整份群花名册拉下来自己拼——后者正是
+        // 群成员分页要消灭的东西。
         let mut sql = String::from(
             r#"
             SELECT 
-                message_id,
-                channel_id,
-                sender_id,
-                pts,
-                local_message_id,
-                content,
-                message_type,
-                metadata,
-                reply_to_message_id,
-                created_at,
-                updated_at,
-                deleted,
-                deleted_at,
-                revoked,
-                revoked_at,
-                revoked_by
-            FROM privchat_messages
+                m.message_id,
+                m.channel_id,
+                m.sender_id,
+                m.pts,
+                m.local_message_id,
+                m.content,
+                m.message_type,
+                m.metadata,
+                m.reply_to_message_id,
+                m.created_at,
+                m.updated_at,
+                m.deleted,
+                m.deleted_at,
+                m.revoked,
+                m.revoked_at,
+                m.revoked_by,
+                u.username as sender_username,
+                u.display_name as sender_display_name,
+                u.avatar_url as sender_avatar_url
+            FROM privchat_messages m
+            LEFT JOIN privchat_users u ON u.user_id = m.sender_id
             WHERE 1=1
             "#,
         );
@@ -1099,22 +1106,22 @@ impl PgMessageRepository {
         let mut bind_count = 0;
         if channel_id.is_some() {
             bind_count += 1;
-            sql.push_str(&format!(" AND channel_id = ${}", bind_count));
+            sql.push_str(&format!(" AND m.channel_id = ${}", bind_count));
         }
         if user_id.is_some() {
             bind_count += 1;
-            sql.push_str(&format!(" AND sender_id = ${}", bind_count));
+            sql.push_str(&format!(" AND m.sender_id = ${}", bind_count));
         }
         if start_time.is_some() {
             bind_count += 1;
-            sql.push_str(&format!(" AND created_at >= ${}", bind_count));
+            sql.push_str(&format!(" AND m.created_at >= ${}", bind_count));
         }
         if end_time.is_some() {
             bind_count += 1;
-            sql.push_str(&format!(" AND created_at <= ${}", bind_count));
+            sql.push_str(&format!(" AND m.created_at <= ${}", bind_count));
         }
 
-        sql.push_str(" ORDER BY created_at DESC");
+        sql.push_str(" ORDER BY m.created_at DESC");
         bind_count += 1;
         sql.push_str(&format!(" LIMIT ${}", bind_count));
         bind_count += 1;
@@ -1201,6 +1208,9 @@ impl PgMessageRepository {
                 "revoked": r.revoked,
                 "revoked_at": r.revoked_at,
                 "revoked_by": r.revoked_by.map(|id| id as u64),
+                "sender_username": r.sender_username,
+                "sender_display_name": r.sender_display_name,
+                "sender_avatar_url": r.sender_avatar_url,
             })
         }).collect();
 
@@ -1387,6 +1397,10 @@ struct MessageRow {
     revoked: bool,
     revoked_at: Option<i64>,
     revoked_by: Option<i64>,
+    /// LEFT JOIN privchat_users 带回：发送方账号已删除时为 None。
+    sender_username: Option<String>,
+    sender_display_name: Option<String>,
+    sender_avatar_url: Option<String>,
 }
 
 impl MessageRepository for PgMessageRepository {

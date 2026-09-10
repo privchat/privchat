@@ -145,14 +145,22 @@ pub struct GroupMemberItem {
     pub role: String,
     pub joined_at: Option<i64>,
     pub nickname: Option<String>,
+    /// JOIN privchat_users 带回的全局展示字段。
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
-/// 群组成员列表响应
+/// 群组成员分页响应。
+///
+/// `total` 是库里的活跃成员总数（独立 COUNT），不是本页条数 —— 前端靠它算总页数。
 #[derive(Debug, Serialize)]
 pub struct ListGroupMembersResponse {
     pub group_id: u64,
-    pub members: Vec<GroupMemberItem>,
-    pub total: usize,
+    pub members: Vec<serde_json::Value>,
+    pub total: u32,
+    pub page: u32,
+    pub page_size: u32,
 }
 
 /// 移除群组成员响应

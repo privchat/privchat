@@ -1882,36 +1882,41 @@ async fn revoke_all_user_devices(
 // P0: 群组成员管理
 // =====================================================
 
-/// 获取群组成员列表
+/// 获取群组成员列表（分页）
 ///
-/// GET /api/service/groups/:group_id/members
+/// GET /api/service/groups/:group_id/members?page=1&page_size=20
+///
+/// 群详情不再内嵌完整成员数组，成员一律从这里翻页取。
 async fn list_group_members(
     State(state): State<AdminServerState>,
     headers: HeaderMap,
     Path(group_id): Path<u64>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> ApiResult<dto::ListGroupMembersResponse> {
     verify_service_key(&headers, &state).await?;
 
-    let members = state.channel_service.list_members_admin(group_id).await?;
+    let page = params
+        .get("page")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = params
+        .get("page_size")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(20)
+        .clamp(1, 200);
 
-    let member_list: Vec<dto::GroupMemberItem> = members
-        .into_iter()
-        .map(|(uid, role, joined_at, nickname)| dto::GroupMemberItem {
-            user_id: uid,
-            role: role
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "member".to_string()),
-            joined_at: Some(joined_at),
-            nickname,
-        })
-        .collect();
-
-    let total = member_list.len();
+    let (members, total) = state
+        .channel_service
+        .list_members_admin(group_id, page, page_size)
+        .await?;
 
     Ok(ApiEnvelope::ok(dto::ListGroupMembersResponse {
         group_id,
-        members: member_list,
+        members,
         total,
+        page,
+        page_size,
     }))
 }
 

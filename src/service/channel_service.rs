@@ -503,44 +503,9 @@ impl ChannelService {
         let group =
             group.ok_or_else(|| ServerError::NotFound(format!("群组 {} 不存在", group_id)))?;
 
-        // 群成员：JOIN users 拿全局 username/display_name/avatar；只返活跃成员
-        // （left_at IS NULL）。已离开的不在 admin 列表里露出。
-        let members = sqlx::query!(
-            r#"
-            SELECT
-                m.user_id,
-                m.role,
-                m.joined_at,
-                m.nickname,
-                u.username,
-                u.display_name,
-                u.avatar_url
-            FROM privchat_group_members m
-            LEFT JOIN privchat_users u ON u.user_id = m.user_id
-            WHERE m.group_id = $1 AND m.left_at IS NULL
-            ORDER BY m.role ASC, m.joined_at ASC
-            "#,
-            group_id as i64,
-        )
-        .fetch_all(self.pool())
-        .await
-        .map_err(|e| ServerError::Database(format!("查询群组成员失败: {}", e)))?;
-
-        let member_list: Vec<serde_json::Value> = members
-            .into_iter()
-            .map(|m| {
-                serde_json::json!({
-                    "user_id": m.user_id as u64,
-                    "role": m.role,
-                    "joined_at": m.joined_at,
-                    "nickname": m.nickname,
-                    "username": m.username,
-                    "display_name": m.display_name,
-                    "avatar_url": m.avatar_url,
-                })
-            })
-            .collect();
-
+        // 群详情不内嵌成员数组：万人群一次性全返会把这个接口拖死，成员一律走
+        // `GET /api/service/groups/:id/members` 的分页接口。member_count 仍在，
+        // 前端拿它显示总数、拿分页接口翻页。
         let owner_id = Some(group.owner_id as u64);
         Ok(serde_json::json!({
             "group_id": group_id,
@@ -552,7 +517,6 @@ impl ChannelService {
             "owner_display_name": group.owner_display_name,
             "owner_avatar_url": group.owner_avatar_url,
             "member_count": group.member_count.unwrap_or(0) as u32,
-            "members": member_list,
             "last_message_id": group.last_message_id.map(|id| id as u64),
             "last_message_at": group.last_message_at.map(|ts| ts),
             "message_count": group.message_count.unwrap_or(0) as u64,
@@ -1217,32 +1181,78 @@ impl ChannelService {
     }
 
     /// 获取群组成员列表（管理 API）
+    /// 群成员分页（管理 API）。
+    ///
+    /// JOIN privchat_users 带回全局 username/display_name/avatar_url —— 否则 admin
+    /// 拿到一页 user_id 还得逐个反查。只返活跃成员（left_at IS NULL），已离开的不
+    /// 露出。total 走独立 COUNT，不是 `rows.len()`：后者在分页下等于每页页大小，
+    /// 前端会算出 1 页的总页数。
+    ///
+    /// 排序 `role ASC, joined_at ASC` —— 群主/管理员排在前面，且必须是确定序，
+    /// 否则翻页会出现重复或漏行。
     pub async fn list_members_admin(
         &self,
         group_id: u64,
-    ) -> Result<Vec<(u64, Option<i16>, i64, Option<String>)>> {
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<serde_json::Value>, u32)> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = ((page - 1) * page_size) as i64;
+
         let members = sqlx::query!(
             r#"
             SELECT
-                user_id,
-                role,
-                joined_at,
-                nickname
-            FROM privchat_group_members
-            WHERE group_id = $1
-              AND left_at IS NULL
-            ORDER BY joined_at ASC
+                m.user_id,
+                m.role,
+                m.joined_at,
+                m.nickname,
+                u.username,
+                u.display_name,
+                u.avatar_url
+            FROM privchat_group_members m
+            LEFT JOIN privchat_users u ON u.user_id = m.user_id
+            WHERE m.group_id = $1
+              AND m.left_at IS NULL
+            ORDER BY m.role ASC, m.joined_at ASC
+            LIMIT $2 OFFSET $3
             "#,
             group_id as i64,
+            page_size as i64,
+            offset,
         )
         .fetch_all(self.pool())
         .await
         .map_err(|e| ServerError::Database(format!("查询群组成员失败: {}", e)))?;
 
-        Ok(members
+        let total = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) FROM privchat_group_members
+            WHERE group_id = $1 AND left_at IS NULL
+            "#,
+            group_id as i64,
+        )
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("统计群组成员失败: {}", e)))?
+        .unwrap_or(0) as u32;
+
+        let items = members
             .into_iter()
-            .map(|m| (m.user_id as u64, m.role, m.joined_at, m.nickname))
-            .collect())
+            .map(|m| {
+                serde_json::json!({
+                    "user_id": m.user_id as u64,
+                    "role": m.role,
+                    "joined_at": m.joined_at,
+                    "nickname": m.nickname,
+                    "username": m.username,
+                    "display_name": m.display_name,
+                    "avatar_url": m.avatar_url,
+                })
+            })
+            .collect();
+
+        Ok((items, total))
     }
 
     /// 移除群组成员（管理 API）
