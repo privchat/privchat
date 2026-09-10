@@ -15,75 +15,77 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::policy::{ensure_read_stats_allowed, parse_read_receipt_mode};
+use super::policy::{
+    authorize_read_detail, ensure_read_stats_allowed, read_detail_retention_days,
+    resolve_read_receipt_mode,
+};
 use crate::repository::message_repo::MessageRepository;
 use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use serde_json::{json, Value};
 
-/// 处理 查询群消息已读统计 请求（不包含用户列表，性能更好）
+fn u64_field(body: &Value, key: &str) -> RpcResult<u64> {
+    body.get(key)
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .ok_or_else(|| RpcError::validation(format!("{} is required (must be u64)", key)))
+}
+
+/// 查询某条群消息的已读**人数**（READ_STATUS_SPEC §6.5）。
+///
+/// 与名单共用 [`authorize_read_detail`]，两个接口的口径必须一致——各算各的正是
+/// 人数与名单对不上的来源。
 pub async fn handle(
     body: Value,
     services: RpcServiceContext,
     ctx: crate::rpc::RpcContext,
 ) -> RpcResult<Value> {
-    tracing::debug!("🔧 处理查询群消息已读统计请求: {:?}", body);
+    let message_id = u64_field(&body, "message_id")?;
+    let channel_id = u64_field(&body, "channel_id")?;
 
-    // 解析参数（所有ID必须是u64类型）
-    let message_id = body
-        .get("message_id")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| RpcError::validation("message_id is required (must be u64)".to_string()))?;
+    ensure_read_stats_allowed(resolve_read_receipt_mode())?;
 
-    let channel_id = body
-        .get("channel_id")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| RpcError::validation("channel_id is required (must be u64)".to_string()))?;
-    let receipt_mode = parse_read_receipt_mode(&body)?;
-    ensure_read_stats_allowed(receipt_mode)?;
-
-    // 获取频道信息（用于获取成员总数）
-    let channel = services
-        .channel_service
-        .get_channel(&channel_id)
-        .await
-        .map_err(|e| RpcError::not_found(format!("频道不存在: {}", e)))?;
-
-    // 权威成员列表（Direct 严格认 direct_user1/2，群认 members）。
-    let member_ids: Vec<u64> = channel.get_member_ids();
-    let total_members = member_ids.len() as u32;
-
+    let requester_id = crate::rpc::get_current_user_id(&ctx)?;
     let message = services
         .message_repository
         .find_by_id(message_id)
         .await
         .map_err(|e| RpcError::internal(format!("查询消息失败: {}", e)))?
         .ok_or_else(|| RpcError::not_found(format!("消息不存在: {}", message_id)))?;
-    if message.channel_id != channel_id {
-        return Err(RpcError::validation(
-            "message_id 与 channel_id 不匹配".to_string(),
-        ));
-    }
-    let message_pts = message.pts.unwrap_or(0).max(0) as u64;
 
-    let read_count = services
+    let expires_at = authorize_read_detail(requester_id, &message, channel_id)?;
+
+    let channel = services
+        .channel_service
+        .get_channel(&channel_id)
+        .await
+        .map_err(|e| RpcError::not_found(format!("频道不存在: {}", e)))?;
+
+    let recipient_ids: Vec<u64> = channel
+        .get_member_ids()
+        .into_iter()
+        .filter(|id| *id != message.sender_id)
+        .collect();
+
+    let message_pts = message.pts.unwrap_or(0).max(0) as u64;
+    let readers = services
         .read_state_service
-        .count_read_members_by_message_pts(channel_id, message_pts, &member_ids)
+        .list_read_members_by_message_pts(channel_id, message_pts, &recipient_ids)
         .await
         .map_err(|e| RpcError::internal(format!("查询已读统计失败: {}", e)))?;
-    tracing::debug!(
-        "✅ 查询已读统计成功(投影): message_id={} channel_id={} message_pts={} 已读 {}/{}",
-        message_id,
-        channel_id,
-        message_pts,
-        read_count,
-        total_members
-    );
+
+    // 人数只来自阅读数据，不掺资料加载结果。
+    let read_count = readers.len() as u32;
+    let recipient_count = recipient_ids.len() as u32;
     Ok(json!({
         "message_id": message_id,
         "channel_id": channel_id,
-        "total_count": total_members,
+        "recipient_count": recipient_count,
         "read_count": read_count,
-        "unread_count": total_members.saturating_sub(read_count)
+        "unread_count": recipient_count.saturating_sub(read_count),
+        "detail_expires_at": expires_at.timestamp_millis(),
+        "retention_days": read_detail_retention_days(),
     }))
 }

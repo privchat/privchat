@@ -358,6 +358,38 @@ impl ReadStateService {
         Ok((rows, next_version, has_more))
     }
 
+    /// 水位以内、由**别人**发出的消息的作者去重集合。
+    ///
+    /// 群聚合通知只发给这些人——「你的消息有人读了」。不给全群广播：
+    /// 一次已读上报可能跨很多条消息，逐条逐人推会变成推送风暴（§6.5.8）。
+    async fn list_message_authors_up_to_pts(
+        &self,
+        channel_id: ChannelId,
+        last_read_pts: u64,
+        reader_id: UserId,
+    ) -> Result<Vec<UserId>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT from_uid
+            FROM privchat_messages
+            WHERE channel_id = $1
+              AND pts <= $2
+              AND from_uid <> $3
+              AND revoked = false
+            "#,
+        )
+        .bind(channel_id as i64)
+        .bind(last_read_pts as i64)
+        .bind(reader_id as i64)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询消息作者失败: {}", e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<i64, _>("from_uid") as u64)
+            .collect())
+    }
+
     pub async fn list_read_members_by_message_pts(
         &self,
         channel_id: ChannelId,
@@ -449,6 +481,29 @@ impl ReadStateService {
                 self.send_read_cursor_event(
                     peer_id,
                     "peer_read_pts_updated",
+                    channel_id,
+                    channel_type,
+                    reader_id,
+                    last_read_pts,
+                )
+                .await?;
+            }
+        } else if matches!(channel_kind, ChannelKind::GroupChat) {
+            // 群：只推**聚合**变化，不广播全群每个人的阅读轨迹（READ_STATUS_SPEC §6.5.8）。
+            //
+            // 这里之前只有 Direct 分支，群读完谁都不知道——发送者的气泡永远停在"已发送"。
+            //
+            // 通知只发给**消息的发送者**们（也就是水位以内、非本人发的消息的作者），
+            // 语义是"你的消息有人读了"。收到的一方只需要知道"变成已读了"，
+            // 不需要知道是谁——那属于按需查询的明细层。
+            let authors = self
+                .list_message_authors_up_to_pts(channel_id, last_read_pts, reader_id)
+                .await
+                .unwrap_or_default();
+            for author_id in authors {
+                self.send_read_cursor_event(
+                    author_id,
+                    "group_read_aggregate_updated",
                     channel_id,
                     channel_type,
                     reader_id,
