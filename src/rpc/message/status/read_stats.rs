@@ -63,13 +63,12 @@ pub async fn handle(
 
     let expires_at = authorize_read_detail(requester_id, &message, channel_id, &channel)?;
 
-    let recipient_ids: Vec<u64> = channel
-        .get_member_ids()
-        .into_iter()
-        .filter(|id| *id != message.sender_id)
-        .collect();
-
     let message_pts = message.pts.unwrap_or(0).max(0) as u64;
+    let recipient_ids = services
+        .read_state_service
+        .recipients_at_send_time(channel_id, message_pts, message.sender_id)
+        .await
+        .map_err(|e| RpcError::internal(format!("查询发送时收件人失败: {}", e)))?;
     // 人数只来自阅读数据，不掺资料加载结果；与名单接口同一个 COUNT，口径不会分叉。
     let read_count = services
         .read_state_service

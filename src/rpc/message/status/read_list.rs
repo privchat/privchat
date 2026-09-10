@@ -74,14 +74,14 @@ pub async fn handle(
     // 翻页途中过期会在这里被拒。
     let expires_at = authorize_read_detail(requester_id, &message, channel_id, &channel)?;
 
-    // 排除发送者自己：自己读自己的消息不算（§6.5.3）。
-    let recipient_ids: Vec<u64> = channel
-        .get_member_ids()
-        .into_iter()
-        .filter(|id| *id != message.sender_id)
-        .collect();
-
     let message_pts = message.pts.unwrap_or(0).max(0) as u64;
+    // 🔴 「**发送时**有权接收的其他用户」，不是当前成员表（§6.5.3）。
+    // 用当前成员表会让退群者消失、后加入者混入。发送者自己在查询里就排除了。
+    let recipient_ids = services
+        .read_state_service
+        .recipients_at_send_time(channel_id, message_pts, message.sender_id)
+        .await
+        .map_err(|e| RpcError::internal(format!("查询发送时收件人失败: {}", e)))?;
     // 🔴 键集分页在数据库里做，不是"全量查出来再内存 skip/take"——后者既把整份名单
     // 读进内存，又会在名单增长时重复返回。
     let page = services

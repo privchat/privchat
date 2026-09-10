@@ -645,6 +645,31 @@ impl ChannelRepository for PgChannelRepository {
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to add participant: {}", e)))?;
 
+        // 开一段成员区间（READ_STATUS_SPEC §6.5.3）。
+        //
+        // 上面那条 upsert 在重新入群时把 left_at 清空、joined_at 改写，所以它只保留
+        // **当前**这段关系；多次进出的历史会被覆盖掉。而「这条消息发出时你在不在群里」
+        // 恰恰需要历史。区间表按 pts 记录，与消息同一把尺子。
+        //
+        // 已有未关闭区间时不重复开——重复调用 add_participant 不该造出多段。
+        sqlx::query(
+            r#"
+            INSERT INTO privchat_channel_membership_interval (channel_id, user_id, joined_pts)
+            SELECT $1, $2, COALESCE(
+                (SELECT current_pts FROM privchat_channel_pts WHERE channel_id = $1), 0
+            )
+            WHERE NOT EXISTS (
+                SELECT 1 FROM privchat_channel_membership_interval
+                WHERE channel_id = $1 AND user_id = $2 AND left_pts IS NULL
+            )
+            "#,
+        )
+        .bind(channel_id as i64)
+        .bind(user_id as i64)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| DatabaseError::Database(format!("Failed to open membership interval: {}", e)))?;
+
         Ok(())
     }
 }

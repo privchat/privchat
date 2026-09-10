@@ -617,6 +617,27 @@ impl ChannelService {
         .execute(&mut **tx)
         .await
         .map_err(|e| ServerError::Database(format!("标记群成员离开失败: {}", e)))?;
+
+        // 在同一个事务里关闭成员区间（READ_STATUS_SPEC §6.5.3）。
+        //
+        // group_members.left_at 会在重新入群时被清空，留不住多次进出的历史；而
+        // 「这条消息发出时你在不在群里」需要历史。区间按 pts 记，与消息同一把尺子。
+        if result.rows_affected() > 0 {
+            sqlx::query(
+                r#"
+                UPDATE privchat_channel_membership_interval
+                SET left_pts = COALESCE(
+                    (SELECT current_pts FROM privchat_channel_pts WHERE channel_id = $1), 0
+                )
+                WHERE channel_id = $1 AND user_id = $2 AND left_pts IS NULL
+                "#,
+            )
+            .bind(group_id as i64)
+            .bind(user_id as i64)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| ServerError::Database(format!("关闭成员区间失败: {}", e)))?;
+        }
         Ok(result.rows_affected() > 0)
     }
 

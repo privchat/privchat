@@ -411,6 +411,45 @@ impl ReadStateService {
     /// offset 分页在这里是错的——名单会持续增长。第一页拿到 [20,30] 之后有人（uid=10）
     /// 读了，第二页从 offset=2 开始会把 30 再返回一次。按稳定键翻页没有这个问题，
     /// 新读者靠刷新看到，符合 spec §6.5.7 的「查询时刻实时结果」语义。
+    /// 某条消息**发送时**有权接收它的其他用户（READ_STATUS_SPEC §6.5.3）。
+    ///
+    /// 不能用当前成员表：退群者会从统计里消失、消息之后入群的人会混进来。
+    /// 判据是成员区间覆盖了这条消息的 pts：
+    ///
+    /// ```text
+    /// joined_pts < message_pts  且  (left_pts IS NULL 或 left_pts >= message_pts)
+    /// ```
+    ///
+    /// 也不能用 privchat_message_dispatch_recipient 那份投递快照——它虽然正是发送时的
+    /// 收件人，但投递完成 24 小时后就被清理了（DISPATCHED_RETENTION_MS），撑不住 7 天窗口。
+    pub async fn recipients_at_send_time(
+        &self,
+        channel_id: ChannelId,
+        message_pts: u64,
+        sender_id: UserId,
+    ) -> Result<Vec<UserId>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT user_id
+            FROM privchat_channel_membership_interval
+            WHERE channel_id = $1
+              AND user_id <> $2
+              AND joined_pts < $3
+              AND (left_pts IS NULL OR left_pts >= $3)
+            "#,
+        )
+        .bind(channel_id as i64)
+        .bind(sender_id as i64)
+        .bind(message_pts as i64)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询发送时收件人失败: {}", e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<i64, _>("user_id") as u64)
+            .collect())
+    }
+
     pub async fn page_read_members_by_message_pts(
         &self,
         channel_id: ChannelId,
