@@ -31,8 +31,10 @@ pub async fn register_routes(services: RpcServiceContext) {
     search::register_routes(services.clone()).await; // 用户搜索接口
     privacy::register_routes(services.clone()).await; // 隐私设置接口
     bot::register_routes(services.clone()).await; // Bot 关注 / 取消关注（spec SERVICE_ACCOUNT_FOLLOW_SPEC）
-                                                  // TODO: 暂时注释 profile 模块
-                                                  // profile::register_routes(services.clone()).await;
+    // 自助改资料（昵称/头像）。整个模块此前被注释掉是因为两个 handler 都是
+    // 「返回 success 但什么都不做」的桩；现在 update 有真实实现，get 仍是桩，
+    // 所以 profile::register_routes 只注册 update。
+    profile::register_routes(services.clone()).await;
 
-    tracing::debug!("📋 Account 系统路由注册完成 (user, auth, search, privacy, bot 模块)");
+    tracing::debug!("📋 Account 系统路由注册完成 (user, auth, search, privacy, bot, profile 模块)");
 }

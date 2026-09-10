@@ -24,6 +24,7 @@ pub mod auth_service;
 pub mod channel_service; // ChannelService 在这里
 pub mod committed_timeline_delivery_service;
 pub mod entity_invalidation_publisher;
+pub mod user_profile_invalidation;
 pub mod friend_service;
 pub mod group_service;
 pub mod legacy_media_refs;
@@ -99,6 +100,9 @@ pub use committed_timeline_delivery_service::{
 };
 pub use delivery_tracker::DeliveryTracker;
 pub use entity_invalidation_publisher::EntityInvalidationPublisher;
+pub use user_profile_invalidation::{
+    invalidate_user_profile_everywhere, profile_invalidation_recipients,
+};
 pub use file_service::{FileMetadata, FileService, FileType, FileUrlResponse};
 pub use friend_service::FriendService;
 pub use group_service::GroupService;

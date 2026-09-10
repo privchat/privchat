@@ -53,7 +53,7 @@ use axum::{
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
@@ -711,13 +711,15 @@ async fn update_user(
         )
         .await?;
 
-    // 清缓存与发失效通知**成对**出现：只发通知不清缓存，等于把客户端叫醒来重读
-    // 同一份旧数据（2026-09-09 生产故障）。清缓存放在前面——先让权威读干净，
-    // 再让别人来读。
-    if let Err(error) = state.cache_manager.invalidate_user_profile(user_id).await {
-        warn!(user_id, %error, "profile cache invalidation failed");
-    }
-    publish_user_profile_invalidation(&state, user_id).await;
+    // 清缓存 + 广播失效：与自助改资料共用同一个实现（成对的顺序在那里说明）。
+    crate::service::invalidate_user_profile_everywhere(
+        user_id,
+        &state.cache_manager,
+        &state.friend_service,
+        &state.channel_service,
+        state.connection_manager.clone(),
+    )
+    .await;
 
     Ok(ApiEnvelope::ok(json!({
         "user_id": updated.id,
@@ -734,69 +736,6 @@ async fn update_user(
         "updated_at": updated.updated_at.timestamp_millis(),
         "last_active_at": updated.last_active_at.map(|dt| dt.timestamp_millis()),
     })))
-}
-
-/// Profile writes commit before this best-effort control-plane hint. The
-/// entity row + sync_version remain authoritative, so a failed online push is
-/// repaired by reconnect/foreground entity sync.
-async fn publish_user_profile_invalidation(state: &AdminServerState, user_id: u64) {
-    let (friends, channels) = tokio::join!(state.friend_service.get_friends(user_id), async {
-        state
-            .channel_service
-            .get_user_channels(user_id)
-            .await
-            .channels
-    },);
-    let friend_ids = match friends {
-        Ok(ids) => ids,
-        Err(error) => {
-            warn!(
-                user_id,
-                %error,
-                "profile invalidation friend recipient resolution failed"
-            );
-            Vec::new()
-        }
-    };
-    let recipients = profile_invalidation_recipients(
-        user_id,
-        friend_ids,
-        channels.into_iter().map(|channel| channel.get_member_ids()),
-    );
-
-    let publisher =
-        crate::service::EntityInvalidationPublisher::new(state.connection_manager.clone());
-    if let Err(error) = publisher
-        .publish_to_users(
-            recipients,
-            vec![privchat_protocol::EntityInvalidation {
-                entity_type: "user".to_string(),
-                entity_id: Some(user_id.to_string()),
-                // user entity scope is always the target user id. It is not
-                // a channel id even when visibility came from a channel.
-                scope: Some(user_id.to_string()),
-                target_version: 0,
-                mutation_hint: privchat_protocol::EntityMutationHint::Upsert,
-            }],
-        )
-        .await
-    {
-        warn!(user_id, %error, "profile invalidation dispatch failed");
-    }
-}
-
-fn profile_invalidation_recipients(
-    user_id: u64,
-    friend_ids: impl IntoIterator<Item = u64>,
-    channel_member_ids: impl IntoIterator<Item = Vec<u64>>,
-) -> BTreeSet<u64> {
-    let mut recipients = BTreeSet::from([user_id]);
-    recipients.extend(friend_ids);
-    for members in channel_member_ids {
-        recipients.extend(members);
-    }
-    recipients.remove(&0);
-    recipients
 }
 
 /// 删除/禁用用户
@@ -3179,9 +3118,11 @@ async fn push_qr_authorized(
 
 #[cfg(test)]
 mod profile_invalidation_tests {
-    use super::profile_invalidation_recipients;
+    use crate::service::profile_invalidation_recipients;
     use std::collections::BTreeSet;
 
+    /// 收件人规则搬到了 service 层（自助改资料是第二个调用方），
+    /// 这条断言留在这里，是为了钉住 admin 这条路径用的仍然是同一份规则。
     #[test]
     fn recipients_include_self_friends_and_shared_channel_members_once() {
         assert_eq!(

@@ -392,6 +392,53 @@ impl UserService {
     /// admin 更新用户：拉取现有用户 -> 按 patch 语义 merge -> 持久化。
     ///
     /// 邮箱变更会检查除本人外是否存在冲突占用；空字符串视为清空。
+    /// 用户改自己的资料：只有昵称与头像两项。
+    ///
+    /// 与 [`Self::update_user_admin`] 分开是因为可改的字段集合不同，而不是重名。
+    /// 自助入口不得碰 username / email / phone / status —— 那些要么是登录凭证、
+    /// 要么是审核状态，一旦让本人的一次「改昵称」把它们一并带上，越权就藏在
+    /// 一个看起来人畜无害的调用里。
+    ///
+    /// `None` = 本次不改该字段（不是"清空"）。昵称传空串表示清空，头像同理。
+    pub async fn update_own_profile(
+        &self,
+        user_id: u64,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+    ) -> Result<User, ServerError> {
+        let mut user = self
+            .find_by_id(user_id)
+            .await?
+            .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
+
+        if let Some(display_name) = display_name {
+            let trimmed = display_name.trim();
+            user.display_name = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Some(avatar_url) = avatar_url {
+            let trimmed = avatar_url.trim();
+            user.avatar_url = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+
+        // 与 update_user_admin 同样的理由：sync_version 由 DB trigger 分配，
+        // 客户端增量同步只看它，这里的 updated_at 仅用于审计。
+        user.updated_at = chrono::Utc::now();
+
+        self.user_repository
+            .update(&user)
+            .await
+            .map(|_| user)
+            .map_err(|e| ServerError::Database(format!("更新个人资料失败: {}", e)))
+    }
+
     /// `username` 不做业务校验（spec MODULE_MEMBER_PROFILE_SPEC §7.1）；
     /// DB UNIQUE 23505 → `ServerError::DuplicateEntry` → 409。
     pub async fn update_user_admin(
