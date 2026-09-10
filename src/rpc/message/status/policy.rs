@@ -55,6 +55,7 @@ pub fn authorize_read_detail(
     requester_id: u64,
     message: &crate::model::message::Message,
     channel_id: u64,
+    channel: &crate::model::channel::Channel,
 ) -> RpcResult<chrono::DateTime<chrono::Utc>> {
     if message.channel_id != channel_id {
         return Err(RpcError::validation(
@@ -65,6 +66,13 @@ pub fn authorize_read_detail(
     if message.sender_id != requester_id {
         return Err(RpcError::forbidden(
             "only the sender may query who read this message".to_string(),
+        ));
+    }
+    // 🔴 "以前发过" ≠ "现在还能看"。被移出群之后不该还能查群成员的阅读情况。
+    // 只校验 message.channel_id == channel_id 是不够的——那只说明消息属于这个频道。
+    if !channel.is_member(requester_id) {
+        return Err(RpcError::forbidden(
+            "requester no longer has access to this channel".to_string(),
         ));
     }
     if message.revoked || message.deleted {
@@ -109,6 +117,14 @@ mod tests {
     use crate::model::message::Message;
     use privchat_protocol::ContentMessageType;
 
+    fn group_with(members: &[u64]) -> crate::model::channel::Channel {
+        let mut c = crate::model::channel::Channel::new_group(100, members[0], None);
+        for m in members.iter().skip(1) {
+            let _ = c.add_member(*m, None);
+        }
+        c
+    }
+
     fn msg(sender_id: u64, channel_id: u64, age_days: i64, revoked: bool) -> Message {
         Message {
             message_id: 1,
@@ -135,28 +151,28 @@ mod tests {
     #[test]
     fn only_the_sender_may_query() {
         let m = msg(7, 100, 0, false);
-        assert!(authorize_read_detail(7, &m, 100).is_ok());
-        assert!(authorize_read_detail(8, &m, 100).is_err());
+        assert!(authorize_read_detail(7, &m, 100, &group_with(&[7, 8])).is_ok());
+        assert!(authorize_read_detail(8, &m, 100, &group_with(&[7, 8])).is_err());
     }
 
     /// 窗口锚在**发送时间**，不是"读完再留 N 天"（§6.5.4）。
     #[test]
     fn the_window_is_anchored_to_the_send_time() {
-        assert!(authorize_read_detail(7, &msg(7, 100, 6, false), 100).is_ok());
-        assert!(authorize_read_detail(7, &msg(7, 100, 8, false), 100).is_err());
+        assert!(authorize_read_detail(7, &msg(7, 100, 6, false), 100, &group_with(&[7, 8])).is_ok());
+        assert!(authorize_read_detail(7, &msg(7, 100, 8, false), 100, &group_with(&[7, 8])).is_err());
     }
 
     /// 过期必须是**错误**，不能退化成空名单——否则和"无人已读"分不开（§6.5.4）。
     #[test]
     fn expiry_is_an_error_not_an_empty_list() {
-        let err = authorize_read_detail(7, &msg(7, 100, 30, false), 100).unwrap_err();
+        let err = authorize_read_detail(7, &msg(7, 100, 30, false), 100, &group_with(&[7, 8])).unwrap_err();
         assert!(format!("{:?}", err).contains("expired"));
     }
 
     #[test]
     fn revoked_and_mismatched_channel_are_rejected() {
-        assert!(authorize_read_detail(7, &msg(7, 100, 0, true), 100).is_err());
-        assert!(authorize_read_detail(7, &msg(7, 100, 0, false), 999).is_err());
+        assert!(authorize_read_detail(7, &msg(7, 100, 0, true), 100, &group_with(&[7, 8])).is_err());
+        assert!(authorize_read_detail(7, &msg(7, 100, 0, false), 999, &group_with(&[7, 8])).is_err());
     }
 
     /// 模式是服务端决定的，签名里没有请求体——这条防的是把它改回从 body 解析。

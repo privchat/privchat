@@ -45,7 +45,8 @@ pub async fn handle(
 ) -> RpcResult<Value> {
     let message_id = u64_field(&body, "message_id")?;
     let channel_id = u64_field(&body, "channel_id")?;
-    let offset = body.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+    // 键集分页：上一页最后一个 user_id。首页传 0/不传。
+    let after_user_id = body.get("after_user_id").and_then(|v| v.as_u64()).unwrap_or(0);
     let limit = body
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -63,14 +64,15 @@ pub async fn handle(
         .map_err(|e| RpcError::internal(format!("查询消息失败: {}", e)))?
         .ok_or_else(|| RpcError::not_found(format!("消息不存在: {}", message_id)))?;
 
-    // 发送者判定 + 撤回 + 窗口，全在这一个入口里（§6.5.5）。翻页途中过期会在这里被拒。
-    let expires_at = authorize_read_detail(requester_id, &message, channel_id)?;
-
     let channel = services
         .channel_service
         .get_channel(&channel_id)
         .await
         .map_err(|e| RpcError::not_found(format!("频道不存在: {}", e)))?;
+
+    // 发送者判定 + 当前访问权 + 撤回 + 窗口，全在这一个入口里（§6.5.5）。
+    // 翻页途中过期会在这里被拒。
+    let expires_at = authorize_read_detail(requester_id, &message, channel_id, &channel)?;
 
     // 排除发送者自己：自己读自己的消息不算（§6.5.3）。
     let recipient_ids: Vec<u64> = channel
@@ -80,20 +82,24 @@ pub async fn handle(
         .collect();
 
     let message_pts = message.pts.unwrap_or(0).max(0) as u64;
-    let mut readers = services
+    // 🔴 键集分页在数据库里做，不是"全量查出来再内存 skip/take"——后者既把整份名单
+    // 读进内存，又会在名单增长时重复返回。
+    let page = services
         .read_state_service
-        .list_read_members_by_message_pts(channel_id, message_pts, &recipient_ids)
+        .page_read_members_by_message_pts(
+            channel_id,
+            message_pts,
+            &recipient_ids,
+            after_user_id,
+            limit,
+        )
         .await
         .map_err(|e| RpcError::internal(format!("查询已读列表失败: {}", e)))?;
-
-    // 🔴 按稳定的 user_id 排序分页。游标 updated_at 会变，用它翻页会重复/漏项。
-    readers.sort_by_key(|r| r.user_id);
-    let read_count = readers.len() as u32;
-    let page: Vec<_> = readers
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+    let read_count = services
+        .read_state_service
+        .count_read_members_by_message_pts(channel_id, message_pts, &recipient_ids)
+        .await
+        .map_err(|e| RpcError::internal(format!("查询已读人数失败: {}", e)))?;
 
     // 🔴 阅读事实与资料分离：资料拉不到就降级显示，不把人从名单里丢掉，
     // 也绝不用"资料成功条数"当人数——那会让人数随资料服务抖动。
@@ -122,9 +128,9 @@ pub async fn handle(
         "channel_id": channel_id,
         "recipient_count": recipient_ids.len() as u32,
         "read_count": read_count,
-        "offset": offset,
         "limit": limit,
-        "has_more": (offset + page.len() as u64) < read_count as u64,
+        "next_after_user_id": page.last().map(|r| r.user_id),
+        "has_more": page.len() as u32 == limit,
         "detail_expires_at": expires_at.timestamp_millis(),
         "retention_days": read_detail_retention_days(),
         "read_list": read_list,

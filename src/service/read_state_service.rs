@@ -50,6 +50,9 @@ pub struct ChannelReadMemberRow {
 struct UpsertCursorResult {
     last_read_pts: u64,
     advanced: bool,
+    /// 本次推进之前的水位。群聚合通知只处理 `(previous_pts, last_read_pts]` 这一段，
+    /// 不重扫整段历史。首次建行时为 0。
+    previous_pts: u64,
 }
 
 async fn upsert_channel_read_cursor_row(
@@ -88,6 +91,7 @@ async fn upsert_channel_read_cursor_row(
         )
         SELECT
             upserted.last_read_pts,
+            COALESCE((SELECT last_read_pts FROM existing LIMIT 1), 0) AS previous_pts,
             (
                 (SELECT last_read_pts FROM existing LIMIT 1) IS NULL
                 OR $3 > (SELECT last_read_pts FROM existing LIMIT 1)
@@ -105,6 +109,7 @@ async fn upsert_channel_read_cursor_row(
     Ok(UpsertCursorResult {
         last_read_pts: upserted.get::<i64, _>("last_read_pts") as u64,
         advanced: upserted.get::<bool, _>("advanced"),
+        previous_pts: upserted.get::<i64, _>("previous_pts").max(0) as u64,
     })
 }
 
@@ -252,8 +257,13 @@ impl ReadStateService {
 
         let advanced = upserted.advanced;
         if advanced {
-            self.broadcast_read_cursor(reader_id, channel_id, upserted.last_read_pts)
-                .await?;
+            self.broadcast_read_cursor(
+                reader_id,
+                channel_id,
+                upserted.previous_pts,
+                upserted.last_read_pts,
+            )
+            .await?;
         }
 
         Ok(ReadPtsUpdateResult {
@@ -358,27 +368,33 @@ impl ReadStateService {
         Ok((rows, next_version, has_more))
     }
 
-    /// 水位以内、由**别人**发出的消息的作者去重集合。
+    /// 本次推进**新覆盖**的那段消息里，由别人发出的消息作者去重集合。
     ///
-    /// 群聚合通知只发给这些人——「你的消息有人读了」。不给全群广播：
-    /// 一次已读上报可能跨很多条消息，逐条逐人推会变成推送风暴（§6.5.8）。
-    async fn list_message_authors_up_to_pts(
+    /// 只发给这些人——「你的消息有人读了」，不给全群广播：一次已读上报可能跨很多条
+    /// 消息，逐条逐人推会变成推送风暴（§6.5.8）。
+    ///
+    /// 范围是 `(previous_pts, last_read_pts]` 而不是 `<= last_read_pts`：后者每次推进
+    /// 都要重扫整段历史、把早已通知过的作者再通知一遍，聚合状态其实没有变化。
+    async fn list_message_authors_in_range(
         &self,
         channel_id: ChannelId,
+        previous_pts: u64,
         last_read_pts: u64,
         reader_id: UserId,
     ) -> Result<Vec<UserId>> {
         let rows = sqlx::query(
             r#"
-            SELECT DISTINCT from_uid
+            SELECT DISTINCT sender_id
             FROM privchat_messages
             WHERE channel_id = $1
-              AND pts <= $2
-              AND from_uid <> $3
+              AND pts > $2
+              AND pts <= $3
+              AND sender_id <> $4
               AND revoked = false
             "#,
         )
         .bind(channel_id as i64)
+        .bind(previous_pts as i64)
         .bind(last_read_pts as i64)
         .bind(reader_id as i64)
         .fetch_all(self.pool.as_ref())
@@ -386,7 +402,51 @@ impl ReadStateService {
         .map_err(|e| ServerError::Database(format!("查询消息作者失败: {}", e)))?;
         Ok(rows
             .into_iter()
-            .map(|row| row.get::<i64, _>("from_uid") as u64)
+            .map(|row| row.get::<i64, _>("sender_id") as u64)
+            .collect())
+    }
+
+    /// 键集分页版：只取 `user_id > after_user_id` 的一页。
+    ///
+    /// offset 分页在这里是错的——名单会持续增长。第一页拿到 [20,30] 之后有人（uid=10）
+    /// 读了，第二页从 offset=2 开始会把 30 再返回一次。按稳定键翻页没有这个问题，
+    /// 新读者靠刷新看到，符合 spec §6.5.7 的「查询时刻实时结果」语义。
+    pub async fn page_read_members_by_message_pts(
+        &self,
+        channel_id: ChannelId,
+        message_pts: u64,
+        member_ids: &[UserId],
+        after_user_id: u64,
+        limit: u32,
+    ) -> Result<Vec<ChannelReadMemberRow>> {
+        let ids: Vec<i64> = member_ids.iter().map(|v| *v as i64).collect();
+        let rows = sqlx::query(
+            r#"
+            SELECT user_id, last_read_pts, updated_at
+            FROM privchat_channel_read_cursor
+            WHERE channel_id = $1
+              AND user_id = ANY($2)
+              AND last_read_pts >= $3
+              AND user_id > $4
+            ORDER BY user_id
+            LIMIT $5
+            "#,
+        )
+        .bind(channel_id as i64)
+        .bind(&ids)
+        .bind(message_pts as i64)
+        .bind(after_user_id as i64)
+        .bind(limit as i64)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询 read_list 分页失败: {}", e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChannelReadMemberRow {
+                user_id: row.get::<i64, _>("user_id") as u64,
+                last_read_pts: row.get::<i64, _>("last_read_pts") as u64,
+                updated_at: row.get("updated_at"),
+            })
             .collect())
     }
 
@@ -455,6 +515,7 @@ impl ReadStateService {
         &self,
         reader_id: UserId,
         channel_id: ChannelId,
+        previous_pts: u64,
         last_read_pts: u64,
     ) -> Result<()> {
         let channel = self.channel_service.get_channel(&channel_id).await?;
@@ -496,22 +557,103 @@ impl ReadStateService {
             // 通知只发给**消息的发送者**们（也就是水位以内、非本人发的消息的作者），
             // 语义是"你的消息有人读了"。收到的一方只需要知道"变成已读了"，
             // 不需要知道是谁——那属于按需查询的明细层。
+            // 🔴 数据库错误不吞。原来这里 `unwrap_or_default()`，SQL 写错列名后
+            // 直接退化成"没人需要通知"，群通知静默不发，而且不会有任何报错。
             let authors = self
-                .list_message_authors_up_to_pts(channel_id, last_read_pts, reader_id)
-                .await
-                .unwrap_or_default();
+                .list_message_authors_in_range(channel_id, previous_pts, last_read_pts, reader_id)
+                .await?;
             for author_id in authors {
-                self.send_read_cursor_event(
+                // 🔴 聚合必须是**面向该接收者的权威结果**，不是把某个人的游标改个事件名。
+                //
+                // 这里下发的是「除你之外，其他人里读得最靠前的位置」——它是全群的 MAX，
+                // 不指向任何具体的人。之前直接复用 send_read_cursor_event，payload 和
+                // 外层 from_uid 都带 reader_id，等于把逐人阅读轨迹长期推给作者，
+                // 客户端可以绕开名单接口和 7 天窗口拿到谁读过。
+                let aggregate_pts = self
+                    .aggregate_read_pts_excluding(channel_id, author_id)
+                    .await?;
+                if aggregate_pts == 0 {
+                    continue;
+                }
+                self.send_group_read_aggregate_event(
                     author_id,
-                    "group_read_aggregate_updated",
                     channel_id,
                     channel_type,
-                    reader_id,
-                    last_read_pts,
+                    aggregate_pts,
                 )
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    /// 除 `exclude_user` 之外，本频道其他成员的已读水位最大值。
+    ///
+    /// 这是群聚合的定义：**任意一人读到这里**，所以是 MAX 而不是某个人的游标。
+    /// 它不指向具体的人，因此可以长期下发而不泄露阅读者身份。
+    async fn aggregate_read_pts_excluding(
+        &self,
+        channel_id: ChannelId,
+        exclude_user: UserId,
+    ) -> Result<u64> {
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            r#"
+            SELECT MAX(last_read_pts)
+            FROM privchat_channel_read_cursor
+            WHERE channel_id = $1 AND user_id <> $2
+            "#,
+        )
+        .bind(channel_id as i64)
+        .bind(exclude_user as i64)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询群聚合已读水位失败: {}", e)))?;
+        Ok(row.and_then(|r| r.0).unwrap_or(0).max(0) as u64)
+    }
+
+    /// 群聚合已读通知：**不带阅读者身份**。
+    ///
+    /// `reader_id` 与外层 `from_uid` 都置 0，表示"这是聚合，不指向任何人"。
+    async fn send_group_read_aggregate_event(
+        &self,
+        target_user_id: UserId,
+        channel_id: ChannelId,
+        channel_type: i32,
+        aggregate_read_pts: u64,
+    ) -> Result<()> {
+        let seq_u32 = u32::try_from(aggregate_read_pts).unwrap_or(u32::MAX).max(1);
+        let payload = ChannelReadCursorNotification::new(
+            channel_id,
+            channel_type,
+            0, // 匿名：聚合不指向任何具体阅读者
+            aggregate_read_pts,
+            "group_read_aggregate_updated",
+            chrono::Utc::now().timestamp_millis(),
+        );
+        let notification = PushMessageRequest {
+            setting: Default::default(),
+            msg_key: String::new(),
+            server_message_id: u64::from(seq_u32),
+            message_seq: seq_u32,
+            local_message_id: 0,
+            stream_no: String::new(),
+            stream_seq: 0,
+            stream_flag: 0,
+            timestamp: chrono::Utc::now().timestamp() as u32,
+            channel_id,
+            channel_type: channel_type as u8,
+            message_type: privchat_protocol::ContentMessageType::System.as_u32(),
+            expire: 0,
+            topic: String::new(),
+            from_uid: 0, // 同上：不暴露阅读者
+            payload: serde_json::to_vec(&payload)
+                .map_err(|e| ServerError::Serialization(e.to_string()))?,
+            deleted: false,
+        };
+        self.message_router
+            .route_message_to_user(&target_user_id, notification)
+            .await
+            .map_err(|e| ServerError::Network(format!("发送群聚合已读事件失败: {}", e)))?;
         Ok(())
     }
 

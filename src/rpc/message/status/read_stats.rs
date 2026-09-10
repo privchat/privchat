@@ -55,13 +55,13 @@ pub async fn handle(
         .map_err(|e| RpcError::internal(format!("查询消息失败: {}", e)))?
         .ok_or_else(|| RpcError::not_found(format!("消息不存在: {}", message_id)))?;
 
-    let expires_at = authorize_read_detail(requester_id, &message, channel_id)?;
-
     let channel = services
         .channel_service
         .get_channel(&channel_id)
         .await
         .map_err(|e| RpcError::not_found(format!("频道不存在: {}", e)))?;
+
+    let expires_at = authorize_read_detail(requester_id, &message, channel_id, &channel)?;
 
     let recipient_ids: Vec<u64> = channel
         .get_member_ids()
@@ -70,14 +70,12 @@ pub async fn handle(
         .collect();
 
     let message_pts = message.pts.unwrap_or(0).max(0) as u64;
-    let readers = services
+    // 人数只来自阅读数据，不掺资料加载结果；与名单接口同一个 COUNT，口径不会分叉。
+    let read_count = services
         .read_state_service
-        .list_read_members_by_message_pts(channel_id, message_pts, &recipient_ids)
+        .count_read_members_by_message_pts(channel_id, message_pts, &recipient_ids)
         .await
         .map_err(|e| RpcError::internal(format!("查询已读统计失败: {}", e)))?;
-
-    // 人数只来自阅读数据，不掺资料加载结果。
-    let read_count = readers.len() as u32;
     let recipient_count = recipient_ids.len() as u32;
     Ok(json!({
         "message_id": message_id,
