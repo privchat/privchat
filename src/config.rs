@@ -2665,6 +2665,37 @@ pub struct MessageConfig {
     /// - `0`（或配置为 null / 省略）：**不限制时效**，普通用户任意时间均可撤回自己的消息
     #[serde(default = "default_recall_time_limit_secs")]
     pub recall_time_limit_secs: i64,
+
+    /// 群已读**明细**（人数/名单）的可查天数（READ_STATUS_SPEC §6.5.4）。
+    ///
+    /// 锚点是消息发送时间，不是"读完再留 N 天"。截止时间在发送时固定到消息上，
+    /// 所以调大这个值只影响新消息，不会让早已过期的旧名单重新开放。
+    /// 聚合的「已读」状态不受它影响，永久保留。
+    #[serde(default = "default_read_detail_retention_days")]
+    pub read_detail_retention_days: i64,
+}
+
+/// 发送路径要固定明细截止时间，但 send_message_handler 拿不到 ServerConfig。
+///
+/// 与其把 config 一路穿进 handler 和 repository，这里在启动时装一次全局值。
+/// 只读一次、之后不变：改配置要重启，这和其它 `[message]` 项的语义一致。
+static READ_DETAIL_RETENTION_DAYS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+pub fn init_read_detail_retention_days(days: i64) {
+    let _ = READ_DETAIL_RETENTION_DAYS.set(days.max(0));
+}
+
+/// 发送时用它算截止时间；查询时优先用消息上已固定的值，见 policy::authorize_read_detail。
+pub fn read_detail_retention_days_global() -> i64 {
+    *READ_DETAIL_RETENTION_DAYS
+        .get()
+        .unwrap_or(&DEFAULT_READ_DETAIL_RETENTION_DAYS)
+}
+
+const DEFAULT_READ_DETAIL_RETENTION_DAYS: i64 = 7;
+
+fn default_read_detail_retention_days() -> i64 {
+    DEFAULT_READ_DETAIL_RETENTION_DAYS
 }
 
 fn default_recall_time_limit_secs() -> i64 {
@@ -2676,6 +2707,7 @@ impl Default for MessageConfig {
     fn default() -> Self {
         Self {
             recall_time_limit_secs: default_recall_time_limit_secs(),
+            read_detail_retention_days: default_read_detail_retention_days(),
         }
     }
 }

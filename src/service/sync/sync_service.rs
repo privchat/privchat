@@ -402,6 +402,7 @@ impl SyncService {
             revoked: false,
             revoked_at: None,
             revoked_by: None,
+            read_detail_expires_at: None,
         };
         Ok((
             message,

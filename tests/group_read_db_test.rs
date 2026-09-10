@@ -172,3 +172,65 @@ async fn aggregate_is_a_max_not_one_persons_cursor() {
     .expect("aggregate");
     assert_eq!(row.0, Some(5), "排除 b 之后其他人的最大水位是 c 的 5");
 }
+
+/// 群聚合必须能靠**补拉**恢复，不能只依赖那一次在线通知（§6.5.8）。
+///
+/// 场景：作者离线时别人读了消息，通知丢了。作者上线/换新设备后补拉，
+/// 必须拿到聚合水位，且这一行**不指向任何具体阅读者**（user_id = 0）。
+#[tokio::test]
+async fn group_aggregate_is_recoverable_by_backfill() {
+    let Some(p) = pool().await else { return };
+    let channel = 900_004i64;
+    seed(&p, channel).await;
+    let [author, r1, r2] = users(channel);
+    // 作者必须是群成员，补拉才认这一行。
+    for uid in [author, r1, r2] {
+        sqlx::query(
+            "INSERT INTO privchat_channel_participants (channel_id, user_id, role, joined_at)
+             VALUES ($1,$2,2,0) ON CONFLICT (channel_id, user_id) DO UPDATE SET left_at = NULL",
+        )
+        .bind(channel)
+        .bind(uid)
+        .execute(&p)
+        .await
+        .expect("participant");
+    }
+    for (user, pts) in [(r1, 4i64), (r2, 9)] {
+        sqlx::query(
+            "INSERT INTO privchat_channel_read_cursor (user_id,channel_id,last_read_pts,sync_version)
+             VALUES ($1,$2,$3, nextval('privchat_channel_read_cursor_sync_version_seq'))",
+        )
+        .bind(user)
+        .bind(channel)
+        .bind(pts)
+        .execute(&p)
+        .await
+        .expect("cursor");
+    }
+    // 与 sync_channel_read_cursor_page 的 group_rows 同一条语句。
+    let row = sqlx::query(
+        r#"
+        SELECT cur.channel_id, 0::BIGINT AS user_id,
+               MAX(cur.last_read_pts) AS last_read_pts,
+               MAX(cur.sync_version) AS sync_version
+        FROM privchat_channel_read_cursor cur
+        JOIN privchat_channels ch ON ch.channel_id = cur.channel_id
+        JOIN privchat_channel_participants me
+             ON me.channel_id = cur.channel_id AND me.user_id = $1 AND me.left_at IS NULL
+        WHERE ch.channel_type = 1 AND cur.user_id <> $1 AND cur.channel_id = $2
+        GROUP BY cur.channel_id
+        HAVING MAX(cur.sync_version) > 0
+        "#,
+    )
+    .bind(author)
+    .bind(channel)
+    .fetch_one(&p)
+    .await
+    .expect("backfill must return the group aggregate");
+    assert_eq!(row.get::<i64, _>("user_id"), 0, "聚合行不得指向具体阅读者");
+    assert_eq!(
+        row.get::<i64, _>("last_read_pts"),
+        9,
+        "聚合是除自己外的 MAX，任意一人读到 9 就是 9"
+    );
+}

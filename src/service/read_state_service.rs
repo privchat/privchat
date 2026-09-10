@@ -295,9 +295,8 @@ impl ReadStateService {
         // unchanged. Caller distinguishes self/peer via `user_id` in
         // the payload.
         //
-        // Group channels (channel_type=1 by channels-table convention)
-        // are excluded from the peer branch because group "已读"
-        // semantics need per-member cursors and a different surface.
+        // 群（channel_type=1）不走 peer 分支：那一支会把每个成员的游标连同身份一起下发。
+        // 群有自己的第三支 group_rows，只给**聚合水位**，见下面的注释。
         let db_rows = sqlx::query(
             r#"
             WITH self_rows AS (
@@ -320,10 +319,35 @@ impl ReadStateService {
                     OR
                     (ch.direct_user2_id = $1 AND cur.user_id = ch.direct_user1_id)
                   )
+            ),
+            -- 群聚合：每个我参与的群一行，值是**除我之外**其他人的已读水位最大值。
+            --
+            -- user_id 恒为 0 = 「这是聚合，不指向任何人」。这一支是「永久已读」的
+            -- 权威恢复来源：离线错过在线通知、换新设备、推送失败，都靠补拉这里收敛，
+            -- 而不是指望那一次在线通知送达。
+            --
+            -- sync_version 取该群其他人游标里的最大值，让它能参与同一条 since 分页。
+            group_rows AS (
+                SELECT
+                    cur.channel_id,
+                    0::BIGINT AS user_id,
+                    MAX(cur.last_read_pts) AS last_read_pts,
+                    MAX(cur.sync_version) AS sync_version
+                FROM privchat_channel_read_cursor cur
+                JOIN privchat_channels ch ON ch.channel_id = cur.channel_id
+                JOIN privchat_channel_participants me
+                     ON me.channel_id = cur.channel_id AND me.user_id = $1 AND me.left_at IS NULL
+                WHERE ch.channel_type = 1
+                  AND cur.user_id <> $1
+                  AND ($3::BIGINT IS NULL OR cur.channel_id = $3)
+                GROUP BY cur.channel_id
+                HAVING MAX(cur.sync_version) > $2
             )
             SELECT channel_id, user_id, last_read_pts, sync_version FROM self_rows
             UNION ALL
             SELECT channel_id, user_id, last_read_pts, sync_version FROM peer_rows
+            UNION ALL
+            SELECT channel_id, user_id, last_read_pts, sync_version FROM group_rows
             ORDER BY sync_version ASC, channel_id ASC, user_id ASC
             LIMIT $4
             "#,

@@ -215,6 +215,8 @@ impl MessageService {
             revoked: false,
             revoked_at: None,
             revoked_by: None,
+            // 发送时固定明细截止时间：之后调大配置不会重新开放旧名单（§6.5.4）。
+            read_detail_expires_at: None,
         };
         let tx_result = self
             .message_repository

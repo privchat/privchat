@@ -72,7 +72,9 @@ pub async fn handle(
 
     // 发送者判定 + 当前访问权 + 撤回 + 窗口，全在这一个入口里（§6.5.5）。
     // 翻页途中过期会在这里被拒。
-    let expires_at = authorize_read_detail(requester_id, &message, channel_id, &channel)?;
+    let retention_days = read_detail_retention_days(&services.config.message);
+    let expires_at =
+        authorize_read_detail(requester_id, &message, channel_id, &channel, retention_days)?;
 
     let message_pts = message.pts.unwrap_or(0).max(0) as u64;
     // 🔴 「**发送时**有权接收的其他用户」，不是当前成员表（§6.5.3）。
@@ -132,7 +134,7 @@ pub async fn handle(
         "next_after_user_id": page.last().map(|r| r.user_id),
         "has_more": page.len() as u32 == limit,
         "detail_expires_at": expires_at.timestamp_millis(),
-        "retention_days": read_detail_retention_days(),
+        "retention_days": retention_days,
         "read_list": read_list,
     }))
 }

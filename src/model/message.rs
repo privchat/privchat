@@ -49,6 +49,9 @@ pub struct Message {
     pub revoked_at: Option<DateTime<Utc>>,
     /// 撤回者ID
     pub revoked_by: Option<u64>,
+    /// 群已读明细的可查截止时间，发送时固定（READ_STATUS_SPEC §6.5.4）。
+    /// None = 存量消息，回落到"发送时间 + 当前配置"。
+    pub read_detail_expires_at: Option<DateTime<Utc>>,
 }
 
 /// 消息状态
@@ -152,7 +155,18 @@ impl Message {
             revoked: false,
             revoked_at: None,
             revoked_by: None,
+            // 由发送路径 stamp_read_detail_expiry 按配置固定，见 §6.5.4。
+            read_detail_expires_at: None,
         }
+    }
+
+    /// 把群已读明细的可查截止时间**固定**在消息上。
+    ///
+    /// 不能在查询时按"当前配置"现算：把保留期从 7 天调到 30 天会让早已过期的
+    /// 旧名单重新开放。所以发送时算一次，之后改配置只影响新消息。
+    pub fn stamp_read_detail_expiry(&mut self, retention_days: i64) {
+        self.read_detail_expires_at =
+            Some(self.created_at + chrono::Duration::days(retention_days.max(0)));
     }
 
     /// 从数据库行创建（处理时间戳转换）
@@ -173,6 +187,7 @@ impl Message {
         revoked: bool,
         revoked_at: Option<i64>, // 毫秒时间戳
         revoked_by: Option<i64>, // PostgreSQL BIGINT
+        read_detail_expires_at: Option<i64>, // 毫秒时间戳
     ) -> Self {
         Self {
             message_id: message_id as u64,
@@ -192,6 +207,8 @@ impl Message {
             revoked,
             revoked_at: revoked_at.and_then(|ts| DateTime::from_timestamp_millis(ts)),
             revoked_by: revoked_by.map(|id| id as u64),
+            read_detail_expires_at: read_detail_expires_at
+                .and_then(|ts| DateTime::from_timestamp_millis(ts)),
         }
     }
 
@@ -264,6 +281,7 @@ impl Message {
             revoked: false,
             revoked_at: None,
             revoked_by: None,
+            read_detail_expires_at: None,
         }
     }
 

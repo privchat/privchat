@@ -757,6 +757,14 @@ impl ChatServer {
             }
         );
 
+        // 群已读明细保留期：发送路径要用它固定每条消息的截止时间，而 handler
+        // 拿不到 ServerConfig，所以在这里装一次全局值（config::read_detail_retention_days_global）。
+        crate::config::init_read_detail_retention_days(config.message.read_detail_retention_days);
+        info!(
+            "✅ 群已读明细保留期: {} 天",
+            config.message.read_detail_retention_days
+        );
+
         // 用户服务：admin / RPC / job 对 User 领域对象的唯一入口
         let user_service = Arc::new(crate::service::UserService::new(user_repository.clone()));
         info!("✅ UserService 创建完成");

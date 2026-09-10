@@ -61,7 +61,9 @@ pub async fn handle(
         .await
         .map_err(|e| RpcError::not_found(format!("频道不存在: {}", e)))?;
 
-    let expires_at = authorize_read_detail(requester_id, &message, channel_id, &channel)?;
+    let retention_days = read_detail_retention_days(&services.config.message);
+    let expires_at =
+        authorize_read_detail(requester_id, &message, channel_id, &channel, retention_days)?;
 
     let message_pts = message.pts.unwrap_or(0).max(0) as u64;
     let recipient_ids = services
@@ -83,6 +85,6 @@ pub async fn handle(
         "read_count": read_count,
         "unread_count": recipient_count.saturating_sub(read_count),
         "detail_expires_at": expires_at.timestamp_millis(),
-        "retention_days": read_detail_retention_days(),
+        "retention_days": retention_days,
     }))
 }

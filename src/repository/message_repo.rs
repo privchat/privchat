@@ -363,6 +363,7 @@ impl PgMessageRepository {
             row.revoked,
             row.revoked_at,
             row.revoked_by,
+            row.read_detail_expires_at,
         )
     }
 
@@ -377,7 +378,7 @@ impl PgMessageRepository {
                 m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
                 m.content, m.message_type, m.metadata, m.reply_to_message_id,
                 m.created_at, m.updated_at, m.deleted, m.deleted_at,
-                m.revoked, m.revoked_at, m.revoked_by
+                m.revoked, m.revoked_at, m.revoked_by, m.read_detail_expires_at
             FROM privchat_message_dedup d
             JOIN privchat_messages m ON m.message_id = d.message_id
             WHERE d.dedup_key = $1
@@ -405,7 +406,7 @@ impl PgMessageRepository {
                 m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
                 m.content, m.message_type, m.metadata, m.reply_to_message_id,
                 m.created_at, m.updated_at, m.deleted, m.deleted_at,
-                m.revoked, m.revoked_at, m.revoked_by
+                m.revoked, m.revoked_at, m.revoked_by, m.read_detail_expires_at
             FROM privchat_client_msg_registry r
             JOIN privchat_messages m ON m.message_id = r.server_msg_id
             WHERE r.sender_id = $1 AND r.device_id = $2 AND r.local_message_id = $3
@@ -485,7 +486,7 @@ impl PgMessageRepository {
                         m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
                         m.content, m.message_type, m.metadata, m.reply_to_message_id,
                         m.created_at, m.updated_at, m.deleted, m.deleted_at,
-                        m.revoked, m.revoked_at, m.revoked_by
+                        m.revoked, m.revoked_at, m.revoked_by, m.read_detail_expires_at
                     FROM privchat_message_dedup d
                     JOIN privchat_messages m ON m.message_id = d.message_id
                     WHERE d.dedup_key = $1
@@ -566,9 +567,10 @@ impl PgMessageRepository {
             INSERT INTO privchat_messages (
                 message_id, channel_id, sender_id, pts, local_message_id,
                 message_type, content, metadata, reply_to_message_id,
-                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by
+                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by,
+                read_detail_expires_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             "#,
         )
         .bind(message_id)
@@ -587,6 +589,8 @@ impl PgMessageRepository {
         .bind(revoked)
         .bind(revoked_at)
         .bind(revoked_by)
+        // 明细截止时间在发送时固定，见 READ_STATUS_SPEC §6.5.4。
+        .bind(message.read_detail_expires_at.map(|t| t.timestamp_millis()))
         .execute(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
@@ -1094,6 +1098,7 @@ impl PgMessageRepository {
                 m.revoked,
                 m.revoked_at,
                 m.revoked_by,
+                m.read_detail_expires_at,
                 u.username as sender_username,
                 u.display_name as sender_display_name,
                 u.avatar_url as sender_avatar_url
@@ -1397,6 +1402,7 @@ struct MessageRow {
     revoked: bool,
     revoked_at: Option<i64>,
     revoked_by: Option<i64>,
+    read_detail_expires_at: Option<i64>,
     /// LEFT JOIN privchat_users 带回：发送方账号已删除时为 None。
     sender_username: Option<String>,
     sender_display_name: Option<String>,
@@ -1424,6 +1430,7 @@ impl MessageRepository for PgMessageRepository {
             revoked: bool,
             revoked_at: Option<i64>,
             revoked_by: Option<i64>,
+            read_detail_expires_at: Option<i64>,
         }
 
         let row = sqlx::query_as::<_, MessageRow>(
@@ -1444,7 +1451,8 @@ impl MessageRepository for PgMessageRepository {
                 deleted_at,
                 revoked,
                 revoked_at,
-                revoked_by
+                revoked_by,
+                read_detail_expires_at
             FROM privchat_messages
             WHERE message_id = $1
             ORDER BY created_at DESC
@@ -1475,6 +1483,7 @@ impl MessageRepository for PgMessageRepository {
                 r.revoked,
                 r.revoked_at,
                 r.revoked_by,
+                r.read_detail_expires_at,
             ))),
             None => Ok(None),
         }
@@ -1509,9 +1518,10 @@ impl MessageRepository for PgMessageRepository {
             INSERT INTO privchat_messages (
                 message_id, channel_id, sender_id, pts, local_message_id,
                 message_type, content, metadata, reply_to_message_id,
-                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by
+                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by,
+                read_detail_expires_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             "#,
         )
         .bind(message_id)
@@ -1530,6 +1540,8 @@ impl MessageRepository for PgMessageRepository {
         .bind(revoked)
         .bind(revoked_at)
         .bind(revoked_by)
+        // 明细截止时间在发送时固定，见 READ_STATUS_SPEC §6.5.4。
+        .bind(message.read_detail_expires_at.map(|t| t.timestamp_millis()))
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
@@ -1608,9 +1620,10 @@ impl MessageRepository for PgMessageRepository {
             INSERT INTO privchat_messages (
                 message_id, channel_id, sender_id, pts, local_message_id,
                 message_type, content, metadata, reply_to_message_id,
-                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by
+                created_at, updated_at, deleted, deleted_at, revoked, revoked_at, revoked_by,
+                read_detail_expires_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             "#,
         )
         .bind(message_id)
@@ -1629,6 +1642,8 @@ impl MessageRepository for PgMessageRepository {
         .bind(revoked)
         .bind(revoked_at)
         .bind(revoked_by)
+        // 明细截止时间在发送时固定，见 READ_STATUS_SPEC §6.5.4。
+        .bind(message.read_detail_expires_at.map(|t| t.timestamp_millis()))
         .execute(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
@@ -1765,6 +1780,7 @@ impl MessageRepository for PgMessageRepository {
             revoked: bool,
             revoked_at: Option<i64>,
             revoked_by: Option<i64>,
+            read_detail_expires_at: Option<i64>,
         }
 
         let query = if let Some(before_ts) = before_created_at {
@@ -1786,7 +1802,8 @@ impl MessageRepository for PgMessageRepository {
                     deleted_at,
                     revoked,
                     revoked_at,
-                    revoked_by
+                    revoked_by,
+                    read_detail_expires_at
                 FROM privchat_messages
                 WHERE channel_id = $1 AND created_at < $2 AND deleted = false
                 ORDER BY created_at DESC
@@ -1815,7 +1832,8 @@ impl MessageRepository for PgMessageRepository {
                     deleted_at,
                     revoked,
                     revoked_at,
-                    revoked_by
+                    revoked_by,
+                    read_detail_expires_at
                 FROM privchat_messages
                 WHERE channel_id = $1 AND deleted = false
                 ORDER BY created_at DESC
@@ -1852,6 +1870,7 @@ impl MessageRepository for PgMessageRepository {
                     r.revoked,
                     r.revoked_at,
                     r.revoked_by,
+                    r.read_detail_expires_at,
                 )
             })
             .collect())
@@ -1881,6 +1900,7 @@ impl MessageRepository for PgMessageRepository {
             revoked: bool,
             revoked_at: Option<i64>,
             revoked_by: Option<i64>,
+            read_detail_expires_at: Option<i64>,
         }
 
         let row = sqlx::query_as::<_, MessageRow>(
@@ -1901,7 +1921,8 @@ impl MessageRepository for PgMessageRepository {
                 deleted_at,
                 revoked,
                 revoked_at,
-                revoked_by
+                revoked_by,
+                read_detail_expires_at
             FROM privchat_messages
             WHERE sender_id = $1 AND pts = $2
             LIMIT 1
@@ -1932,6 +1953,7 @@ impl MessageRepository for PgMessageRepository {
                 r.revoked,
                 r.revoked_at,
                 r.revoked_by,
+                r.read_detail_expires_at,
             ))),
             None => Ok(None),
         }
@@ -2338,13 +2360,15 @@ impl PgMessageRepository {
             revoked: bool,
             revoked_at: Option<i64>,
             revoked_by: Option<i64>,
+            read_detail_expires_at: Option<i64>,
         }
 
         let sql = if before {
             r#"
             SELECT message_id, channel_id, sender_id, pts, local_message_id, content,
                    message_type, metadata, reply_to_message_id, created_at, updated_at,
-                   deleted, deleted_at, revoked, revoked_at, revoked_by
+                   deleted, deleted_at, revoked, revoked_at, revoked_by,
+                   read_detail_expires_at
             FROM privchat_messages
             WHERE channel_id = $1 AND deleted = false
               AND (created_at < $2 OR (created_at = $2 AND message_id < $3))
@@ -2355,7 +2379,8 @@ impl PgMessageRepository {
             r#"
             SELECT message_id, channel_id, sender_id, pts, local_message_id, content,
                    message_type, metadata, reply_to_message_id, created_at, updated_at,
-                   deleted, deleted_at, revoked, revoked_at, revoked_by
+                   deleted, deleted_at, revoked, revoked_at, revoked_by,
+                   read_detail_expires_at
             FROM privchat_messages
             WHERE channel_id = $1 AND deleted = false
               AND (created_at > $2 OR (created_at = $2 AND message_id > $3))
@@ -2394,6 +2419,7 @@ impl PgMessageRepository {
                     r.revoked,
                     r.revoked_at,
                     r.revoked_by,
+                    r.read_detail_expires_at,
                 )
             })
             .collect())
@@ -2754,6 +2780,7 @@ mod atomic_dispatch_tests {
             revoked: false,
             revoked_at: None,
             revoked_by: None,
+            read_detail_expires_at: None,
         };
         // 附件绑定守卫要求文件属于发送者且尚未被占用——先造出这两个文件行，
         // 否则提交会以 ATTACHMENT_BINDING_REJECTED 失败，测不到引用写入。
@@ -2896,6 +2923,7 @@ mod atomic_dispatch_tests {
             revoked: false,
             revoked_at: None,
             revoked_by: None,
+            read_detail_expires_at: None,
         };
         repo.create_message_and_commit_atomic(AtomicMessageCommitRequest {
             message,
@@ -3053,6 +3081,7 @@ mod atomic_dispatch_tests {
             revoked: false,
             revoked_at: None,
             revoked_by: None,
+            read_detail_expires_at: None,
         };
         let result = repo
             .create_message_and_commit_atomic(AtomicMessageCommitRequest {

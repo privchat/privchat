@@ -1,5 +1,4 @@
 use crate::rpc::error::{RpcError, RpcResult};
-use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadReceiptMode {
@@ -37,9 +36,9 @@ pub fn resolve_read_receipt_mode() -> ReadReceiptMode {
     ReadReceiptMode::FullList
 }
 
-/// 明细保留期限（天）。留成函数是为了后面接系统配置时不必改调用点。
-pub fn read_detail_retention_days() -> i64 {
-    DEFAULT_READ_DETAIL_RETENTION_DAYS
+/// 明细保留期限（天）。来自 `[message] read_detail_retention_days`。
+pub fn read_detail_retention_days(config: &crate::config::MessageConfig) -> i64 {
+    config.read_detail_retention_days.max(0)
 }
 
 /// 已读明细查询的**唯一**授权入口：人数与名单共用。
@@ -56,6 +55,7 @@ pub fn authorize_read_detail(
     message: &crate::model::message::Message,
     channel_id: u64,
     channel: &crate::model::channel::Channel,
+    retention_days: i64,
 ) -> RpcResult<chrono::DateTime<chrono::Utc>> {
     if message.channel_id != channel_id {
         return Err(RpcError::validation(
@@ -78,8 +78,13 @@ pub fn authorize_read_detail(
     if message.revoked || message.deleted {
         return Err(RpcError::not_found("message is revoked".to_string()));
     }
-    let expires_at =
-        message.created_at + chrono::Duration::days(read_detail_retention_days());
+    // 🔴 优先用消息上**固定**的截止时间。
+    //
+    // 若每次都按当前配置现算，把保留期从 7 天调到 30 天会让早已过期的旧名单重新开放，
+    // 违反 §6.5.4。存量消息没有这个字段时才回落到"发送时间 + 当前配置"。
+    let expires_at = message
+        .read_detail_expires_at
+        .unwrap_or(message.created_at + chrono::Duration::days(retention_days));
     if chrono::Utc::now() >= expires_at {
         // 过期要能和"无人已读"区分开：这里必须是错误，不能返回空列表。
         return Err(RpcError::forbidden(
@@ -143,36 +148,60 @@ mod tests {
             revoked,
             revoked_at: None,
             revoked_by: None,
+            read_detail_expires_at: None,
         }
     }
+
+    /// 默认保留期，测试里统一用它，改配置的影响单独在下面那条测。
+    const D: i64 = 7;
 
     /// 只有发送者能看谁读了自己的消息（§6.5.5）。
     /// 这条挡的是「登录了就能查任意消息读者」——外层的身份校验不等于消息级授权。
     #[test]
     fn only_the_sender_may_query() {
         let m = msg(7, 100, 0, false);
-        assert!(authorize_read_detail(7, &m, 100, &group_with(&[7, 8])).is_ok());
-        assert!(authorize_read_detail(8, &m, 100, &group_with(&[7, 8])).is_err());
+        assert!(authorize_read_detail(7, &m, 100, &group_with(&[7, 8]), D).is_ok());
+        assert!(authorize_read_detail(8, &m, 100, &group_with(&[7, 8]), D).is_err());
     }
 
     /// 窗口锚在**发送时间**，不是"读完再留 N 天"（§6.5.4）。
     #[test]
     fn the_window_is_anchored_to_the_send_time() {
-        assert!(authorize_read_detail(7, &msg(7, 100, 6, false), 100, &group_with(&[7, 8])).is_ok());
-        assert!(authorize_read_detail(7, &msg(7, 100, 8, false), 100, &group_with(&[7, 8])).is_err());
+        assert!(authorize_read_detail(7, &msg(7, 100, 6, false), 100, &group_with(&[7, 8]), D).is_ok());
+        assert!(authorize_read_detail(7, &msg(7, 100, 8, false), 100, &group_with(&[7, 8]), D).is_err());
     }
 
     /// 过期必须是**错误**，不能退化成空名单——否则和"无人已读"分不开（§6.5.4）。
     #[test]
     fn expiry_is_an_error_not_an_empty_list() {
-        let err = authorize_read_detail(7, &msg(7, 100, 30, false), 100, &group_with(&[7, 8])).unwrap_err();
+        let err = authorize_read_detail(7, &msg(7, 100, 30, false), 100, &group_with(&[7, 8]), D).unwrap_err();
         assert!(format!("{:?}", err).contains("expired"));
+    }
+
+    /// 🔴 调大保留期不得让**已过期**的旧名单重新开放（§6.5.4）。
+    ///
+    /// 截止时间在发送时固定在消息上；查询时若还按"当前配置"现算，把 7 天改成 30 天
+    /// 就会把三周前那条群消息的读者名单又放出来。
+    #[test]
+    fn raising_the_retention_does_not_reopen_a_fixed_expiry() {
+        let mut m = msg(7, 100, 20, false);
+        m.stamp_read_detail_expiry(D); // 发送时（20 天前）按当时的 7 天固定
+        let err = authorize_read_detail(7, &m, 100, &group_with(&[7, 8]), 365).unwrap_err();
+        assert!(format!("{:?}", err).contains("expired"), "固定的截止时间优先于当前配置");
+    }
+
+    /// 存量消息没有固定值时，回落到"发送时间 + 当前配置"。
+    #[test]
+    fn legacy_messages_fall_back_to_the_current_config() {
+        let m = msg(7, 100, 20, false); // read_detail_expires_at = None
+        assert!(authorize_read_detail(7, &m, 100, &group_with(&[7, 8]), 365).is_ok());
+        assert!(authorize_read_detail(7, &m, 100, &group_with(&[7, 8]), D).is_err());
     }
 
     #[test]
     fn revoked_and_mismatched_channel_are_rejected() {
-        assert!(authorize_read_detail(7, &msg(7, 100, 0, true), 100, &group_with(&[7, 8])).is_err());
-        assert!(authorize_read_detail(7, &msg(7, 100, 0, false), 999, &group_with(&[7, 8])).is_err());
+        assert!(authorize_read_detail(7, &msg(7, 100, 0, true), 100, &group_with(&[7, 8]), D).is_err());
+        assert!(authorize_read_detail(7, &msg(7, 100, 0, false), 999, &group_with(&[7, 8]), D).is_err());
     }
 
     /// 模式是服务端决定的，签名里没有请求体——这条防的是把它改回从 body 解析。
