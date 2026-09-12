@@ -1142,6 +1142,11 @@ struct TomlPushApnsConfig {
 struct TomlPushFcmConfig {
     enabled: Option<bool>,
     project_id: Option<String>,
+    /// 🔴 这一行漏了三个月：[push.fcm] 里写了 service_account_path，服务端照常启动、
+    /// 照常说配置有效，值却被丢掉——因为镜像结构没有这个字段，而 serde 默认忽略未知键。
+    /// 唯一能设上的途径是环境变量 PUSH_FCM_SERVICE_ACCOUNT_PATH。
+    /// 镜像结构和真实结构必须一起改，这是这个文件里最容易漏的一条。
+    service_account_path: Option<String>,
     access_token: Option<String>,
 }
 
@@ -1897,6 +1902,9 @@ impl TryFrom<TomlConfig> for ServerConfig {
                 }
                 if let Some(project_id) = fcm.project_id {
                     config.push.fcm.project_id = Some(project_id);
+                }
+                if let Some(service_account_path) = fcm.service_account_path {
+                    config.push.fcm.service_account_path = Some(service_account_path);
                 }
                 if let Some(access_token) = fcm.access_token {
                     config.push.fcm.access_token = Some(access_token);
@@ -2983,6 +2991,60 @@ port = 9001
         assert_eq!(
             cfg.tls_key_path.as_deref(),
             Some("/etc/privchat/tls/server.key")
+        );
+    }
+}
+
+#[cfg(test)]
+mod push_config_tests {
+    use super::ServerConfig;
+    use std::io::Write;
+
+    /// 配置文件里的每一个推送字段都必须真的落到配置里。
+    ///
+    /// 🔴 防的是"接受但忽略"：TOML 镜像结构少一个字段，serde 会安静地跳过它，
+    /// validate-config 依然报「配置有效」，运维看着自己写的路径，服务端用的是 None。
+    /// service_account_path 就这么丢过一次——FCM 推送在生产上等于没配。
+    #[test]
+    fn push_fields_survive_the_toml_mirror() {
+        let mut f = tempfile::NamedTempFile::new().expect("tmp");
+        f.write_all(
+            r#"
+[push]
+enabled = true
+
+[push.apns]
+enabled = true
+bundle_id = "com.netonstream.weey"
+team_id = "TEAM123"
+key_id = "KEY456"
+private_key_path = "/secrets/apns.p8"
+use_sandbox = false
+
+[push.fcm]
+enabled = true
+project_id = "weey-chat"
+service_account_path = "/secrets/fcm.json"
+"#
+            .as_bytes(),
+        )
+        .expect("write");
+        f.flush().expect("flush");
+
+        let cfg = ServerConfig::from_toml_file(f.path()).expect("解析");
+        assert!(cfg.push.enabled);
+        assert!(cfg.push.apns.enabled);
+        assert_eq!(cfg.push.apns.bundle_id.as_deref(), Some("com.netonstream.weey"));
+        assert_eq!(cfg.push.apns.team_id.as_deref(), Some("TEAM123"));
+        assert_eq!(cfg.push.apns.key_id.as_deref(), Some("KEY456"));
+        assert_eq!(cfg.push.apns.private_key_path.as_deref(), Some("/secrets/apns.p8"));
+        assert!(!cfg.push.apns.use_sandbox);
+        assert!(cfg.push.fcm.enabled);
+        assert_eq!(cfg.push.fcm.project_id.as_deref(), Some("weey-chat"));
+        assert_eq!(
+            cfg.push.fcm.service_account_path.as_deref(),
+            Some("/secrets/fcm.json"),
+            "service_account_path 被 TOML 镜像结构吞掉了"
         );
     }
 }
