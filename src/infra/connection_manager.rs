@@ -2039,8 +2039,27 @@ mod tests {
             report.failed_sessions[0].classification,
             DeliveryFailureClassification::RouteTimeout
         );
-        assert_eq!(report.successful_count(), 1);
-        assert!(manager.is_device_online(837, "device-b").await);
+        assert_eq!(
+            report.successful_count(),
+            1,
+            "一台设备成功就不算用户离线——这是本用例的主张"
+        );
+        // 🔴 超时的那台要被摘掉，而不是留在索引里。
+        //
+        // 这条断言以前是反的（要求 device-b 仍然在线）。留着它的代价在 iOS 上暴露过：
+        // App 被挂起后 socket 还在索引里，服务端据此判定用户在线并跳过推送，
+        // 然后每条消息都走直投、每次都超时——用户在几十秒里既收不到消息也收不到通知。
+        // 写超时的语义就是"对面没在收"，与 DeadConnection 无异；真的只是网络抖动的话，
+        // 客户端重连后按 PTS 补齐，代价是可恢复的。
+        assert!(
+            !manager.is_device_online(837, "device-b").await,
+            "写超时的会话必须被清理，否则服务端会继续对外谎报它在线"
+        );
+        assert!(report.failed_sessions[0].cleaned_up);
+        assert!(
+            manager.is_device_online(837, "device-a").await,
+            "成功的那台不受影响"
+        );
     }
 
     #[tokio::test]
