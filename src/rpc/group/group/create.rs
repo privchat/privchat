@@ -197,26 +197,59 @@ pub async fn handle(
                         .filter(|uid| *uid != creator_id)
                         .collect();
 
+                    // 🔴 谁真的进群了，要以写入结果为准，不能以请求为准。
+                    //
+                    // 这两次写入任何一次失败，这个人就没有进群（第二次失败时他还会卡在
+                    // "在 channel_participants 里、不在 group_members 里"的半截状态）。
+                    // 而下面的 member_count 和系统消息如果照着请求列表来写，结果就是：
+                    // 接口返回成功、群里显示 5 个人、系统消息说"邀请了 Y 和 Z"，
+                    // 实际群里只有 3 个——客户端没有任何办法知道出了问题。
+                    //
+                    // 生产日志里这条路径真的走到过（外键约束挡下不存在的用户，40 次），
+                    // 每次都只留下一条 warn 然后当作成功返回。
+                    let mut joined_members: Vec<u64> = Vec::with_capacity(initial_members.len());
+                    let mut failed_members: Vec<u64> = Vec::new();
                     for &uid in &initial_members {
-                        if let Err(e) = services
+                        let participant = services
                             .channel_service
                             .add_participant(
                                 actual_channel_id,
                                 uid,
                                 crate::model::channel::MemberRole::Member,
                             )
-                            .await
-                        {
-                            tracing::warn!("⚠️ 初始成员入库失败 uid={}: {}", uid, e);
+                            .await;
+                        if let Err(e) = participant {
+                            tracing::error!("❌ 初始成员入库失败 uid={}: {}", uid, e);
+                            failed_members.push(uid);
+                            continue;
                         }
                         if let Err(e) = services
                             .channel_service
                             .add_member_to_group(actual_channel_id, uid)
                             .await
                         {
-                            tracing::warn!("⚠️ 初始成员加入群频道失败 uid={}: {}", uid, e);
+                            // 半截状态：participant 写进去了、group_members 没有。
+                            // 没有可用的回滚接口，至少要让它在日志里显形并算作失败，
+                            // 不能计入群成员数。
+                            tracing::error!(
+                                "❌ 初始成员加入群频道失败 uid={}（participant 已写入，成员状态不一致）: {}",
+                                uid,
+                                e
+                            );
+                            failed_members.push(uid);
+                            continue;
                         }
+                        joined_members.push(uid);
                     }
+                    if !failed_members.is_empty() {
+                        tracing::error!(
+                            group_id = actual_channel_id,
+                            "❌ 建群：{} 个初始成员未能加入 {:?}（已在响应中返回）",
+                            failed_members.len(),
+                            failed_members
+                        );
+                    }
+                    let initial_members = joined_members;
 
                     if !initial_members.is_empty() {
                         // 构建系统消息 payload —— spec §3 + §4 + §5
@@ -297,7 +330,10 @@ pub async fn handle(
                         "description": description,
                         "member_count": member_count,
                         "created_at": chrono::Utc::now().timestamp_millis(),
-                        "creator_id": creator_id
+                        "creator_id": creator_id,
+                        // 没能加进来的人。老客户端会忽略这个字段，新客户端可以据此
+                        // 提示"部分成员未能加入"，而不是让用户自己发现群里少人。
+                        "failed_member_ids": failed_members
                     }))
                 }
                 Err(e) => {
