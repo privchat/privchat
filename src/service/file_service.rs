@@ -773,8 +773,23 @@ fn spawn_s3_capability_diagnostics(
                 );
             }
             Ok(Ok(false)) => {
-                tracing::warn!(
-                    "⚠️ 存储源 id={} 的后端不支持 CompleteMPU 的 If-None-Match：并发 complete 可能覆盖已有正式对象。已按运营策略照常接线，上传期失败将返回错误码，建议更换支持该能力的后端",
+                // info 而不是 warn：第二十九轮起 `If-None-Match` 已不是不可覆盖性的闸门，
+                // 只是纵深防御的一层。真正挡住覆盖的是三件事，且都不依赖后端能力：
+                // final_key 由明文摘要推出（内容寻址，不同内容不会落到同一个 key）、
+                // s3_complete 第 3 步在任何不可逆操作之前 HEAD final_key（命中已有对象
+                // 就转 recover_from_existing_object，根本不会发 Complete）、以及 Complete
+                // 之后的整文件回读 + 解密重算明文摘要（唯一的身份权威，挡「声明 A 的身份
+                // 上传 B 的密文」）。
+                //
+                // 残留风险只剩 HEAD 与 Complete 之间那个很窄的 TOCTOU 窗口，而能走到
+                // 那里的前提是同一份内容的两次并发首传——两边写的字节本来就一样。
+                // 内容不符的那种会被回读校验抓住并按统一删除规则清掉。
+                //
+                // 旧文案说「可能覆盖已有正式对象，建议更换支持该能力的后端」：那是
+                // If-None-Match 还是闸门时写的，现在既高估了风险，也给错了建议——
+                // 承重的后端能力是 DELETE 的 If-Match（见上一项探测），不是这一项。
+                tracing::info!(
+                    "ℹ️ 存储源 id={} 的后端忽略 CompleteMPU 的 If-None-Match。该条件已非不可覆盖性的闸门（内容寻址 key + complete 前 HEAD 预检 + 整文件回读重算摘要），此处仅作能力记录",
                     source_id
                 );
             }

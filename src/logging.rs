@@ -260,8 +260,16 @@ pub fn init_logging(
     retention_days: u32,
 ) -> Result<()> {
     let level = if quiet { "error" } else { log_level };
-    // 默认将 msgtrans 传输层日志设为 info，避免大量底层 debug 日志刷屏
-    let default_filter = format!("{},msgtrans=info", level);
+    // 默认将 msgtrans 传输层日志设为 info，避免大量底层 debug 日志刷屏。
+    //
+    // quinn_udp 压到 error：它会在每个 socket 上先尝试 UDP 分段卸载（GSO），本机
+    // 虚拟网卡是 `tx-udp-segmentation: off [fixed]`，于是首批发送必然 `sendmsg` EIO，
+    // 被它按 WARN 打出来。而 quinn-udp 自己接住了这个错——置 `max_gso_segments=1`
+    // 永久关掉 GSO 并继续发，丢掉的包由 QUIC 重传补上。它的注释也写明「管线里已有的
+    // GSO 发送仍会失败，必须容忍额外几次」，所以这是设计好的降级过程，不是故障。
+    // 这个 WARN 不可操作（quinn-udp 0.5 没有提前关掉 GSO 的开关），留着只会让
+    // 每次重启的日志里浮起一批看着像 I/O 错误的东西。
+    let default_filter = format!("{},msgtrans=info,quinn_udp=error", level);
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&default_filter));
 
