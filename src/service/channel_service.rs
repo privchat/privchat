@@ -361,6 +361,53 @@ impl ChannelService {
         Ok(())
     }
 
+    /// 一条消息被撤回后，把它从**还没读到它的那些人**的未读里扣掉。
+    ///
+    /// 撤回的消息不该继续占角标：对方点进去只会看到「消息已撤回」，没有东西可读。
+    /// 服务端这一份 `privchat_user_channels.unread_count` 是推送角标（APNs badge）的来源，
+    /// 不跟着减的话，客户端本地修好了，锁屏上的数字还是错的。
+    ///
+    /// 🔴 必须按读游标逐人区分，不能对全体成员一律减一。已经读过这条消息的人，他的未读
+    /// 是由**其它**消息构成的——给他减一是拿别人的账扣他的数。判据是
+    /// `last_read_pts < 被撤回消息的 pts`；没有游标行等于一条都没读过，视为未读。
+    ///
+    /// 发送者不在扣减范围内：自己发的消息从来没进过自己的角标。
+    pub async fn discount_unread_for_revoked_message(
+        &self,
+        channel_id: u64,
+        message_pts: i64,
+        sender_id: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE privchat_user_channels uc
+            SET unread_count = GREATEST(0, uc.unread_count - 1),
+                updated_at = $3
+            WHERE uc.channel_id = $1
+              AND uc.user_id <> $2
+              AND uc.unread_count > 0
+              AND COALESCE((
+                    SELECT rc.last_read_pts
+                    FROM privchat_channel_read_cursor rc
+                    WHERE rc.user_id = uc.user_id
+                      AND rc.channel_id = uc.channel_id
+                  ), 0) < $4
+            "#,
+        )
+        .bind(channel_id as i64)
+        .bind(sender_id as i64)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(message_pts)
+        .execute(self.pool())
+        .await
+        .map_err(|e| {
+            ServerError::Database(format!(
+                "discount unread for revoked message failed channel={channel_id}: {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
     pub async fn clear_user_channel_unread(&self, user_id: u64, channel_id: u64) -> Result<()> {
         self.ensure_user_channel_rows(channel_id, &[user_id])
             .await?;

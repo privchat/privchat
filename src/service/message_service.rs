@@ -526,6 +526,23 @@ impl MessageService {
             revoker_id
         );
 
+        // 撤回的消息不再占未读角标。这里是两个撤回入口（用户撤回 / admin 撤回）的公共
+        // 收口，而两边都先校验过 `message.revoked` 才进来，所以这段每条消息只会跑一次，
+        // 不会重复扣。
+        //
+        // 没有 pts 的消息从未进入过时间线，也就从未被计入谁的未读，跳过。
+        if let Some(pts) = revoked_msg.pts {
+            if let Err(e) = self
+                .channel_service
+                .discount_unread_for_revoked_message(channel_id, pts, revoked_msg.sender_id)
+                .await
+            {
+                // 角标没扣成不该让撤回失败：消息已经标成撤回了，硬失败只会让客户端重试
+                // 一个已经完成的撤回。
+                warn!("⚠️ 撤回后扣减未读失败 message_id={}: {}", message_id, e);
+            }
+        }
+
         // 2. 发布 MessageRevoked 事件
         if let Some(event_bus) = crate::handler::send_message_handler::get_global_event_bus() {
             let event = crate::domain::events::DomainEvent::MessageRevoked {
