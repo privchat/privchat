@@ -459,8 +459,8 @@ impl PushPlanner {
         };
 
         info!(
-            "[PUSH PLANNER] Received MessageDelivered: message_id={}, device_id={}",
-            message_id, device_id
+            "[PUSH PLANNER] Received MessageDelivered: message_id={}, user_id={}, device_id={}",
+            message_id, user_id, device_id
         );
 
         // 取消这条消息对该用户的推送。
@@ -476,6 +476,19 @@ impl PushPlanner {
                 .mark_cancelled_by_device(&device_id, Some(message_id))
                 .await
         };
+        if count == 0 {
+            // 只在"这条消息确实有 intent、却没有一条属于该用户"时才出声。
+            //
+            // 发送者自己的那份投递也会走到这里（他的其它设备要收到回显），而发送者
+            // 从来没有 intent——无条件打日志的话，每条消息都会报一次"未取消"。
+            let known = self.intent_state.debug_intents_for_message(message_id).await;
+            if !known.is_empty() {
+                debug!(
+                    "[PUSH PLANNER] MessageDelivered 未取消任何 intent: message_id={}, user_id={}, intents_for_message={:?}",
+                    message_id, user_id, known,
+                );
+            }
+        }
         if count > 0 {
             info!(
                 "[PUSH PLANNER] {} intent(s) cancelled for device {} (message {})",

@@ -217,6 +217,30 @@ impl IntentStateManager {
         count
     }
 
+    /// 诊断用：这条消息名下都有哪些 intent、各自什么状态、属于哪个用户。
+    pub async fn debug_intents_for_message(&self, message_id: u64) -> Vec<(String, String)> {
+        let ids = {
+            let map = self.intent_by_message.read().await;
+            map.get(&message_id).cloned().unwrap_or_default()
+        };
+        let status = self.intent_status.read().await;
+        let by_user = self.intents_by_user.read().await;
+        ids.into_iter()
+            .map(|id| {
+                let st = status
+                    .get(&id)
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|| "missing".to_string());
+                let owner = by_user
+                    .iter()
+                    .find(|(_, v)| v.contains(&id))
+                    .map(|(u, _)| u.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                (id, format!("{st}/user={owner}"))
+            })
+            .collect()
+    }
+
     /// 清理已完成的 Intent（可选，防止内存泄漏）
     pub async fn cleanup_completed(&self, _intent_id: &str) {
         // 从所有映射中移除
