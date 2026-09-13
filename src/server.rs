@@ -69,10 +69,49 @@ fn sanitize_inbound_payload_for_log(payload: &str) -> String {
             value.to_string()
         }
         Err(_) if looks_like_jwt(payload) => "<redacted jwt-like payload>".to_string(),
-        Err(_) => payload.to_string(),
+        // 🔴 解析不出 JSON 的一律不落原文。
+        //
+        // 以前这里是 `payload.to_string()`——原样打印。而入站包的主力是 FlatBuffers 帧，
+        // 它永远解析不成 JSON，于是每一个包的原始字节都进了 info 日志：消息正文、
+        // 推送 token（生产 journald 里能直接读到完整 APNs token）、帧里夹带的一切。
+        // 脱敏只在"恰好是 JSON"时生效，等于对真实流量几乎不生效。
+        //
+        // 帧里嵌着的 JSON body 由 RPC 层解析后自己按需记录（那条路径走 redact），
+        // 这里只需要知道"收到了多大的包"。
+        Err(_) => format!("<{} bytes non-json payload>", payload.len()),
     };
 
     truncate_for_log(sanitized, MAX_INBOUND_LOG_PAYLOAD_CHARS)
+}
+
+#[cfg(test)]
+mod inbound_log_sanitize_tests {
+    use super::sanitize_inbound_payload_for_log;
+
+    /// 🔴 解析不出 JSON 的 payload 一个字节都不能落进日志。
+    ///
+    /// 入站包绝大多数是 FlatBuffers 帧，永远解析不成 JSON。这条兜底以前是"原样打印"，
+    /// 于是帧里夹带的消息正文和 APNs push token 全进了 info 日志——生产 journald 里
+    /// 能直接读到完整 token。脱敏函数当时是有的，只是对真实流量几乎不生效。
+    #[test]
+    fn non_json_payload_is_never_echoed() {
+        let frame = "\u{0}\u{1}{\"push_token\":\"8073dba2f608\"}\u{0}";
+        let logged = sanitize_inbound_payload_for_log(frame);
+        assert!(
+            !logged.contains("8073dba2f608"),
+            "帧里的 token 泄漏进了日志: {logged}"
+        );
+        assert!(logged.contains("bytes non-json payload"), "应当只报长度: {logged}");
+    }
+
+    /// 是 JSON 的照旧走字段级脱敏，可读性不能一起丢掉。
+    #[test]
+    fn json_payload_keeps_shape_but_redacts_secrets() {
+        let logged =
+            sanitize_inbound_payload_for_log(r#"{"route":"device/push/update","push_token":"abc123"}"#);
+        assert!(logged.contains("device/push/update"), "非敏感字段要保留: {logged}");
+        assert!(!logged.contains("abc123"), "token 必须被脱敏: {logged}");
+    }
 }
 
 fn redact_sensitive_log_fields(value: &mut Value) {
