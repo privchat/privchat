@@ -269,7 +269,7 @@ pub struct JwtConfig {
     pub kid: String,
     /// access token TTL 秒；spec 锁定 1h
     pub access_ttl_secs: i64,
-    /// refresh token TTL 秒；spec 锁定 7d
+    /// refresh token TTL 秒
     pub refresh_ttl_secs: i64,
     /// 颁发方 issuer claim；锁定 "privchat-server"
     pub issuer: String,
@@ -286,8 +286,16 @@ impl Default for JwtConfig {
             public_key_path: String::new(),
             kid: "v1".to_string(),
             access_ttl_secs: 3600,
-            // 30 天（之前 7 天偏短）。access 1h 不变，靠静默 refresh；30 天让长期活跃用户不掉线。
-            refresh_ttl_secs: 2592000,
+            // 一年。access 1h 不变，靠静默 refresh 续；每次刷新重新签发，所以这是个滑动窗口——
+            // 真正决定「多久不打开就被登出」的正是这个数。
+            //
+            // 之前是 30 天，含义是「一个月没打开 App 的用户，下次打开被踢回登录页」。掉线的不是
+            // 攻击者，是那些本来还会回来的用户，而重新登录要收验证码——相当一部分人就此不回来了。
+            // 微信/Telegram 的会话基本是「除非主动吊销否则不过期」，一年已经接近这个体感。
+            //
+            // 安全性不靠这个 TTL 兜底：改密码会抬高 session_version，一次作废该用户所有会话，
+            // 那才是真正的吊销开关，而且立刻生效——比等 token 自然过期快得多。
+            refresh_ttl_secs: 31536000,
             issuer: "privchat-server".to_string(),
             default_audience: vec![
                 "privchat-application".to_string(),

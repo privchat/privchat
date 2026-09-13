@@ -92,7 +92,7 @@ algorithm        = "HS256"
 secret           = "CHANGE_ME_jwt_hs256_secret"
 kid              = "v1"
 access_ttl_secs  = 3600
-refresh_ttl_secs = 2592000
+refresh_ttl_secs = 31536000   # 1 年滑动窗口；决定「多久不打开就被登出」
 issuer           = "privchat-server"
 default_audience = ["privchat-application", "privchat-server"]
 
