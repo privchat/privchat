@@ -132,7 +132,7 @@ impl PushPlanner {
                     }
                 }
                 Ok(event @ DomainEvent::MessageRevoked { .. }) => {
-                    if let Err(e) = self.handle_message_revoked(event).await {
+                    if let Err(e) = self.handle_message_revoked(event, &sender).await {
                         error!("[PUSH PLANNER] Failed to handle MessageRevoked: {}", e);
                     }
                 }
@@ -391,14 +391,28 @@ impl PushPlanner {
     }
 
     /// 处理消息撤销事件（Phase 3）
-    async fn handle_message_revoked(&self, event: DomainEvent) -> Result<()> {
-        let message_id = match event {
-            DomainEvent::MessageRevoked { message_id, .. } => message_id,
+    async fn handle_message_revoked(
+        &self,
+        event: DomainEvent,
+        sender: &tokio::sync::mpsc::Sender<PushIntent>,
+    ) -> Result<()> {
+        let (message_id, conversation_id) = match event {
+            DomainEvent::MessageRevoked {
+                message_id,
+                conversation_id,
+                ..
+            } => (message_id, conversation_id),
             _ => {
                 error!("[PUSH PLANNER] Unexpected event type in handle_message_revoked");
                 return Ok(());
             }
         };
+        // 谁曾经为这条消息排过推送，就给谁补一条"删通知"的静默推送。
+        // 必须在 mark_revoked 之前取：那之后状态就不是 Pending 了，但名单还在。
+        let notified_users = self
+            .intent_state
+            .users_with_intents_for_message(message_id)
+            .await;
 
         info!(
             "[PUSH PLANNER] Received MessageRevoked: message_id={}",
@@ -407,6 +421,49 @@ impl PushPlanner {
 
         // 标记 Intent 为 revoked（Phase 3.5: 返回取消的数量）
         let count = self.intent_state.mark_revoked(message_id).await;
+        // 🔴 标记只能拦住"还没发出去"的那些。
+        //
+        // 已经投递到设备上的通知，APNs 没有任何接口能收回——只能再发一条静默推送，
+        // 请客户端自己把那条删掉。所以这里对所有曾经排过推送的用户都补一条：
+        // 没发出去的那份刚被标成 revoked，多发一条静默推送客户端找不到对应通知，
+        // 是个无害的空操作；漏发才是有代价的（撤回了，通知还挂在别人锁屏上）。
+        for user_id in notified_users {
+            let intent_id = Uuid::new_v4().to_string();
+            let intent = PushIntent::new(
+                intent_id,
+                message_id,
+                conversation_id,
+                user_id,
+                String::new(),
+                0,
+                PushPayload {
+                    r#type: "revoke".to_string(),
+                    conversation_id,
+                    channel_type: 0,
+                    unread_total: 0,
+                    message_type: String::new(),
+                    show_preview: false,
+                    message_id,
+                    sender_id: 0,
+                    content_preview: String::new(),
+                },
+                chrono::Utc::now().timestamp(),
+                // 立刻发：这条是去删通知的，晚一秒用户就多看一秒不该看到的内容。
+                chrono::Utc::now().timestamp_millis(),
+            );
+            if let Err(e) = sender.send(intent).await {
+                warn!(
+                    "[PUSH PLANNER] 撤回静默推送入队失败 user={}, message={}: {}",
+                    user_id, message_id, e
+                );
+            } else {
+                info!(
+                    "[PUSH PLANNER] Revoke silent push queued: user={}, message={}",
+                    user_id, message_id
+                );
+            }
+        }
+
         if count > 0 {
             info!(
                 "[PUSH PLANNER] {} intent(s) marked as revoked for message {}",

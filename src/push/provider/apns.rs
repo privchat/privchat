@@ -123,8 +123,29 @@ impl ApnsProvider {
         Ok(token)
     }
 
+    /// 撤回通知：静默推送，唯一目的是让客户端把**已经投递**的那条通知删掉。
+    ///
+    /// 🔴 APNs 没有"撤回已投递通知"的接口，服务端只能请客户端自己删。
+    ///
+    /// 所以这条推送不带 alert / sound / badge——带了就会在用户屏幕上多弹一条
+    /// "某条消息被撤回了"，那比留着原通知更吵。content-available=1 把 App 唤起来，
+    /// 由它按 message_id 删掉对应的那条。
+    fn build_revoke_payload(task: &PushTask) -> serde_json::Value {
+        json!({
+            "aps": { "content-available": 1 },
+            "data": {
+                "type": "revoke",
+                "conversation_id": task.payload.conversation_id.to_string(),
+                "message_id": task.payload.message_id.to_string(),
+            }
+        })
+    }
+
     /// 构建 APNs 消息 payload
     fn build_apns_payload(task: &PushTask) -> serde_json::Value {
+        if task.payload.r#type == "revoke" {
+            return Self::build_revoke_payload(task);
+        }
         // 语言由设备上报（privchat_user_devices.locale）。iOS 的 alert 是系统直接
         // 展示的，App 没有机会本地化，所以只能在这里定。
         let locale = crate::push::types::locale::PushLocale::parse(task.locale.as_deref());
@@ -192,6 +213,10 @@ impl PushProvider for ApnsProvider {
             + PUSH_TTL_SECS;
         // collapse-id 上限 64 字节，会话 id 远在其内。
         let collapse_id = format!("conv-{}", task.payload.conversation_id);
+        // 撤回是静默推送：Apple 对 background 类型有独立要求——push-type 必须是
+        // background，priority 必须是 5（用 10 会被拒），而且不能参与 alert 的
+        // collapse，否则会把同会话那条真通知顶掉。
+        let is_revoke = task.payload.r#type == "revoke";
 
         info!(
             "[APNs] Sending push: task_id={}, user_id={}, device_id={}",
@@ -199,20 +224,25 @@ impl PushProvider for ApnsProvider {
         );
 
         // 4. 发送 HTTP/2 请求
-        let response = self
+        let mut request = self
             .client
             .post(&url)
             .header("authorization", format!("bearer {}", jwt_token))
             .header("apns-topic", &self.bundle_id)
-            .header("apns-priority", "10")
-            .header("apns-push-type", "alert")
+            .header("apns-priority", if is_revoke { "5" } else { "10" })
+            .header("apns-push-type", if is_revoke { "background" } else { "alert" })
             // 一条消息只有一次机会：设备离线超过一天再上线时，补投一堆隔夜通知
             // 只会淹掉当下真正要看的东西。到点 Apple 自己丢弃。
             .header("apns-expiration", expiration.to_string())
             // 同会话去重：Apple 只保留同一个 collapse-id 的最后一条。锁屏上因此
             // 是"这个会话有新消息"，而不是同一个人刷屏刷出二十条通知。
-            .header("apns-collapse-id", collapse_id)
-            .json(&payload)
+            .json(&payload);
+        if !is_revoke {
+            // 同会话去重：Apple 只保留同一个 collapse-id 的最后一条。锁屏上因此
+            // 是"这个会话有新消息"，而不是同一个人刷屏刷出二十条通知。
+            request = request.header("apns-collapse-id", collapse_id);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| ServerError::Internal(format!("APNs request failed: {}", e)))?;

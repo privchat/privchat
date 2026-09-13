@@ -217,6 +217,29 @@ impl IntentStateManager {
         count
     }
 
+    /// 这条消息曾经为哪些用户排过推送。
+    ///
+    /// 撤回时要给这些人补一条静默推送去删通知——**包括状态已经是 Sent 的**：
+    /// 恰恰是那些已经发出去的才需要删，没发出去的直接标 revoked 就够了。
+    pub async fn users_with_intents_for_message(&self, message_id: u64) -> Vec<u64> {
+        let ids = {
+            let map = self.intent_by_message.read().await;
+            map.get(&message_id).cloned().unwrap_or_default()
+        };
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let by_user = self.intents_by_user.read().await;
+        let mut users: Vec<u64> = by_user
+            .iter()
+            .filter(|(_, intents)| intents.iter().any(|i| ids.contains(i)))
+            .map(|(user, _)| *user)
+            .collect();
+        users.sort_unstable();
+        users.dedup();
+        users
+    }
+
     /// 诊断用：这条消息名下都有哪些 intent、各自什么状态、属于哪个用户。
     pub async fn debug_intents_for_message(&self, message_id: u64) -> Vec<(String, String)> {
         let ids = {
