@@ -959,10 +959,22 @@ impl ConnectionManager {
                     // Queue overflow is positive evidence of a slow consumer. Keeping that
                     // socket alive only accumulates more data, so fail closed and let the
                     // durable offline/PTS paths recover the client after reconnect.
+                    //
+                    // 🔴 写超时同样按"连接已死"处理，不能留着。
+                    //
+                    // 留着的代价不是多占一个 socket，而是**服务端对外谎报这个用户在线**：
+                    // 推送决策只在消息提交那一刻做一次，依据就是 ConnectionManager。
+                    // iOS 把 App 挂起之后 socket 不再被消费，写必然超时，而连接还挂在
+                    // 索引里——于是后续每一条消息都继续走直投、继续超时，一条推送都不发。
+                    // 实测用户按下 Home 之后的几十秒里，消息既没送达也没有通知。
+                    //
+                    // 超时的语义本来就是"对面在合理时间内没有收"，与 DeadConnection 无异；
+                    // 真正只是网络抖动的话，客户端重连后走 PTS 补齐，代价是可恢复的。
                     let cleaned_up = if matches!(
                         classification,
                         DeliveryFailureClassification::DeadConnection
                             | DeliveryFailureClassification::SlowConsumer
+                            | DeliveryFailureClassification::RouteTimeout
                     ) {
                         self.force_close_session(session_id).await;
                         self.unregister_connection(session_id)

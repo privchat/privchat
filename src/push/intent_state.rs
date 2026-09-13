@@ -184,6 +184,39 @@ impl IntentStateManager {
         count
     }
 
+    /// 按「消息 + 用户」取消 Intent。
+    ///
+    /// 长连接投递成功时用它把这条消息的推送拦下来。不能复用 mark_cancelled(user_id)：
+    /// 那会把该用户**所有**待发推送都取消掉，包括其它会话里他还没收到的消息。
+    /// 也不能复用 mark_cancelled_by_device：用户级 Intent 的 device_id 是空串。
+    pub async fn mark_cancelled_by_message_user(&self, message_id: u64, user_id: u64) -> usize {
+        let intent_ids = {
+            let map = self.intent_by_message.read().await;
+            map.get(&message_id).cloned().unwrap_or_default()
+        };
+        if intent_ids.is_empty() {
+            return 0;
+        }
+        let user_intents = {
+            let map = self.intents_by_user.read().await;
+            map.get(&user_id).cloned().unwrap_or_default()
+        };
+        let mut count = 0;
+        let mut status = self.intent_status.write().await;
+        for intent_id in intent_ids {
+            if !user_intents.contains(&intent_id) {
+                continue;
+            }
+            if let Some(st) = status.get_mut(&intent_id) {
+                if *st == IntentStatus::Pending {
+                    *st = IntentStatus::Cancelled;
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// 清理已完成的 Intent（可选，防止内存泄漏）
     pub async fn cleanup_completed(&self, _intent_id: &str) {
         // 从所有映射中移除
@@ -195,5 +228,50 @@ impl IntentStateManager {
 impl Default for IntentStateManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 长连接把消息送到了 → 这条消息对这个用户的推送必须被取消。
+    ///
+    /// 🔴 只能取消「这一条」，不能牵连该用户其它会话里待发的推送。
+    /// mark_cancelled(user_id) 会把用户所有待发推送一起清掉，那会让他错过
+    /// 其它会话真正没收到的消息——这正是不复用它的原因。
+    #[tokio::test]
+    async fn delivery_cancels_only_that_message_for_that_user() {
+        let state = IntentStateManager::new();
+        state.register_intent("i-a", 100, 52).await;
+        state.register_intent("i-b", 200, 52).await; // 同一用户，另一条消息
+        state.register_intent("i-c", 100, 99).await; // 同一条消息，另一个用户
+
+        let cancelled = state.mark_cancelled_by_message_user(100, 52).await;
+        assert_eq!(cancelled, 1);
+
+        assert_eq!(state.get_status("i-a").await, Some(IntentStatus::Cancelled));
+        assert_eq!(
+            state.get_status("i-b").await,
+            Some(IntentStatus::Pending),
+            "同一用户的其它消息不该被牵连"
+        );
+        assert_eq!(
+            state.get_status("i-c").await,
+            Some(IntentStatus::Pending),
+            "同一条消息发给别人的那份不该被牵连"
+        );
+    }
+
+    /// 撤回把这条消息的所有 Intent 都标成 revoked（含多设备）。
+    #[tokio::test]
+    async fn revoke_covers_every_device_of_that_message() {
+        let state = IntentStateManager::new();
+        state.register_device_intent("d1", 300, 52, "iphone").await;
+        state.register_device_intent("d2", 300, 52, "ipad").await;
+
+        assert_eq!(state.mark_revoked(300).await, 2);
+        assert_eq!(state.get_status("d1").await, Some(IntentStatus::Revoked));
+        assert_eq!(state.get_status("d2").await, Some(IntentStatus::Revoked));
     }
 }

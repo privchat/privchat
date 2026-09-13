@@ -35,6 +35,15 @@ use uuid::Uuid;
 /// - 检查用户是否在线（查询 Redis Presence）
 /// - 如果离线，生成 PushIntent 并发送到 Worker
 /// - 处理 MessageRevoked 和 UserOnline 事件（Phase 3）
+/// 推送发出前的可取消窗口（毫秒）。
+///
+/// 这几秒是留给"真实送达"的：收件人在线时回执几百毫秒就回来，窗口内取消，他不会被通知；
+/// 发送者几秒内撤回同样能把推送拦下来——APNs 一旦投递就再也收不回，只能在发之前拦。
+///
+/// 取值是个权衡：太短则回执来不及、在线用户会被通知打扰；太长则真正离线的人收到通知变慢。
+/// 2 秒足够覆盖一次往返回执，而用户对"消息到手机"的感知阈值远在这之上。
+const PUSH_CANCEL_WINDOW_MS: i64 = 2_000;
+
 pub struct PushPlanner {
     redis: Option<Arc<RedisClient>>,
     connection_manager: Option<Arc<ConnectionManager>>,
@@ -270,6 +279,7 @@ impl PushPlanner {
                     content_preview,
                 },
                 timestamp,
+                chrono::Utc::now().timestamp_millis() + PUSH_CANCEL_WINDOW_MS,
             );
 
             // 注册设备级 Intent
@@ -292,18 +302,20 @@ impl PushPlanner {
             return Ok(());
         }
 
-        // 兼容旧逻辑：检查用户是否在线（ConnectionManager 为在线态真源）
-        let is_online = self.check_user_online(recipient_id).await?;
-
-        if is_online {
-            debug!("[PUSH PLANNER] User {} is online, skip push", recipient_id);
-            return Ok(());
-        }
-
+        // 🔴 不再用"提交那一刻在不在线"决定推不推。
+        //
+        // 那个判断在 iOS 上是错的：App 被挂起之后 socket 还挂在 ConnectionManager 里，
+        // 看起来在线，实际没人消费——直投 5 秒超时，而推送早就被跳过了，用户什么都收不到。
+        // 实测按下 Home 之后的几十秒内消息既不送达也不通知。
+        //
+        // 改成：一律先排一条延迟推送，谁真的收到了谁来取消（送达回执 / 设备上线 / 撤回）。
+        // 在线用户的回执几百毫秒就回来了，PUSH_CANCEL_WINDOW 内取消，他不会收到通知；
+        // 真没收到的，窗口一过就推出去。判据从"我猜你在线"变成"你确实收到了"。
         debug!(
-            "[PUSH PLANNER] User {} is offline, generating push intent (legacy mode)",
-            recipient_id
+            "[PUSH PLANNER] Scheduling delayed push intent for user {} (cancellable within {}ms)",
+            recipient_id, PUSH_CANCEL_WINDOW_MS
         );
+        let not_before_ms = chrono::Utc::now().timestamp_millis() + PUSH_CANCEL_WINDOW_MS;
 
         // 生成用户级 PushIntent（兼容旧逻辑）
         let intent_id = Uuid::new_v4().to_string();
@@ -326,6 +338,7 @@ impl PushPlanner {
                 content_preview,
             },
             timestamp,
+            not_before_ms,
         );
 
         // 注册 Intent（兼容旧逻辑）
@@ -432,12 +445,13 @@ impl PushPlanner {
 
     /// ✨ Phase 3.5: 处理消息已送达事件
     async fn handle_message_delivered(&self, event: DomainEvent) -> Result<()> {
-        let (message_id, device_id) = match event {
+        let (message_id, user_id, device_id) = match event {
             DomainEvent::MessageDelivered {
                 message_id,
+                user_id,
                 device_id,
                 ..
-            } => (message_id, device_id),
+            } => (message_id, user_id, device_id),
             _ => {
                 error!("[PUSH PLANNER] Unexpected event type in handle_message_delivered");
                 return Ok(());
@@ -449,11 +463,19 @@ impl PushPlanner {
             message_id, device_id
         );
 
-        // 取消该设备对应的 Push Intent
-        let count = self
-            .intent_state
-            .mark_cancelled_by_device(&device_id, Some(message_id))
-            .await;
+        // 取消这条消息对该用户的推送。
+        //
+        // device_id 为空 = 用户级送达回执（长连接投递成功），按「消息 + 用户」取消；
+        // 非空则是设备级，按设备取消。
+        let count = if device_id.is_empty() {
+            self.intent_state
+                .mark_cancelled_by_message_user(message_id, user_id)
+                .await
+        } else {
+            self.intent_state
+                .mark_cancelled_by_device(&device_id, Some(message_id))
+                .await
+        };
         if count > 0 {
             info!(
                 "[PUSH PLANNER] {} intent(s) cancelled for device {} (message {})",

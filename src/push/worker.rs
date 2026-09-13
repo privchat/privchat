@@ -36,8 +36,17 @@ use uuid::Uuid;
 /// - 展开 Intent 为设备级 PushTask
 /// - 调用 Provider 发送推送
 /// - 检查 Intent 状态（撤销/取消）
+/// Worker 的无接收端部分：可 clone，供每条 intent 的独立任务持有。
+///
+/// 拆出来是因为每条 intent 都要先等到 not_before 才发，而 worker 主循环是串行消费的——
+/// 在循环里等，一条 intent 就把整个队列堵住几秒。
 pub struct PushWorker {
     receiver: mpsc::Receiver<PushIntent>,
+    dispatcher: PushDispatcher,
+}
+
+#[derive(Clone)]
+pub struct PushDispatcher {
     mock_provider: Arc<MockProvider>,
     fcm_provider: Option<Arc<FcmProvider>>, // Phase 2: FCM Provider（可选）
     apns_provider: Option<Arc<ApnsProvider>>, // Phase 3: APNs Provider（可选）
@@ -57,6 +66,7 @@ impl PushWorker {
     pub fn new(receiver: mpsc::Receiver<PushIntent>) -> Self {
         Self {
             receiver,
+            dispatcher: PushDispatcher {
             mock_provider: Arc::new(MockProvider),
             fcm_provider: None,
             apns_provider: None,
@@ -70,6 +80,7 @@ impl PushWorker {
             meizu_provider: None,
             device_repo: None,
             intent_state: None,
+            },
         }
     }
 
@@ -80,6 +91,7 @@ impl PushWorker {
     ) -> Self {
         Self {
             receiver,
+            dispatcher: PushDispatcher {
             mock_provider: Arc::new(MockProvider),
             fcm_provider: None,
             apns_provider: None,
@@ -93,6 +105,7 @@ impl PushWorker {
             meizu_provider: None,
             device_repo: Some(device_repo),
             intent_state: None,
+            },
         }
     }
 
@@ -114,6 +127,7 @@ impl PushWorker {
     ) -> Self {
         Self {
             receiver,
+            dispatcher: PushDispatcher {
             mock_provider: Arc::new(MockProvider),
             fcm_provider,
             apns_provider,
@@ -127,6 +141,7 @@ impl PushWorker {
             meizu_provider,
             device_repo: Some(device_repo),
             intent_state: Some(intent_state),
+            },
         }
     }
 
@@ -134,20 +149,39 @@ impl PushWorker {
     pub async fn start(&mut self) -> Result<()> {
         info!("[PUSH WORKER] Started");
 
+        // 🔴 每条 intent 起一个任务，不能在循环里 await。
+        //
+        // 每条 intent 都要先等到 not_before（给送达回执/撤回留出取消窗口），串行等待会让
+        // 一条消息把整个推送队列堵住几秒——高峰期就是全站推送停摆。
         while let Some(intent) = self.receiver.recv().await {
-            if let Err(e) = self.process_intent(intent).await {
-                error!("[PUSH WORKER] Failed to process intent: {}", e);
-            }
+            let dispatcher = self.dispatcher.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dispatcher.process_intent(intent).await {
+                    error!("[PUSH WORKER] Failed to process intent: {}", e);
+                }
+            });
         }
 
         Ok(())
     }
+}
 
+impl PushDispatcher {
     async fn process_intent(&self, intent: PushIntent) -> Result<()> {
         info!(
             "[PUSH WORKER] Processing intent: intent_id={}, user_id={}, message_id={}",
             intent.intent_id, intent.user_id, intent.message_id
         );
+
+        // 🔴 先等到 not_before，再检查状态——顺序不能反。
+        //
+        // 这几秒就是"让真实送达来取消推送"的窗口：等待期间收件人真收到了消息、
+        // 或者发送者撤回了，下面的状态检查就会把这条 intent 拦掉。
+        // 先检查后等待等于没等：检查那一刻回执还没到。
+        let wait_ms = intent.not_before_ms - chrono::Utc::now().timestamp_millis();
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms as u64)).await;
+        }
 
         // Phase 3: 检查 Intent 状态（撤销/取消）
         if let Some(intent_state) = &self.intent_state {

@@ -106,6 +106,15 @@ pub struct PushIntent {
     pub payload: PushPayload,
     pub created_at: i64,
     pub status: IntentStatus,
+    /// 最早可发送时刻（epoch 毫秒）。
+    ///
+    /// 🔴 推送**故意压后几秒**，这是整条链路的关键设计。
+    ///
+    /// 收件人此刻在不在线，服务端在消息提交那一刻是猜不准的：iOS 把 App 挂起之后
+    /// socket 还挂在索引里，看起来在线，其实没人收。所以不再猜——先排一条推送，
+    /// 谁真的收到了（送达回执 / 设备上线 / 撤回）谁来取消它。
+    /// 这个窗口同时给了"撤回能收回通知"一个机会：几秒内撤回，推送根本不会发出去。
+    pub not_before_ms: i64,
 }
 
 impl PushIntent {
@@ -118,8 +127,10 @@ impl PushIntent {
         sender_id: u64,
         payload: PushPayload,
         created_at: i64,
+        not_before_ms: i64,
     ) -> Self {
         Self {
+            not_before_ms,
             intent_id,
             message_id,
             conversation_id,

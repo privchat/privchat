@@ -603,6 +603,25 @@ impl CommittedTimelineDeliveryService {
             .await
         {
             Ok(route) if route.success_count > 0 => {
+                // 🔴 长连接投递成功 → 告诉 Push Planner 把这条的推送取消掉。
+                //
+                // DomainEvent::MessageDelivered 以前**从来没有人发布过**：planner 里那个
+                // handler 是死代码，"送达即取消推送"的设计存在于代码里但从未生效。
+                // 而现在推送改成了延迟发送、靠取消来避免打扰在线用户——这条事件就是唯一的
+                // 取消来源，不发布的话在线用户会被自己正在看的消息通知一遍。
+                if let Some(event_bus) = crate::handler::send_message_handler::get_global_event_bus() {
+                    let event = crate::domain::events::DomainEvent::MessageDelivered {
+                        message_id: claim.server_msg_id as u64,
+                        user_id: claim.user_id as u64,
+                        device_id: String::new(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    };
+                    if let Err(error) = event_bus.publish(event) {
+                        tracing::warn!(
+                            "发布 MessageDelivered 失败（该消息的推送将照常发出）: {error}"
+                        );
+                    }
+                }
                 if let Some(ack_session_id) = route
                     .delivery_report
                     .as_ref()
