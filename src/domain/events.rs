@@ -63,6 +63,20 @@ pub enum DomainEvent {
         timestamp: i64,
     },
 
+    /// 收到好友申请。
+    ///
+    /// 与消息不同，它不属于任何会话，也没有 message_id——之前整条路只有
+    /// `connection_manager.send_push_to_user` 这一下 socket 广播，对端没有活跃
+    /// session 时直接返回空报告，于是 App 被杀掉时好友申请一点动静都没有，
+    /// 用户只能等下次打开才发现。
+    FriendRequestReceived {
+        requester_id: u64,
+        /// 申请人的展示名，用于通知正文。取不到时留空，客户端/兜底文案自行处理。
+        requester_name: String,
+        target_user_id: u64,
+        timestamp: i64,
+    },
+
     /// 设备上线（Phase 3.5，替代 UserOnline 用于设备级取消）
     DeviceOnline {
         user_id: u64,

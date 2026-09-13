@@ -146,6 +146,11 @@ impl PushPlanner {
                         error!("[PUSH PLANNER] Failed to handle MessageDelivered: {}", e);
                     }
                 }
+                Ok(event @ DomainEvent::FriendRequestReceived { .. }) => {
+                    if let Err(e) = self.handle_friend_request_received(event, &sender).await {
+                        error!("[PUSH PLANNER] Failed to handle FriendRequestReceived: {}", e);
+                    }
+                }
                 Ok(event @ DomainEvent::DeviceOnline { .. }) => {
                     if let Err(e) = self.handle_device_online(event).await {
                         error!("[PUSH PLANNER] Failed to handle DeviceOnline: {}", e);
@@ -391,6 +396,99 @@ impl PushPlanner {
     }
 
     /// 处理消息撤销事件（Phase 3）
+    /// 好友申请 → 远程推送。
+    ///
+    /// 好友申请此前只有 `connection_manager.send_push_to_user` 那一下 socket 广播：
+    /// 对端没有活跃 session 时它直接返回空报告，没有离线队列也没有 APNs/FCM 兜底。
+    /// 结果是 App 被杀掉时收到的好友申请毫无动静，只能等下次打开才发现。
+    ///
+    /// 与消息推送的差别只有两处：没有会话（conversation_id / message_id 记 0），
+    /// 以及正文用申请人的名字而不是消息预览。延迟窗口和取消机制照旧——用户要是
+    /// 真在线，socket 那条已经送到，`UserOnline` 会在窗口内把这条 intent 取消掉。
+    async fn handle_friend_request_received(
+        &self,
+        event: DomainEvent,
+        sender: &tokio::sync::mpsc::Sender<PushIntent>,
+    ) -> Result<()> {
+        let (requester_id, requester_name, target_user_id, timestamp) = match event {
+            DomainEvent::FriendRequestReceived {
+                requester_id,
+                requester_name,
+                target_user_id,
+                timestamp,
+            } => (requester_id, requester_name, target_user_id, timestamp),
+            _ => {
+                error!("[PUSH PLANNER] Unexpected event type in handle_friend_request_received");
+                return Ok(());
+            }
+        };
+
+        // 与消息路径同一条原则：读不到收件人的免打扰/预览设置就不推。
+        // 按默认值推会把申请人的名字推到一个关掉了预览的用户的锁屏上，而那是不可撤销的。
+        let ctx = match &self.device_repo {
+            Some(repo) => match repo.load_push_context(target_user_id, 0).await {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    error!(
+                        "[PUSH PLANNER] 读取 user {} 的推送上下文失败，放弃好友申请推送: {}",
+                        target_user_id, e
+                    );
+                    return Ok(());
+                }
+            },
+            None => crate::repository::user_device_repo::PushContext::default(),
+        };
+
+        if ctx.global_mute {
+            debug!(
+                "[PUSH PLANNER] user {} 开启了全局免打扰，跳过好友申请推送",
+                target_user_id
+            );
+            return Ok(());
+        }
+
+        let not_before_ms = chrono::Utc::now().timestamp_millis() + PUSH_CANCEL_WINDOW_MS;
+        let intent_id = Uuid::new_v4().to_string();
+        let intent = PushIntent::new(
+            intent_id.clone(),
+            0,
+            0,
+            target_user_id,
+            String::new(),
+            requester_id,
+            PushPayload {
+                r#type: PushPayload::TYPE_FRIEND_REQUEST.to_string(),
+                conversation_id: 0,
+                channel_type: 0,
+                unread_total: ctx.unread_total,
+                message_type: String::new(),
+                show_preview: ctx.show_preview,
+                message_id: 0,
+                sender_id: requester_id,
+                // 好友申请没有正文，这里放申请人的名字供通知渲染。
+                content_preview: requester_name,
+            },
+            timestamp,
+            not_before_ms,
+        );
+
+        self.intent_state
+            .register_intent(&intent_id, 0, target_user_id)
+            .await;
+
+        sender.send(intent).await.map_err(|e| {
+            crate::error::ServerError::Internal(format!(
+                "Failed to send friend request intent to worker: {}",
+                e
+            ))
+        })?;
+        info!(
+            "[PUSH PLANNER] 好友申请推送已排队: requester={} target={}",
+            requester_id, target_user_id
+        );
+        Ok(())
+    }
+
     async fn handle_message_revoked(
         &self,
         event: DomainEvent,

@@ -84,6 +84,35 @@ pub struct PushPayload {
     pub content_preview: String,
 }
 
+impl PushPayload {
+    pub const TYPE_NEW_MESSAGE: &'static str = "new_message";
+    pub const TYPE_FRIEND_REQUEST: &'static str = "friend_request";
+
+    /// 这条推送在通知栏上显示的标题与正文。
+    ///
+    /// 收口在这里而不是各个 provider 里：标题原先是十来个 provider 各自硬编码的
+    /// `"新消息"`，多一种推送类型就要改十来处，漏一处就在那个厂商的手机上显示成
+    /// 「新消息」。
+    pub fn notification_text(&self, locale: locale::PushLocale) -> (String, String) {
+        if self.r#type == Self::TYPE_FRIEND_REQUEST {
+            // 关掉预览的用户连申请人的名字也不该出现在锁屏上。
+            let name = if self.show_preview {
+                self.content_preview.as_str()
+            } else {
+                ""
+            };
+            return (
+                locale.friend_request_title().to_string(),
+                locale.friend_request_body(name),
+            );
+        }
+        (
+            locale.default_title().to_string(),
+            locale.render_body(&self.message_type, &self.content_preview, self.show_preview),
+        )
+    }
+}
+
 /// Intent 状态（Phase 3）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntentStatus {
@@ -211,6 +240,38 @@ pub mod locale {
                 Self::ZhHant => "新訊息",
                 Self::English => "New message",
                 Self::Vietnamese => "Tin nhắn mới",
+            }
+        }
+
+        /// 好友申请的通知标题。
+        pub fn friend_request_title(self) -> &'static str {
+            match self {
+                Self::ZhHans => "好友申请",
+                Self::ZhHant => "好友申請",
+                Self::English => "Friend request",
+                Self::Vietnamese => "Lời mời kết bạn",
+            }
+        }
+
+        /// 好友申请的通知正文。
+        ///
+        /// 名字取不到时退回不带名字的说法，而不是渲染出「 请求添加你为好友」
+        /// 这种前面空一格的句子。
+        pub fn friend_request_body(self, requester_name: &str) -> String {
+            let name = requester_name.trim();
+            if name.is_empty() {
+                return match self {
+                    Self::ZhHans => "有人请求添加你为好友".to_string(),
+                    Self::ZhHant => "有人請求加你為好友".to_string(),
+                    Self::English => "Someone wants to add you as a friend".to_string(),
+                    Self::Vietnamese => "Ai đó muốn kết bạn với bạn".to_string(),
+                };
+            }
+            match self {
+                Self::ZhHans => format!("{name} 请求添加你为好友"),
+                Self::ZhHant => format!("{name} 請求加你為好友"),
+                Self::English => format!("{name} wants to add you as a friend"),
+                Self::Vietnamese => format!("{name} muốn kết bạn với bạn"),
             }
         }
 

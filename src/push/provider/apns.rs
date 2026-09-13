@@ -151,14 +151,10 @@ impl ApnsProvider {
         let locale = crate::push::types::locale::PushLocale::parse(task.locale.as_deref());
         // 非文本消息渲染成 `[图片]` 这类占位符；用户关掉预览时只给通用文案。
         // 裁剪必须在这里做完——alert 一旦发出去就已经在设备上了。
-        let body = locale.render_body(
-            &task.payload.message_type,
-            &task.payload.content_preview,
-            task.payload.show_preview,
-        );
+        let (title, body) = task.payload.notification_text(locale);
         let mut aps = json!({
             "alert": {
-                "title": locale.default_title(),
+                "title": title,
                 "body": body
             },
 
@@ -330,6 +326,43 @@ mod tests {
         assert_eq!(payload["data"]["channel_type"], "2");
         assert_eq!(payload["aps"]["alert"]["body"], "hi");
         assert_eq!(payload["aps"]["thread-id"], "1234");
+    }
+
+    fn friend_request_task(name: &str, show_preview: bool) -> PushTask {
+        let mut t = task(1);
+        t.payload.r#type = crate::push::types::PushPayload::TYPE_FRIEND_REQUEST.into();
+        t.payload.conversation_id = 0;
+        t.payload.message_id = 0;
+        t.payload.message_type = String::new();
+        t.payload.content_preview = name.into();
+        t.payload.show_preview = show_preview;
+        t
+    }
+
+    /// 好友申请的通知要说清楚是谁申请，而不是复用「新消息」。
+    ///
+    /// 在此之前好友申请根本发不出远程推送：只有一条 socket 广播，对端没有活跃
+    /// session 就直接丢弃，App 被杀掉的用户一点动静都收不到。
+    #[test]
+    fn apns_renders_a_friend_request_instead_of_a_new_message() {
+        let payload = ApnsProvider::build_apns_payload(&friend_request_task("Test 2", true));
+        assert_eq!(payload["aps"]["alert"]["title"], "好友申请");
+        assert_eq!(payload["aps"]["alert"]["body"], "Test 2 请求添加你为好友");
+    }
+
+    /// 关掉「显示消息预览」的用户，锁屏上也不该出现申请人的名字。
+    #[test]
+    fn apns_hides_the_requester_name_when_preview_is_off() {
+        let payload = ApnsProvider::build_apns_payload(&friend_request_task("Test 2", false));
+        assert_eq!(payload["aps"]["alert"]["title"], "好友申请");
+        assert_eq!(payload["aps"]["alert"]["body"], "有人请求添加你为好友");
+    }
+
+    /// 名字取不到时不能渲染出前面空一格的句子。
+    #[test]
+    fn apns_friend_request_without_a_name_reads_naturally() {
+        let payload = ApnsProvider::build_apns_payload(&friend_request_task("", true));
+        assert_eq!(payload["aps"]["alert"]["body"], "有人请求添加你为好友");
     }
 
     /// iOS 的 alert 由系统展示，App 没机会本地化：语言必须在服务端定。

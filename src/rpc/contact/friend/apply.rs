@@ -357,7 +357,9 @@ async fn finish_apply(
                     // 1. friend.request.received → target 所有设备；
                     // 2. friend.request.sent → requester 自己所有设备（多端同步）。
                     //
-                    // 仅在线唤醒，离线补偿由 friendships 表 + entity sync 兜底。
+                    // 仅在线唤醒——对端没有活跃 session 时它什么都不做。离线的那份
+                    // 由下面的 FriendRequestReceived 事件走 PushPlanner 发远程推送，
+                    // 外加 friendships 表 + entity sync 在用户下次打开时兜底。
                     push_helpers::push_friend_request_received(
                         &services,
                         from_user_id,
@@ -365,6 +367,38 @@ async fn finish_apply(
                         message,
                     )
                     .await;
+
+                    // 远程推送（APNs / FCM）。socket 那条只覆盖在线设备，App 被杀掉
+                    // 的用户此前对好友申请毫无感知。
+                    if let Some(event_bus) =
+                        crate::handler::send_message_handler::get_global_event_bus()
+                    {
+                        let requester_name = services
+                            .cache_manager
+                            .get_user_profile(from_user_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            // 通知里显示昵称；没设昵称就退回用户名，两者都空时
+                            // 由 locale 的兜底文案给出「有人请求添加你为好友」。
+                            .map(|u| {
+                                if u.nickname.trim().is_empty() {
+                                    u.username
+                                } else {
+                                    u.nickname
+                                }
+                            })
+                            .unwrap_or_default();
+                        let event = crate::domain::events::DomainEvent::FriendRequestReceived {
+                            requester_id: from_user_id,
+                            requester_name,
+                            target_user_id,
+                            timestamp: chrono::Utc::now().timestamp_millis(),
+                        };
+                        if let Err(e) = event_bus.publish(event) {
+                            tracing::warn!("⚠️ 发布 FriendRequestReceived 事件失败: {}", e);
+                        }
+                    }
                     push_helpers::push_friend_request_sent(&services, from_user_id, target_user_id)
                         .await;
                     let publisher =
