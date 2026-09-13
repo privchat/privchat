@@ -127,7 +127,15 @@ impl DeviceManager {
             debug!("更新设备活跃时间: device_id={}", device_id);
             Ok(())
         } else {
-            warn!("设备不存在: device_id={}", device_id);
+            // debug 而不是 warn：`device_index` 是纯内存索引，进程一重启就是空的，
+            // 于是**每台设备重启后的第一次连接**都必然走到这里。而唯一的调用方
+            // （ConnectMessageHandler）本来就把这条错误当成「没见过这台设备」的信号，
+            // 接住并自动注册——这是正常开机路径，不是故障。按 warn 打的结果是每次重启后
+            // 日志里浮起一批「设备不存在」，看着像出了事，实际什么也没发生。
+            //
+            // 下面 update_device_name 的同名日志保持 warn：那里没有自动注册兜底，
+            // 重命名一台不存在的设备是真的不对劲。
+            debug!("设备不存在（调用方将自动注册）: device_id={}", device_id);
             Err(ServerError::NotFound(format!("设备不存在: {}", device_id)))
         }
     }
