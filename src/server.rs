@@ -194,11 +194,41 @@ mod tests {
 
     #[test]
     fn inbound_log_payload_truncates_large_payload() {
+        // 必须拿**能解析成 JSON** 的大 payload 来验截断。
+        //
+        // 这里原来喂的是一长串 `x`，解析不成 JSON。当时非 JSON 的兜底是「原样打印」，
+        // 所以它照样会走到截断；后来兜底改成只记长度（`<N bytes non-json payload>`，
+        // 见 sanitize_inbound_payload_for_log 的注释），产出恒为几十字符，
+        // 再也触发不了截断——这个用例从此测的是一条不存在的路径。
+        // 取远大于上限的体量：只比上限多几个字符的话，截断省下的还没有
+        // `...<truncated N chars>` 这个后缀本身长，"截断后更短"就不成立了。
+        let big = "x".repeat(MAX_INBOUND_LOG_PAYLOAD_CHARS * 4);
+        let payload = format!(r#"{{"text":"{big}"}}"#);
+        let safe = sanitize_inbound_payload_for_log(&payload);
+
+        assert!(
+            safe.contains("...<truncated"),
+            "超长 JSON payload 没有被截断就进了日志: {}",
+            &safe[..safe.len().min(120)]
+        );
+        assert!(
+            safe.chars().count() < payload.chars().count(),
+            "截断后反而更长了：safe={} payload={}",
+            safe.chars().count(),
+            payload.chars().count()
+        );
+    }
+
+    /// 非 JSON 的入站包只报长度，不落原文，因此**短到不需要截断**。
+    ///
+    /// 与上一个用例互补：截断走 JSON 这条路，非 JSON 走的是「一个字节都不落」。
+    #[test]
+    fn inbound_log_payload_reports_only_the_size_of_a_non_json_frame() {
         let payload = "x".repeat(MAX_INBOUND_LOG_PAYLOAD_CHARS + 10);
         let safe = sanitize_inbound_payload_for_log(&payload);
 
-        assert!(safe.contains("...<truncated"));
-        assert!(safe.len() < payload.len() + 20);
+        assert!(!safe.contains("xxx"), "非 JSON 帧的原始字节进了日志: {safe}");
+        assert!(safe.contains(&format!("{} bytes", payload.len())));
     }
 }
 
