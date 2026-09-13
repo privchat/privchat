@@ -78,6 +78,25 @@ impl ChannelType {
     pub fn to_wire_u8(self) -> u8 {
         (self.to_i16() as u8) + 1
     }
+
+    /// 从**线上（wire）表示**解析：Direct=1, Group=2, Room=3。
+    ///
+    /// 🔴 与 [`Self::from_i16`] 差一位，两个千万别用混。
+    ///
+    /// 拿 wire 值直接去 match DB 编号，出来的是"群聊被当成 Room、Room 被当成群聊"，
+    /// 而且不会报错——只是走进了另一条分支。subscribe 处理器就这么错过：客户端订阅
+    /// 群聊（wire 2）被读成 Room，于是去要 room ticket，四天里拒绝了 443 次订阅，
+    /// 所有群聊的实时订阅实际都是失败的。
+    ///
+    /// 返回 None 而不是兜底成 Direct：解析不出来的值是协议错误，不该被悄悄当成单聊。
+    pub fn from_wire_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(ChannelType::Direct),
+            2 => Some(ChannelType::Group),
+            3 => Some(ChannelType::Room),
+            _ => None,
+        }
+    }
 }
 
 /// 频道类型 - 统一抽象所有消息场景（业务层使用）
@@ -1647,5 +1666,41 @@ mod mute_tests {
             mute_reject_message(Some(now - Duration::minutes(1)), now),
             "您已被禁言，剩余 1 分钟"
         );
+    }
+}
+
+#[cfg(test)]
+mod wire_mapping_tests {
+    use super::ChannelType;
+
+    /// wire 与 DB 的编号差一位，而两边都是小整数、混用不会报错——只会安静地走错分支。
+    ///
+    /// 🔴 这正是 subscribe 处理器踩过的：拿 wire 值 match DB 编号，群聊（wire 2）被当成
+    /// Room 去要 ticket，生产上四天拒了 443 次订阅，没有任何报错。
+    #[test]
+    fn wire_and_db_numbering_stay_one_apart() {
+        for ty in [ChannelType::Direct, ChannelType::Group, ChannelType::Room] {
+            assert_eq!(
+                ty.to_wire_u8() as i16,
+                ty.to_i16() + 1,
+                "{ty:?}: wire 必须比 DB 大一"
+            );
+            assert_eq!(
+                ChannelType::from_wire_u8(ty.to_wire_u8()),
+                Some(ty),
+                "{ty:?}: wire 往返必须回到自己"
+            );
+        }
+    }
+
+    /// DB 编号喂进 wire 解析必须**解析不出来**，而不是悄悄变成另一种类型。
+    #[test]
+    fn db_numbering_is_not_accepted_as_wire() {
+        assert_eq!(ChannelType::from_wire_u8(0), None, "DB 的 Direct=0 不是合法 wire 值");
+        assert_eq!(ChannelType::from_wire_u8(4), None);
+        // 1 和 2 在两套编号里都合法，但含义不同——这就是为什么必须显式转换，
+        // 而不能指望"看起来对"。
+        assert_eq!(ChannelType::from_wire_u8(1), Some(ChannelType::Direct));
+        assert_eq!(ChannelType::from_i16(1), ChannelType::Group);
     }
 }

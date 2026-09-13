@@ -161,6 +161,8 @@ impl MessageHandler for SubscribeMessageHandler {
             })?;
 
         let channel_type = subscribe_request.channel_type;
+        // wire 值解析一次，后面全用它——这个文件里三处都曾拿 wire 值直接比 DB 编号。
+        let parsed_channel_type = crate::model::channel::ChannelType::from_wire_u8(channel_type);
         let action = subscribe_request.action;
         let channel_id = subscribe_request.channel_id;
 
@@ -174,9 +176,17 @@ impl MessageHandler for SubscribeMessageHandler {
 
         // 授权检查（仅 subscribe 需要，unsubscribe 无条件放行）
         if action == ACTION_SUBSCRIBE {
-            reason_code = match channel_type {
-                // Private(0) / Group(1)：校验连接绑定的 user_id 是否为频道成员
-                0 | 1 => {
+            // 🔴 channel_type 是 **wire** 值（Direct=1/Group=2/Room=3），不是 DB 编号。
+            //
+            // 这里原来直接 `match channel_type { 0|1 => 成员校验, 2 => Room }`，
+            // 拿 wire 值匹配 DB 编号（Direct=0/Group=1/Room=2），差一位：
+            // 群聊（wire 2）被当成 Room，于是去校验 room ticket 并拒绝——生产日志里
+            // 四天 443 次 "Room N ticket rejected: missing"，涉及的两个 channel
+            // 在库里都是 group_id 非空的群。单聊（wire 1）落进 0|1 分支纯属巧合。
+            reason_code = match parsed_channel_type {
+                // 单聊 / 群聊：校验连接绑定的 user_id 是否为频道成员
+                Some(crate::model::channel::ChannelType::Direct)
+                | Some(crate::model::channel::ChannelType::Group) => {
                     match &context.user_id {
                         Some(uid_str) => {
                             if let Ok(uid) = uid_str.parse::<u64>() {
@@ -213,11 +223,11 @@ impl MessageHandler for SubscribeMessageHandler {
                         }
                     }
                 }
-                // Room(2)：完整 ticket 校验（spec ROOM_CHANNEL_SPEC §4.6）。
+                // Room：完整 ticket 校验（spec ROOM_CHANNEL_SPEC §4.6）。
                 // 1) authenticated（拿到 user_id / device_id 才能比对 ticket.did）
                 // 2) `[room_ticket]` 配过：解码 + 校验签名 + exp + cid + ct + did + scope
                 // 3) 未配 `[room_ticket]`：v1 兼容模式 — "已认证即放行"，warn 告警
-                2 => {
+                Some(crate::model::channel::ChannelType::Room) => {
                     if context.user_id.is_none() {
                         warn!(
                             "📡 SubscribeMessageHandler: 未认证的会话 {} 尝试订阅 Room {}",
@@ -272,7 +282,7 @@ impl MessageHandler for SubscribeMessageHandler {
                     }
                 }
                 // 未知 channel_type
-                _ => {
+                None => {
                     warn!(
                         "📡 SubscribeMessageHandler: 不支持的 channel_type: {}",
                         channel_type
@@ -295,12 +305,20 @@ impl MessageHandler for SubscribeMessageHandler {
                                 "📡 SubscribeMessageHandler: Session {} 订阅频道 {}",
                                 context.session_id, channel_id
                             );
-                            should_replay_room_history = channel_type == 2
-                                && self.room_history_service.subscribe_history_enabled();
+                            // Room 才回放历史。按 wire 值这里是 3；写 2 的话回放会挂到
+                            // 群聊上，而真正的 Room 永远回放不到。
+                            should_replay_room_history = matches!(
+                                parsed_channel_type,
+                                Some(crate::model::channel::ChannelType::Room)
+                            ) && self.room_history_service.subscribe_history_enabled();
                             // presence 与订阅严格绑定：DM/Group 订阅成功后，立即把频道对端成员的
                             // 当前 presence 快照推给**本会话**（初始态），后续变化由广播跟进。
                             // 这样「订阅即拿到 presence」，不依赖客户端单独 presence/status/get。
-                            if channel_type == 0 || channel_type == 1 {
+                            if matches!(
+                                parsed_channel_type,
+                                Some(crate::model::channel::ChannelType::Direct)
+                                    | Some(crate::model::channel::ChannelType::Group)
+                            ) {
                                 let self_uid =
                                     context.user_id.as_ref().and_then(|s| s.parse::<u64>().ok());
                                 if let Ok(members) =
