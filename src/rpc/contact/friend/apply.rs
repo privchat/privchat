@@ -32,11 +32,6 @@ pub async fn handle(
     tracing::debug!("🔧 处理 好友申请 请求: {:?}", body);
 
     // 在 body 被 move 之前提取额外的字段（用于兼容性）
-    let has_qrcode = body.get("qrcode").is_some();
-    let qrcode = body
-        .get("qrcode")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
     let phone = body
         .get("phone")
         .and_then(|v| v.as_str())
@@ -161,6 +156,14 @@ pub async fn handle(
                     friend_id: Some(friend_id),
                 }
             }
+            "qrcode" => {
+                // source_id = qr_key。客户端扫码后打开资料页拿到的就是它
+                // （PrivChatNavGraph 的 `"qrcode" to qrKey`），而这里原本没有对应分支，
+                // 整条「扫码加好友」因此被白名单一律拒掉（生产日志里的 10100）。
+                crate::model::privacy::UserDetailSource::Qrcode {
+                    qr_key: source_id_str.to_string(),
+                }
+            }
             "conversation" => {
                 // 在 1v1 / 群聊里点开对方资料 → 添加好友。
                 // source_id = 来源 channel_id（server 校验 from_user_id 与对方在该 channel 共存）。
@@ -171,21 +174,26 @@ pub async fn handle(
             }
             _ => {
                 return Err(RpcError::validation(format!(
-                    "Invalid source type: {}. Must be one of: search, group, card_share, friend, conversation",
+                    "Invalid source type: {}. Must be one of: search, group, qrcode, card_share, friend, conversation",
                     source_str
                 )));
             }
         })
     } else {
-        // 如果没有提供来源，尝试使用 qrcode 或 phone（这些不需要 source_id）
-        if has_qrcode {
-            // qrcode 来源不需要验证（扫码本身就是验证）
-            None
-        } else {
-            return Err(RpcError::validation(
-                "source and source_id are required (same as detail interface)".to_string(),
-            ));
-        }
+        // 🔴 这里曾有一条后门：body 顶层带个 `qrcode` 字段（任意字符串）就把
+        // detail_source 置成 None，从而**跳过全部来源校验**，注释写的是
+        // 「扫码来源不需要验证（扫码本身就是验证）」。
+        //
+        // 但扫码发生在客户端，服务端看见的只是一个字符串。而 FriendApplyRequest
+        // 的字段里根本没有 `qrcode`——任何正常客户端都发不出这个形状，能触发它的
+        // 只有手工构造的 JSON。于是它不是兼容性，是「报一个 qrcode 就能无视对方
+        // 隐私设置加任何人」。
+        //
+        // 扫码现在按正经来源走 `source=qrcode` + `source_id=qr_key`，由
+        // privacy_service 验 qr_key 的真伪与归属（与其它来源同一个判定点）。
+        return Err(RpcError::validation(
+            "source and source_id are required (same as detail interface)".to_string(),
+        ));
     };
 
     // 验证来源（和 detail 接口相同的裁决:真伪 Err;加好友权限按 verdict 映射
@@ -249,6 +257,9 @@ pub async fn handle(
                     let search_session_id = source_id_str.parse::<u64>().unwrap_or(0);
                     Some(crate::model::privacy::FriendRequestSource::Search { search_session_id })
                 }
+                "qrcode" => Some(crate::model::privacy::FriendRequestSource::Qrcode {
+                    qrcode: source_id_str.to_string(),
+                }),
                 "conversation" => {
                     let channel_id = source_id_str.parse::<u64>().unwrap_or(0);
                     Some(crate::model::privacy::FriendRequestSource::Conversation { channel_id })
@@ -258,8 +269,6 @@ pub async fn handle(
                     None
                 }
             }
-        } else if let Some(qrcode_str) = qrcode {
-            Some(crate::model::privacy::FriendRequestSource::Qrcode { qrcode: qrcode_str })
         } else if let Some(phone_str) = phone {
             Some(crate::model::privacy::FriendRequestSource::Phone { phone: phone_str })
         } else {

@@ -119,6 +119,15 @@ pub enum UserDetailSource {
     /// source_id: channel_id
     Conversation { channel_id: u64 },
 
+    /// 扫码来源（扫对方的个人二维码后打开资料 / 加好友）
+    /// source_id: qr_key
+    ///
+    /// 与其它来源一样要验真伪：qr_key 必须存在、未撤销、未过期，且它指向的
+    /// 正是本次要看的那个人。曾经这条路完全不校验（「扫码本身就是验证」），
+    /// 可扫码发生在客户端，服务端见到的只是一个字符串——任何已认证用户报一个
+    /// `source=qrcode` 就能绕开对方的隐私开关。
+    Qrcode { qr_key: String },
+
     /// 本人查本人（我的资料页 / 资料变更后刷新）。无需任何外部来源。
     SelfProfile,
 }

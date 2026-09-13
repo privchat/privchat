@@ -48,7 +48,7 @@ pub async fn handle(
     // 使用协议层枚举解析来源类型
     let source_type = DetailSourceType::from_str(source_str).ok_or_else(|| {
         RpcError::validation(format!(
-            "Invalid source type: {}. Must be one of: search, group, friend, card_share, friend_pending, conversation, self",
+            "Invalid source type: {}. Must be one of: search, group, friend, card_share, qrcode, friend_pending, conversation, self",
             source_str
         ))
     })?;
@@ -81,6 +81,9 @@ pub async fn handle(
                 .map_err(|_| RpcError::validation(format!("Invalid share_id: {}", source_id)))?;
             UserDetailSource::CardShare { share_id }
         }
+        DetailSourceType::Qrcode => UserDetailSource::Qrcode {
+            qr_key: source_id.to_string(),
+        },
         DetailSourceType::FriendPending => UserDetailSource::Friend { friend_id: None },
         DetailSourceType::Conversation => {
             let channel_id = source_id

@@ -704,6 +704,7 @@ impl ChatServer {
             cache_manager.clone(),
             channel_service.clone(),
             friend_service.clone(),
+            qrcode_service.clone(),
         ));
 
         // 创建已读回执服务

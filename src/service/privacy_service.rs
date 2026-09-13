@@ -80,6 +80,7 @@ pub struct PrivacyService {
     cache_manager: Arc<CacheManager>,
     channel_service: Arc<ChannelService>,
     friend_service: Arc<FriendService>,
+    qrcode_service: Arc<crate::service::QRCodeService>,
     /// 平台级「按用户名搜索」开关的内存镜像(真源 privchat_platform_settings)。
     platform_username_searchable: AtomicBool,
     /// 0=未加载 1=已加载(懒加载一次,admin 更新时同步刷新)
@@ -91,11 +92,13 @@ impl PrivacyService {
         cache_manager: Arc<CacheManager>,
         channel_service: Arc<ChannelService>,
         friend_service: Arc<FriendService>,
+        qrcode_service: Arc<crate::service::QRCodeService>,
     ) -> Self {
         Self {
             cache_manager,
             channel_service,
             friend_service,
+            qrcode_service,
             platform_username_searchable: AtomicBool::new(true),
             platform_loaded: AtomicU8::new(0),
         }
@@ -196,6 +199,9 @@ impl PrivacyService {
             UserDetailSource::Search { search_session_id } => {
                 self.evaluate_search_source(searcher_id, target_id, search_session_id)
                     .await
+            }
+            UserDetailSource::Qrcode { ref qr_key } => {
+                self.evaluate_qrcode_source(target_id, qr_key).await
             }
             UserDetailSource::Group { group_id } => {
                 self.evaluate_group_source(searcher_id, target_id, group_id)
@@ -319,6 +325,54 @@ impl PrivacyService {
                 record.hit_by,
                 Some(crate::model::privacy::SearchType::Username)
             ),
+        })
+    }
+
+    /// 评估扫码来源:qr_key 真伪(存在/未撤销/未过期/确实指向 target)Err;
+    /// 个人「允许通过二维码找到我」开关只影响 can_add_friend。
+    ///
+    /// 用 `get` 而不是 `resolve`：扫的动作在打开资料页那一刻就已经发生并计过数了，
+    /// 这里是随后的「加好友」二次校验。再 `resolve` 一次会重复累加 used_count，
+    /// 一次性二维码更是直接被自己判成已用尽。
+    async fn evaluate_qrcode_source(
+        &self,
+        target_id: u64,
+        qr_key: &str,
+    ) -> Result<DetailAccessVerdict> {
+        let record = self
+            .qrcode_service
+            .get(qr_key)
+            .await
+            .ok_or_else(|| ServerError::Forbidden("QR key not found".to_string()))?;
+
+        if record.revoked {
+            return Err(ServerError::Forbidden("QR key has been revoked".to_string()));
+        }
+        if let Some(expire_at) = record.expire_at {
+            if expire_at <= chrono::Utc::now() {
+                return Err(ServerError::Forbidden("QR key has expired".to_string()));
+            }
+        }
+        // 必须是「个人名片」码。群码/登录码指向的不是一个可加好友的人，
+        // 拿它来当加好友的来源就是伪造来源。
+        if record.qr_type != crate::model::qrcode::QRType::User {
+            return Err(ServerError::Forbidden(
+                "QR key is not a user card".to_string(),
+            ));
+        }
+        // 🔴 码必须指向本次要看的这个人。少了这一步，任何一个有效 qr_key
+        // 都能被拿去看任意人的资料。
+        if record.target_id != target_id.to_string() {
+            return Err(ServerError::Forbidden(
+                "QR key does not point to this user".to_string(),
+            ));
+        }
+
+        let privacy = self.get_or_create_privacy_settings(target_id).await?;
+        Ok(if privacy.allows_search(crate::model::privacy::SearchType::Qrcode) {
+            DetailAccessVerdict::viewable_and_addable()
+        } else {
+            DetailAccessVerdict::view_only("personal_privacy")
         })
     }
 
@@ -639,6 +693,12 @@ mod tests {
     /// 安全门禁不能靠「没数据库就跳过」显示绿色:CI 里设 `PRIVCHAT_REQUIRE_DB=1`,
     /// 数据库不可用时**直接失败**,而不是静默 skip 出一个假绿。
     async fn open_service() -> Option<PrivacyService> {
+        open_service_with_qrcode(test_qrcode_service()).await
+    }
+
+    async fn open_service_with_qrcode(
+        qrcode_service: Arc<crate::service::QRCodeService>,
+    ) -> Option<PrivacyService> {
         let require_db = std::env::var("PRIVCHAT_REQUIRE_DB").ok().as_deref() == Some("1");
         let url = match std::env::var("PRIVCHAT_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
@@ -659,7 +719,12 @@ mod tests {
             PgChannelRepository::new(pool.clone()),
         )));
         let friend_service = Arc::new(FriendService::new(pool));
-        Some(PrivacyService::new(cache, channel_service, friend_service))
+        Some(PrivacyService::new(cache, channel_service, friend_service, qrcode_service))
+    }
+
+    /// 空的二维码服务：这些用例都不走扫码来源，只是构造 PrivacyService 需要它。
+    fn test_qrcode_service() -> Arc<crate::service::QRCodeService> {
+        Arc::new(crate::service::QRCodeService::new())
     }
 
     /// 指向不存在的数据库：任何 DB 访问都会失败。用于证明权限判定**不会把数据库
@@ -681,7 +746,112 @@ mod tests {
             PgChannelRepository::new(pool.clone()),
         )));
         let friend_service = Arc::new(FriendService::new(pool));
-        PrivacyService::new(cache, channel_service, friend_service)
+        PrivacyService::new(cache, channel_service, friend_service, test_qrcode_service())
+    }
+
+    async fn issue_user_qr(
+        qrcode: &crate::service::QRCodeService,
+        target_id: u64,
+    ) -> String {
+        qrcode
+            .generate(
+                crate::model::qrcode::QRType::User,
+                target_id.to_string(),
+                target_id.to_string(),
+                crate::model::qrcode::QRKeyOptions::default(),
+            )
+            .await
+            .expect("generate qr")
+            .qr_key
+    }
+
+    /// 不存在的 qr_key 不能当来源用。
+    ///
+    /// 这条曾经是**整个扫码路径都不校验**：apply 只要 body 里带个 `qrcode` 字段
+    /// （内容随便写）就跳过全部来源验证，报一个来源就能无视对方隐私设置加任何人。
+    #[tokio::test]
+    async fn an_unknown_qr_key_is_not_a_valid_source() {
+        let qrcode = Arc::new(crate::service::QRCodeService::new());
+        let Some(svc) = open_service_with_qrcode(qrcode).await else {
+            return;
+        };
+        let verdict = svc
+            .evaluate_detail_access(
+                1001,
+                1002,
+                UserDetailSource::Qrcode {
+                    qr_key: "totally-made-up".to_string(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(verdict, Err(ServerError::Forbidden(_))),
+            "伪造的 qr_key 被放行了: {verdict:?}"
+        );
+    }
+
+    /// 二维码必须指向本次要看的那个人。
+    ///
+    /// 少了这一步，任何一个有效的 qr_key（比如自己的）都能被拿去看任意人的资料。
+    #[tokio::test]
+    async fn a_qr_key_for_someone_else_is_rejected() {
+        let qrcode = Arc::new(crate::service::QRCodeService::new());
+        // 这是 2003 的码，却拿去看 1002。
+        let qr_key = issue_user_qr(&qrcode, 2003).await;
+        let Some(svc) = open_service_with_qrcode(qrcode).await else {
+            return;
+        };
+        let verdict = svc
+            .evaluate_detail_access(1001, 1002, UserDetailSource::Qrcode { qr_key })
+            .await;
+        assert!(
+            matches!(verdict, Err(ServerError::Forbidden(_))),
+            "别人的二维码被当成了这个人的来源: {verdict:?}"
+        );
+    }
+
+    /// 群码 / 登录码不是个人名片，不能当加好友的来源。
+    #[tokio::test]
+    async fn a_group_qr_key_is_not_a_person() {
+        let qrcode = Arc::new(crate::service::QRCodeService::new());
+        let qr_key = qrcode
+            .generate(
+                crate::model::qrcode::QRType::Group,
+                1002.to_string(),
+                9.to_string(),
+                crate::model::qrcode::QRKeyOptions::default(),
+            )
+            .await
+            .expect("generate group qr")
+            .qr_key;
+        let Some(svc) = open_service_with_qrcode(qrcode).await else {
+            return;
+        };
+        let verdict = svc
+            .evaluate_detail_access(1001, 1002, UserDetailSource::Qrcode { qr_key })
+            .await;
+        assert!(
+            matches!(verdict, Err(ServerError::Forbidden(_))),
+            "群二维码被当成了个人名片: {verdict:?}"
+        );
+    }
+
+    /// 已撤销的码立刻失效——用户「换一张二维码」就是为了让旧的不再好使。
+    #[tokio::test]
+    async fn a_revoked_qr_key_stops_working() {
+        let qrcode = Arc::new(crate::service::QRCodeService::new());
+        let qr_key = issue_user_qr(&qrcode, 1002).await;
+        qrcode.revoke(&qr_key).await.expect("revoke");
+        let Some(svc) = open_service_with_qrcode(qrcode).await else {
+            return;
+        };
+        let verdict = svc
+            .evaluate_detail_access(1001, 1002, UserDetailSource::Qrcode { qr_key })
+            .await;
+        assert!(
+            matches!(verdict, Err(ServerError::Forbidden(_))),
+            "撤销掉的二维码还能用: {verdict:?}"
+        );
     }
 
     async fn ensure_user(svc: &PrivacyService, user_id: u64, username: &str) {
