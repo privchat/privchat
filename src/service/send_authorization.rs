@@ -54,6 +54,9 @@ pub enum SendRefusal {
     PeerInMyBlacklist,
     /// 对方只接收好友消息。
     PeerRejectsNonFriends,
+    /// 两人曾是好友，关系已被删除。删除后不再走「非好友消息」那条隐私开关——
+    /// 那条开关是给从未加过好友的陌生人用的，删好友本身就是「不想再收到」。
+    FriendshipRemoved,
     /// 频道设置不允许该成员发言（如群 `allow_member_post=false`）。
     ChannelForbidsPosting,
     /// 策略判定不出来（数据库故障等）。**不是「有权」也不是「无权」**——
@@ -72,6 +75,7 @@ impl SendRefusal {
             SendRefusal::BlockedByPeer => ErrorCode::BlockedByUser,
             SendRefusal::PeerInMyBlacklist => ErrorCode::UserInBlacklist,
             SendRefusal::PeerRejectsNonFriends => ErrorCode::PermissionDenied,
+            SendRefusal::FriendshipRemoved => ErrorCode::FriendNotFound,
             SendRefusal::ChannelForbidsPosting => ErrorCode::PermissionDenied,
             // 🔴 必须是 ServiceUnavailable(3) 而不是 InternalError(4)：
             // 两端 SDK 的可重试白名单里有 3、没有 4。用 4 的话文案说「稍后重试」，
@@ -91,6 +95,7 @@ impl SendRefusal {
             SendRefusal::PeerRejectsNonFriends => {
                 "对方设置了仅接收好友消息，无法发送".to_string()
             }
+            SendRefusal::FriendshipRemoved => "你不是对方好友，消息无法发送".to_string(),
             SendRefusal::ChannelForbidsPosting => "无权限发送消息".to_string(),
             SendRefusal::PolicyUnavailable => "服务暂时不可用，请稍后重试".to_string(),
         }
@@ -248,6 +253,18 @@ pub async fn authorize_send_to_channel(
                 return Ok(());
             }
 
+            let friendship_removed = deps
+                .friend_service
+                .try_friendship_removed(sender_id, peer_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("查询 {sender_id}↔{peer_id} 好友删除记录失败: {e}");
+                    SendRefusal::PolicyUnavailable
+                })?;
+            if friendship_removed {
+                return Err(SendRefusal::FriendshipRemoved);
+            }
+
             // 🔴 隐私设置取不到同样按拒绝：原来的「默认允许」会让「仅接收好友消息」
             // 在数据库抖动时形同虚设。
             let settings = deps
@@ -272,6 +289,23 @@ mod tests {
     use super::*;
 
     /// 每种拒绝都有自己的错误码：客户端据此决定「稍后再试」还是「别再发了」。
+    /// 被删好友与「对方只收好友消息」是两件事：码不同，客户端才能说清是哪一种。
+    #[test]
+    fn removed_friendship_has_its_own_code_and_message() {
+        assert_eq!(
+            SendRefusal::FriendshipRemoved.error_code(),
+            ErrorCode::FriendNotFound
+        );
+        assert_ne!(
+            SendRefusal::FriendshipRemoved.error_code(),
+            SendRefusal::PeerRejectsNonFriends.error_code()
+        );
+        assert_eq!(
+            SendRefusal::FriendshipRemoved.message(),
+            "你不是对方好友，消息无法发送"
+        );
+    }
+
     #[test]
     fn each_refusal_carries_its_own_error_code() {
         assert_eq!(

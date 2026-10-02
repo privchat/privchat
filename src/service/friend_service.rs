@@ -438,6 +438,29 @@ impl FriendService {
         .map_err(|e| ServerError::Database(format!("Failed to check friendship: {}", e)))
     }
 
+    /// 两人是否曾是好友、而关系已被删除（`remove_friend` 把双向记录都置为 2）。
+    /// 保留数据库错误：吞成 false 会让被删的人重新能发消息。
+    pub async fn try_friendship_removed(&self, user_id: u64, friend_id: u64) -> Result<bool> {
+        sqlx::query_scalar::<_, i32>(
+            r#"
+            SELECT 1
+            FROM privchat_friendships
+            WHERE status = 2
+              AND (
+                  (user_id = $1 AND friend_id = $2)
+               OR (user_id = $2 AND friend_id = $1)
+              )
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(friend_id as i64)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map(|v| v.is_some())
+        .map_err(|e| ServerError::Database(format!("Failed to check removed friendship: {}", e)))
+    }
+
     /// 获取与某用户的好友关系（用于列表返回 source_type/source_id）
     pub async fn get_friendship(&self, user_id: u64, friend_id: u64) -> Option<Friendship> {
         let row = sqlx::query_as::<
