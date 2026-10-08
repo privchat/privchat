@@ -1049,12 +1049,21 @@ impl ChatServer {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(str::to_string);
+            // 出墙代理（墙内服务器连不上 Google，经墙外中转）；只给 FCM 用。
+            let fcm_https_proxy = config
+                .push
+                .fcm
+                .https_proxy
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
 
             // 服务账号优先：它能自动续期。静态 access_token 只是联调兜底。
             match (service_account_path, project_id, access_token) {
                 (Some(path), project_id, _) => {
                     match crate::push::provider::FcmProvider::from_service_account_file(
-                        &path, project_id,
+                        &path, project_id, fcm_https_proxy.as_deref(),
                     ) {
                         Ok(provider) => {
                             info!("✅ FCM Provider 已启用（service account）");
@@ -1071,6 +1080,7 @@ impl ChatServer {
                     Some(Arc::new(crate::push::provider::FcmProvider::new(
                         project_id,
                         access_token,
+                        fcm_https_proxy.as_deref(),
                     )))
                 }
                 _ => {

@@ -715,6 +715,9 @@ impl ServerConfig {
         if let Ok(service_account_path) = env::var("PUSH_FCM_SERVICE_ACCOUNT_PATH") {
             self.push.fcm.service_account_path = Some(service_account_path);
         }
+        if let Ok(https_proxy) = env::var("PUSH_FCM_HTTPS_PROXY") {
+            self.push.fcm.https_proxy = Some(https_proxy);
+        }
 
         // HMS
         if let Ok(v) = env::var("PUSH_HMS_ENABLED") {
@@ -1186,6 +1189,7 @@ struct TomlPushFcmConfig {
     /// 镜像结构和真实结构必须一起改，这是这个文件里最容易漏的一条。
     service_account_path: Option<String>,
     access_token: Option<String>,
+    https_proxy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1947,6 +1951,9 @@ impl TryFrom<TomlConfig> for ServerConfig {
                 if let Some(access_token) = fcm.access_token {
                     config.push.fcm.access_token = Some(access_token);
                 }
+                if let Some(https_proxy) = fcm.https_proxy {
+                    config.push.fcm.https_proxy = Some(https_proxy);
+                }
             }
             if let Some(hms) = push.hms {
                 if let Some(enabled) = hms.enabled {
@@ -2427,6 +2434,11 @@ pub struct PushFcmConfig {
     pub service_account_path: Option<String>,
     /// 手工粘贴的 OAuth2 access token。**1 小时后失效且不会自愈**，仅供本地联调。
     pub access_token: Option<String>,
+    /// 出墙代理（如 `http://user:pass@seoul-ip:8443`）。生产服务器在墙内连不上
+    /// `fcm.googleapis.com` / `oauth2.googleapis.com`，经墙外中转才通。**只作用于 FCM
+    /// 这一个 provider 的 OAuth + 发送**，APNs/厂商推送仍直连（它们从墙内可达）。
+    /// 空=直连。支持 reqwest 识别的任意 scheme（http/https/socks5h）。
+    pub https_proxy: Option<String>,
 }
 
 impl Default for PushFcmConfig {
@@ -2436,6 +2448,7 @@ impl Default for PushFcmConfig {
             project_id: None,
             service_account_path: None,
             access_token: None,
+            https_proxy: None,
         }
     }
 }

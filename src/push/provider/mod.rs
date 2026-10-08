@@ -52,9 +52,24 @@ pub use zte::ZteProvider;
 /// `build()` 只在 TLS 后端不可用时失败（rustls 已启用，属启动期灾难性配置错误），
 /// 此时推送根本无法工作，fail-fast 比静默退回无超时 client 更安全。
 pub fn build_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    build_http_client_with_proxy(None)
+}
+
+/// 可选出墙代理的推送 HTTP client。
+///
+/// 只有 FCM 需要它:生产服务器在墙内连不上 Google,经墙外中转。APNs/厂商推送传 `None`
+/// 直连。代理 URL 解析失败时**不静默直连**(那会让人以为配了代理其实没走),直接 panic
+/// 在启动期暴露配置错误——和私钥坏掉同样对待。
+pub fn build_http_client_with_proxy(proxy: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(15));
+    if let Some(url) = proxy.map(str::trim).filter(|v| !v.is_empty()) {
+        let p = reqwest::Proxy::all(url)
+            .unwrap_or_else(|e| panic!("FCM 出墙代理 URL 无效 ({}): {}", url, e));
+        builder = builder.proxy(p);
+    }
+    builder
         .build()
         .expect("构造推送 HTTP client 失败（TLS 后端不可用）")
 }

@@ -79,7 +79,11 @@ pub struct FcmProvider {
 
 impl FcmProvider {
     /// 从服务账号 JSON 文件构造（推荐）。`project_id` 缺省时取文件里的。
-    pub fn from_service_account_file(path: &str, project_id_override: Option<String>) -> Result<Self> {
+    pub fn from_service_account_file(
+        path: &str,
+        project_id_override: Option<String>,
+        proxy: Option<&str>,
+    ) -> Result<Self> {
         let raw = std::fs::read_to_string(path).map_err(|e| {
             ServerError::Internal(format!("读取 FCM 服务账号文件失败 ({}): {}", path, e))
         })?;
@@ -95,7 +99,7 @@ impl FcmProvider {
             .filter(|it| !it.is_empty())
             .unwrap_or_else(|| account.project_id.clone());
         Ok(Self {
-            client: super::build_http_client(),
+            client: super::build_http_client_with_proxy(proxy),
             project_id,
             credentials: Arc::new(Credentials::ServiceAccount {
                 account,
@@ -106,13 +110,13 @@ impl FcmProvider {
     }
 
     /// 用现成的 access token 构造（仅联调）。
-    pub fn new(project_id: String, access_token: String) -> Self {
+    pub fn new(project_id: String, access_token: String, proxy: Option<&str>) -> Self {
         warn!(
             "[FCM] 使用静态 access_token：OAuth2 token 有效期只有 1 小时，过期后推送会持续 401 \
              且不会自动恢复。生产请改配 push.fcm.service_account_path"
         );
         Self {
-            client: super::build_http_client(),
+            client: super::build_http_client_with_proxy(proxy),
             project_id,
             credentials: Arc::new(Credentials::StaticToken(access_token)),
         }
