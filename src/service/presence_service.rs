@@ -168,10 +168,10 @@ impl PresenceService {
             .drain_timeout_candidates(threshold_secs);
         let mut timed_out = 0usize;
         let mut recalibrated = 0usize;
-        for user_id in candidates {
+        for (user_id, last_seen) in candidates {
             let conns = self.connection_manager.get_user_connections(user_id).await;
             if conns.is_empty() {
-                if let Err(e) = self.on_timeout(user_id).await {
+                if let Err(e) = self.on_timeout(user_id, last_seen).await {
                     tracing::warn!(
                         "presence timeout sweep: on_timeout({}) 失败: {}",
                         user_id,
@@ -192,8 +192,10 @@ impl PresenceService {
         (timed_out, recalibrated)
     }
 
-    pub async fn on_timeout(&self, user_id: u64) -> Result<(), ServerError> {
-        let snapshot = self.presence_tracker.on_timeout(user_id).await?;
+    /// `last_seen` 为触发超时的真实最后活跃时间（心跳表旧值），落库时用它而非 now，
+    /// 否则所有超时用户会被统一标成「刚刚在线」。
+    pub async fn on_timeout(&self, user_id: u64, last_seen: i64) -> Result<(), ServerError> {
+        let snapshot = self.presence_tracker.on_timeout(user_id, last_seen).await?;
         self.publish_presence_changed(snapshot).await
     }
 
@@ -592,7 +594,7 @@ mod tests {
         service.on_device_connected(77, "ios-77").await.unwrap();
         let _ = service.take_test_published_events();
 
-        service.on_timeout(77).await.unwrap();
+        service.on_timeout(77, 1_700_000_000).await.unwrap();
 
         let published = service.take_test_published_events();
         assert_eq!(published.len(), 2);
@@ -648,7 +650,7 @@ mod tests {
         let _ = service.take_test_published_events(); // 清除上线事件
 
         // 模拟会话超时清理（这应该是服务器清理过期会话时调用的路径）
-        service.on_timeout(100).await.unwrap();
+        service.on_timeout(100, 1_700_000_000).await.unwrap();
 
         // 验证订阅者收到了离线状态更新
         let published = service.take_test_published_events();

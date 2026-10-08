@@ -227,15 +227,18 @@ impl PresenceManagerWithDb {
     /// 取出即从表中移除（调用方据此触发 on_timeout；用户重新活跃时 user_online/
     /// update_heartbeat 会重新入表，不会重复告警）。last_seen 查询不受影响：
     /// 内存 miss 时回源 DB（privchat_user_last_seen）。
-    pub fn drain_timeout_candidates(&self, threshold_secs: i64) -> Vec<u64> {
+    ///
+    /// 返回 `(user_id, last_seen)`：`last_seen` 是触发超时的**真实最后活跃时间**
+    /// （内存心跳值），调用方据此落库，避免把 last_seen 覆盖成「巡检当下」。
+    pub fn drain_timeout_candidates(&self, threshold_secs: i64) -> Vec<(u64, i64)> {
         let now = Utc::now().timestamp();
-        let expired: Vec<u64> = self
+        let expired: Vec<(u64, i64)> = self
             .last_seen
             .iter()
             .filter(|entry| now - *entry.value() > threshold_secs)
-            .map(|entry| *entry.key())
+            .map(|entry| (*entry.key(), *entry.value()))
             .collect();
-        for user_id in &expired {
+        for (user_id, _) in &expired {
             self.last_seen.remove(user_id);
         }
         expired
@@ -306,10 +309,21 @@ impl PresenceManagerWithDb {
         Ok(())
     }
 
-    /// 用户下线
+    /// 用户下线（主动断开）：last_seen = 现在。断开时用户刚刚还活跃，now 即真实值。
     pub async fn user_offline(&self, user_id: u64) -> Result<(), ServerError> {
-        let now = Utc::now().timestamp();
+        self.user_offline_at(user_id, Utc::now().timestamp()).await
+    }
 
+    /// 用户下线并落地指定的 last_seen。
+    ///
+    /// 超时巡检必须走这里并传入**真实最后活跃时间**（心跳表里的旧值），否则
+    /// 会把 last_seen 覆盖成「巡检当下」，导致所有超时用户统一显示「刚刚/几分钟前
+    /// 在线」。主动断开可用 now（见 [`user_offline`]）。
+    pub async fn user_offline_at(
+        &self,
+        user_id: u64,
+        last_seen: i64,
+    ) -> Result<(), ServerError> {
         // P1-13：离线 = 移出在线追踪表（last_seen DashMap 只追踪「可能在线」的
         // 用户，供超时巡检 drain）。此前 insert 会把已离线用户留在表里，被巡检
         // 每轮重复 timeout。查询侧不受影响：内存 miss 回源 DB（下面已持久化）。
@@ -317,7 +331,7 @@ impl PresenceManagerWithDb {
 
         // 立即更新数据库（用户下线是重要事件，必须持久化）
         if let Some(ref db_repo) = self.db_repo {
-            if let Err(e) = db_repo.update_last_seen(user_id, now).await {
+            if let Err(e) = db_repo.update_last_seen(user_id, last_seen).await {
                 error!(
                     "Failed to update last_seen on offline for user {}: {}",
                     user_id, e
@@ -329,7 +343,7 @@ impl PresenceManagerWithDb {
         let new_info = OnlineStatusInfo {
             user_id,
             status: OnlineStatus::Recently,
-            last_seen: now,
+            last_seen,
             online_devices: vec![],
         };
         self.status_cache.insert(user_id, new_info.clone()).await;

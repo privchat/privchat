@@ -37,7 +37,7 @@ pub struct PresenceTracker {
 
 impl PresenceTracker {
     /// P1-13：转发心跳超时巡检候选（见 PresenceStateStore::drain_timeout_candidates）。
-    pub fn drain_timeout_candidates(&self, threshold_secs: i64) -> Vec<u64> {
+    pub fn drain_timeout_candidates(&self, threshold_secs: i64) -> Vec<(u64, i64)> {
         self.state_store.drain_timeout_candidates(threshold_secs)
     }
 
@@ -103,10 +103,16 @@ impl PresenceTracker {
         self.state_store.update_heartbeat(user_id).await
     }
 
-    pub async fn on_timeout(&self, user_id: u64) -> Result<PresenceSnapshot, ServerError> {
+    /// `last_seen` 为触发超时的真实最后活跃时间，必须透传落库（见
+    /// [`PresenceStateStore::user_offline_at`]），不可用 now 覆盖。
+    pub async fn on_timeout(
+        &self,
+        user_id: u64,
+        last_seen: i64,
+    ) -> Result<PresenceSnapshot, ServerError> {
         let old_snapshot = self.get_snapshot(user_id).await;
         self.online_devices.remove(&user_id);
-        self.state_store.user_offline(user_id).await?;
+        self.state_store.user_offline_at(user_id, last_seen).await?;
         let mut snapshot = self.get_snapshot(user_id).await;
         snapshot.version = self.version_after_change(user_id, &old_snapshot, &snapshot);
         Ok(snapshot)
@@ -278,10 +284,16 @@ mod tests {
         assert!(online.is_online);
         assert_eq!(online.version, 1);
 
-        let timeout = tracker.on_timeout(1005).await.unwrap();
+        // 超时必须落地「触发超时的真实最后活跃时间」，而不是巡检当下 now——否则
+        // 所有超时用户会被统一标成「刚刚在线」。这里传入一个早于上线时刻的时间戳，
+        // 验证它被原样保留（历史回归：曾用 now 覆盖）。
+        let real_last_seen = 1_700_000_000;
+        let timeout = tracker.on_timeout(1005, real_last_seen).await.unwrap();
         assert!(!timeout.is_online);
         assert_eq!(timeout.device_count, 0);
         assert_eq!(timeout.version, 2);
-        assert!(timeout.last_seen_at >= online.last_seen_at);
+        // snapshot.last_seen_at 以毫秒对外（DB 存秒，to_snapshot ×1000）。
+        assert_eq!(timeout.last_seen_at, real_last_seen * 1000);
+        assert!(timeout.last_seen_at <= online.last_seen_at);
     }
 }
