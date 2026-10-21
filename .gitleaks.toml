@@ -25,6 +25,14 @@ paths = [
 # ---- repo-specific narrow allowlists (path + rule) ----
 
 [[allowlists]]
+description = "RFC 6455 public example handshake nonce in call integration tests"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/call_(state_db|im_runtime)_test\.rs$''']
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
+
+[[allowlists]]
 description = "doc-comment examples of QR keys / tokens and demo upload token"
 targetRules = ["generic-api-key", "curl-auth-header"]
 paths = [

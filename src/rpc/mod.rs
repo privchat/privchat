@@ -22,6 +22,7 @@ pub mod types;
 
 // 系统模块
 pub mod account;
+pub mod call;
 pub mod channel;
 pub mod channel_broadcast;
 pub mod contact;
@@ -262,6 +263,7 @@ impl RpcServiceContext {
 
 /// 初始化 RPC 系统
 pub async fn init_rpc_system(services: RpcServiceContext) {
+    call::register_routes(services.clone()).await;
     // 注册所有路由，传入服务上下文
     account::register_routes(services.clone()).await;
     contact::register_routes(services.clone()).await;

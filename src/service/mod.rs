@@ -17,6 +17,8 @@
 
 // 业务服务层模块
 pub mod admin_service;
+pub mod call_config;
+pub mod call_service;
 pub mod attachment_authorization;
 pub mod attachment_verify;
 pub mod file_claim_service;

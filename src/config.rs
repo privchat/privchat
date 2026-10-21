@@ -71,6 +71,8 @@ impl AttachmentKeys {
 /// 服务器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub call: crate::service::call_config::CallConfig,
     /// 服务器监听地址
     pub host: String,
     /// 服务器监听端口
@@ -379,6 +381,7 @@ impl AccountConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            call: crate::service::call_config::CallConfig::default(),
             host: "127.0.0.1".to_string(),
             port: 9001,
             database_url: String::new(),
@@ -1047,6 +1050,7 @@ impl ServerConfig {
 /// TOML 配置文件结构（用于反序列化）
 #[derive(Debug, Deserialize)]
 struct TomlConfig {
+    call: Option<crate::service::call_config::CallConfig>,
     gateway: Option<TomlGatewayConfig>,
     database: Option<TomlDatabaseConfig>,
     cache: Option<TomlCacheConfig>,
@@ -1659,6 +1663,8 @@ impl TryFrom<TomlConfig> for ServerConfig {
 
     fn try_from(toml: TomlConfig) -> Result<Self> {
         let mut config = Self::default();
+        config.call = toml.call.unwrap_or_default();
+        config.call.validate()?;
 
         // 网关：gateway.listeners
         // 无论从哪条路径构造，附件密钥都走同一套规则。

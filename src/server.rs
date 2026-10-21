@@ -2144,7 +2144,7 @@ impl ChatServer {
                     match sqlx::query(
                         "DELETE FROM privchat_message_dedup WHERE dedup_key IN (
                              SELECT dedup_key FROM privchat_message_dedup
-                             WHERE created_at < $1 LIMIT $2
+                             WHERE created_at < $1 AND dedup_key NOT LIKE 'call-summary:%' LIMIT $2
                          )",
                     )
                     .bind(cutoff)

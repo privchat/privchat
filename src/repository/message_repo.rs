@@ -1403,8 +1403,11 @@ struct MessageRow {
     revoked_by: Option<i64>,
     read_detail_expires_at: Option<i64>,
     /// LEFT JOIN privchat_users 带回：发送方账号已删除时为 None。
+    #[sqlx(default)]
     sender_username: Option<String>,
+    #[sqlx(default)]
     sender_display_name: Option<String>,
+    #[sqlx(default)]
     sender_avatar_url: Option<String>,
 }
 
