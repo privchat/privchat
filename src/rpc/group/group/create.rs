@@ -62,6 +62,7 @@ pub async fn handle(
     // System User (user_type=1) 禁止入群——spec 07-application/SYSTEM_USER_SPEC §4
     // + 02-server/CHANNEL_SPEC §10.5。这里前置校验 initial_members，避免后续
     // add_participant / add_member_to_group 写入再回滚。
+    let mut unreachable_members = std::collections::HashSet::new();
     if let Some(initial_members) = request.member_ids.as_deref() {
         for &uid in initial_members {
             if uid == creator_id {
@@ -76,9 +77,10 @@ pub async fn handle(
                         format!("user {} is a system user and cannot join a group", uid),
                     ));
                 }
-                // 私人助理首版不可入群（ACCOUNT_IDENTITY_SPEC §6.5），按用户不存在处理。
+                // 私人助理首版不可入群（ACCOUNT_IDENTITY_SPEC §6.5）：与不存在的用户一样
+                // 落进 failed_member_ids，不单独报错——否则回包能区分出它是私人助理。
                 Ok(Some(t)) if helpers::is_unreachable_user_type(t) => {
-                    return Err(RpcError::not_found(format!("User '{}' not found", uid)));
+                    unreachable_members.insert(uid);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -214,6 +216,10 @@ pub async fn handle(
                     let mut joined_members: Vec<u64> = Vec::with_capacity(initial_members.len());
                     let mut failed_members: Vec<u64> = Vec::new();
                     for &uid in &initial_members {
+                        if unreachable_members.contains(&uid) {
+                            failed_members.push(uid);
+                            continue;
+                        }
                         let participant = services
                             .channel_service
                             .add_participant(

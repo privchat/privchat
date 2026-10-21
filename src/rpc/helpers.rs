@@ -136,15 +136,16 @@ pub async fn is_unreachable_user(
         .is_some_and(is_unreachable_user_type))
 }
 
-/// 入口闸口：目标是私人助理时返回调用方原本的"不存在"错误 [not_found]，查询失败拒绝。
+/// 入口闸口：目标不存在或是私人助理时，都返回调用方给的同一个"不存在"错误 [not_found]，
+/// 两者回包完全一致，外部无法借此判断某个 uid 是私人助理。查询失败拒绝。
 pub async fn ensure_reachable_user(
     user_id: u64,
     services: &crate::rpc::RpcServiceContext,
     not_found: impl FnOnce() -> crate::rpc::error::RpcError,
 ) -> crate::rpc::error::RpcResult<()> {
-    match is_unreachable_user(user_id, &services.user_repository, &services.cache_manager).await {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(not_found()),
+    match lookup_user_type(user_id, &services.user_repository, &services.cache_manager).await {
+        Ok(Some(t)) if !is_unreachable_user_type(t) => Ok(()),
+        Ok(_) => Err(not_found()),
         Err(e) => {
             tracing::error!("校验目标用户可达性失败 user_id={}: {}", user_id, e);
             Err(crate::rpc::error::RpcError::internal(

@@ -74,7 +74,11 @@ pub async fn handle(
                 format!("user {} is a system user and cannot join a group", user_id),
             ));
         }
-        // 私人助理首版不可入群（ACCOUNT_IDENTITY_SPEC §6.5），按用户不存在处理。
+        // 私人助理首版不可入群（ACCOUNT_IDENTITY_SPEC §6.5），与不存在的用户同一回包
+        // （此前不存在的 uid 会一路走到外键约束、回 500）。
+        Ok(None) => {
+            return Err(RpcError::not_found(format!("User '{}' not found", user_id)));
+        }
         Ok(Some(t)) if helpers::is_unreachable_user_type(t) => {
             return Err(RpcError::not_found(format!("User '{}' not found", user_id)));
         }
