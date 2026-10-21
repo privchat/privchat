@@ -44,6 +44,13 @@ pub async fn handle(
     // 通过 qrcode 索引查找 user_id
     match services.cache_manager.find_user_by_qrcode(qrcode).await {
         Ok(Some(user_id)) => {
+            // 私人助理首版不可经二维码触达（ACCOUNT_IDENTITY_SPEC §6.5），与未命中同形。
+            if user_id != searcher_id {
+                crate::rpc::helpers::ensure_reachable_user(user_id, &services, || {
+                    RpcError::not_found(format!("User not found for qrcode: {}", qrcode))
+                })
+                .await?;
+            }
             // 检查隐私设置：是否允许通过二维码搜索
             let privacy = services
                 .privacy_service

@@ -2487,6 +2487,7 @@ impl ChatServer {
             self.config.room_ticket.clone().map(Arc::new),
             self.privacy_service.clone(),
             self.cache_manager.clone(),
+            self.config.account.mode,
             self.config.admin_api_port,
         );
 

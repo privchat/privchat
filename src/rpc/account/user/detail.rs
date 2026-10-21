@@ -42,6 +42,14 @@ pub async fn handle(
 
     let searcher_id = request.user_id;
     let user_id = request.target_user_id;
+    // 私人助理首版对他人不可达（ACCOUNT_IDENTITY_SPEC §6.5）：先于隐私判定，
+    // 免得"无权查看"与"不存在"两种回包暴露它的存在。
+    if user_id != searcher_id {
+        helpers::ensure_reachable_user(user_id, &services, || {
+            RpcError::not_found(format!("User '{}' not found", user_id))
+        })
+        .await?;
+    }
     let source_str = &request.source;
     let source_id = &request.source_id;
 

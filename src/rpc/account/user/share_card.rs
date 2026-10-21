@@ -45,6 +45,12 @@ pub async fn handle(
     let target_user_id = request.target_user_id;
     let receiver_id = request.receiver_id;
 
+    // 私人助理首版不可被分享名片（ACCOUNT_IDENTITY_SPEC §6.5）。
+    crate::rpc::helpers::ensure_reachable_user(target_user_id, &services, || {
+        RpcError::not_found(format!("User '{}' not found", target_user_id))
+    })
+    .await?;
+
     // 1. 验证分享者是否是被分享用户的好友
     if !services
         .friend_service

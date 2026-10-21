@@ -74,6 +74,10 @@ pub async fn handle(
                 format!("user {} is a system user and cannot join a group", user_id),
             ));
         }
+        // 私人助理首版不可入群（ACCOUNT_IDENTITY_SPEC §6.5），按用户不存在处理。
+        Ok(Some(t)) if helpers::is_unreachable_user_type(t) => {
+            return Err(RpcError::not_found(format!("User '{}' not found", user_id)));
+        }
         Ok(_) => {}
         Err(e) => {
             tracing::error!("校验被邀请人 user_type 失败 user_id={}: {}", user_id, e);

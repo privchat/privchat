@@ -40,6 +40,12 @@ pub async fn handle(
         return Err(RpcError::validation("不能与自己创建私聊会话".to_string()));
     }
 
+    // 私人助理首版不可私聊（ACCOUNT_IDENTITY_SPEC §6.5）。
+    crate::rpc::helpers::ensure_reachable_user(target_user_id, &services, || {
+        RpcError::not_found(format!("User '{}' not found", target_user_id))
+    })
+    .await?;
+
     let (channel_id, created) = services
         .channel_service
         .get_or_create_direct_channel(

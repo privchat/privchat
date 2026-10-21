@@ -158,6 +158,10 @@ pub async fn resolve(
 
     let target_user_id = row.0 as u64;
     let is_self = target_user_id == operator_id;
+    // 私人助理首版不可经名片码触达（ACCOUNT_IDENTITY_SPEC §6.5），与无效码同形。
+    if !is_self && crate::rpc::helpers::is_unreachable_user_type(row.4) {
+        return Err(RpcError::not_found("名片码无效或已被旋转".to_string()));
+    }
 
     // 调用方与目标是否已经是好友 —— is_friend 本身是 best-effort，无 Result。
     let is_friend = if is_self {

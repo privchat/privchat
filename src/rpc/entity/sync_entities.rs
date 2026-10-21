@@ -153,6 +153,12 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
                 let user = entry.user;
                 let updated_at = user.updated_at.timestamp_millis();
                 next_version = next_version.max(entry.sync_version);
+                // 私人助理首版对他人不可见（ACCOUNT_IDENTITY_SPEC §6.5）；游标照常前进。
+                if user.id != user_id
+                    && crate::rpc::helpers::is_unreachable_user_type(user.user_type)
+                {
+                    continue;
+                }
                 items.push(SyncEntityItem {
                     entity_id: user.id.to_string(),
                     version: entry.sync_version,

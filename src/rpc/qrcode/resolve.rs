@@ -80,6 +80,20 @@ pub async fn handle(
     // 根据类型获取详细信息和建议的操作
     let (data, action) = match record.qr_type {
         QRType::User => {
+            // 私人助理首版不可经二维码触达（ACCOUNT_IDENTITY_SPEC §6.5），与无效码同形。
+            if let Ok(target_uid) = record.target_id.parse::<u64>() {
+                if target_uid != scanner_id {
+                    crate::rpc::helpers::ensure_reachable_user(target_uid, &services, || {
+                        RpcError::not_found(format!(
+                            "{}",
+                            crate::error::ServerError::NotFound(
+                                "QR Key 不存在或已失效".to_string()
+                            )
+                        ))
+                    })
+                    .await?;
+                }
+            }
             // 获取用户信息
             let user_data = json!({
                 "user_id": record.target_id,

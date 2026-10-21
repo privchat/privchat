@@ -48,6 +48,12 @@ pub async fn handle(
     let target_user_id = request.target_user_id;
     let message = request.message.as_deref().unwrap_or("");
 
+    // 私人助理首版不可加好友（ACCOUNT_IDENTITY_SPEC §6.5），按用户不存在处理。
+    helpers::ensure_reachable_user(target_user_id, &services, || {
+        RpcError::not_found(format!("User '{}' not found", target_user_id))
+    })
+    .await?;
+
     // ✨ 凭证路径(PROFILE_VISIBILITY §2.5.1):携带 grant_id 时按 detail 时刻
     // 的判定快照放行,不再重跑来源校验;黑名单在 apply 时刻重验(拉黑必须即时
     // 生效)。凭证无效/过期 → 20313,客户端重拉 detail 自愈。

@@ -70,6 +70,7 @@ pub fn create_route() -> Router<AdminServerState> {
             post(issue_token_for_user), // v1.2 新路径：uid-scoped IM token 签发
         )
         // 用户管理
+        .route("/account-mode", get(get_account_mode)) // 账号体系归属(BUILTIN/PLATFORM)
         .route("/privacy-config", get(get_privacy_config)) // 平台隐私开关(PROFILE_VISIBILITY P2)
         .route("/privacy-config", put(update_privacy_config))
         .route("/users", post(create_user)) // 创建用户
@@ -3134,6 +3135,16 @@ mod profile_invalidation_tests {
             BTreeSet::from([10, 20, 30, 40, 50]),
         );
     }
+}
+
+/// 账号体系归属。application 不读 server 配置文件,以此为准判断 PLATFORM 模式
+/// (ACCOUNT_IDENTITY_SPEC §6.5:个人助理只在 PLATFORM 开放)。
+async fn get_account_mode(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+) -> ApiResult<Value> {
+    verify_service_key(&headers, &state).await?;
+    Ok(ApiEnvelope::ok(json!({ "mode": state.account_mode })))
 }
 
 /// 平台级隐私配置(PROFILE_VISIBILITY P2 D4 顶层)。

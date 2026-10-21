@@ -102,6 +102,8 @@ pub async fn handle(
             hit_by = Some(SearchType::Email);
         }
     }
+    // 私人助理首版对搜索不可见（ACCOUNT_IDENTITY_SPEC §6.5），与未命中同形返回。
+    let user_opt = user_opt.filter(|u| !crate::rpc::helpers::is_unreachable_user_type(u.user_type));
     let (user_opt, search_type, hit_by) = (user_opt, search_type, hit_by);
 
     // 处理找到的用户

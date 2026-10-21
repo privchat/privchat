@@ -80,9 +80,11 @@ pub async fn get_user_profile_fresh(
     user_repository: &crate::repository::UserRepository,
     cache_manager: &crate::infra::CacheManager,
 ) -> Result<Option<CachedUserProfile>, crate::error::ServerError> {
-    Ok(get_user_profile_fresh_versioned(user_id, user_repository, cache_manager)
-        .await?
-        .map(|(profile, _)| profile))
+    Ok(
+        get_user_profile_fresh_versioned(user_id, user_repository, cache_manager)
+            .await?
+            .map(|(profile, _)| profile),
+    )
 }
 
 /// 同上，但一并返回这份资料在 `user` 实体序列里的位置。
@@ -113,7 +115,46 @@ pub async fn get_user_profile_fresh_versioned(
     }
 }
 
-/// 查 user_type（0=普通 / 1=系统 / 2=机器人）。
+/// 私人助理（ACCOUNT_IDENTITY_SPEC §6.5）。
+pub const USER_TYPE_PERSONAL_ASSISTANT: i16 = 3;
+
+/// 首版私人助理对**所有其他用户（含 owner）**不可达：搜索、资料、二维码、加好友、
+/// 私聊、入群一律按"用户不存在"处理，不暴露"该 uid 是私人助理"（§6.5 可达性）。
+pub fn is_unreachable_user_type(user_type: i16) -> bool {
+    user_type == USER_TYPE_PERSONAL_ASSISTANT
+}
+
+/// 按 uid 判定 [is_unreachable_user_type]。查不到用户返回 false（交给调用方原有的不存在分支）；
+/// 查询出错返回 Err——调用方必须拒绝，不能当作可达放行。
+pub async fn is_unreachable_user(
+    user_id: u64,
+    user_repository: &crate::repository::UserRepository,
+    cache_manager: &crate::infra::CacheManager,
+) -> Result<bool, crate::error::ServerError> {
+    Ok(lookup_user_type(user_id, user_repository, cache_manager)
+        .await?
+        .is_some_and(is_unreachable_user_type))
+}
+
+/// 入口闸口：目标是私人助理时返回调用方原本的"不存在"错误 [not_found]，查询失败拒绝。
+pub async fn ensure_reachable_user(
+    user_id: u64,
+    services: &crate::rpc::RpcServiceContext,
+    not_found: impl FnOnce() -> crate::rpc::error::RpcError,
+) -> crate::rpc::error::RpcResult<()> {
+    match is_unreachable_user(user_id, &services.user_repository, &services.cache_manager).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(not_found()),
+        Err(e) => {
+            tracing::error!("校验目标用户可达性失败 user_id={}: {}", user_id, e);
+            Err(crate::rpc::error::RpcError::internal(
+                "校验用户身份失败".to_string(),
+            ))
+        }
+    }
+}
+
+/// 查 user_type（0=普通 / 1=系统 / 2=机器人 / 3=私人助理）。
 ///
 /// 顺序：1~99 区段直接判内置 System User；缓存命中读 `CachedUserProfile.user_type`；
 /// 缓存未命中走 `user_repository.find_by_id`。未找到的 user 返回 `None`——调用方
@@ -134,4 +175,80 @@ pub async fn lookup_user_type(
         .await
         .map_err(|e| crate::error::ServerError::Internal(format!("查询用户失败: {}", e)))?;
     Ok(user.map(|u| u.user_type))
+}
+
+#[cfg(test)]
+mod personal_assistant_reachability_tests {
+    use super::*;
+    use crate::config::CacheConfig;
+    use crate::infra::CacheManager;
+    use crate::repository::UserRepository;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    const NORMAL_UID: u64 = 93_000_001;
+    const ASSISTANT_UID: u64 = 93_000_002;
+
+    #[test]
+    fn only_personal_assistant_type_is_unreachable() {
+        assert!(!is_unreachable_user_type(0));
+        assert!(!is_unreachable_user_type(1));
+        assert!(!is_unreachable_user_type(2));
+        assert!(is_unreachable_user_type(USER_TYPE_PERSONAL_ASSISTANT));
+    }
+
+    /// 走真实 privchat_users + 缓存未命中路径：user_type=3 判为不可达，普通用户与不存在的 uid 不受影响。
+    #[tokio::test]
+    async fn lookup_marks_stored_personal_assistant_unreachable() {
+        let _guard = crate::database_fixture_lock().lock().await;
+        let Some(url) = crate::require_test_database_url() else {
+            return;
+        };
+        let pool = Arc::new(
+            PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&url)
+                .await
+                .expect("connect"),
+        );
+        let cache = CacheManager::new(CacheConfig::default())
+            .await
+            .expect("cache");
+        let repo = UserRepository::new(pool.clone());
+        for (uid, username, user_type) in [
+            (NORMAL_UID, "pa_reach_normal", 0i16),
+            (
+                ASSISTANT_UID,
+                "_pa_reach_assistant",
+                USER_TYPE_PERSONAL_ASSISTANT,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO privchat_users (user_id, username, display_name, qr_key, user_type)
+                 VALUES ($1, $2, $2, $3, $4)
+                 ON CONFLICT (user_id) DO UPDATE SET user_type = EXCLUDED.user_type",
+            )
+            .bind(uid as i64)
+            .bind(username)
+            .bind(crate::rpc::qr::generate_qr_key())
+            .bind(user_type)
+            .execute(pool.as_ref())
+            .await
+            .expect("seed user");
+        }
+        assert!(!is_unreachable_user(NORMAL_UID, &repo, &cache)
+            .await
+            .unwrap());
+        assert!(is_unreachable_user(ASSISTANT_UID, &repo, &cache)
+            .await
+            .unwrap());
+        assert!(!is_unreachable_user(93_000_999, &repo, &cache)
+            .await
+            .unwrap());
+        sqlx::query("DELETE FROM privchat_users WHERE user_id = ANY($1)")
+            .bind(vec![NORMAL_UID as i64, ASSISTANT_UID as i64])
+            .execute(pool.as_ref())
+            .await
+            .expect("cleanup");
+    }
 }
