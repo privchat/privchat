@@ -7,7 +7,7 @@ use super::{
 };
 use crate::service::{call_service::CallService, message_service::ServerSendMessageRequest};
 use privchat_protocol::{
-    protocol::{MessageType, PublishRequest},
+    protocol::{MessageType, RpcRequest},
     rpc::{call::*, routes::call as routes},
 };
 use serde_json::{json, Value};
@@ -162,9 +162,9 @@ async fn dispatch_one(service: &CallService, services: &RpcServiceContext) -> an
     let result: anyhow::Result<()> = async {
         match kind.as_str() {
             "state" => {
-                let event = PublishRequest {
-                    channel_id:call.channel_id, topic:Some(routes::STATE.into()),timestamp:chrono::Utc::now().timestamp_millis() as u64,
-                    payload:serde_json::to_vec(&CallResponse {call:call.clone()})?,publisher:None,server_message_id:None,
+                let event = RpcRequest {
+                    route: routes::STATE.into(),
+                    body: serde_json::to_vec(&CallResponse {call:call.clone()})?,
                 };
                 let bytes = privchat_protocol::encode_message(&event)?;
                 for participant in &call.participants {
@@ -173,7 +173,7 @@ async fn dispatch_one(service: &CallService, services: &RpcServiceContext) -> an
                     for connection in services.connection_manager.get_user_connections(participant.user_id).await {
                         let transport = services.connection_manager.transport_server.read().await;
                         let Some(server) = transport.as_ref() else { anyhow::bail!("Call transport unavailable"); };
-                        tokio::time::timeout(std::time::Duration::from_secs(5), server.send_with_options(connection.session_id,bytes.clone().into(),msgtrans::SendOptions::new().biz_type(MessageType::PublishRequest as u8))).await??;
+                        tokio::time::timeout(std::time::Duration::from_secs(5), server.send_with_options(connection.session_id,bytes.clone().into(),msgtrans::SendOptions::new().biz_type(MessageType::RpcRequest as u8))).await??;
                     }
                 }
             }

@@ -175,7 +175,7 @@ pub async fn handle(
 
     // 4.1. 更新描述
     if let Some(desc) = description {
-        services
+        let changed = services
             .channel_service
             .update_channel_metadata(
                 &group_id,
@@ -185,7 +185,24 @@ pub async fn handle(
             )
             .await
             .map_err(|e| RpcError::internal(format!("更新群描述失败: {}", e)))?;
-        update_count += 1;
+        if changed {
+            update_count += 1;
+            let publisher = crate::service::EntityInvalidationPublisher::new(
+                services.connection_manager.clone(),
+            );
+            if let Err(error) = publisher.publish_to_users(
+                channel.members.keys().copied(),
+                vec![privchat_protocol::EntityInvalidation {
+                    entity_type: "group".to_string(),
+                    entity_id: Some(channel.group_id.unwrap_or(group_id).to_string()),
+                    scope: None,
+                    target_version: 0,
+                    mutation_hint: privchat_protocol::EntityMutationHint::Upsert,
+                }],
+            ).await {
+                tracing::warn!(group_id, %error, "group profile committed; invalidation failed");
+            }
+        }
         tracing::debug!("✅ 更新群描述成功");
     }
 

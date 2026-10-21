@@ -421,8 +421,8 @@ impl CallService {
                 .execute(&mut *tx)
                 .await
                 .map_err(db)?;
-            let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM privchat_calls WHERE state <> 'ended' AND document->'call'->'participants' @> $1::jsonb)")
-                .bind(json!([{"user_id":user,"state":"joined"}])).fetch_one(&mut *tx).await.map_err(db)?;
+            let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM privchat_calls WHERE state <> 'ended' AND (document->'call'->'participants' @> $1::jsonb OR document->'call'->'participants' @> $2::jsonb))")
+                .bind(json!([{"user_id":user,"state":"joined"}])).bind(json!([{"user_id":user,"state":"invited"}])).fetch_one(&mut *tx).await.map_err(db)?;
             if busy {
                 return Err(RpcError::validation("User is busy in another call"));
             }
@@ -579,8 +579,8 @@ impl CallService {
                     .execute(&mut *tx)
                     .await
                     .map_err(db)?;
-                let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM privchat_calls WHERE call_id <> $1 AND state <> 'ended' AND document->'call'->'participants' @> $2::jsonb)")
-                    .bind(req.call_id as i64).bind(json!([{"user_id":actor,"state":"joined"}])).fetch_one(&mut *tx).await.map_err(db)?;
+                let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM privchat_calls WHERE call_id <> $1 AND state <> 'ended' AND (document->'call'->'participants' @> $2::jsonb OR document->'call'->'participants' @> $3::jsonb))")
+                    .bind(req.call_id as i64).bind(json!([{"user_id":actor,"state":"joined"}])).bind(json!([{"user_id":actor,"state":"invited"}])).fetch_one(&mut *tx).await.map_err(db)?;
                 if busy {
                     return Err(RpcError::validation("User is busy in another call"));
                 }

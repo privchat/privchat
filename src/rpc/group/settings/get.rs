@@ -80,7 +80,15 @@ pub async fn handle(
     }
 
     // 3. 群业务策略以 DB(privchat_groups) 为真源（重启不丢）；
-    //    公告/描述/成员上限/时间仍取自频道。
+    //    群介绍同样直读 DB，避免其它实例的频道缓存返回旧资料。
+    let description = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT description FROM privchat_groups WHERE group_id = $1",
+    )
+    .bind(channel.group_id.unwrap_or(group_id) as i64)
+    .fetch_optional(services.channel_service.pool())
+    .await
+    .map_err(|e| RpcError::internal(format!("查询群介绍失败: {}", e)))?
+    .ok_or_else(|| RpcError::not_found("群组不存在".to_string()))?;
     let policy = services
         .channel_service
         .get_group_policy(group_id)
@@ -103,7 +111,7 @@ pub async fn handle(
             .or(channel.metadata.max_members)
             .unwrap_or(500),
         announcement: channel.metadata.announcement.clone(),
-        description: channel.metadata.description.clone(),
+        description,
         created_at: channel.created_at.timestamp_millis() as u64,
         updated_at: channel.updated_at.timestamp_millis() as u64,
     };

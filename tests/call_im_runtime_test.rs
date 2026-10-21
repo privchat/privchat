@@ -53,6 +53,7 @@ async fn login(account: &Value, app: &str) -> (TransportClient, Events) {
                 ClientEvent::Message(m) => (m.biz_type(), m.into_payload().to_vec()),
                 ClientEvent::Request(r) => {
                     let packet = (r.biz_type(), r.payload().to_vec());
+                    assert_ne!(packet.0, MessageType::RpcRequest as u8, "call notification must be one-way, not a transport request");
                     if packet.0 == MessageType::PushMessageRequest as u8 {
                         let ack = privchat_protocol::protocol::PushMessageResponse {
                             succeed: true,
@@ -110,14 +111,19 @@ async fn state(events: &mut Events, id: u64, expected: &str) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let (kind, bytes) = events.recv().await.expect("event stream open");
-            if kind != MessageType::PublishRequest as u8 {
+            if kind == MessageType::PublishRequest as u8 {
+                let event: PublishRequest = decode_message(&bytes).unwrap();
+                assert_ne!(event.topic.as_deref(), Some("call/state"), "call state must never use Publish");
+            }
+            if kind != MessageType::RpcRequest as u8 {
                 continue;
             }
-            let event: PublishRequest = decode_message(&bytes).unwrap();
-            if event.topic.as_deref() != Some("call/state") {
+            assert_eq!(kind, 17);
+            let event: RpcRequest = decode_message(&bytes).unwrap();
+            if event.route != "call/state" {
                 continue;
             }
-            let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+            let payload: Value = serde_json::from_slice(&event.body).unwrap();
             if payload["call"]["call_id"] == id && payload["call"]["state"] == expected {
                 break;
             }
@@ -129,7 +135,7 @@ async fn state(events: &mut Events, id: u64, expected: &str) {
 
 #[tokio::test]
 #[ignore = "requires explicitly created isolated loopback IM fixture"]
-async fn real_im_invite_multidevice_publish_end_and_exactly_once_history() {
+async fn real_im_invite_multidevice_rpc_notification_end_and_exactly_once_history() {
     let root = std::env::var("PRIVCHAT_CALL_IM_RUNTIME").expect("isolated fixture required");
     assert!(
         root.starts_with("/tmp/privchat-call-im.") || root.starts_with("/tmp/privchat-peer-im.")
@@ -461,5 +467,5 @@ async fn real_im_invite_multidevice_publish_end_and_exactly_once_history() {
     alice.disconnect().await.unwrap();
     bob.disconnect().await.unwrap();
     desktop.disconnect().await.unwrap();
-    println!("PASS: normal login/auth, unsubscribed user Publish, active reconciliation, device race, authenticated peer relay/replay, terminal journal cleanup, actual history push/replay, P1 DB-timeout durable retry and recovery (no media transport claim)");
+    println!("PASS: normal login/auth, unsubscribed user one-way RPC notification, active reconciliation, device race, authenticated peer relay/replay, terminal journal cleanup, actual history push/replay, P1 DB-timeout durable retry and recovery (no media transport claim)");
 }

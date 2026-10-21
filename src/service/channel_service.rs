@@ -2199,8 +2199,8 @@ impl ChannelService {
                 // 全部丢失——重启后禁言直接失效（安全语义破坏）。从各自 DB 真源补齐。
                 if conv_with_members.channel_type == ChannelType::Group {
                     let group_id = conv_with_members.group_id.unwrap_or(channel_id);
-                    match sqlx::query_as::<_, (Option<String>, bool, i16, bool, bool, bool)>(
-                        "SELECT name, allow_search, join_policy, allow_member_invite, \
+                    match sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, bool, i16, bool, bool, bool)>(
+                        "SELECT name, description, avatar_url, allow_search, join_policy, allow_member_invite, \
                                 allow_member_add_friend, all_muted \
                          FROM privchat_groups WHERE group_id = $1",
                     )
@@ -2210,15 +2210,17 @@ impl ChannelService {
                     {
                         Ok(Some((
                             name,
+                            description,
+                            avatar_url,
                             allow_search,
                             join_policy,
                             allow_member_invite,
                             allow_member_add_friend,
                             all_muted,
                         ))) => {
-                            if conv_with_members.metadata.name.is_none() {
-                                conv_with_members.metadata.name = name;
-                            }
+                            conv_with_members.metadata.name = name;
+                            conv_with_members.metadata.description = description;
+                            conv_with_members.metadata.avatar_url = avatar_url;
                             let settings = conv_with_members.settings.get_or_insert_with(
                                 crate::model::channel::ChannelSettings::default,
                             );
@@ -3995,6 +3997,10 @@ impl ChannelService {
         Ok(total_unread)
     }
 
+    pub async fn invalidate_group_profile_cache(&self, group_id: u64) {
+        self.channels.write().await.retain(|_, channel| channel.group_id != Some(group_id));
+    }
+
     /// 更新频道元数据
     pub async fn update_channel_metadata(
         &self,
@@ -4002,7 +4008,18 @@ impl ChannelService {
         name: Option<String>,
         description: Option<String>,
         avatar_url: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let channel = self.get_channel(channel_id).await?;
+        if channel.channel_type == ChannelType::Group {
+            let group_id = channel.group_id.unwrap_or(*channel_id);
+            let changed = self.persist_group_profile(group_id, name, description, avatar_url)
+                .await?;
+            // Rehydrate from the authoritative group row rather than retaining a
+            // potentially stale full snapshot after concurrent partial writes.
+            self.channels.write().await.remove(channel_id);
+            self.get_channel(channel_id).await?;
+            return Ok(changed);
+        }
         let mut channels = self.channels.write().await;
         if let Some(channel) = channels.get_mut(channel_id) {
             if let Some(name) = name {
@@ -4015,13 +4032,53 @@ impl ChannelService {
                 channel.metadata.avatar_url = Some(avatar_url);
             }
             channel.updated_at = chrono::Utc::now();
-            Ok(())
+            Ok(true)
         } else {
             Err(ServerError::NotFound(format!(
                 "Channel not found: {}",
                 channel_id
             )))
         }
+    }
+
+    /// Persist a partial group profile; omitted fields preserve existing values.
+    pub async fn persist_group_profile(
+        &self,
+        group_id: u64,
+        name: Option<String>,
+        description: Option<String>,
+        avatar_url: Option<String>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE privchat_groups SET \
+             name = COALESCE($2, name), description = COALESCE($3, description), \
+             avatar_url = COALESCE($4, avatar_url), updated_at = now_millis() \
+             WHERE group_id = $1 AND ( \
+               ($2::text IS NOT NULL AND name IS DISTINCT FROM $2) OR \
+               ($3::text IS NOT NULL AND description IS DISTINCT FROM $3) OR \
+               ($4::text IS NOT NULL AND avatar_url IS DISTINCT FROM $4))",
+        )
+        .bind(group_id as i64)
+        .bind(name)
+        .bind(description)
+        .bind(avatar_url)
+        .execute(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("更新群资料失败: {}", e)))?;
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM privchat_groups WHERE group_id = $1)",
+        )
+        .bind(group_id as i64)
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| ServerError::Database(format!("查询群资料失败: {}", e)))?;
+        if !exists {
+            return Err(ServerError::NotFound(format!("Group not found: {}", group_id)));
+        }
+        Ok(false)
     }
 
     /// 设置频道公告

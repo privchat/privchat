@@ -18,6 +18,8 @@
 pub mod add;
 pub mod create;
 pub mod info;
+pub mod update;
+pub mod notify;
 
 use super::super::router::GLOBAL_RPC_ROUTER;
 use super::super::RpcServiceContext;
@@ -25,6 +27,13 @@ use super::super::RpcServiceContext;
 /// 注册群组模块的所有路由
 pub async fn register_routes(services: RpcServiceContext) {
     let router = GLOBAL_RPC_ROUTER.clone();
+    router.register("group/group/update", {
+        let services = services.clone();
+        Box::new(move |body, ctx| {
+            let services = services.clone();
+            Box::pin(async move { update::handle(body, services, ctx).await })
+        })
+    }).await;
 
     router
         .register("group/group/create", {

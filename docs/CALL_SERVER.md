@@ -100,8 +100,10 @@ credentials while authorized; an expired cached token is not silently reissued b
 replaying its old command. Ended/removed/blocked participants cannot replay a join
 command to obtain credentials. Participant device identifiers are not broadcast.
 
-`call/state` uses a direct per-user authenticated-session PublishRequest with
-JSON `{ "call": CallSnapshot }`; it does not depend on a chat subscription. Events
+`call/state` uses a direct per-user authenticated-session one-way `RpcRequest`
+(business type 17), with route `call/state` and JSON body `{ "call": CallSnapshot }`.
+It uses neither Publish nor chat subscriptions. Shared notification bounds are
+256 route bytes, 256 KiB body, and 1024 bytes envelope overhead. Events
 are hints and may repeat. Compare monotonically increasing `call.version` and use
 `call/get` / `call/active` after reconnect or a gap. Active returns that user's
 invitations and joined calls, not every call in a group. Call lifecycle clocks are
@@ -157,7 +159,8 @@ it is not an audio/video track transport test.
 
 `tests/call_im_runtime_test.rs` requires an explicitly created isolated IM fixture
 via `PRIVCHAT_CALL_IM_RUNTIME`, and runs only with `--ignored`. It tests ordinary
-password login and authentication, direct Publish downlink without subscription,
+password login and authentication, one-way RPC notification without subscription
+(and explicitly rejects Publish or request/response delivery for call state),
 active-list reconciliation, device contention, authenticated peer signal relay,
 replay and terminal journal cleanup,
 terminal summary delivery through the existing message outbox, and replay of the

@@ -593,6 +593,41 @@ async fn peer_allow_turn_disabled_generates_no_credentials_and_sanitizes_replay(
 }
 
 #[tokio::test]
+async fn join_rejects_other_ringing_invitation_from_legacy_state() {
+    let (_db, s) = setup("call_legacy_busy").await;
+    let first = s.invite(1, "a", invite("first", 100)).await.unwrap();
+    let id = call_id(&first);
+    // Simulate pre-upgrade overlapping invitations, which new invites prohibit.
+    sqlx::query("UPDATE privchat_calls SET state='ended' WHERE call_id=$1")
+        .bind(id as i64).execute(&s.pool).await.unwrap();
+    s.invite(3, "c", invite("second", 101)).await.unwrap();
+    sqlx::query("UPDATE privchat_calls SET state='ringing' WHERE call_id=$1")
+        .bind(id as i64).execute(&s.pool).await.unwrap();
+    assert!(s.mutate("join", 2, "b", command("join", id)).await.is_err());
+}
+
+#[tokio::test]
+async fn ringing_participants_are_atomically_busy_across_calls() {
+    let (_db, s) = setup("call_ringing_busy").await;
+    let (a, c) = tokio::join!(
+        s.invite(1, "a", invite("a-to-b", 100)),
+        s.invite(3, "c", invite("c-to-b", 101))
+    );
+    assert_ne!(a.is_ok(), c.is_ok(), "only one caller can reserve B");
+    let (owner, channel, device, result) = match a {
+        Ok(value) => (1, 100, "a", value),
+        Err(_) => (3, 101, "c", c.unwrap()),
+    };
+    let id = call_id(&result);
+    assert!(s.invite(owner, device, invite("caller-busy", channel)).await.is_err());
+    assert!(s.invite(2, "b", invite("callee-busy", channel)).await.is_err());
+    assert_eq!(s.active(2).await.unwrap().calls.len(), 1);
+    s.mutate("reject", 2, "b", command("reject", id)).await.unwrap();
+    let next = s.invite(owner, device, invite("after-reject", channel)).await.unwrap();
+    assert_ne!(call_id(&next), id, "terminal/rejected participants release occupancy");
+}
+
+#[tokio::test]
 async fn durable_commands_and_first_device_wins() {
     let (_db, s) = setup("call_race").await;
     let req = invite("invite", 100);

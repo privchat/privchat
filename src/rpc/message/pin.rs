@@ -100,7 +100,7 @@ pub async fn handle(
         .map_err(|e| RpcError::internal(format!("查询消息失败: {}", e)))?
         .ok_or_else(|| RpcError::not_found("消息不存在".to_string()))?;
 
-    if message.revoked {
+    if message.revoked && request.pinned {
         return Err(RpcError::validation("消息已被撤回，无法置顶".to_string()));
     }
     if message.channel_id != channel.id {
@@ -129,6 +129,7 @@ pub async fn handle(
         .await
         .map_err(|e| RpcError::internal(format!("置顶写入失败: {}", e)))?;
 
+        crate::rpc::group::group::notify::publish_changed(&services, channel.id, "pinned_messages_changed").await;
         let response = MessagePinResponse {
             success: true,
             group_id,
@@ -179,6 +180,7 @@ pub async fn handle(
         .await
         .map_err(|e| RpcError::internal(format!("取消置顶失败: {}", e)))?;
 
+        crate::rpc::group::group::notify::publish_changed(&services, channel.id, "pinned_messages_changed").await;
         let response = MessagePinResponse {
             success: true,
             group_id,
@@ -212,6 +214,9 @@ pub async fn handle_list(
         .get_channel(&group_id)
         .await
         .map_err(|e| RpcError::not_found(format!("群组不存在: {}", e)))?;
+    if channel.group_id != Some(group_id) {
+        return Err(RpcError::not_found("群组不存在"));
+    }
     if !channel.members.contains_key(&request.user_id) {
         return Err(RpcError::forbidden("您不是群组成员".to_string()));
     }

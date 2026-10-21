@@ -107,6 +107,73 @@ async fn role_of(pool: &sqlx::PgPool, user_id: i64) -> Option<i16> {
     .expect("read role")
 }
 
+#[tokio::test]
+async fn group_profile_persists_preserves_omissions_and_clears_explicit_empty() {
+    let _guard = fixture_lock().lock().await;
+    let Some((service, pool)) = service().await else {
+        return;
+    };
+    seed(&pool).await;
+    assert!(service.persist_group_profile(
+        GROUP_ID as u64, None, Some("介绍".into()), None,
+    ).await.expect("persist"));
+    let row: (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT name, description, sync_version FROM privchat_groups WHERE group_id = $1",
+    ).bind(GROUP_ID).fetch_one(pool.as_ref()).await.unwrap();
+    assert_eq!(row.0, "role-authz");
+    assert_eq!(row.1.as_deref(), Some("介绍"));
+    assert!(!service.persist_group_profile(
+        GROUP_ID as u64, None, Some("介绍".into()), None,
+    ).await.expect("no-op"));
+    assert!(!service.persist_group_profile(
+        GROUP_ID as u64, None, None, None,
+    ).await.expect("omitted"));
+    let version: i64 = sqlx::query_scalar(
+        "SELECT sync_version FROM privchat_groups WHERE group_id = $1",
+    ).bind(GROUP_ID).fetch_one(pool.as_ref()).await.unwrap();
+    assert_eq!(version, row.2, "no-op must not advance the sync cursor");
+    assert!(service.persist_group_profile(
+        GROUP_ID as u64, None, Some(String::new()), None,
+    ).await.expect("clear"));
+    let description: Option<String> = sqlx::query_scalar(
+        "SELECT description FROM privchat_groups WHERE group_id = $1",
+    ).bind(GROUP_ID).fetch_one(pool.as_ref()).await.unwrap();
+    assert_eq!(description.as_deref(), Some(""));
+    cleanup(&pool).await;
+    assert!(service.persist_group_profile(
+        GROUP_ID as u64, None, Some("missing".into()), None,
+    ).await.is_err(), "missing groups cannot report a successful save");
+}
+
+#[tokio::test]
+async fn group_description_survives_a_new_service_instance() {
+    let _guard = fixture_lock().lock().await;
+    let Some((service, pool)) = service().await else {
+        return;
+    };
+    seed(&pool).await;
+    sqlx::query(
+        "INSERT INTO privchat_channels (channel_id, channel_type, group_id, created_at, updated_at) \
+         VALUES ($1, 1, $1, now_millis(), now_millis())",
+    ).bind(GROUP_ID).execute(pool.as_ref()).await.unwrap();
+    assert!(service.get_channel(&(GROUP_ID as u64)).await.unwrap().metadata.description.is_none());
+    assert!(service.update_channel_metadata(
+        &(GROUP_ID as u64), None, Some("persistent introduction".into()), None,
+    ).await.unwrap());
+
+    // Subsequent legacy settings setters still require a cached channel.
+    service.set_channel_join_approval(&(GROUP_ID as u64), true).await.unwrap();
+    let restarted = ChannelService::new_with_repository(Arc::new(
+        PgChannelRepository::new(pool.clone()),
+    ));
+    let reloaded = restarted.get_channel(&(GROUP_ID as u64)).await.unwrap();
+    assert_eq!(reloaded.metadata.description.as_deref(), Some("persistent introduction"));
+    assert_eq!(reloaded.metadata.name.as_deref(), Some("role-authz"));
+    sqlx::query("DELETE FROM privchat_channels WHERE channel_id = $1")
+        .bind(GROUP_ID).execute(pool.as_ref()).await.unwrap();
+    cleanup(&pool).await;
+}
+
 async fn owner_of(pool: &sqlx::PgPool) -> i64 {
     sqlx::query_scalar("SELECT owner_id FROM privchat_groups WHERE group_id = $1")
         .bind(GROUP_ID)
@@ -271,5 +338,36 @@ async fn setting_roles_persists_and_refuses_to_touch_ownership() {
     assert_eq!(owner_of(&pool).await, OWNER);
     assert_eq!(role_of(&pool, OWNER).await, Some(0));
 
+    cleanup(&pool).await;
+}
+
+#[tokio::test]
+async fn profile_rpc_allows_managers_only_and_preserves_patch_semantics() {
+    use privchat::rpc::group::group::update::update_profile;
+    use privchat_protocol::rpc::group::group::{GroupProfilePatch, GroupUpdateRequest};
+    let _guard = fixture_lock().lock().await;
+    let Some((_, pool)) = service().await else { return; };
+    seed(&pool).await;
+    let patch = |name: Option<&str>, description: Option<&str>| GroupUpdateRequest {
+        group_id: GROUP_ID as u64,
+        profile: GroupProfilePatch { name: name.map(str::to_owned), description: description.map(str::to_owned) },
+    };
+    for uid in [MEMBER, 0, 9_920_999] {
+        assert!(update_profile(&pool, uid as u64, patch(None, Some("denied"))).await.is_err());
+    }
+    let (first, changed) = update_profile(&pool, ADMIN as u64, patch(None, Some("admin intro"))).await.unwrap();
+    assert!(changed);
+    let (same, changed) = update_profile(&pool, OWNER as u64, patch(None, Some("admin intro"))).await.unwrap();
+    assert!(!changed);
+    assert_eq!(same.sync_version, first.sync_version);
+    let (renamed, _) = update_profile(&pool, OWNER as u64, patch(Some(" renamed "), None)).await.unwrap();
+    assert_eq!(renamed.name, "renamed");
+    assert_eq!(renamed.description.as_deref(), Some("admin intro"));
+    for name in [" ", "bad\nname", "abcdefghijklmnopqrstuvwxyz12345"] {
+        assert!(update_profile(&pool, OWNER as u64, patch(Some(name), None)).await.is_err());
+    }
+    let (cleared, _) = update_profile(&pool, ADMIN as u64, patch(None, Some(""))).await.unwrap();
+    assert_eq!(cleared.description.as_deref(), Some(""));
+    assert!(cleared.sync_version > first.sync_version);
     cleanup(&pool).await;
 }

@@ -17,7 +17,9 @@ pub struct ScratchDatabase {
 impl ScratchDatabase {
     pub async fn create(name: &str) -> Option<Self> {
         let url = privchat::require_test_database_url()?;
-        let (base, _) = url.rsplit_once('/').expect("url must carry a database name");
+        let (base, _) = url
+            .rsplit_once('/')
+            .expect("url must carry a database name");
         // 🔴 库名必须带进程 id。固定名字在两个 CI shard（或本地同时跑两次）时会撞上，
         // 而 `Drop` 会 `pg_terminate_backend` 掉"同名"库的全部连接——一组测试因此能
         // 把另一组正在跑的测试踢断，表现成随机的连接错误。
@@ -92,7 +94,6 @@ impl Drop for ScratchDatabase {
         .ok();
     }
 }
-
 
 #[macro_export]
 macro_rules! scratch_or_skip {
