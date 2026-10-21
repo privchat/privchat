@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+mod peer;
 
 fn db(_: sqlx::Error) -> RpcError {
     RpcError::from_code(
@@ -27,6 +28,12 @@ struct DeviceClaim {
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredCall {
+    #[serde(default)]
+    peer_revision: u32,
+    #[serde(default)]
+    peer_answered: bool,
+    #[serde(default)]
+    peer_seq: u64,
     call: CallSnapshot,
     channel_type: i16,
     claims: BTreeMap<u64, DeviceClaim>,
@@ -37,6 +44,7 @@ pub struct CallService {
     pub pool: PgPool,
     pub config: CallConfig,
     credentials: Option<(String, String)>,
+    turn_secret: Option<String>,
 }
 impl CallService {
     pub fn new(
@@ -44,8 +52,21 @@ impl CallService {
         config: CallConfig,
         credentials: Option<(String, String)>,
     ) -> anyhow::Result<Self> {
+        let secret = if config.enabled && config.peer.enabled && config.peer.allow_turn {
+            std::env::var(&config.peer.turn_secret_env).ok()
+        } else {
+            None
+        };
+        Self::with_peer_secret(pool, config, credentials, secret)
+    }
+    pub fn with_peer_secret(
+        pool: PgPool,
+        config: CallConfig,
+        credentials: Option<(String, String)>,
+        turn_secret: Option<String>,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
-        if config.enabled {
+        if config.enabled && !config.livekit_url.is_empty() {
             anyhow::ensure!(
                 credentials
                     .as_ref()
@@ -53,10 +74,19 @@ impl CallService {
                 "LiveKit credentials unavailable"
             );
         }
+        let turn_secret =
+            turn_secret.filter(|_| config.enabled && config.peer.enabled && config.peer.allow_turn);
+        if config.enabled && config.peer.enabled && config.peer.allow_turn {
+            anyhow::ensure!(
+                turn_secret.as_ref().is_some_and(|s| s.len() >= 16),
+                "TURN secret unavailable or too short"
+            );
+        }
         Ok(Self {
             pool,
             config,
             credentials,
+            turn_secret,
         })
     }
     pub fn from_environment(pool: PgPool, config: CallConfig) -> anyhow::Result<Self> {
@@ -73,6 +103,10 @@ impl CallService {
     pub fn capabilities(&self) -> CallCapabilitiesResponse {
         CallCapabilitiesResponse {
             enabled: self.config.enabled,
+            peer_enabled: self.config.enabled && self.config.peer.enabled,
+            livekit_enabled: self.config.enabled
+                && !self.config.livekit_url.is_empty()
+                && self.credentials.is_some(),
             audio_participant_limit: self.config.audio_participant_limit,
             video_participant_limit: self.config.video_participant_limit,
             ringing_timeout_seconds: self.config.ringing_timeout_seconds,
@@ -114,7 +148,19 @@ impl CallService {
             .execute(&mut **tx)
             .await
             .map_err(db)?;
+        // Preserve fingerprints of pre-peer commands when the additive flag is absent/false.
+        let mut body = body.clone();
+        if body.get("supports_peer").and_then(Value::as_bool) == Some(false) {
+            body.as_object_mut().unwrap().remove("supports_peer");
+        }
         let fingerprint = hex::encode(Sha256::digest(format!("{route}:{body}")));
+        let peer_used: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM privchat_call_peer_commands WHERE user_id=$1 AND device_id=$2 AND command_id=$3)")
+            .bind(actor as i64).bind(device).bind(id).fetch_one(&mut **tx).await.map_err(db)?;
+        if peer_used {
+            return Err(RpcError::validation(
+                "command_id already used by peer signalling",
+            ));
+        }
         let row = sqlx::query("SELECT fingerprint, response FROM privchat_call_commands WHERE user_id=$1 AND device_id=$2 AND command_id=$3")
             .bind(actor as i64).bind(device).bind(id).fetch_optional(&mut **tx).await.map_err(db)?;
         if let Some(row) = row {
@@ -229,7 +275,11 @@ impl CallService {
         }
         if stored.call.state == CallState::Ended {
             Self::effect(tx, &stored.call, "history", json!({})).await?;
-            Self::effect(tx, &stored.call, "delete_room", json!({})).await?;
+            if stored.call.transport == CallTransport::Livekit {
+                Self::effect(tx, &stored.call, "delete_room", json!({})).await?;
+            } else {
+                Self::clear_peer(tx, stored.call.call_id).await?;
+            }
         }
         Ok(())
     }
@@ -287,7 +337,9 @@ impl CallService {
         if changed {
             stored.call.version += 1;
             for p in &stored.call.participants {
-                if p.state == CallParticipantState::Left {
+                if p.state == CallParticipantState::Left
+                    && stored.call.transport == CallTransport::Livekit
+                {
                     if let Some(c) = stored.claims.get(&p.user_id) {
                         Self::effect(tx, &stored.call, "remove_participant", json!({"identity": self.identity(stored.call.call_id,p.user_id,&c.device)})).await?;
                     }
@@ -324,6 +376,25 @@ impl CallService {
         }
         if let Some(value) = replay {
             return Ok(value);
+        }
+        if kind == 0 && !self.config.peer.enabled {
+            return Err(RpcError::from_code(
+                privchat_protocol::ErrorCode::ServiceUnavailable,
+                "Direct peer calls unavailable; peer transport must be enabled".into(),
+            ));
+        }
+        let transport = if kind == 0 {
+            CallTransport::Webrtc
+        } else {
+            CallTransport::Livekit
+        };
+        if transport == CallTransport::Webrtc && !req.supports_peer {
+            return Err(RpcError::validation(
+                "This direct call requires a peer-capable client",
+            ));
+        }
+        if transport == CallTransport::Livekit && self.config.livekit_url.is_empty() {
+            return Err(RpcError::validation("LiveKit is unavailable for this call"));
         }
         let mut targets: BTreeSet<u64> = if req.invitee_ids.is_empty() {
             members.keys().copied().collect()
@@ -370,7 +441,11 @@ impl CallService {
             })
             .collect();
         let stored = StoredCall {
+            peer_revision: 0,
+            peer_answered: false,
+            peer_seq: 0,
             call: CallSnapshot {
+                transport,
                 call_id: id,
                 channel_id: req.channel_id,
                 initiator_id: actor,
@@ -437,7 +512,12 @@ impl CallService {
             .iter()
             .position(|p| p.user_id == actor)
             .ok_or_else(|| RpcError::forbidden("Not invited to call"))?;
-        if let Some(response) = replay {
+        if route == "join" && stored.call.transport == CallTransport::Webrtc && !req.supports_peer {
+            return Err(RpcError::validation(
+                "This direct call requires a peer-capable client",
+            ));
+        }
+        if let Some(mut response) = replay {
             if route == "join" {
                 if stored.call.state == CallState::Ended
                     || (stored.call.state == CallState::Ringing
@@ -455,6 +535,10 @@ impl CallService {
                     if peer.user_id != actor && peer.state == CallParticipantState::Joined {
                         Self::not_blocked(&mut tx, actor, peer.user_id).await?;
                     }
+                }
+                if stored.call.transport == CallTransport::Webrtc && !self.config.peer.allow_turn {
+                    // A policy change must also suppress credentials cached by an older command.
+                    response["peer"] = encode(self.peer_config(&stored.call, actor)?)?;
                 }
             }
             return Ok(response);
@@ -606,11 +690,25 @@ impl CallService {
         }
         let response = if route == "join" {
             let expires = now() + i64::from(self.config.token_ttl_seconds) * 1000;
+            let peer = if stored.call.transport == CallTransport::Webrtc {
+                Some(self.peer_config(&stored.call, actor)?)
+            } else {
+                None
+            };
             encode(CallJoinResponse {
                 call: stored.call.clone(),
-                url: self.config.livekit_url.clone(),
-                token: self.join_token(&stored.call, actor, device, expires)?,
-                expires_at_ms: expires,
+                url: if peer.is_none() {
+                    self.config.livekit_url.clone()
+                } else {
+                    String::new()
+                },
+                token: if peer.is_none() {
+                    self.join_token(&stored.call, actor, device, expires)?
+                } else {
+                    String::new()
+                },
+                expires_at_ms: if peer.is_none() { expires } else { 0 },
+                peer,
             })?
         } else {
             encode(CallResponse {
@@ -671,6 +769,7 @@ impl CallService {
         Ok(CallActiveResponse { calls })
     }
     pub async fn sweep(&self) -> RpcResult<()> {
+        self.sweep_peer().await?;
         let ids: Vec<i64> = sqlx::query_scalar("SELECT call_id FROM privchat_calls WHERE state <> 'ended' ORDER BY updated_at LIMIT 100")
             .fetch_all(&self.pool).await.map_err(db)?;
         for id in ids {
@@ -713,6 +812,11 @@ impl CallService {
         device: &str,
         expires: i64,
     ) -> RpcResult<String> {
+        if call.transport != CallTransport::Livekit {
+            return Err(RpcError::forbidden(
+                "Peer calls do not receive SFU credentials",
+            ));
+        }
         let (key, _) = self
             .credentials
             .as_ref()
@@ -730,6 +834,9 @@ impl CallService {
         call: &CallSnapshot,
         identity: Option<&str>,
     ) -> RpcResult<()> {
+        if call.transport == CallTransport::Webrtc {
+            return Ok(());
+        }
         let (key, _) = self
             .credentials
             .as_ref()

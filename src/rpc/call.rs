@@ -44,6 +44,8 @@ pub async fn register_routes(services: RpcServiceContext) {
         routes::GET,
         routes::ACTIVE,
         routes::HEARTBEAT,
+        routes::PEER_SIGNAL,
+        routes::PEER_EVENTS,
     ] {
         let service = service.clone();
         GLOBAL_RPC_ROUTER
@@ -89,6 +91,24 @@ async fn handle(
         .ok_or_else(|| RpcError::unauthorized("Authenticated device required"))?;
     let invalid = |_| RpcError::validation("Invalid call request");
     match route {
+        routes::PEER_SIGNAL => Ok(json!(
+            service
+                .peer_signal(
+                    actor,
+                    device,
+                    serde_json::from_value(params).map_err(invalid)?
+                )
+                .await?
+        )),
+        routes::PEER_EVENTS => Ok(json!(
+            service
+                .peer_events(
+                    actor,
+                    device,
+                    serde_json::from_value(params).map_err(invalid)?
+                )
+                .await?
+        )),
         routes::CAPABILITIES => Ok(json!(service.capabilities())),
         routes::INVITE => {
             service

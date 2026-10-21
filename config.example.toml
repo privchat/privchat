@@ -27,6 +27,33 @@ handler_max_inflight = 2000
 [account]
 mode = "BUILTIN"
 
+# Calls are opt-in. New direct calls require peer; groups require LiveKit.
+# capability.peer_enabled and capability.livekit_enabled gate the two UI entries.
+# Existing stored call.transport is immutable (missing legacy value = livekit).
+[call]
+enabled = false
+livekit_url = ""
+api_key_env = "PRIVCHAT_LIVEKIT_API_KEY"
+api_secret_env = "PRIVCHAT_LIVEKIT_API_SECRET"
+token_ttl_seconds = 60
+ringing_timeout_seconds = 45
+heartbeat_lease_seconds = 60
+audio_participant_limit = 16
+video_participant_limit = 9
+
+[call.peer]
+enabled = false
+allow_turn = false
+# With TURN disabled, no secret is needed; STUN is optional. There is no relay fallback.
+stun_urls = []
+turn_urls = []
+# Production examples only: stun:turn.example.invalid:3478;
+# turn:turn.example.invalid:3478?transport=udp; turns:turn.example.invalid:5349?transport=tcp
+# Only when allow_turn=true: supply URLs and coturn's shared REST auth secret via env.
+turn_secret_env = "PRIVCHAT_TURN_SECRET"
+credential_ttl_seconds = 600
+journal_ttl_seconds = 300
+
 # 网关级 TLS 身份：QUIC 与 TLS/TCP 共用同一套长期密钥和同一组 SPKI pins
 # （GATEWAY_TRANSPORT_SPEC §1.1）。放网关级而非 listener 级，是为了从结构上杜绝
 # 「两个 listener 配出不同身份」——那会让客户端按传输方式拿到不同 SPKI，pinning 失效。

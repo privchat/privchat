@@ -50,21 +50,29 @@ async fn setup(name: &str) -> (common::ScratchDatabase, CallService) {
     let config = CallConfig {
         enabled: true,
         livekit_url: "ws://127.0.0.1:56780".into(),
+        peer: privchat::service::call_config::CallPeerSettings {
+            enabled: true,
+            allow_turn: true,
+            turn_urls: vec!["turn:127.0.0.1:56888?transport=udp".into()],
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let service = CallService::new(
+    let service = CallService::with_peer_secret(
         pool,
         config,
         Some((
             "test-key".into(),
             "test-secret-at-least-thirty-two-bytes".into(),
         )),
+        Some("isolated-turn-secret-not-production".into()),
     )
     .unwrap();
     (db, service)
 }
 fn invite(id: &str, channel: u64) -> CallInviteRequest {
     CallInviteRequest {
+        supports_peer: true,
         command_id: id.into(),
         channel_id: channel,
         media_kind: CallMediaKind::Audio,
@@ -73,12 +81,515 @@ fn invite(id: &str, channel: u64) -> CallInviteRequest {
 }
 fn command(id: &str, call: u64) -> CallMutationRequest {
     CallMutationRequest {
+        supports_peer: true,
         command_id: id.into(),
         call_id: call,
     }
 }
 fn call_id(value: &Value) -> u64 {
     value["call"]["call_id"].as_u64().unwrap()
+}
+
+async fn peer_setup(name: &str) -> (common::ScratchDatabase, CallService) {
+    let (db, old) = setup(name).await;
+    let mut config = old.config.clone();
+    config.peer.enabled = true;
+    config.peer.stun_urls = vec!["stun:127.0.0.1:53479".into()];
+    config.peer.turn_urls = vec!["turn:127.0.0.1:53479?transport=udp".into()];
+    let service = CallService::with_peer_secret(
+        old.pool.clone(),
+        config,
+        Some(("test-key".into(), "test-secret".into())),
+        Some("isolated-turn-secret-not-production".into()),
+    )
+    .unwrap();
+    (db, service)
+}
+fn peer_command(id: &str, call: u64) -> CallMutationRequest {
+    CallMutationRequest {
+        supports_peer: true,
+        ..command(id, call)
+    }
+}
+fn signal(id: &str, call: u64, revision: u32, kind: CallPeerSignalKind) -> CallPeerSignalRequest {
+    CallPeerSignalRequest {
+        command_id: id.into(),
+        call_id: call,
+        revision,
+        kind,
+        payload: if kind == CallPeerSignalKind::Ice {
+            json!({"candidate":"candidate:test","sdpMid":"0","sdpMLineIndex":0}).to_string()
+        } else {
+            "v=0\r\ns=test fixture\r\n".into()
+        },
+    }
+}
+
+#[tokio::test]
+async fn peer_transport_credentials_and_legacy_compatibility() {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    let (_db, s) = peer_setup("peer_transport").await;
+    assert!(s
+        .invite(
+            1,
+            "a",
+            CallInviteRequest {
+                supports_peer: false,
+                ..invite("old", 100)
+            }
+        )
+        .await
+        .is_err());
+    let offered = s
+        .invite(
+            1,
+            "a",
+            CallInviteRequest {
+                supports_peer: true,
+                ..invite("offer", 100)
+            },
+        )
+        .await
+        .unwrap();
+    let id = call_id(&offered);
+    assert_eq!(offered["call"]["transport"], "webrtc");
+    assert!(s
+        .mutate(
+            "join",
+            2,
+            "b",
+            CallMutationRequest {
+                supports_peer: false,
+                ..command("oldjoin", id)
+            }
+        )
+        .await
+        .is_err());
+    let a = s
+        .mutate("join", 1, "a", peer_command("join-a", id))
+        .await
+        .unwrap();
+    let b = s
+        .mutate("join", 2, "b", peer_command("join-b", id))
+        .await
+        .unwrap();
+    assert_eq!(a["url"], "");
+    assert_eq!(a["token"], "");
+    assert_eq!(a["peer"]["offerer"], true);
+    assert_eq!(b["peer"]["self_user_id"], 2);
+    assert_eq!(b["peer"]["peer_user_id"], 1);
+    assert_eq!(b["peer"]["offerer"], false);
+    let ice = &a["peer"]["ice_servers"][1];
+    let mut mac =
+        Hmac::<sha1::Sha1>::new_from_slice(b"isolated-turn-secret-not-production").unwrap();
+    mac.update(ice["username"].as_str().unwrap().as_bytes());
+    assert_eq!(
+        ice["credential"],
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    );
+    assert!(
+        a["peer"]["credential_expires_at_ms"].as_i64().unwrap()
+            > chrono::Utc::now().timestamp_millis()
+    );
+    let snapshot = s.get(1, id).await.unwrap();
+    assert!(s.join_token(&snapshot, 1, "a", i64::MAX).is_err());
+    s.media_cleanup(&snapshot, None).await.unwrap();
+    // Existing call transport is immutable even if current peer selection is disabled.
+    let mut off = s.clone();
+    off.config.peer.enabled = false;
+    assert_eq!(
+        off.get(1, id).await.unwrap().transport,
+        CallTransport::Webrtc
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let renewed = s
+        .mutate("join", 1, "a", peer_command("renew", id))
+        .await
+        .unwrap();
+    assert!(
+        renewed["peer"]["credential_expires_at_ms"]
+            .as_i64()
+            .unwrap()
+            > a["peer"]["credential_expires_at_ms"].as_i64().unwrap()
+    );
+    assert_eq!(
+        s.mutate("join", 1, "a", peer_command("join-a", id))
+            .await
+            .unwrap(),
+        a
+    );
+    s.mutate("end", 1, "a", peer_command("end", id))
+        .await
+        .unwrap();
+    let cleanup:i64=sqlx::query_scalar("SELECT count(*) FROM privchat_call_effects WHERE call_id=$1 AND kind IN ('delete_room','remove_participant')").bind(id as i64).fetch_one(&s.pool).await.unwrap();
+    assert_eq!(cleanup, 0);
+    let group = s
+        .invite(
+            1,
+            "a",
+            CallInviteRequest {
+                invitee_ids: vec![2],
+                ..invite("group", 200)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(group["call"]["transport"], "livekit");
+    let group_join = s
+        .mutate("join", 2, "b", command("groupjoin", call_id(&group)))
+        .await
+        .unwrap();
+    assert!(group_join["peer"].is_null());
+    assert!(!group_join["token"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn peer_journal_auth_replay_revision_restart_and_terminal_cleanup() {
+    let (_db, s) = peer_setup("peer_journal").await;
+    let id = call_id(
+        &s.invite(
+            1,
+            "a",
+            CallInviteRequest {
+                supports_peer: true,
+                ..invite("invite", 100)
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let read = CallPeerEventsRequest {
+        call_id: id,
+        after_seq: 0,
+    };
+    assert!(s.peer_events(2, "b", read.clone()).await.is_err());
+    s.mutate("join", 2, "b", peer_command("join", id))
+        .await
+        .unwrap();
+    assert!(s
+        .peer_signal(
+            2,
+            "b",
+            signal("bad-offer", id, 1, CallPeerSignalKind::Offer)
+        )
+        .await
+        .is_err());
+    assert!(s
+        .peer_signal(
+            1,
+            "other",
+            signal("bad-device", id, 1, CallPeerSignalKind::Offer)
+        )
+        .await
+        .is_err());
+    let offer = signal("offer1", id, 1, CallPeerSignalKind::Offer);
+    let first = s.peer_signal(1, "a", offer.clone()).await.unwrap();
+    assert_eq!(first.next_seq, 1);
+    s.peer_signal(1, "a", signal("ice", id, 1, CallPeerSignalKind::Ice))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(s.peer_signal(1, "a", offer.clone()).await.unwrap()).unwrap(),
+        serde_json::to_value(&first).unwrap()
+    );
+    let mut conflict = offer.clone();
+    conflict.payload.push('x');
+    assert!(s.peer_signal(1, "a", conflict).await.is_err());
+    assert!(s
+        .mutate("heartbeat", 1, "a", peer_command("offer1", id))
+        .await
+        .is_err());
+    assert!(s
+        .peer_signal(2, "b", signal("join", id, 1, CallPeerSignalKind::Answer))
+        .await
+        .is_err());
+    let events = s.peer_events(2, "b", read.clone()).await.unwrap();
+    assert_eq!(events.events.len(), 2);
+    assert_eq!(events.next_seq, 2);
+    assert_eq!(events.events[0].from_user_id, 1);
+    assert_eq!(events.events[0].payload, offer.payload);
+    assert!(s
+        .peer_events(1, "a", read.clone())
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+    assert!(s.peer_events(2, "wrong", read.clone()).await.is_err());
+    assert!(s.peer_events(3, "c", read.clone()).await.is_err());
+    assert!(s
+        .peer_signal(
+            1,
+            "a",
+            signal("badanswer", id, 1, CallPeerSignalKind::Answer)
+        )
+        .await
+        .is_err());
+    s.peer_signal(2, "b", signal("answer", id, 1, CallPeerSignalKind::Answer))
+        .await
+        .unwrap();
+    assert!(s
+        .peer_signal(2, "b", signal("answer2", id, 1, CallPeerSignalKind::Answer))
+        .await
+        .is_err());
+    let restarted = CallService::with_peer_secret(
+        s.pool.clone(),
+        s.config.clone(),
+        Some(("k".into(), "s".into())),
+        Some("isolated-turn-secret-not-production".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        restarted
+            .peer_events(1, "a", read.clone())
+            .await
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
+    s.peer_signal(1, "a", signal("restart", id, 2, CallPeerSignalKind::Offer))
+        .await
+        .unwrap();
+    assert!(s
+        .peer_signal(2, "b", signal("oldice", id, 1, CallPeerSignalKind::Ice))
+        .await
+        .is_err());
+    assert!(s.peer_signal(1, "a", offer).await.is_err());
+    sqlx::query("INSERT INTO privchat_blacklist(user_id,blocked_user_id) VALUES(1,2)")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    assert!(s.peer_events(2, "b", read.clone()).await.is_err());
+    sqlx::query("DELETE FROM privchat_blacklist WHERE user_id=1 AND blocked_user_id=2")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE privchat_channels SET direct_user2_id=3 WHERE channel_id=100")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    assert!(s.peer_events(2, "b", read.clone()).await.is_err());
+    sqlx::query("UPDATE privchat_channels SET direct_user2_id=2 WHERE channel_id=100")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    s.mutate("end", 1, "a", peer_command("end", id))
+        .await
+        .unwrap();
+    assert!(s.peer_events(1, "a", read).await.is_err());
+    assert!(s
+        .peer_signal(1, "a", signal("terminal", id, 3, CallPeerSignalKind::Offer))
+        .await
+        .is_err());
+    for table in [
+        "privchat_call_peer_events",
+        "privchat_call_peer_commands",
+        "privchat_call_peer_rates",
+    ] {
+        let count: i64 =
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE call_id=$1"))
+                .bind(id as i64)
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+#[tokio::test]
+async fn peer_journal_payload_rate_queue_and_expiry_bounds() {
+    let (_db, s) = peer_setup("peer_bounds").await;
+    let id = call_id(
+        &s.invite(
+            1,
+            "a",
+            CallInviteRequest {
+                supports_peer: true,
+                ..invite("invite", 100)
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    s.mutate("join", 2, "b", peer_command("join", id))
+        .await
+        .unwrap();
+    let mut huge = signal("huge", id, 1, CallPeerSignalKind::Offer);
+    huge.payload = "x".repeat(65537);
+    assert!(s.peer_signal(1, "a", huge).await.is_err());
+    s.peer_signal(1, "a", signal("offer", id, 1, CallPeerSignalKind::Offer))
+        .await
+        .unwrap();
+    let mut bad = signal("badice", id, 1, CallPeerSignalKind::Ice);
+    bad.payload = "{}".into();
+    assert!(s.peer_signal(1, "a", bad).await.is_err());
+    sqlx::query("INSERT INTO privchat_call_peer_rates(call_id,user_id,operation,bucket,count) VALUES($1,2,'events',$2,40)").bind(id as i64).bind(chrono::Utc::now().timestamp_millis()/10000).execute(&s.pool).await.unwrap();
+    assert!(s
+        .peer_events(
+            2,
+            "b",
+            CallPeerEventsRequest {
+                call_id: id,
+                after_seq: 0
+            }
+        )
+        .await
+        .is_err());
+    sqlx::query("UPDATE privchat_call_peer_rates SET count=60,bucket=$2 WHERE call_id=$1 AND operation='signal'").bind(id as i64).bind(chrono::Utc::now().timestamp_millis()/10000).execute(&s.pool).await.unwrap();
+    assert!(s
+        .peer_signal(1, "a", signal("limited", id, 1, CallPeerSignalKind::Ice))
+        .await
+        .is_err());
+    sqlx::query("DELETE FROM privchat_call_peer_rates WHERE call_id=$1")
+        .bind(id as i64)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO privchat_call_peer_events SELECT $1,n,1,'ice','{}',1,$2 FROM generate_series(2,512) n").bind(id as i64).bind(chrono::Utc::now().timestamp_millis()+300000).execute(&s.pool).await.unwrap();
+    assert!(s
+        .peer_signal(1, "a", signal("full", id, 1, CallPeerSignalKind::Ice))
+        .await
+        .is_err());
+    sqlx::query("UPDATE privchat_call_peer_events SET expires_at=0 WHERE call_id=$1")
+        .bind(id as i64)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE privchat_call_peer_commands SET expires_at=0 WHERE call_id=$1")
+        .bind(id as i64)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    s.sweep().await.unwrap();
+    assert!(s
+        .peer_events(
+            2,
+            "b",
+            CallPeerEventsRequest {
+                call_id: id,
+                after_seq: 0
+            }
+        )
+        .await
+        .is_err());
+    s.peer_signal(1, "a", signal("restart", id, 2, CallPeerSignalKind::Offer))
+        .await
+        .unwrap();
+    let events = s
+        .peer_events(
+            2,
+            "b",
+            CallPeerEventsRequest {
+                call_id: id,
+                after_seq: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.events.len(), 1);
+    assert_eq!(events.events[0].revision, 2);
+}
+
+#[tokio::test]
+async fn peer_unavailable_rejects_new_dm_but_legacy_transport_still_joins() {
+    let (_db, s) = setup("peer_legacy").await;
+    let id = call_id(&s.invite(1, "a", invite("invite", 100)).await.unwrap());
+    // A stored pre-peer snapshot lacks transport and must retain the SFU path.
+    sqlx::query(
+        "UPDATE privchat_calls SET document=document #- '{call,transport}' WHERE call_id=$1",
+    )
+    .bind(id as i64)
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    let mut legacy = s.clone();
+    legacy.config.peer.enabled = false;
+    assert!(!legacy.capabilities().peer_enabled);
+    assert!(legacy.capabilities().livekit_enabled);
+    let join = legacy
+        .mutate(
+            "join",
+            2,
+            "b",
+            CallMutationRequest {
+                supports_peer: false,
+                ..command("legacy-join", id)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(join["call"]["transport"], "livekit");
+    assert!(!join["token"].as_str().unwrap().is_empty());
+    legacy
+        .mutate("end", 2, "b", command("end", id))
+        .await
+        .unwrap();
+    assert!(legacy.invite(1, "a", invite("new-dm", 100)).await.is_err());
+    let mut peer_only = s.clone();
+    peer_only.config.livekit_url.clear();
+    assert!(peer_only.capabilities().peer_enabled);
+    assert!(!peer_only.capabilities().livekit_enabled);
+    assert!(peer_only
+        .invite(
+            1,
+            "a",
+            CallInviteRequest {
+                invitee_ids: vec![2],
+                ..invite("no-group", 200)
+            }
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn peer_allow_turn_disabled_generates_no_credentials_and_sanitizes_replay() {
+    let (_db, s) = peer_setup("peer_turn_opt_in").await;
+    let id = call_id(&s.invite(1, "a", invite("invite", 100)).await.unwrap());
+    let original = s.mutate("join", 1, "a", command("join", id)).await.unwrap();
+    assert!(original["peer"]["ice_servers"][1]["credential"].is_string());
+    let mut config = s.config.clone();
+    config.livekit_url.clear();
+    config.peer.allow_turn = false;
+    let direct = CallService::with_peer_secret(s.pool.clone(), config.clone(), None, None).unwrap();
+    let replay = direct
+        .mutate("join", 1, "a", command("join", id))
+        .await
+        .unwrap();
+    let fresh = direct
+        .mutate("join", 2, "b", command("callee", id))
+        .await
+        .unwrap();
+    for response in [replay, fresh] {
+        let response: CallJoinResponse = serde_json::from_value(response).unwrap();
+        let peer = response.peer.unwrap();
+        assert_eq!(peer.credential_expires_at_ms, 0);
+        assert_eq!(peer.ice_servers.len(), 1);
+        assert!(peer.ice_servers[0]
+            .urls
+            .iter()
+            .all(|u| u.starts_with("stun:")));
+        assert!(peer.ice_servers[0].username.is_none());
+        assert!(peer.ice_servers[0].credential.is_none());
+    }
+    config.peer.stun_urls.clear();
+    config.peer.turn_urls.clear();
+    let host_only = CallService::with_peer_secret(s.pool.clone(), config, None, None).unwrap();
+    let join = host_only
+        .mutate("join", 1, "a", command("host-only", id))
+        .await
+        .unwrap();
+    assert_eq!(join["peer"]["credential_expires_at_ms"], 0);
+    assert_eq!(join["peer"]["ice_servers"], json!([]));
+    // The switch also suppresses old cached TURN data with no configured STUN.
+    assert_eq!(
+        host_only
+            .mutate("join", 1, "a", command("join", id))
+            .await
+            .unwrap()["peer"]["ice_servers"],
+        json!([])
+    );
 }
 
 #[tokio::test]
@@ -108,13 +619,14 @@ async fn durable_commands_and_first_device_wins() {
     } else {
         ("desktop", "phone", b.unwrap())
     };
-    let restarted = CallService::new(
+    let restarted = CallService::with_peer_secret(
         s.pool.clone(),
         s.config.clone(),
         Some((
             "test-key".into(),
             "test-secret-at-least-thirty-two-bytes".into(),
         )),
+        Some("isolated-turn-secret-not-production".into()),
     )
     .unwrap();
     assert_eq!(
@@ -172,7 +684,7 @@ async fn durable_commands_and_first_device_wins() {
     .fetch_one(&s.pool)
     .await
     .unwrap();
-    assert_eq!(clean, 1);
+    assert_eq!(clean, 0);
 }
 
 #[tokio::test]
@@ -271,7 +783,17 @@ async fn token_grants_and_disabled_default() {
         .invite(1, "a", invite("disabled", 100))
         .await
         .is_err());
-    let value = s.invite(1, "a", invite("invite", 100)).await.unwrap();
+    let value = s
+        .invite(
+            1,
+            "a",
+            CallInviteRequest {
+                invitee_ids: vec![2],
+                ..invite("invite", 200)
+            },
+        )
+        .await
+        .unwrap();
     let id = call_id(&value);
     let joined = s.mutate("join", 1, "a", command("join", id)).await.unwrap();
     let claims = jsonwebtoken::decode::<Value>(
@@ -282,7 +804,7 @@ async fn token_grants_and_disabled_default() {
     .unwrap()
     .claims;
     assert_eq!(claims["video"]["canPublishSources"], json!(["microphone"]));
-    assert_eq!(claims["video"]["room"], format!("pc-100-{id}"));
+    assert_eq!(claims["video"]["room"], format!("pc-200-{id}"));
     assert_eq!(claims["video"]["canPublishData"], false);
     assert!(claims["video"].get("roomAdmin").is_none());
     assert!(claims["exp"].as_i64().unwrap() - chrono::Utc::now().timestamp() <= 60);
@@ -300,19 +822,41 @@ async fn livekit_real_join_and_delete_room() {
         .nth(1)
         .expect("test key mapping");
     let (key, secret) = line.trim().split_once(':').expect("test key mapping");
-    s = CallService::new(
+    let port: u16 = config
+        .lines()
+        .find_map(|line| line.strip_prefix("port:"))
+        .expect("fixture port")
+        .trim()
+        .parse()
+        .unwrap();
+    let mut call_config = s.config.clone();
+    call_config.livekit_url = format!("ws://127.0.0.1:{port}");
+    s = CallService::with_peer_secret(
         s.pool.clone(),
-        s.config.clone(),
+        call_config,
         Some((
             key.trim().trim_matches(['\"', '\'']).into(),
             secret.trim().trim_matches(['\"', '\'']).into(),
         )),
+        Some("isolated-turn-secret-not-production".into()),
     )
     .unwrap();
-    let value = s.invite(1, "a", invite("invite", 100)).await.unwrap();
+    let value = s
+        .invite(
+            1,
+            "a",
+            CallInviteRequest {
+                invitee_ids: vec![2],
+                ..invite("invite", 200)
+            },
+        )
+        .await
+        .unwrap();
     let id = call_id(&value);
     let response = s.mutate("join", 1, "a", command("join", id)).await.unwrap();
-    let mut url = url::Url::parse("http://127.0.0.1:56780/rtc").unwrap();
+    assert_eq!(response["call"]["transport"], "livekit");
+    assert!(response["peer"].is_null());
+    let mut url = url::Url::parse(&format!("http://127.0.0.1:{port}/rtc")).unwrap();
     url.query_pairs_mut()
         .append_pair("access_token", response["token"].as_str().unwrap())
         .append_pair("auto_subscribe", "1")
@@ -348,8 +892,13 @@ async fn reject_cancel_group_leave_and_heartbeat_capability() {
     assert_eq!(s.capabilities().heartbeat_lease_seconds, 60);
     let mut cfg = s.config.clone();
     cfg.heartbeat_lease_seconds = 10;
-    let short =
-        CallService::new(s.pool.clone(), cfg, Some(("key".into(), "secret".into()))).unwrap();
+    let short = CallService::with_peer_secret(
+        s.pool.clone(),
+        cfg,
+        Some(("key".into(), "secret".into())),
+        Some("isolated-turn-secret-not-production".into()),
+    )
+    .unwrap();
     assert_eq!(short.capabilities().heartbeat_lease_seconds, 10);
     let id = call_id(
         &s.invite(1, "a", invite("reject-invite", 100))

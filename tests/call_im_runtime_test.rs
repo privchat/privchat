@@ -35,7 +35,10 @@ fn data(response: RpcResponse) -> Value {
 }
 type Events = tokio::sync::mpsc::UnboundedReceiver<(u8, Vec<u8>)>;
 async fn login(account: &Value, app: &str) -> (TransportClient, Events) {
-    let cfg = WebSocketClientConfig::new("ws://127.0.0.1:56880/gate").unwrap();
+    let endpoint = std::env::var("PRIVCHAT_CALL_IM_WS_URL")
+        .unwrap_or_else(|_| "ws://127.0.0.1:56880/gate".into());
+    assert!(endpoint.starts_with("ws://127.0.0.1:"));
+    let cfg = WebSocketClientConfig::new(&endpoint).unwrap();
     let mut client = TransportClientBuilder::new()
         .protocol(cfg)
         .build()
@@ -128,10 +131,12 @@ async fn state(events: &mut Events, id: u64, expected: &str) {
 #[ignore = "requires explicitly created isolated loopback IM fixture"]
 async fn real_im_invite_multidevice_publish_end_and_exactly_once_history() {
     let root = std::env::var("PRIVCHAT_CALL_IM_RUNTIME").expect("isolated fixture required");
-    assert!(root.starts_with("/tmp/privchat-call-im."));
+    assert!(
+        root.starts_with("/tmp/privchat-call-im.") || root.starts_with("/tmp/privchat-peer-im.")
+    );
     let db = std::fs::read_to_string(format!("{root}/db-name")).unwrap();
     assert!(
-        db.starts_with("privchat_call_im_")
+        (db.starts_with("privchat_call_im_") || db.starts_with("privchat_peer_im_"))
             && db.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     );
     let pool = sqlx::PgPool::connect(&format!("postgres://zoujiaqing@localhost/{db}"))
@@ -147,7 +152,8 @@ async fn real_im_invite_multidevice_publish_end_and_exactly_once_history() {
     let capabilities = data(rpc(&alice, "call/capabilities", json!({})).await);
     assert_eq!(capabilities["enabled"], true);
     assert_eq!(capabilities["heartbeat_lease_seconds"], 60);
-    let invite = json!({"command_id":uuid::Uuid::new_v4().to_string(),"channel_id":600001,"media_kind":"audio"});
+    assert_eq!(capabilities["peer_enabled"], true);
+    let invite = json!({"command_id":uuid::Uuid::new_v4().to_string(),"channel_id":600001,"media_kind":"audio","supports_peer":true});
     let offered = data(rpc(&alice, "call/invite", invite.clone()).await);
     let id = offered["call"]["call_id"].as_u64().unwrap();
     assert_eq!(offered, data(rpc(&alice, "call/invite", invite).await));
@@ -159,7 +165,8 @@ async fn real_im_invite_multidevice_publish_end_and_exactly_once_history() {
         .unwrap()
         .iter()
         .any(|c| c["call_id"] == id));
-    let join = json!({"command_id":uuid::Uuid::new_v4().to_string(),"call_id":id});
+    let join =
+        json!({"command_id":uuid::Uuid::new_v4().to_string(),"call_id":id,"supports_peer":true});
     let (phone_result, desktop_result) = tokio::join!(
         rpc(&bob, "call/join", join.clone()),
         rpc(&desktop, "call/join", join)
@@ -170,30 +177,96 @@ async fn real_im_invite_multidevice_publish_end_and_exactly_once_history() {
     } else {
         (&desktop, &bob, data(desktop_result))
     };
-    assert!(joined["token"].as_str().is_some_and(|t| !t.is_empty()));
-    let mut media_url = url::Url::parse("http://127.0.0.1:56780/rtc").unwrap();
-    media_url
-        .query_pairs_mut()
-        .append_pair("access_token", joined["token"].as_str().unwrap())
-        .append_pair("auto_subscribe", "1")
-        .append_pair("protocol", "15")
-        .append_pair("sdk", "rust");
-    let media_response = reqwest::Client::new()
-        .get(media_url)
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .unwrap_or_else(|_| panic!("Media handshake failed (URL redacted)"));
+    assert_eq!(joined["call"]["transport"], "webrtc");
+    assert_eq!(joined["token"], "");
+    assert_eq!(joined["peer"]["offerer"], false);
+    let caller_join=data(rpc(&alice,"call/join",json!({"command_id":uuid::Uuid::new_v4().to_string(),"call_id":id,"supports_peer":true})).await);
+    assert_eq!(caller_join["peer"]["offerer"], true);
+    if std::env::var("PRIVCHAT_CALL_TURN_CHECK").as_deref() == Ok("1") {
+        let turn = caller_join["peer"]["ice_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ice| ice["username"].is_string())
+            .expect("TURN credentials");
+        assert!(turn["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == "turn:127.0.0.1:56888?transport=udp"));
+        // Capture, never print, coturn output: it can contain network addresses.
+        let mut client = tokio::process::Command::new("/opt/homebrew/bin/turnutils_uclient");
+        client
+            .args(["-y", "-c", "-n", "2", "-m", "1", "-p", "56888", "-u"])
+            .arg(turn["username"].as_str().unwrap())
+            .arg("-w")
+            .arg(turn["credential"].as_str().unwrap())
+            .arg("127.0.0.1")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(20), client.output())
+            .await
+            .expect("TURN relay timeout")
+            .expect("TURN utility");
+        assert!(
+            output.status.success(),
+            "TURN allocation/relay failed (private output redacted)"
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.split("tot_recv_msgs=").skip(1).any(|s| s
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0)
+                > 0),
+            "TURN returned no received packets (private output redacted)"
+        );
+        println!("PASS: IM-issued TURN REST credentials allocated relays and received actual UDP packets");
+    }
+    let offer = json!({"command_id":uuid::Uuid::new_v4().to_string(),"call_id":id,"revision":1,"kind":"offer","payload":"v=0\r\ns=private-test-sdp\r\n"});
+    assert_ne!(rpc(loser, "call/peer/signal", offer.clone()).await.code, 0);
+    assert_ne!(rpc(winner, "call/peer/signal", offer.clone()).await.code, 0);
+    let sent = data(rpc(&alice, "call/peer/signal", offer.clone()).await);
     assert_eq!(
-        media_response.status(),
-        101,
-        "IM-issued credentials must authenticate with real SFU"
+        sent,
+        data(rpc(&alice, "call/peer/signal", offer.clone()).await)
     );
-    let media_connection = media_response.upgrade().await.unwrap();
+    let events = data(
+        rpc(
+            winner,
+            "call/peer/events",
+            json!({"call_id":id,"after_seq":0}),
+        )
+        .await,
+    );
+    assert_eq!(events["events"][0]["payload"], offer["payload"]);
+    assert_eq!(
+        events["events"][0]["from_user_id"],
+        accounts["alice"]["user_id"]
+    );
+    assert_ne!(
+        rpc(
+            loser,
+            "call/peer/events",
+            json!({"call_id":id,"after_seq":0})
+        )
+        .await
+        .code,
+        0
+    );
+    let answer = json!({"command_id":uuid::Uuid::new_v4().to_string(),"call_id":id,"revision":1,"kind":"answer","payload":"v=0\r\ns=private-test-answer\r\n"});
+    data(rpc(winner, "call/peer/signal", answer).await);
+    let received = data(
+        rpc(
+            &alice,
+            "call/peer/events",
+            json!({"call_id":id,"after_seq":0}),
+        )
+        .await,
+    );
+    assert_eq!(received["events"].as_array().unwrap().len(), 1);
+    assert_eq!(received["events"][0]["kind"], "answer");
     let rejected = rpc(
         loser,
         "call/heartbeat",
@@ -222,7 +295,14 @@ async fn real_im_invite_multidevice_publish_end_and_exactly_once_history() {
             if complete {break;} tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }).await.expect("normal timeline history and SFU cleanup");
-    drop(media_connection);
+    assert_ne!(rpc(&alice, "call/peer/signal", offer).await.code, 0);
+    let private_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM privchat_call_peer_events WHERE call_id=$1")
+            .bind(id as i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(private_rows, 0);
     let delivered = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let (kind, bytes) = bob_events.recv().await.expect("message stream");
@@ -381,5 +461,5 @@ async fn real_im_invite_multidevice_publish_end_and_exactly_once_history() {
     alice.disconnect().await.unwrap();
     bob.disconnect().await.unwrap();
     desktop.disconnect().await.unwrap();
-    println!("PASS: normal login/auth, unsubscribed user Publish, active reconciliation, device race, terminal event, durable normal history replay, media cleanup, P1 DB-timeout durable retry and recovery");
+    println!("PASS: normal login/auth, unsubscribed user Publish, active reconciliation, device race, authenticated peer relay/replay, terminal journal cleanup, actual history push/replay, P1 DB-timeout durable retry and recovery (no media transport claim)");
 }
