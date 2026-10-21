@@ -983,6 +983,7 @@ impl ChatServer {
             server_event_client.clone(),
             connection_manager.clone(),
             subscribe_manager.clone(),
+            auth_session_manager.clone(),
         )?;
 
         // ✨ 初始化 Push 系统（Phase 2：带 Redis 和设备查询）

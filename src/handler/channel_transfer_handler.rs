@@ -48,6 +48,7 @@ use crate::error::{Result, ServerError};
 use crate::handler::MessageHandler;
 use crate::infra::{ConnectionManager, SubscribeManager};
 use crate::server_event::types::TransferResponsePayload;
+use crate::server_event::types::TransferCaller;
 use crate::server_event::{ServerEvent, ServerEventClient, ServerEventError};
 
 // =====================================================================
@@ -145,27 +146,49 @@ impl ChannelTransferLookups for DefaultChannelTransferLookups {
 pub struct ChannelTransferHandler {
     lookups: Arc<dyn ChannelTransferLookups>,
     server_event_client: Arc<ServerEventClient>,
+    session_manager: Arc<crate::infra::SessionManager>,
 }
 
 impl ChannelTransferHandler {
     pub fn new(
         lookups: Arc<dyn ChannelTransferLookups>,
         server_event_client: Arc<ServerEventClient>,
+        session_manager: Arc<crate::infra::SessionManager>,
     ) -> Self {
         Self {
             lookups,
             server_event_client,
+            session_manager,
         }
     }
+}
+
+/// 从认证会话取发起方身份。会话不存在或与 ctx 的 user 不一致时返回 None（按未认证拒绝）。
+pub fn caller_from_session(
+    ctx_user_id: Option<&str>,
+    session: Option<&crate::infra::session_manager::SessionInfo>,
+) -> Option<TransferCaller> {
+    let session = session?;
+    let user_id = ctx_user_id?.parse::<u64>().ok()?;
+    if session.user_id.parse::<u64>().ok()? != user_id {
+        return None;
+    }
+    Some(TransferCaller {
+        user_id,
+        device_id: session.device_id.clone(),
+        session_version: session.jwt_claims.session_version,
+        scope: session.jwt_claims.scope.clone(),
+    })
 }
 
 #[async_trait]
 impl MessageHandler for ChannelTransferHandler {
     async fn handle(&self, ctx: RequestContext) -> Result<Option<Vec<u8>>> {
-        let auth_user_id = ctx.user_id.as_ref().and_then(|s| s.parse::<u64>().ok());
+        let session = self.session_manager.get_session_info(&ctx.session_id).await;
+        let caller = caller_from_session(ctx.user_id.as_deref(), session.as_ref());
         let bytes = process_transfer_request(
             &ctx.data,
-            auth_user_id,
+            caller,
             self.lookups.as_ref(),
             self.server_event_client.as_ref(),
         )
@@ -201,7 +224,7 @@ impl MessageHandler for ChannelTransferHandler {
 ///    - 传输级失败（超时 / 连接拒绝 / 解析失败）→ 映射为 wire 错误码
 pub async fn process_transfer_request(
     raw_wire: &[u8],
-    auth_user_id: Option<u64>,
+    caller: Option<TransferCaller>,
     lookups: &dyn ChannelTransferLookups,
     server_event_client: &ServerEventClient,
 ) -> Result<Vec<u8>> {
@@ -216,7 +239,7 @@ pub async fn process_transfer_request(
     };
 
     // 2. Auth
-    let Some(user_id) = auth_user_id else {
+    let Some(caller) = caller else {
         return encode_response(
             &req.request_id,
             req.channel_id,
@@ -269,7 +292,7 @@ pub async fn process_transfer_request(
     };
 
     // 6. Room membership
-    if !lookups.is_room_member(user_id, room_id).await {
+    if !lookups.is_room_member(caller.user_id, room_id).await {
         return encode_response(
             &req.request_id,
             req.channel_id,
@@ -283,7 +306,7 @@ pub async fn process_transfer_request(
     let occurred_at_ms = chrono::Utc::now().timestamp_millis();
     let event = match ServerEvent::transfer_requested(
         req.request_id.clone(),
-        user_id,
+        &caller,
         req.channel_id,
         room_id,
         req.route.clone(),
@@ -468,6 +491,7 @@ pub fn try_register_channel_transfer_handler(
     server_event_client: Option<Arc<ServerEventClient>>,
     connection_manager: Arc<ConnectionManager>,
     subscribe_manager: Arc<SubscribeManager>,
+    session_manager: Arc<crate::infra::SessionManager>,
 ) -> Result<bool> {
     let Some(client) = server_event_client else {
         info!(
@@ -483,11 +507,93 @@ pub fn try_register_channel_transfer_handler(
     ));
     dispatcher.register_handler(
         MessageType::TransferRequest,
-        Box::new(ChannelTransferHandler::new(lookups, client.clone())),
+        Box::new(ChannelTransferHandler::new(lookups, client.clone(), session_manager)),
     );
     info!(
         "✅ Channel Transfer: wire ingress 已注册（出站 → {} via ServerEvent transfer.requested）",
         client.endpoint()
     );
     Ok(true)
+}
+
+#[cfg(test)]
+mod caller_identity_tests {
+    use super::*;
+    use crate::auth::token_service::UnifiedTokenClaims;
+    use crate::infra::session_manager::SessionInfo;
+
+    fn session(user_id: &str, device_id: &str, version: i64, scope: &[&str]) -> SessionInfo {
+        SessionInfo {
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            authenticated_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            jwt_claims: UnifiedTokenClaims {
+                iss: "privchat-server".into(),
+                sub: user_id.to_string(),
+                aud: vec![],
+                iat: 0,
+                exp: 0,
+                jti: "j".into(),
+                token_type: "access".into(),
+                device_id: device_id.to_string(),
+                session_version: version,
+                scope: scope.iter().map(|s| s.to_string()).collect(),
+                business_system_id: "privchat-application".into(),
+                app_id: "weey-agent".into(),
+            },
+            client_pts: 0,
+            ready_for_push: true,
+        }
+    }
+
+    #[test]
+    fn caller_comes_from_authenticated_session() {
+        let s = session("1001", "node-a", 7, &["agent_node"]);
+        let caller = caller_from_session(Some("1001"), Some(&s)).expect("caller");
+        assert_eq!(
+            caller,
+            TransferCaller {
+                user_id: 1001,
+                device_id: "node-a".into(),
+                session_version: 7,
+                scope: vec!["agent_node".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn missing_or_mismatched_session_is_unauthenticated() {
+        let s = session("1001", "node-a", 7, &["agent_node"]);
+        assert!(caller_from_session(Some("1001"), None).is_none());
+        assert!(caller_from_session(None, Some(&s)).is_none());
+        assert!(caller_from_session(Some("1002"), Some(&s)).is_none());
+    }
+
+    /// 上行事件里的设备身份只来自会话：wire 包里没有、也无法放入 device_id。
+    #[test]
+    fn transfer_event_carries_session_device_identity() {
+        let caller = TransferCaller {
+            user_id: 1001,
+            device_id: "node-a".into(),
+            session_version: 7,
+            scope: vec!["agent_node".into()],
+        };
+        let event = ServerEvent::transfer_requested(
+            "550e8400-e29b-41d4-a716-446655440000".into(),
+            &caller,
+            42,
+            42,
+            "agent/node/report".into(),
+            br#"{"device_id":"node-b","user_id":9}"#.to_vec(),
+            0,
+        )
+        .expect("event");
+        let raw = BASE64_STD.decode(&event.payload).expect("base64 payload");
+        let payload: serde_json::Value = serde_json::from_slice(&raw).expect("json payload");
+        assert_eq!(payload["user_id"], 1001);
+        assert_eq!(payload["device_id"], "node-a");
+        assert_eq!(payload["session_version"], 7);
+        assert_eq!(payload["scope"], serde_json::json!(["agent_node"]));
+    }
 }

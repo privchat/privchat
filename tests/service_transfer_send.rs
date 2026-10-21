@@ -24,7 +24,7 @@ use privchat::channel_transfer::MAX_TRANSFER_BODY_BYTES;
 use privchat::http::envelope::ApiEnvelope;
 use privchat::http::routes::transfer::{
     process_app_transfer_send, TransferSendBackend, TransferSendOk, TransferSendOutcome,
-    TransferSendRequest,
+    TransferSendRequest, TransferTarget,
 };
 
 // =====================================================================
@@ -34,6 +34,7 @@ use privchat::http::routes::transfer::{
 #[derive(Default)]
 struct DeliverCapture {
     target_user_id: Option<u64>,
+    target_device_id: Option<String>,
     channel_id: Option<u64>,
     encoded_packet: Option<Vec<u8>>,
 }
@@ -66,18 +67,19 @@ impl TransferSendBackend for CannedBackend {
     async fn resolve_room(&self, _channel_id: u64) -> Option<u64> {
         self.resolve_room
     }
-    async fn is_user_online(&self, _user_id: u64) -> bool {
+    async fn is_user_online(&self, _target: &TransferTarget) -> bool {
         self.is_user_online
     }
-    async fn is_user_subscribed(&self, _user_id: u64, _channel_id: u64) -> bool {
+    async fn is_user_subscribed(&self, _target: &TransferTarget, _channel_id: u64) -> bool {
         self.is_user_subscribed
     }
     async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
         self.is_room_member
     }
-    async fn deliver(&self, target_user_id: u64, channel_id: u64, encoded_packet: &[u8]) -> usize {
+    async fn deliver(&self, target: &TransferTarget, channel_id: u64, encoded_packet: &[u8]) -> usize {
         let mut g = self.capture.lock().await;
-        g.target_user_id = Some(target_user_id);
+        g.target_user_id = Some(target.user_id);
+        g.target_device_id = target.device_id.clone();
         g.channel_id = Some(channel_id);
         g.encoded_packet = Some(encoded_packet.to_vec());
         self.canned_delivered
@@ -97,6 +99,7 @@ fn req(body: &[u8]) -> TransferSendRequest {
         request_id: VALID_REQ_ID.to_string(),
         channel_id: VALID_CHANNEL,
         target_user_id: VALID_TARGET,
+        target_device_id: None,
         route: "game/poker/private-cards".to_string(),
         body: BASE64_STD.encode(body),
     }
@@ -305,4 +308,118 @@ async fn arc_dyn_backend_is_supported() {
     let backend: Arc<dyn TransferSendBackend> = Arc::new(CannedBackend::happy_path());
     let outcome = process_app_transfer_send(req(b"x"), backend.as_ref()).await;
     assert!(matches!(outcome, TransferSendOutcome::Ok(_)));
+}
+
+// =====================================================================
+// Device-targeted delivery (ASSISTANT_AI_AGENT_ARCHITECTURE_SPEC §6.2)
+// =====================================================================
+
+/// 按连接表回答的后端：每条连接 (user, device, 是否已订阅)。用真实的
+/// `TransferTarget::includes` 过滤，验证设备定向从判定到投递全程只看目标设备。
+struct ConnectionsBackend {
+    conns: Vec<(u64, &'static str, bool)>,
+    delivered_to: Mutex<Vec<&'static str>>,
+}
+
+impl ConnectionsBackend {
+    fn new(conns: Vec<(u64, &'static str, bool)>) -> Self {
+        Self { conns, delivered_to: Mutex::new(Vec::new()) }
+    }
+    fn of<'a>(&'a self, t: &'a TransferTarget) -> impl Iterator<Item = &'a (u64, &'static str, bool)> + 'a {
+        self.conns.iter().filter(move |(u, d, _)| t.includes(*u, d))
+    }
+}
+
+#[async_trait]
+impl TransferSendBackend for ConnectionsBackend {
+    async fn resolve_room(&self, channel_id: u64) -> Option<u64> {
+        Some(channel_id)
+    }
+    async fn is_user_online(&self, target: &TransferTarget) -> bool {
+        self.of(target).next().is_some()
+    }
+    async fn is_user_subscribed(&self, target: &TransferTarget, _channel_id: u64) -> bool {
+        self.of(target).any(|(_, _, sub)| *sub)
+    }
+    async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
+        true
+    }
+    async fn deliver(&self, target: &TransferTarget, _channel_id: u64, _packet: &[u8]) -> usize {
+        let hits: Vec<&'static str> = self.of(target).filter(|(_, _, sub)| *sub).map(|(_, d, _)| *d).collect();
+        self.delivered_to.lock().await.extend(hits.iter().copied());
+        hits.len()
+    }
+}
+
+fn targeted(device: &str) -> TransferSendRequest {
+    let mut r = req(b"x");
+    r.target_device_id = Some(device.to_string());
+    r
+}
+
+#[tokio::test]
+async fn targeted_send_reaches_only_the_named_device() {
+    let backend = ConnectionsBackend::new(vec![
+        (VALID_TARGET, "node-a", true),
+        (VALID_TARGET, "node-b", true),
+        (VALID_TARGET + 1, "node-a", true),
+    ]);
+    match process_app_transfer_send(targeted("node-a"), &backend).await {
+        TransferSendOutcome::Ok(ok) => assert_eq!(ok.delivered_sessions, 1),
+        other => panic!("expected Ok, got {other:?}"),
+    }
+    assert_eq!(*backend.delivered_to.lock().await, vec!["node-a"]);
+}
+
+#[tokio::test]
+async fn targeted_send_to_offline_device_never_falls_back_to_other_devices() {
+    let backend = ConnectionsBackend::new(vec![(VALID_TARGET, "node-b", true)]);
+    match process_app_transfer_send(targeted("node-a"), &backend).await {
+        TransferSendOutcome::Ok(ok) => {
+            assert!(ok.accepted);
+            assert_eq!(ok.delivered_sessions, 0, "offline target device must report zero, not broadcast");
+        }
+        other => panic!("expected Ok(0), got {other:?}"),
+    }
+    assert!(backend.delivered_to.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn targeted_send_to_online_unsubscribed_device_is_21500_even_if_others_subscribed() {
+    let backend = ConnectionsBackend::new(vec![
+        (VALID_TARGET, "node-a", false),
+        (VALID_TARGET, "node-b", true),
+    ]);
+    let outcome = process_app_transfer_send(targeted("node-a"), &backend).await;
+    assert_err(&outcome, privchat_protocol::ErrorCode::ChannelNotSubscribed as u32);
+    assert!(backend.delivered_to.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn untargeted_send_keeps_all_subscribed_sessions() {
+    let backend = ConnectionsBackend::new(vec![
+        (VALID_TARGET, "phone", true),
+        (VALID_TARGET, "desktop", true),
+        (VALID_TARGET, "tablet", false),
+    ]);
+    match process_app_transfer_send(req(b"x"), &backend).await {
+        TransferSendOutcome::Ok(ok) => assert_eq!(ok.delivered_sessions, 2),
+        other => panic!("expected Ok, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn blank_target_device_is_rejected() {
+    let backend = ConnectionsBackend::new(vec![(VALID_TARGET, "node-a", true)]);
+    let outcome = process_app_transfer_send(targeted("  "), &backend).await;
+    assert_err(&outcome, 10100);
+}
+
+#[test]
+fn target_device_id_is_optional_on_the_wire() {
+    let r: TransferSendRequest = serde_json::from_str(
+        r#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","channel_id":1,"target_user_id":2,"route":"a/b","body":""}"#,
+    )
+    .unwrap();
+    assert_eq!(r.target_device_id, None);
 }

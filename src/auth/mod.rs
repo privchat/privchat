@@ -41,7 +41,9 @@ pub use password::{hash_password, verify_password, PASSWORD_COST};
 pub use service_key_manager::{ServiceKeyManager, ServiceKeyStrategy};
 pub use session_state::{KickReason, KickedDevice, SessionState, SessionVerifyResult};
 pub use token::TokenAuth;
-pub use token_capability::{allows_message_type, allows_rpc_route, SCOPE_IM, SCOPE_MESSAGING, SCOPE_USER};
+pub use token_capability::{
+    allows_message_type, allows_rpc_route, SCOPE_AGENT_NODE, SCOPE_IM, SCOPE_MESSAGING, SCOPE_USER,
+};
 pub use token_issue_service::TokenIssueService;
 pub use token_revocation::TokenRevocationService;
 pub use token_service::{

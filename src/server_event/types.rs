@@ -180,7 +180,7 @@ impl ServerEvent {
     /// 幂等）。`internal_event_id` 仍由 [`Self::new`] 自动生成——两层幂等彼此独立。
     pub fn transfer_requested(
         client_request_id: String,
-        user_id: u64,
+        caller: &TransferCaller,
         channel_id: u64,
         room_id: u64,
         route: String,
@@ -189,7 +189,10 @@ impl ServerEvent {
     ) -> Result<Self, serde_json::Error> {
         let payload = TransferRequestedPayload {
             request_id: client_request_id,
-            user_id,
+            user_id: caller.user_id,
+            device_id: caller.device_id.clone(),
+            session_version: caller.session_version,
+            scope: caller.scope.clone(),
             channel_id,
             room_id,
             route,
@@ -274,10 +277,20 @@ pub struct SystemUserMessageReceivedPayload {
     pub occurred_at: i64,
 }
 
+/// 上行 Transfer 的发起方，全部取自认证会话（WEEY_AGENT_SPEC §9：上行不能伪造 deviceId）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferCaller {
+    pub user_id: u64,
+    pub device_id: String,
+    pub session_version: i64,
+    pub scope: Vec<String>,
+}
+
 /// Payload for `transfer.requested`（client wire `TransferRequest` 包装）。
 ///
 /// 字段一一对应 client 看到的 wire 协议字段；下游 (application) 通过 `channel_id`
 /// 解析 `privchat_business_channel`，再走 transfer 业务 dispatcher。
+/// `user_id` / `device_id` / `session_version` / `scope` 由 server 从认证会话注入。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferRequestedPayload {
     /// Client 发起的请求 ID（wire `TransferRequest.request_id` 透传）。
@@ -285,6 +298,12 @@ pub struct TransferRequestedPayload {
     pub request_id: String,
     /// 发起方 user ID（server 从认证 session 注入）。
     pub user_id: u64,
+    /// 发起方设备（server 从认证 session 注入，客户端无法自报）。
+    pub device_id: String,
+    /// 发起会话的 session_version；业务侧据此拒绝已撤销设备的旧会话。
+    pub session_version: i64,
+    /// 发起会话 token 的 scope，例如 `agent_node`。
+    pub scope: Vec<String>,
     /// 目标 channel ID。
     pub channel_id: u64,
     /// channel 所在 room ID。当前 PrivChat 模型 `room_id == channel_id`，保留独立字段

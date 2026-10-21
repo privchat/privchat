@@ -89,8 +89,27 @@ pub struct TransferSendRequest {
     pub request_id: String,
     pub channel_id: u64,
     pub target_user_id: u64,
+    /// 只投递给目标用户的这一台设备（ASSISTANT_AI_AGENT_ARCHITECTURE_SPEC §6.2）。
+    /// 设置后绝不退化成同 UID 全端投递：该设备离线 → `delivered_sessions=0`；
+    /// 在线但未订阅 → 21500。缺省为原语义（该用户全部已订阅会话）。
+    #[serde(default)]
+    pub target_device_id: Option<String>,
     pub route: String,
     pub body: String,
+}
+
+/// 投递目标：用户，及可选的单台设备。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferTarget {
+    pub user_id: u64,
+    pub device_id: Option<String>,
+}
+
+impl TransferTarget {
+    /// 连接是否属于本次投递目标。设备定向时只认完全相同的 device_id。
+    pub fn includes(&self, user_id: u64, device_id: &str) -> bool {
+        user_id == self.user_id && self.device_id.as_deref().map_or(true, |d| d == device_id)
+    }
 }
 
 /// `data` payload of the success envelope (spec §5.2):
@@ -158,11 +177,11 @@ pub trait TransferSendBackend: Send + Sync {
     /// Whether `user_id` has *any* authenticated online session right now.
     /// Used to distinguish "offline → success(0)" from
     /// "online but unsubscribed → 21500".
-    async fn is_user_online(&self, user_id: u64) -> bool;
+    async fn is_user_online(&self, target: &TransferTarget) -> bool;
 
     /// Whether `user_id` has at least one authenticated session subscribed
     /// to `channel_id`.
-    async fn is_user_subscribed(&self, user_id: u64, channel_id: u64) -> bool;
+    async fn is_user_subscribed(&self, target: &TransferTarget, channel_id: u64) -> bool;
 
     /// Whether `user_id` is a member of `room_id`. For Room channels in
     /// PrivChat's current model this is implied by subscription.
@@ -178,7 +197,7 @@ pub trait TransferSendBackend: Send + Sync {
     /// implementations wrap it in a `msgtrans::Packet` with
     /// `biz_type = MessageType::TransferRequest as u8` (= 19) and call the
     /// transport server.
-    async fn deliver(&self, target_user_id: u64, channel_id: u64, encoded_packet: &[u8]) -> usize;
+    async fn deliver(&self, target: &TransferTarget, channel_id: u64, encoded_packet: &[u8]) -> usize;
 }
 
 // =====================================================================
@@ -200,6 +219,16 @@ impl DefaultTransferSendBackend {
             subscribe_manager,
         }
     }
+
+    /// 目标用户的已认证连接，设备定向时只留那一台设备的连接。
+    async fn target_connections(&self, target: &TransferTarget) -> Vec<crate::infra::DeviceConnection> {
+        self.connection_manager
+            .get_user_connections(target.user_id)
+            .await
+            .into_iter()
+            .filter(|c| target.includes(c.user_id, &c.device_id))
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -213,17 +242,12 @@ impl TransferSendBackend for DefaultTransferSendBackend {
         Some(channel_id)
     }
 
-    async fn is_user_online(&self, user_id: u64) -> bool {
-        !self
-            .connection_manager
-            .get_user_connections(user_id)
-            .await
-            .is_empty()
+    async fn is_user_online(&self, target: &TransferTarget) -> bool {
+        !self.target_connections(target).await.is_empty()
     }
 
-    async fn is_user_subscribed(&self, user_id: u64, channel_id: u64) -> bool {
-        let conns = self.connection_manager.get_user_connections(user_id).await;
-        conns.iter().any(|c| {
+    async fn is_user_subscribed(&self, target: &TransferTarget, channel_id: u64) -> bool {
+        self.target_connections(target).await.iter().any(|c| {
             self.subscribe_manager
                 .get_session_channels(&c.session_id)
                 .contains(&channel_id)
@@ -239,11 +263,9 @@ impl TransferSendBackend for DefaultTransferSendBackend {
         true
     }
 
-    async fn deliver(&self, target_user_id: u64, channel_id: u64, encoded_packet: &[u8]) -> usize {
-        let conns = self
-            .connection_manager
-            .get_user_connections(target_user_id)
-            .await;
+    async fn deliver(&self, target: &TransferTarget, channel_id: u64, encoded_packet: &[u8]) -> usize {
+        let target_user_id = target.user_id;
+        let conns = self.target_connections(target).await;
         let target_sessions: Vec<msgtrans::SessionId> = conns
             .iter()
             .filter(|c| {
@@ -341,15 +363,25 @@ pub async fn process_app_transfer_send<B: TransferSendBackend + ?Sized>(
         );
     };
 
+    let target = TransferTarget {
+        user_id: req.target_user_id,
+        device_id: req.target_device_id.clone(),
+    };
+    if target.device_id.as_deref().is_some_and(|d| d.trim().is_empty()) {
+        return TransferSendOutcome::err(
+            CODE_INVALID_PARAMS,
+            "target_device_id must not be blank",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
     // 3. Subscription / online split.
     //    - subscribed       → proceed
     //    - online unsubscribed → 21500 (target online but not in this channel)
     //    - offline           → success with delivered_sessions = 0 (best-effort)
-    let subscribed = backend
-        .is_user_subscribed(req.target_user_id, req.channel_id)
-        .await;
+    let subscribed = backend.is_user_subscribed(&target, req.channel_id).await;
     if !subscribed {
-        let online = backend.is_user_online(req.target_user_id).await;
+        let online = backend.is_user_online(&target).await;
         if online {
             return TransferSendOutcome::err(
                 CODE_CHANNEL_NOT_SUBSCRIBED,
@@ -395,9 +427,7 @@ pub async fn process_app_transfer_send<B: TransferSendBackend + ?Sized>(
     };
 
     // 6. Deliver and report.
-    let delivered = backend
-        .deliver(req.target_user_id, req.channel_id, &encoded)
-        .await;
+    let delivered = backend.deliver(&target, req.channel_id, &encoded).await;
     TransferSendOutcome::Ok(TransferSendOk {
         accepted: true,
         delivered_sessions: delivered,

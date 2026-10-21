@@ -25,8 +25,9 @@
 //!
 //! 1. **能力属于 token，不属于身份。** 受限用户的 `user_type` 仍是 `NORMAL`；
 //!    `user_type` 只做身份分类（0=NORMAL / 1=SYSTEM / 2=BOT）。
-//! 2. **默认全通，显式收紧。** 未知 scope、空 scope、以及既有的 `user` / `im`
-//!    一律视为完整 IM 能力，存量 token 零影响；只有显式的受限 scope 才走白名单。
+//! 2. **完整能力只认显式 scope。** `user` / `im` 与历史上不带 scope 的 token 是完整 IM 能力；
+//!    **未知 scope 没有任何能力**——否则只要签一个拼错或新造的 scope 就等于全权限，
+//!    "受限凭据"无从谈起（WEEY_AGENT_SPEC §9、AUTH_SPEC 受限能力）。
 //! 3. **白名单而非黑名单。** 受限 scope 新增路由默认拒绝，避免新路由悄悄放行。
 
 use privchat_protocol::protocol::MessageType;
@@ -43,10 +44,15 @@ pub const SCOPE_IM: &str = "im";
 /// 只关心它的能力边界。
 pub const SCOPE_MESSAGING: &str = "messaging";
 
+/// 受限 scope：设备执行节点（私人助理 assistant_uid + deviceId 的节点凭据）
+///
+/// 只能建立连接、订阅获准的频道、收发 Transfer。不能读写聊天、查资料、建关系，
+/// 也不能经 server 内置 refresh 续期——续期由业务侧按节点授权重新校验后签发。
+pub const SCOPE_AGENT_NODE: &str = "agent_node";
+
 /// scope 是否代表完整 IM 能力
 fn is_full_access_scope(scope: &str) -> bool {
-    // 未纳入受限清单的 scope 一律按完整能力处理（向后兼容优先）
-    !matches!(scope, SCOPE_MESSAGING)
+    matches!(scope, SCOPE_USER | SCOPE_IM)
 }
 
 lazy_static::lazy_static! {
@@ -109,6 +115,26 @@ lazy_static::lazy_static! {
         set
     };
 
+    /// `agent_node` scope 允许的 RPC 路由：只有登出。
+    static ref AGENT_NODE_ROUTES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert(routes::auth::LOGOUT);
+        set
+    };
+
+    /// `agent_node` scope 允许的入站消息类型：连接维持、频道订阅与 Transfer。
+    /// 不含 SendMessage / Publish——节点不以 IM 身份发言或广播。
+    static ref AGENT_NODE_MESSAGE_TYPES: HashSet<MessageType> = {
+        let mut set = HashSet::new();
+        set.insert(MessageType::AuthorizationRequest);
+        set.insert(MessageType::DisconnectRequest);
+        set.insert(MessageType::PingRequest);
+        set.insert(MessageType::RpcRequest);
+        set.insert(MessageType::SubscribeRequest);
+        set.insert(MessageType::TransferRequest);
+        set
+    };
+
     /// `messaging` scope 允许的入站消息类型
     static ref MESSAGING_MESSAGE_TYPES: HashSet<MessageType> = {
         let mut set = HashSet::new();
@@ -136,6 +162,7 @@ pub fn allows_rpc_route(scopes: &[String], route: &str) -> bool {
         }
         match scope.as_str() {
             SCOPE_MESSAGING => MESSAGING_ROUTES.contains(route),
+            SCOPE_AGENT_NODE => AGENT_NODE_ROUTES.contains(route),
             _ => false,
         }
     })
@@ -153,6 +180,7 @@ pub fn allows_message_type(scopes: &[String], msg_type: &MessageType) -> bool {
         }
         match scope.as_str() {
             SCOPE_MESSAGING => MESSAGING_MESSAGE_TYPES.contains(msg_type),
+            SCOPE_AGENT_NODE => AGENT_NODE_MESSAGE_TYPES.contains(msg_type),
             _ => false,
         }
     })
@@ -163,6 +191,11 @@ pub fn list_scope_routes(scope: &str) -> Vec<&'static str> {
     match scope {
         SCOPE_MESSAGING => {
             let mut v: Vec<&'static str> = MESSAGING_ROUTES.iter().copied().collect();
+            v.sort_unstable();
+            v
+        }
+        SCOPE_AGENT_NODE => {
+            let mut v: Vec<&'static str> = AGENT_NODE_ROUTES.iter().copied().collect();
             v.sort_unstable();
             v
         }
@@ -180,7 +213,7 @@ mod tests {
 
     #[test]
     fn full_access_scopes_allow_everything() {
-        for scope in [SCOPE_USER, SCOPE_IM, "some-future-scope"] {
+        for scope in [SCOPE_USER, SCOPE_IM] {
             let scopes = vec![scope.to_string()];
             assert!(allows_rpc_route(&scopes, routes::account_search::QUERY));
             assert!(allows_rpc_route(&scopes, routes::group::CREATE));
@@ -247,6 +280,51 @@ mod tests {
         let scopes = vec![SCOPE_MESSAGING.to_string(), SCOPE_USER.to_string()];
         // 带完整能力 scope 时按并集放行
         assert!(allows_rpc_route(&scopes, routes::group::CREATE));
+    }
+
+    #[test]
+    fn unknown_scope_has_no_capability() {
+        for scope in ["some-future-scope", "agent", "AGENT_NODE", ""] {
+            let scopes = vec![scope.to_string()];
+            assert!(!allows_rpc_route(&scopes, routes::account_search::QUERY), "{scope}");
+            assert!(!allows_rpc_route(&scopes, routes::auth::LOGOUT), "{scope}");
+            assert!(!allows_message_type(&scopes, &MessageType::AuthorizationRequest), "{scope}");
+            assert!(!allows_message_type(&scopes, &MessageType::SendMessageRequest), "{scope}");
+        }
+    }
+
+    #[test]
+    fn agent_node_scope_only_keeps_connection_subscribe_and_transfer() {
+        let scopes = vec![SCOPE_AGENT_NODE.to_string()];
+        for t in [
+            MessageType::AuthorizationRequest,
+            MessageType::PingRequest,
+            MessageType::SubscribeRequest,
+            MessageType::TransferRequest,
+            MessageType::DisconnectRequest,
+        ] {
+            assert!(allows_message_type(&scopes, &t), "{t:?}");
+        }
+        for t in [MessageType::SendMessageRequest, MessageType::PublishRequest] {
+            assert!(!allows_message_type(&scopes, &t), "{t:?}");
+        }
+        assert!(allows_rpc_route(&scopes, routes::auth::LOGOUT));
+        // 读聊天、改资料、建关系、续期一律拒绝
+        for route in [
+            routes::sync::GET_DIFFERENCE,
+            routes::message_history::GET,
+            routes::entity::SYNC_ENTITIES,
+            routes::account_profile::UPDATE,
+            routes::account_user::DETAIL,
+            routes::account_search::QUERY,
+            routes::friend::APPLY,
+            routes::channel::DIRECT_GET_OR_CREATE,
+            routes::group::CREATE,
+            routes::file::REQUEST_UPLOAD_TOKEN,
+            routes::auth::REFRESH,
+        ] {
+            assert!(!allows_rpc_route(&scopes, route), "{route}");
+        }
     }
 
     #[test]
