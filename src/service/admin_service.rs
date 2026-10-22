@@ -149,9 +149,17 @@ impl AdminService {
     /// 1. 数据库层面标记设备被踢
     /// 2. 断开在线连接
     pub async fn revoke_device(&self, user_id: u64, device_id: &str, reason: &str) -> Result<()> {
-        self.device_manager_db
+        // Idempotent: callers retry until confirmed. A device already kicked (or never active) is the
+        // desired end state, and its connections are still closed in case an earlier attempt died
+        // between the database update and the disconnect.
+        match self
+            .device_manager_db
             .kick_device(user_id, device_id, None, reason)
-            .await?;
+            .await
+        {
+            Ok(()) | Err(ServerError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
 
         let _ = self
             .connection_manager
