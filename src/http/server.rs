@@ -204,6 +204,7 @@ impl FileHttpServer {
 /// 管理 API 服务器（仅内网，127.0.0.1）
 pub struct AdminHttpServer {
     state: AdminServerState,
+    host: String,
     port: u16,
 }
 
@@ -231,6 +232,7 @@ impl AdminHttpServer {
         cache_manager: Arc<crate::infra::CacheManager>,
         account_mode: crate::config::AccountMode,
         room_access: Arc<crate::service::room_access_service::RoomAccessService>,
+        host: String,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -265,6 +267,7 @@ impl AdminHttpServer {
                 account_mode,
                 room_access,
             },
+            host,
             port,
         }
     }
@@ -283,9 +286,9 @@ impl AdminHttpServer {
     pub async fn bind(
         &self,
     ) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error + Send + Sync>> {
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("{}:{}", self.host, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        info!("🔒 管理 API 服务器已绑定端口 {}", self.port);
+        info!("🔒 管理 API 服务器已绑定 {}", addr);
         Ok(listener)
     }
 

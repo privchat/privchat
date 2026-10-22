@@ -131,6 +131,9 @@ pub struct ServerConfig {
     pub http_file_server_host: String,
     /// 管理 API 服务器端口（仅内网访问）
     pub admin_api_port: u16,
+    /// 管理 API 监听地址。默认所有网卡（application 可能在另一台内网机器）；
+    /// 与 application 同机部署或本机测试时应设为 127.0.0.1。
+    pub admin_api_host: String,
     /// 文件服务 API 基础 URL（用于客户端访问，不包含端口号）
     ///
     /// 文件服务的 HTTP 服务器是独立的，客户端通过此 URL 访问文件相关接口。
@@ -410,6 +413,7 @@ impl Default for ServerConfig {
             attachment_keys: AttachmentKeys::default(),
             http_file_server_host: "0.0.0.0".to_string(),
             admin_api_port: 9090,
+            admin_api_host: "0.0.0.0".to_string(),
             file_api_base_url: Some("http://localhost:9083/api/app".to_string()),
             account: AccountConfig::default(), // 默认 BUILTIN（独立部署 / 测试）
             system_message: SystemMessageConfig::default(),
@@ -1152,6 +1156,8 @@ struct TomlJwtConfig {
 /// TOML [admin] 段
 #[derive(Debug, Deserialize)]
 struct TomlAdminConfig {
+    /// 管理 API 监听地址
+    host: Option<String>,
     /// 管理 API 监听端口
     port: Option<u16>,
     /// Master Key（管理 API 认证）
@@ -1839,6 +1845,9 @@ impl TryFrom<TomlConfig> for ServerConfig {
         if let Some(admin) = toml.admin {
             if let Some(port) = admin.port {
                 config.admin_api_port = port;
+            }
+            if let Some(host) = admin.host {
+                config.admin_api_host = host;
             }
             if let Some(key) = admin.master_key {
                 config.service_master_key = key;
@@ -3363,5 +3372,16 @@ mod attachment_config_tests {
         .expect("parse");
         let err = ServerConfig::try_from(toml).expect_err("重复 key_id 必须拒绝");
         assert!(format!("{err:#}").contains("key_id 重复"), "{err:#}");
+    }
+
+    #[test]
+    fn admin_api_bind_host_is_configurable() {
+        let toml: super::TomlConfig = toml::from_str(&format!(
+            "[admin]\nhost = \"127.0.0.1\"\nport = 19890\n\n[[attachment.keys]]\nid = 1\nkey = \"{KEY_A}\"\n"
+        ))
+        .expect("parse");
+        let config = ServerConfig::try_from(toml).expect("valid");
+        assert_eq!((config.admin_api_host.as_str(), config.admin_api_port), ("127.0.0.1", 19890));
+        assert_eq!(ServerConfig::default().admin_api_host, "0.0.0.0");
     }
 }

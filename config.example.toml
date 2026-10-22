@@ -98,6 +98,7 @@ timeout_seconds = 300
 cleanup_interval_seconds = 60
 
 [admin]
+# host = "127.0.0.1"   # 默认 0.0.0.0；与 application 同机或本机测试时只监听回环
 port = 9090
 # master_key = "<32 字节随机十六进制>"  # 也可通过环境变量 SERVICE_MASTER_KEY 设置
 
