@@ -576,6 +576,17 @@ pub struct HealthCheckResponse {
 #[derive(Debug, Deserialize)]
 pub struct CreateRoomChannelRequest {
     pub name: Option<String>,
+    /// 必须持票据订阅（ROOM_CHANNEL_SPEC §4.8）。为 true 时未配置 `[room_ticket]` 一律拒绝订阅。
+    #[serde(default)]
+    pub ticket_required: bool,
+}
+
+/// Room 访问撤权请求。`device_id` 缺省 = 该 UID 在此 Room 的全部设备。
+#[derive(Debug, Deserialize)]
+pub struct RevokeRoomAccessRequest {
+    pub user_id: u64,
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 /// Room 频道广播请求

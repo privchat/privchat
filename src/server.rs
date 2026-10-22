@@ -296,6 +296,8 @@ pub struct ChatServer {
     subscribe_manager: Arc<crate::infra::SubscribeManager>,
     /// Room 订阅历史（Redis）
     room_history_service: Arc<crate::service::RoomHistoryService>,
+    /// Room 持续授权（ROOM_CHANNEL_SPEC §4.8）
+    room_access: Arc<crate::service::room_access_service::RoomAccessService>,
     /// 通用服务端发消息服务（供登录通知、Admin API 等复用）
     message_service: Arc<crate::service::MessageService>,
     /// 用户服务（admin / RPC / job 统一入口，见 ADMIN_API_SPEC §1.4）
@@ -957,6 +959,12 @@ impl ChatServer {
             config.room.history_ttl_seconds
         );
 
+        let room_access = Arc::new(crate::service::room_access_service::RoomAccessService::new(
+            pool.clone(),
+            subscribe_manager.clone(),
+            connection_manager.clone(),
+        ));
+        room_access.spawn_sweeper(std::time::Duration::from_secs(15));
         message_dispatcher.register_handler(
             MessageType::SubscribeRequest,
             Box::new(SubscribeMessageHandler::new(
@@ -966,6 +974,7 @@ impl ChatServer {
                 room_history_service.clone(),
                 presence_service.clone(),
                 config.room_ticket.clone().map(Arc::new),
+                room_access.clone(),
             )),
         );
 
@@ -1739,6 +1748,7 @@ impl ChatServer {
             offline_worker: offline_worker.clone(),
             subscribe_manager,
             room_history_service,
+            room_access,
             message_service,
             user_service,
             qr_login_service,
@@ -2489,6 +2499,7 @@ impl ChatServer {
             self.privacy_service.clone(),
             self.cache_manager.clone(),
             self.config.account.mode,
+            self.room_access.clone(),
             self.config.admin_api_port,
         );
 

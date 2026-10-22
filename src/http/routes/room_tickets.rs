@@ -252,7 +252,7 @@ mod tests {
         };
         let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         let token = sign_with_kid(&cfg, "v1", &claims).expect("sign");
-        let verified = room_ticket::verify(&cfg, &token, 9001, "dev-a").expect("verify");
+        let verified = room_ticket::verify(&cfg, &token, 9001, "dev-a", 100).expect("verify");
         assert_eq!(verified.sub, "100");
         assert_eq!(verified.cid, 9001);
         assert_eq!(verified.did, "dev-a");

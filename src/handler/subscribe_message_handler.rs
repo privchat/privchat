@@ -42,6 +42,8 @@ const REASON_TICKET_MISSING: u8 = 9;
 const REASON_TICKET_INVALID: u8 = 10;
 const REASON_TICKET_EXPIRED: u8 = 11;
 const REASON_ROOM_CLOSED: u8 = 12;
+/// 该 UID／设备在此 Room 的访问已被撤销，且票据签发早于撤权（ROOM_CHANNEL_SPEC §4.8）。
+const REASON_ACCESS_REVOKED: u8 = 13;
 
 pub struct SubscribeMessageHandler {
     subscribe_manager: Arc<SubscribeManager>,
@@ -54,6 +56,8 @@ pub struct SubscribeMessageHandler {
     /// 无 ticket 校验，与 spec §4 不一致；仅过渡用）。配上 secret 才走完整
     /// ticket 校验。
     room_ticket: Option<Arc<RoomTicketConfig>>,
+    /// Room 持续授权：必须持票的 Room、撤权、到期（ROOM_CHANNEL_SPEC §4.8）。
+    room_access: Arc<crate::service::room_access_service::RoomAccessService>,
 }
 
 impl SubscribeMessageHandler {
@@ -64,6 +68,7 @@ impl SubscribeMessageHandler {
         room_history_service: Arc<crate::service::RoomHistoryService>,
         presence_service: Arc<crate::service::PresenceService>,
         room_ticket: Option<Arc<RoomTicketConfig>>,
+        room_access: Arc<crate::service::room_access_service::RoomAccessService>,
     ) -> Self {
         Self {
             subscribe_manager,
@@ -72,6 +77,7 @@ impl SubscribeMessageHandler {
             room_history_service,
             presence_service,
             room_ticket,
+            room_access,
         }
     }
 
@@ -173,6 +179,7 @@ impl MessageHandler for SubscribeMessageHandler {
 
         let mut reason_code = 0u8;
         let mut should_replay_room_history = false;
+        let mut room_grant: Option<crate::service::room_access_service::RoomGrant> = None;
 
         // 授权检查（仅 subscribe 需要，unsubscribe 无条件放行）
         if action == ACTION_SUBSCRIBE {
@@ -240,12 +247,34 @@ impl MessageHandler for SubscribeMessageHandler {
                                 let token = subscribe_request.param.as_str();
                                 // 当前连接的 device_id（spec §4.3 ticket.did 必须匹配）
                                 let dev = context.device_id.as_deref().unwrap_or("");
-                                match room_ticket::verify(cfg, token, channel_id, dev) {
+                                let uid = context
+                                    .user_id
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                    .unwrap_or(0);
+                                match room_ticket::verify(cfg, token, channel_id, dev, uid) {
+                                    Ok(claims)
+                                        if self
+                                            .room_access
+                                            .is_revoked(channel_id, uid, dev, claims.iat)
+                                            .await =>
+                                    {
+                                        warn!(
+                                            "📡 SubscribeMessageHandler: Room {} access revoked for user={} dev={} (ticket iat={})",
+                                            channel_id, uid, dev, claims.iat
+                                        );
+                                        REASON_ACCESS_REVOKED
+                                    }
                                     Ok(claims) => {
                                         info!(
                                             "📡 SubscribeMessageHandler: Room {} ticket verified user={} dev={}",
                                             channel_id, claims.sub, claims.did
                                         );
+                                        room_grant = Some(crate::service::room_access_service::RoomGrant {
+                                            user_id: uid,
+                                            device_id: dev.to_string(),
+                                            expires_at: claims.exp,
+                                        });
                                         REASON_OK
                                     }
                                     Err(e) => {
@@ -262,11 +291,20 @@ impl MessageHandler for SubscribeMessageHandler {
                                             | TicketErr::BadChannelType
                                             | TicketErr::ChannelMismatch
                                             | TicketErr::DeviceMismatch
+                                            | TicketErr::SubjectMismatch
                                             | TicketErr::UnknownKid
                                             | TicketErr::Other => REASON_TICKET_INVALID,
                                         }
                                     }
                                 }
+                            }
+                            None if self.room_access.ticket_required(channel_id).await => {
+                                // 声明必须持票的 Room（如工作空间）不接受兼容模式：fail-closed。
+                                warn!(
+                                    "📡 SubscribeMessageHandler: Room {} requires a ticket but [room_ticket] is not configured; subscribe rejected",
+                                    channel_id
+                                );
+                                REASON_TICKET_INVALID
                             }
                             None => {
                                 // v1 兼容模式：spec §4 要求 ticket，但未配 secret 时退化
@@ -305,6 +343,10 @@ impl MessageHandler for SubscribeMessageHandler {
                                 "📡 SubscribeMessageHandler: Session {} 订阅频道 {}",
                                 context.session_id, channel_id
                             );
+                            if let Some(grant) = room_grant.take() {
+                                self.room_access
+                                    .record_grant(context.session_id.clone(), channel_id, grant);
+                            }
                             // Room 才回放历史。按 wire 值这里是 3；写 2 的话回放会挂到
                             // 群聊上，而真正的 Room 永远回放不到。
                             should_replay_room_history = matches!(
@@ -351,6 +393,7 @@ impl MessageHandler for SubscribeMessageHandler {
                 ACTION_UNSUBSCRIBE => {
                     self.subscribe_manager
                         .unsubscribe(&context.session_id, channel_id);
+                    self.room_access.drop_grant(&context.session_id, channel_id);
                     info!(
                         "📡 SubscribeMessageHandler: Session {} 取消订阅频道 {}",
                         context.session_id, channel_id

@@ -123,6 +123,8 @@ pub struct AdminServerState {
     pub cache_manager: Arc<crate::infra::CacheManager>,
     /// 账号体系归属。application 据此判断是否处于 PLATFORM 模式（个人助理只在 PLATFORM 开放）。
     pub account_mode: crate::config::AccountMode,
+    /// Room 持续授权（ROOM_CHANNEL_SPEC §4.8）。
+    pub room_access: Arc<crate::service::room_access_service::RoomAccessService>,
 }
 
 /// HTTP 文件服务器（对外，0.0.0.0）
@@ -228,6 +230,7 @@ impl AdminHttpServer {
         privacy_service: Arc<crate::service::PrivacyService>,
         cache_manager: Arc<crate::infra::CacheManager>,
         account_mode: crate::config::AccountMode,
+        room_access: Arc<crate::service::room_access_service::RoomAccessService>,
         port: u16,
     ) -> Self {
         let admin_service = Arc::new(AdminService::new(
@@ -260,6 +263,7 @@ impl AdminHttpServer {
                 privacy_service,
                 cache_manager,
                 account_mode,
+                room_access,
             },
             port,
         }

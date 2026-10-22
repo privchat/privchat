@@ -83,6 +83,7 @@ pub mod reaction_service;
 pub mod mention_service;
 // Room 订阅历史服务（Redis）
 pub mod room_history_service;
+pub mod room_access_service;
 // 送达水位追踪服务
 pub mod delivery_tracker;
 // Note: Channel Transfer is *not* a business service (server spec §1.4).

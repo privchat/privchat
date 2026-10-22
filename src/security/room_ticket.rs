@@ -50,6 +50,9 @@ pub struct RoomTicketClaims {
     pub ct: u8,
     pub scope: String,
     pub exp: u64,
+    /// 签发时间（Unix 秒）。撤权以它判断旧票据；早期签发的票据没有该字段，按 0 处理。
+    #[serde(default)]
+    pub iat: u64,
 }
 
 impl RoomTicketClaims {
@@ -71,6 +74,7 @@ impl RoomTicketClaims {
             ct: CT_ROOM,
             scope: SCOPE_SUBSCRIBE.to_string(),
             exp: now.saturating_add(ttl_secs),
+            iat: now,
         }
     }
 }
@@ -96,6 +100,8 @@ pub enum VerifyError {
     ChannelMismatch,
     /// `did` claim does not match the connection's `device_id`.
     DeviceMismatch,
+    /// `sub` claim does not match the authenticated user (same `did`, different user).
+    SubjectMismatch,
     /// `kid` in the header was not found in config.
     UnknownKid,
     /// Anything else (claims malformed beyond a single recognisable cause).
@@ -113,6 +119,7 @@ impl std::fmt::Display for VerifyError {
             Self::BadChannelType => "bad_channel_type",
             Self::ChannelMismatch => "channel_mismatch",
             Self::DeviceMismatch => "device_mismatch",
+            Self::SubjectMismatch => "subject_mismatch",
             Self::UnknownKid => "unknown_kid",
             Self::Other => "other",
         };
@@ -154,6 +161,7 @@ pub fn verify(
     token: &str,
     expected_channel_id: u64,
     expected_device_id: &str,
+    expected_user_id: u64,
 ) -> Result<RoomTicketClaims, VerifyError> {
     if token.is_empty() {
         return Err(VerifyError::Missing);
@@ -206,6 +214,9 @@ pub fn verify(
     if claims.did != expected_device_id {
         return Err(VerifyError::DeviceMismatch);
     }
+    if claims.sub.parse::<u64>().ok() != Some(expected_user_id) {
+        return Err(VerifyError::SubjectMismatch);
+    }
 
     Ok(claims)
 }
@@ -242,7 +253,7 @@ mod tests {
         let cfg = cfg_single("super-secret-32-bytes-or-more!!!");
         let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         let token = sign_default(&cfg, &claims).expect("sign");
-        let ok = verify(&cfg, &token, 9001, "dev-a").expect("verify");
+        let ok = verify(&cfg, &token, 9001, "dev-a", 100).expect("verify");
         assert_eq!(ok.sub, "100");
         assert_eq!(ok.cid, 9001);
         assert_eq!(ok.did, "dev-a");
@@ -253,7 +264,7 @@ mod tests {
         let cfg = cfg_single("s");
         let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         let token = sign_default(&cfg, &claims).unwrap();
-        let err = verify(&cfg, &token, 9999, "dev-a").unwrap_err();
+        let err = verify(&cfg, &token, 9999, "dev-a", 100).unwrap_err();
         assert_eq!(err, VerifyError::ChannelMismatch);
     }
 
@@ -262,21 +273,21 @@ mod tests {
         let cfg = cfg_single("s");
         let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         let token = sign_default(&cfg, &claims).unwrap();
-        let err = verify(&cfg, &token, 9001, "dev-b").unwrap_err();
+        let err = verify(&cfg, &token, 9001, "dev-b", 100).unwrap_err();
         assert_eq!(err, VerifyError::DeviceMismatch);
     }
 
     #[test]
     fn empty_token_is_missing() {
         let cfg = cfg_single("s");
-        let err = verify(&cfg, "", 1, "d").unwrap_err();
+        let err = verify(&cfg, "", 1, "d", 100).unwrap_err();
         assert_eq!(err, VerifyError::Missing);
     }
 
     #[test]
     fn malformed_token_is_malformed_header() {
         let cfg = cfg_single("s");
-        let err = verify(&cfg, "not-a-jwt", 1, "d").unwrap_err();
+        let err = verify(&cfg, "not-a-jwt", 1, "d", 100).unwrap_err();
         assert_eq!(err, VerifyError::MalformedHeader);
     }
 
@@ -286,7 +297,7 @@ mod tests {
         let cfg_verify = cfg_single("wrong-secret");
         let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         let token = sign_default(&cfg_sign, &claims).unwrap();
-        let err = verify(&cfg_verify, &token, 9001, "dev-a").unwrap_err();
+        let err = verify(&cfg_verify, &token, 9001, "dev-a", 100).unwrap_err();
         assert_eq!(err, VerifyError::InvalidSignature);
     }
 
@@ -301,7 +312,7 @@ mod tests {
             .unwrap_or(0);
         claims.exp = now.saturating_sub(120);
         let token = sign_default(&cfg, &claims).unwrap();
-        let err = verify(&cfg, &token, 9001, "dev-a").unwrap_err();
+        let err = verify(&cfg, &token, 9001, "dev-a", 100).unwrap_err();
         assert_eq!(err, VerifyError::Expired);
     }
 
@@ -311,7 +322,7 @@ mod tests {
         let mut claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         claims.scope = "publish".to_string();
         let token = sign_default(&cfg, &claims).unwrap();
-        let err = verify(&cfg, &token, 9001, "dev-a").unwrap_err();
+        let err = verify(&cfg, &token, 9001, "dev-a", 100).unwrap_err();
         assert_eq!(err, VerifyError::BadScope);
     }
 
@@ -321,7 +332,7 @@ mod tests {
         let mut claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         claims.ct = 1; // Group, not Room
         let token = sign_default(&cfg, &claims).unwrap();
-        let err = verify(&cfg, &token, 9001, "dev-a").unwrap_err();
+        let err = verify(&cfg, &token, 9001, "dev-a", 100).unwrap_err();
         assert_eq!(err, VerifyError::BadChannelType);
     }
 
@@ -331,10 +342,10 @@ mod tests {
         let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         // sign with old kid v1; verify still works because v1 still in keys
         let token_v1 = sign(&cfg, "v1", &claims).unwrap();
-        verify(&cfg, &token_v1, 9001, "dev-a").expect("v1 still valid during rotation");
+        verify(&cfg, &token_v1, 9001, "dev-a", 100).expect("v1 still valid during rotation");
         // sign with v2 (default)
         let token_v2 = sign_default(&cfg, &claims).unwrap();
-        verify(&cfg, &token_v2, 9001, "dev-a").expect("v2 ok");
+        verify(&cfg, &token_v2, 9001, "dev-a", 100).expect("v2 ok");
     }
 
     #[test]
@@ -344,7 +355,16 @@ mod tests {
         // simulate a ticket signed with v0 (not in cfg).keys
         let other_cfg = cfg_keys("v0", &[("v0", "k0")]);
         let token = sign(&other_cfg, "v0", &claims).unwrap();
-        let err = verify(&cfg, &token, 9001, "dev-a").unwrap_err();
+        let err = verify(&cfg, &token, 9001, "dev-a", 100).unwrap_err();
         assert_eq!(err, VerifyError::UnknownKid);
+    }
+
+    #[test]
+    fn subject_mismatch_rejected_even_with_same_device() {
+        let cfg = cfg_single("s");
+        let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
+        let token = sign_default(&cfg, &claims).unwrap();
+        assert_eq!(verify(&cfg, &token, 9001, "dev-a", 200).unwrap_err(), VerifyError::SubjectMismatch);
+        assert!(verify(&cfg, &token, 9001, "dev-a", 100).unwrap().iat > 0);
     }
 }

@@ -100,6 +100,7 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/room", get(list_room_channels))
         .route("/room/{channel_id}", get(get_room_channel))
         .route("/room/{channel_id}/broadcast", post(room_broadcast))
+        .route("/room/{channel_id}/revoke", post(revoke_room_access))
         // 好友管理
         .route("/friendships", post(create_friendship)) // 创建好友关系
         .route("/friendships", get(list_friendships))
@@ -887,6 +888,9 @@ async fn create_room_channel(
     verify_service_key(&headers, &state).await?;
 
     let channel_id = next_channel_id();
+    if payload.ticket_required {
+        state.room_access.set_ticket_required(channel_id, true).await?;
+    }
     let name = payload
         .name
         .unwrap_or_else(|| format!("Room-{}", channel_id));
@@ -900,6 +904,7 @@ async fn create_room_channel(
         "success": true,
         "channel_id": channel_id,
         "name": name,
+        "ticket_required": payload.ticket_required,
         "message": "频道创建成功"
     })))
 }
@@ -970,6 +975,27 @@ async fn get_room_channel(
     })))
 }
 
+/// Room 访问撤权（ROOM_CHANNEL_SPEC §4.8）
+///
+/// POST /api/service/room/:channel_id/revoke `{user_id, device_id?}`。持久记录撤权，清除该
+/// UID（指定设备或全部设备）在此 Room 的现有订阅；签发早于撤权的旧票据不能再入场。
+async fn revoke_room_access(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<u64>,
+    Json(payload): Json<dto::RevokeRoomAccessRequest>,
+) -> ApiResult<Value> {
+    verify_service_key(&headers, &state).await?;
+    let device = payload.device_id.as_deref().filter(|d| !d.trim().is_empty());
+    let removed = state.room_access.revoke(channel_id, payload.user_id, device).await?;
+    Ok(ApiEnvelope::ok(json!({
+        "channel_id": channel_id,
+        "user_id": payload.user_id,
+        "device_id": device.unwrap_or(""),
+        "sessions_removed": removed,
+    })))
+}
+
 /// Room 频道广播
 ///
 /// POST /api/service/room/:channel_id/broadcast
@@ -981,7 +1007,10 @@ async fn room_broadcast(
 ) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
-    let sessions = state.subscribe_manager.get_channel_sessions(channel_id);
+    // 持票订阅已到期的会话不再投递（ROOM_CHANNEL_SPEC §4.8）。
+    let sessions = state
+        .room_access
+        .deliverable(channel_id, state.subscribe_manager.get_channel_sessions(channel_id));
     let online_count = sessions.len();
 
     let message_bytes: Vec<u8> = match payload.content_base64.as_deref() {
