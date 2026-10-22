@@ -201,6 +201,15 @@ pub fn verify(
     })?;
     let claims = data.claims;
 
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Future issuance must not let a ticket bypass a subsequent revocation.
+    if claims.iat > now.saturating_add(cfg.leeway_secs) || claims.iat > claims.exp {
+        return Err(VerifyError::Other);
+    }
+
     // 3) Spec §4.6 claim checks beyond what jsonwebtoken did.
     if claims.scope != SCOPE_SUBSCRIBE {
         return Err(VerifyError::BadScope);
@@ -225,6 +234,18 @@ pub fn verify(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn future_issuance_cannot_bypass_revocation_cutoff() {
+        let cfg = cfg_single("review-future-issuance-secret");
+        let mut claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 3600);
+        claims.iat += cfg.leeway_secs + 120;
+        let token = sign_default(&cfg, &claims).unwrap();
+        assert_eq!(
+            verify(&cfg, &token, 9001, "dev-a", 100).unwrap_err(),
+            VerifyError::Other
+        );
+    }
 
     fn cfg_single(secret: &str) -> RoomTicketConfig {
         RoomTicketConfig {
@@ -364,7 +385,10 @@ mod tests {
         let cfg = cfg_single("s");
         let claims = RoomTicketClaims::for_subscribe(100, "dev-a", 9001, 300);
         let token = sign_default(&cfg, &claims).unwrap();
-        assert_eq!(verify(&cfg, &token, 9001, "dev-a", 200).unwrap_err(), VerifyError::SubjectMismatch);
+        assert_eq!(
+            verify(&cfg, &token, 9001, "dev-a", 200).unwrap_err(),
+            VerifyError::SubjectMismatch
+        );
         assert!(verify(&cfg, &token, 9001, "dev-a", 100).unwrap().iat > 0);
     }
 }

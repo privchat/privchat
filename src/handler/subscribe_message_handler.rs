@@ -90,6 +90,7 @@ impl SubscribeMessageHandler {
     async fn replay_room_history_to_session(
         connection_manager: Arc<ConnectionManager>,
         room_history_service: Arc<crate::service::RoomHistoryService>,
+        room_access: Arc<crate::service::room_access_service::RoomAccessService>,
         session_id: SessionId,
         channel_id: u64,
     ) -> Result<()> {
@@ -106,9 +107,18 @@ impl SubscribeMessageHandler {
             );
             return Ok(());
         };
+        let server = server.clone();
+        drop(transport);
 
         let mut delivered = 0usize;
         for publish_request in history {
+            if room_access
+                .deliverable(channel_id, vec![session_id.clone()], true)
+                .await
+                .is_empty()
+            {
+                break;
+            }
             let payload_bytes = match privchat_protocol::encode_message(&publish_request) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -127,7 +137,8 @@ impl SubscribeMessageHandler {
 
             let send_ok = match server
                 .send_with_options(session_id.clone(), payload_bytes.into(), options)
-                .await {
+                .await
+            {
                 Ok(_) => true,
                 Err(e) => {
                     warn!(
@@ -270,11 +281,13 @@ impl MessageHandler for SubscribeMessageHandler {
                                             "📡 SubscribeMessageHandler: Room {} ticket verified user={} dev={}",
                                             channel_id, claims.sub, claims.did
                                         );
-                                        room_grant = Some(crate::service::room_access_service::RoomGrant {
-                                            user_id: uid,
-                                            device_id: dev.to_string(),
-                                            expires_at: claims.exp,
-                                        });
+                                        room_grant =
+                                            Some(crate::service::room_access_service::RoomGrant {
+                                                user_id: uid,
+                                                device_id: dev.to_string(),
+                                                expires_at: claims.exp,
+                                                issued_at: claims.iat,
+                                            });
                                         REASON_OK
                                     }
                                     Err(e) => {
@@ -314,6 +327,16 @@ impl MessageHandler for SubscribeMessageHandler {
                                     "📡 SubscribeMessageHandler: [room_ticket] not configured; Room {} subscribe is open to any authenticated user (spec §4 ticket gate disabled — v1 compat mode)",
                                     channel_id
                                 );
+                                room_grant = Some(crate::service::room_access_service::RoomGrant {
+                                    user_id: context
+                                        .user_id
+                                        .as_deref()
+                                        .and_then(|v| v.parse().ok())
+                                        .unwrap_or(0),
+                                    device_id: context.device_id.clone().unwrap_or_default(),
+                                    expires_at: u64::MAX,
+                                    issued_at: 0,
+                                });
                                 REASON_OK
                             }
                         }
@@ -334,25 +357,40 @@ impl MessageHandler for SubscribeMessageHandler {
         if reason_code == 0 {
             match action {
                 ACTION_SUBSCRIBE => {
-                    match self
-                        .subscribe_manager
-                        .subscribe(context.session_id.clone(), channel_id)
-                    {
+                    let subscribed = match room_grant.take() {
+                        Some(grant) => self.room_access.subscribe(
+                            context.session_id.clone(),
+                            channel_id,
+                            grant,
+                        ),
+                        None => self
+                            .subscribe_manager
+                            .subscribe(context.session_id.clone(), channel_id),
+                    };
+                    match subscribed {
                         Ok(()) => {
+                            if matches!(
+                                parsed_channel_type,
+                                Some(crate::model::channel::ChannelType::Room)
+                            ) && self
+                                .room_access
+                                .deliverable(channel_id, vec![context.session_id.clone()], true)
+                                .await
+                                .is_empty()
+                            {
+                                reason_code = REASON_ACCESS_REVOKED;
+                            }
                             info!(
                                 "📡 SubscribeMessageHandler: Session {} 订阅频道 {}",
                                 context.session_id, channel_id
                             );
-                            if let Some(grant) = room_grant.take() {
-                                self.room_access
-                                    .record_grant(context.session_id.clone(), channel_id, grant);
-                            }
                             // Room 才回放历史。按 wire 值这里是 3；写 2 的话回放会挂到
                             // 群聊上，而真正的 Room 永远回放不到。
                             should_replay_room_history = matches!(
                                 parsed_channel_type,
                                 Some(crate::model::channel::ChannelType::Room)
-                            ) && self.room_history_service.subscribe_history_enabled();
+                            ) && reason_code == REASON_OK
+                                && self.room_history_service.subscribe_history_enabled();
                             // presence 与订阅严格绑定：DM/Group 订阅成功后，立即把频道对端成员的
                             // 当前 presence 快照推给**本会话**（初始态），后续变化由广播跟进。
                             // 这样「订阅即拿到 presence」，不依赖客户端单独 presence/status/get。
@@ -391,9 +429,8 @@ impl MessageHandler for SubscribeMessageHandler {
                     }
                 }
                 ACTION_UNSUBSCRIBE => {
-                    self.subscribe_manager
+                    self.room_access
                         .unsubscribe(&context.session_id, channel_id);
-                    self.room_access.drop_grant(&context.session_id, channel_id);
                     info!(
                         "📡 SubscribeMessageHandler: Session {} 取消订阅频道 {}",
                         context.session_id, channel_id
@@ -409,11 +446,13 @@ impl MessageHandler for SubscribeMessageHandler {
         if should_replay_room_history {
             let connection_manager = self.connection_manager.clone();
             let room_history_service = self.room_history_service.clone();
+            let room_access = self.room_access.clone();
             let session_id = context.session_id.clone();
             tokio::spawn(async move {
                 if let Err(e) = SubscribeMessageHandler::replay_room_history_to_session(
                     connection_manager,
                     room_history_service,
+                    room_access,
                     session_id.clone(),
                     channel_id,
                 )

@@ -987,7 +987,10 @@ async fn revoke_room_access(
 ) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
     let device = payload.device_id.as_deref().filter(|d| !d.trim().is_empty());
-    let removed = state.room_access.revoke(channel_id, payload.user_id, device).await?;
+    let removed = match payload.revoked_before_ms {
+        Some(cutoff) => state.room_access.revoke_before(channel_id, payload.user_id, device, cutoff).await?,
+        None => state.room_access.revoke(channel_id, payload.user_id, device).await?,
+    };
     Ok(ApiEnvelope::ok(json!({
         "channel_id": channel_id,
         "user_id": payload.user_id,
@@ -1010,7 +1013,7 @@ async fn room_broadcast(
     // 持票订阅已到期的会话不再投递（ROOM_CHANNEL_SPEC §4.8）。
     let sessions = state
         .room_access
-        .deliverable(channel_id, state.subscribe_manager.get_channel_sessions(channel_id));
+        .deliverable(channel_id, state.subscribe_manager.get_channel_sessions(channel_id), true).await;
     let online_count = sessions.len();
 
     let message_bytes: Vec<u8> = match payload.content_base64.as_deref() {
@@ -1077,11 +1080,21 @@ async fn room_broadcast(
 
     // 有界并发广播：避免在线人数过多时为每个 session spawn 一个 task。
     let payload_bytes = std::sync::Arc::new(payload_bytes);
-    let delivered = stream::iter(sessions)
+    let mut delivered = 0usize;
+    for batch in sessions.chunks(ROOM_BROADCAST_MAX_CONCURRENCY) {
+        // Recheck persisted revocations for each bounded batch, not only when
+        // the broadcast was first queued. Already in-flight sends cannot be recalled.
+        let batch = state.room_access.deliverable(channel_id, batch.to_vec(), true).await;
+        delivered += stream::iter(batch)
         .map(|sid| {
             let server = server.clone();
             let bytes = payload_bytes.clone();
+            let room_access = state.room_access.clone();
             async move {
+                // A queued recipient may have expired/unsubscribed after the fanout snapshot.
+                if !room_access.is_locally_current(channel_id, &sid) {
+                    return false;
+                }
                 let options = msgtrans::SendOptions::new()
                     .biz_type(privchat_protocol::protocol::MessageType::PublishRequest as u8);
                 match server
@@ -1101,6 +1114,7 @@ async fn room_broadcast(
         .buffer_unordered(ROOM_BROADCAST_MAX_CONCURRENCY)
         .fold(0usize, |acc, ok| async move { acc + usize::from(ok) })
         .await;
+    }
 
     info!(
         "📡 Admin: Room 广播 channel_id={}, 在线={}, 投递={}",

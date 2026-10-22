@@ -587,6 +587,9 @@ pub struct RevokeRoomAccessRequest {
     pub user_id: u64,
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Stable business revocation cutoff; omitted for legacy immediate revocation.
+    #[serde(default)]
+    pub revoked_before_ms: Option<i64>,
 }
 
 /// Room 频道广播请求

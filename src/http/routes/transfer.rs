@@ -207,16 +207,19 @@ pub trait TransferSendBackend: Send + Sync {
 pub struct DefaultTransferSendBackend {
     connection_manager: Arc<ConnectionManager>,
     subscribe_manager: Arc<SubscribeManager>,
+    room_access: Arc<crate::service::room_access_service::RoomAccessService>,
 }
 
 impl DefaultTransferSendBackend {
     pub fn new(
         connection_manager: Arc<ConnectionManager>,
         subscribe_manager: Arc<SubscribeManager>,
+        room_access: Arc<crate::service::room_access_service::RoomAccessService>,
     ) -> Self {
         Self {
             connection_manager,
             subscribe_manager,
+            room_access,
         }
     }
 
@@ -247,11 +250,8 @@ impl TransferSendBackend for DefaultTransferSendBackend {
     }
 
     async fn is_user_subscribed(&self, target: &TransferTarget, channel_id: u64) -> bool {
-        self.target_connections(target).await.iter().any(|c| {
-            self.subscribe_manager
-                .get_session_channels(&c.session_id)
-                .contains(&channel_id)
-        })
+        let sessions = self.target_connections(target).await.into_iter().map(|c| c.session_id).collect();
+        !self.room_access.deliverable(channel_id, sessions, false).await.is_empty()
     }
 
     async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
@@ -275,6 +275,7 @@ impl TransferSendBackend for DefaultTransferSendBackend {
             })
             .map(|c| c.session_id)
             .collect();
+        let target_sessions = self.room_access.deliverable(channel_id, target_sessions, false).await;
         if target_sessions.is_empty() {
             return 0;
         }
@@ -449,6 +450,7 @@ async fn handle_transfer_send(
     let backend = DefaultTransferSendBackend::new(
         state.connection_manager.clone(),
         state.subscribe_manager.clone(),
+        state.room_access.clone(),
     );
     let outcome = process_app_transfer_send(req, &backend).await;
     Ok(outcome.into_response())
