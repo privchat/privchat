@@ -42,9 +42,23 @@ pub async fn handle(
 
     let searcher_id = request.user_id;
     let user_id = request.target_user_id;
+    let assistant_channel = if user_id != searcher_id {
+        crate::service::assistant_direct::owner_channel(
+            services.channel_service.pool(),
+            searcher_id,
+            user_id,
+        )
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?
+    } else {
+        None
+    };
+    let owner_assistant = request.source == "conversation"
+        && assistant_channel.is_some()
+        && request.source_id.parse::<u64>().ok() == assistant_channel;
     // 私人助理首版对他人不可达（ACCOUNT_IDENTITY_SPEC §6.5）：先于隐私判定，
     // 免得"无权查看"与"不存在"两种回包暴露它的存在。
-    if user_id != searcher_id {
+    if user_id != searcher_id && !owner_assistant {
         helpers::ensure_reachable_user(user_id, &services, || {
             RpcError::not_found(format!("User '{}' not found", user_id))
         })
@@ -105,11 +119,20 @@ pub async fn handle(
     };
 
     // 验证访问权限 + 取加好友判定(PROFILE_VISIBILITY §2.5:查看与添加分离)
-    match services
-        .privacy_service
-        .evaluate_detail_access(searcher_id, user_id, source.clone())
-        .await
-    {
+    let access = if owner_assistant {
+        Ok(crate::service::privacy_service::DetailAccessVerdict {
+            is_friend: false,
+            can_add_friend: false,
+            deny_reason: Some("personal_assistant"),
+            username_unlocked: false,
+        })
+    } else {
+        services
+            .privacy_service
+            .evaluate_detail_access(searcher_id, user_id, source.clone())
+            .await
+    };
+    match access {
         Ok(verdict) => {
             // 权限验证通过，从数据库读取用户资料
             match helpers::get_user_profile_fresh_versioned(
@@ -151,11 +174,13 @@ pub async fn handle(
                                 .blacklist_service
                                 .check_mutual_block(searcher_id, user_id)
                                 .await
-                                .unwrap_or((false, false));
+                                .unwrap_or((owner_assistant, owner_assistant));
 
                             // 如果被拉黑，不能发消息
                             if receiver_blocks_sender || sender_blocks_receiver {
                                 false
+                            } else if owner_assistant {
+                                true
                             } else {
                                 // 检查隐私设置：是否允许接收非好友消息
                                 match services

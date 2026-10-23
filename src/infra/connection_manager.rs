@@ -73,6 +73,8 @@ pub struct SessionEntry {
     pub superseded_by: Option<SessionId>,
     pub connected_at: i64,
     pub authenticated_at: Option<i64>,
+    /// Verified token scopes, bound before this entry becomes deliverable.
+    pub scopes: Vec<String>,
 }
 
 /// 设备连接信息（对外快照；只由 Authenticated 的条目投影而来）
@@ -342,6 +344,7 @@ impl ConnectionManager {
             superseded_by: None,
             connected_at: now,
             authenticated_at: None,
+            scopes: vec!["unbound".into()],
         };
         // 若已存在（例如重复事件），保留原条目
         self.index_b.entry(session_id).or_insert(entry);
@@ -364,6 +367,16 @@ impl ConnectionManager {
         user_id: u64,
         device_id: String,
     ) -> AuthenticateOutcome {
+        self.authenticate_with_scopes(session_id, user_id, device_id, Vec::new())
+    }
+
+    pub fn authenticate_with_scopes(
+        &self,
+        session_id: SessionId,
+        user_id: u64,
+        device_id: String,
+        scopes: Vec<String>,
+    ) -> AuthenticateOutcome {
         let now = chrono::Utc::now().timestamp_millis();
 
         // Step 1: Index B 完成绑定（若 session 不存在 Index B，先补 Connecting 再转 Authenticated）
@@ -380,10 +393,12 @@ impl ConnectionManager {
                     superseded_by: None,
                     connected_at: now,
                     authenticated_at: None,
+                    scopes: vec!["unbound".into()],
                 });
             b_entry.user_id = Some(user_id);
             b_entry.device_id = Some(device_id.clone());
             b_entry.owner_node_id = self.local_node_id.clone();
+            b_entry.scopes = scopes;
             b_entry.state = SessionState::Authenticated;
             b_entry.authenticated_at = Some(now);
         }
@@ -469,8 +484,20 @@ impl ConnectionManager {
         device_id: String,
         session_id: SessionId,
     ) -> Result<()> {
+        self.register_connection_with_scopes(user_id, device_id, session_id, Vec::new())
+            .await
+    }
+
+    pub async fn register_connection_with_scopes(
+        &self,
+        user_id: u64,
+        device_id: String,
+        session_id: SessionId,
+        scopes: Vec<String>,
+    ) -> Result<()> {
         self.register_connecting(session_id);
-        let outcome = self.authenticate(session_id, user_id, device_id.clone());
+        let outcome = self.authenticate_with_scopes(session_id, user_id, device_id.clone(), scopes);
+
         if let Some(registry) = self.ownership_registry.read().await.clone() {
             registry.register(user_id, &device_id, session_id).await?;
         }
@@ -1050,6 +1077,10 @@ impl ConnectionManager {
                         if b.state != SessionState::Authenticated {
                             filtered_not_auth += 1;
                             None
+                        } else if !crate::auth::token_capability::allows_chat_push(
+                            &b.scopes, message,
+                        ) {
+                            None
                         } else if b.superseded_by.is_some() {
                             filtered_superseded += 1;
                             None
@@ -1323,6 +1354,25 @@ impl ConnectionManager {
         session_id: SessionId,
         message: &privchat_protocol::protocol::PushMessageRequest,
     ) -> Result<usize> {
+        {
+            let Some(entry) = self.index_b.get(&session_id) else {
+                return Ok(0);
+            };
+            if entry.state != SessionState::Authenticated
+                || entry.superseded_by.is_some()
+                || !crate::auth::token_capability::allows_chat_push(&entry.scopes, message)
+            {
+                return Ok(0);
+            }
+        }
+        self.send_push_transport(session_id, message).await
+    }
+
+    async fn send_push_transport(
+        &self,
+        session_id: SessionId,
+        message: &privchat_protocol::protocol::PushMessageRequest,
+    ) -> Result<usize> {
         let transport = self.transport_server.read().await;
         let Some(server) = transport.as_ref() else {
             warn!("⚠️ ConnectionManager: TransportServer 未设置，无法投递");
@@ -1347,21 +1397,55 @@ impl ConnectionManager {
         }
     }
 
-    /// 把控制事件推到指定 session，**不**校验 Authenticated 状态、不查 index_b。
+    /// 向尚未鉴权的 QR 登录连接投递可信扫码事件，不接受普通聊天或已鉴权会话。
     ///
     /// 用途：扫码登录的 unauth 连接（spec QR_API §5）。这条 session 刻意未鉴权，
     /// 通常也没有进入 `index_a/index_b`（注册口仅 `register_connecting`/`authenticate`
     /// 调用时写入），但 transport 层仍持有它，所以直接走 transport 的 `send_to_session`。
     /// 走 [`Self::send_push_to_session`] 会被 Authenticated 闸门挡掉。
     ///
-    /// 返回 `Ok(0)` 表示 transport 没找到该 session（已断开），调用方按 `NoSubscriber`
+    /// 非 QR、已鉴权/失效目标或断开的 transport 返回 `Ok(0)`，调用方按 `NoSubscriber`
     /// 处理即可，**不要**当作错误。
     pub async fn send_unauth_event_to_session(
         &self,
         session_id: SessionId,
         message: &privchat_protocol::protocol::PushMessageRequest,
     ) -> Result<usize> {
-        self.send_push_on_session(session_id, message).await
+        if message.channel_id != 0
+            || message.channel_type != 0
+            || message.from_uid != 0
+            || message.server_message_id != 0
+        {
+            return Ok(0);
+        }
+        let Ok(event) = serde_json::from_slice::<privchat_protocol::rpc::qr_login::QrLoginPushEvent>(
+            &message.payload,
+        ) else {
+            return Ok(0);
+        };
+        if !matches!(
+            event.event.as_str(),
+            "qr_login.scanned" | "qr_login.authorized" | "qr_login.rejected" | "qr_login.expired"
+        ) || event.event != message.topic
+            || event.scene_id.is_empty()
+            || event.event.strip_prefix("qr_login.") != Some(event.state.as_str())
+        {
+            return Ok(0);
+        }
+        {
+            // QR transports may not yet have an Index B entry. Once bound to an
+            // authenticated identity, this path must never bypass its scopes.
+            if let Some(entry) = self.index_b.get(&session_id) {
+                if entry.state != SessionState::Connecting
+                    || entry.user_id.is_some()
+                    || entry.device_id.is_some()
+                    || entry.superseded_by.is_some()
+                {
+                    return Ok(0);
+                }
+            }
+        }
+        self.send_push_transport(session_id, message).await
     }
 
     /// 用户是否至少有一个 Authenticated 连接（离线判定用）。

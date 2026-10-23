@@ -2187,6 +2187,10 @@ impl ChannelService {
                 // 将参与者添加到会话成员中
                 let mut conv_with_members = conv.clone();
                 for participant in participants {
+                    if conv_with_members.channel_type == ChannelType::Direct {
+                        continue; // Canonical direct_user1/2 already supply exactly two members.
+                    }
+
                     // 用 to_channel_member() 而不是 ChannelMember::new()：后者把 joined_at
                     // 打成 Utc::now()，于是每次重启后全群的入群时间都变成「服务启动那一刻」，
                     // 依赖入群顺序的东西（成员排序、群头像九宫格）跟着一起错。
@@ -3689,6 +3693,17 @@ impl ChannelService {
                 "direct channel invalidation dispatch failed"
             );
         }
+    }
+
+    pub async fn ensure_assistant_direct(&self, owner: u64, assistant: u64) -> Result<(u64, bool)> {
+        let (channel_id, created) =
+            crate::service::assistant_direct::ensure(self.pool(), owner, assistant).await?;
+        self.ensure_user_channel_rows(channel_id, &[owner, assistant]).await?;
+        self.get_or_create_direct_channel(owner, assistant, None, None).await?;
+        if created {
+            self.announce_direct_channel_created(owner, assistant, channel_id).await;
+        }
+        Ok((channel_id, created))
     }
 
     pub async fn get_or_create_direct_channel(

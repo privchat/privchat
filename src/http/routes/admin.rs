@@ -177,6 +177,7 @@ pub fn create_route() -> Router<AdminServerState> {
             get(list_channel_participants),
         )
         .route("/direct-channels/lookup", get(lookup_direct_channel))
+        .route("/direct-channels/ensure", post(ensure_assistant_direct))
         // === P1: 消息广播与搜索 ===
         .route("/messages/broadcast", post(broadcast_message))
         .route("/messages/search", get(search_messages))
@@ -1701,6 +1702,8 @@ async fn get_message_stats(
 /// 消息查询参数
 #[derive(Debug, Deserialize)]
 struct MessageQuery {
+    after_message_id: Option<u64>,
+    asc: Option<bool>,
     channel_id: Option<u64>,
     user_id: Option<u64>,
     start_time: Option<i64>,
@@ -1719,8 +1722,34 @@ async fn list_messages(
 ) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
 
-    let page = params.page.unwrap_or(1);
-    let page_size = params.page_size.unwrap_or(20).min(100);
+    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params.page_size.unwrap_or(20).clamp(1, 100);
+    if params.after_message_id.is_some() || params.asc.is_some() {
+        if params.asc != Some(true)
+            || params.after_message_id.is_none()
+            || params.channel_id.is_none()
+            || params.page.is_some_and(|p| p != 1)
+            || params.user_id.is_some()
+            || params.start_time.is_some()
+            || params.end_time.is_some()
+        {
+            return Err(ServerError::Validation(
+                "cursor requires channel_id, after_message_id and asc=true; no offset/filter"
+                    .into(),
+            ));
+        }
+        let messages = state
+            .message_service
+            .admin_list_after(
+                params.channel_id.unwrap(),
+                params.after_message_id.unwrap(),
+                page_size,
+            )
+            .await?;
+        return Ok(ApiEnvelope::ok(
+            json!({"messages":messages,"total":messages.len(),"page":1,"page_size":page_size}),
+        ));
+    }
 
     let (message_list, total) = state
         .message_service
@@ -2361,7 +2390,10 @@ async fn send_message(
                 "管理端发送消息失败: channel_id={}, sender_id={}, error={}",
                 request.channel_id, request.sender_id, e
             );
-            ServerError::Internal(format!("发送消息失败: {}", e))
+            match e.downcast::<ServerError>() {
+                Ok(error) => error,
+                Err(error) => ServerError::Internal(format!("发送消息失败: {}", error)),
+            }
         })?;
 
     info!(
@@ -2690,6 +2722,25 @@ async fn get_channel(
 struct DirectChannelLookupQuery {
     user_a: u64,
     user_b: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnsureAssistantDirectRequest {
+    owner_user_id: u64,
+    assistant_uid: u64,
+}
+
+async fn ensure_assistant_direct(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(req): Json<EnsureAssistantDirectRequest>,
+) -> ApiResult<Value> {
+    verify_service_key(&headers, &state).await?;
+    let (channel_id, created) = state.channel_service
+        .ensure_assistant_direct(req.owner_user_id, req.assistant_uid).await?;
+    Ok(ApiEnvelope::ok(
+        json!({"channel_id":channel_id,"created":created}),
+    ))
 }
 
 async fn lookup_direct_channel(

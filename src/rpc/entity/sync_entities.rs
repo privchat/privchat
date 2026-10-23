@@ -156,6 +156,14 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
                 // 私人助理首版对他人不可见（ACCOUNT_IDENTITY_SPEC §6.5）；游标照常前进。
                 if user.id != user_id
                     && crate::rpc::helpers::is_unreachable_user_type(user.user_type)
+                    && crate::service::assistant_direct::owner_channel(
+                        services.channel_service.pool(),
+                        user_id,
+                        user.id,
+                    )
+                    .await
+                    .map_err(|e| RpcError::internal(e.to_string()))?
+                    .is_none()
                 {
                     continue;
                 }

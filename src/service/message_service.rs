@@ -177,6 +177,23 @@ impl MessageService {
         &self,
         req: ServerSendMessageRequest,
     ) -> anyhow::Result<ServerSendMessageResult> {
+        let sender_type: Option<i16> =
+            sqlx::query_scalar("SELECT user_type FROM privchat_users WHERE user_id=$1")
+                .bind(req.sender_id as i64)
+                .fetch_optional(self.channel_service.pool())
+                .await?;
+        if sender_type == Some(3) {
+            let owner = req.recipient_user_ids.iter().copied().find(|id| *id != req.sender_id)
+                .ok_or_else(|| ServerError::Authorization("assistant reply requires owner recipient".into()))?;
+            if req.channel_type != 1 || crate::service::assistant_direct::owner_channel(
+                self.channel_service.pool(), owner, req.sender_id).await? != Some(req.channel_id)
+                || req.recipient_user_ids.iter().any(|id| *id != owner && *id != req.sender_id) {
+                return Err(ServerError::Authorization("assistant reply requires provisioned owner Direct".into()).into());
+            }
+            if !req.dedup_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                return Err(ServerError::Validation("assistant reply requires dedup_key".into()).into());
+            }
+        }
         let now = Utc::now();
         let message_id = crate::infra::next_message_id();
         let typed_metadata = MessageMetadata::from_json_value(req.message_type, &req.metadata);
@@ -234,6 +251,14 @@ impl MessageService {
         let message = tx_result.message;
         let pts = message.pts.unwrap_or(0).max(0) as u64;
         if !tx_result.inserted {
+            if sender_type == Some(3) {
+                if message.channel_id != req.channel_id || message.sender_id != req.sender_id
+                    || message.content != req.content || message.message_type != req.message_type
+                    || message.metadata != req.metadata {
+                    return Err(ServerError::Duplicate("assistant dedup_key conflicts with an existing message".into()).into());
+                }
+            }
+
             return Ok(ServerSendMessageResult {
                 message_id: message.message_id,
                 pts,
@@ -658,6 +683,17 @@ impl MessageService {
     // admin handler 不得直连 PgMessageRepository —— 下列方法是纯 pass-through + 错误映射,
     // 若未来要加缓存 / 审计 / 限流 hook,都收敛在这里。
     // ============================================================
+
+    pub async fn admin_list_after(
+        &self,
+        channel: u64,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<Value>, ServerError> {
+        self.message_repository
+            .list_messages_after(channel, after, limit)
+            .await
+    }
 
     pub async fn admin_list(
         &self,

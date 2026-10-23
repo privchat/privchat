@@ -40,7 +40,40 @@ pub async fn handle(
         return Err(RpcError::validation("不能与自己创建私聊会话".to_string()));
     }
 
-    // 私人助理首版不可私聊（ACCOUNT_IDENTITY_SPEC §6.5）。
+    if request.source.as_deref() == Some(crate::service::assistant_direct::SOURCE) {
+        return Err(RpcError::validation("reserved Direct source"));
+    }
+    let types: Vec<i16> =
+        sqlx::query_scalar("SELECT user_type FROM privchat_users WHERE user_id IN ($1,$2)")
+            .bind(user_id as i64)
+            .bind(target_user_id as i64)
+            .fetch_all(services.channel_service.pool())
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+    if types.contains(&3) {
+        let mut channel_id = crate::service::assistant_direct::owner_channel(
+            services.channel_service.pool(),
+            user_id,
+            target_user_id,
+        )
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+        if channel_id.is_none() {
+            channel_id = crate::service::assistant_direct::owner_channel(
+                services.channel_service.pool(),
+                target_user_id,
+                user_id,
+            )
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        }
+        let channel_id = channel_id.ok_or_else(|| RpcError::not_found("User not found"))?;
+        return Ok(json!(GetOrCreateDirectChannelResponse {
+            channel_id,
+            created: false
+        }));
+    }
+    // Unprovisioned type3 targets remain unreachable to ordinary clients.
     crate::rpc::helpers::ensure_reachable_user(target_user_id, &services, || {
         RpcError::not_found(format!("User '{}' not found", target_user_id))
     })

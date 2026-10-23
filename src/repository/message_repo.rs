@@ -253,13 +253,15 @@ impl PgMessageRepository {
         .map_err(|e| DatabaseError::Database(format!("Failed to lock channel: {e}")))?
         .ok_or_else(|| DatabaseError::NotFound(format!("Channel not found: {channel_id}")))?;
 
-        let expected_db_channel_type = match crate::model::channel::ChannelType::from_wire_u8(u8::try_from(wire_channel_type).unwrap_or(u8::MAX)) {
+        let expected_db_channel_type = match crate::model::channel::ChannelType::from_wire_u8(
+            u8::try_from(wire_channel_type).unwrap_or(u8::MAX),
+        ) {
             Some(ty) => ty.to_i16(),
             None => {
                 let value = wire_channel_type;
                 return Err(DatabaseError::Database(format!(
                     "unsupported wire channel type for {channel_id}: {value}"
-                )))
+                )));
             }
         };
         let channel_type = channel.get::<i16, _>("channel_type");
@@ -594,9 +596,8 @@ impl PgMessageRepository {
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
 
-        let bind_file_ids = crate::service::legacy_media_refs::unique_file_ids_of(
-            &request.attachment_refs,
-        );
+        let bind_file_ids =
+            crate::service::legacy_media_refs::unique_file_ids_of(&request.attachment_refs);
         for file_id in bind_file_ids {
             // P1-19 归属守卫：file_id 来自客户端可控的 metadata，必须校验
             // ① 上传者就是发送者（不能引用他人的 file）
@@ -1194,31 +1195,75 @@ impl PgMessageRepository {
 
         let total = total_result.0 as u32;
 
-        let message_list: Vec<serde_json::Value> = rows.into_iter().map(|r| {
-            serde_json::json!({
-                "message_id": r.message_id as u64,
-                "channel_id": r.channel_id as u64,
-                "sender_id": r.sender_id as u64,
-                "pts": r.pts,
-                "local_message_id": r.local_message_id.map(|n| n as u64),
-                "content": r.content,
-                "message_type": privchat_protocol::ContentMessageType::from_u32(r.message_type as u32).map(|t| t.as_str()).unwrap_or("text"),
-                "metadata": r.metadata,
-                "reply_to_message_id": r.reply_to_message_id.map(|id| id as u64),
-                "created_at": r.created_at,
-                "updated_at": r.updated_at,
-                "deleted": r.deleted,
-                "deleted_at": r.deleted_at,
-                "revoked": r.revoked,
-                "revoked_at": r.revoked_at,
-                "revoked_by": r.revoked_by.map(|id| id as u64),
-                "sender_username": r.sender_username,
-                "sender_display_name": r.sender_display_name,
-                "sender_avatar_url": r.sender_avatar_url,
-            })
-        }).collect();
+        let message_list = rows.into_iter().map(Self::admin_message_json).collect();
 
         Ok((message_list, total))
+    }
+
+    /// SM-ID is an anchor, not an ordering key: IDs may be allocated before commit.
+    pub async fn list_messages_after(
+        &self,
+        channel_id: u64,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, crate::error::ServerError> {
+        use crate::error::ServerError;
+        if channel_id == 0 || channel_id > i64::MAX as u64 || after > i64::MAX as u64 {
+            return Err(ServerError::Validation("invalid cursor IDs".into()));
+        }
+        let db = |e| ServerError::Database(format!("message cursor: {e}"));
+        let anchor = if after == 0 {
+            0
+        } else {
+            sqlx::query_scalar::<_,i64>("SELECT pts FROM privchat_messages WHERE channel_id=$1 AND message_id=$2 AND pts IS NOT NULL")
+                .bind(channel_id as i64).bind(after as i64).fetch_optional(self.pool.as_ref()).await.map_err(db)?
+                .ok_or_else(|| ServerError::Validation("cursor anchor missing or in another channel".into()))?
+        };
+        // Modern writes atomically commit projection + log. During a rolling upgrade,
+        // never advance across a committed content event whose projection is missing.
+        let gap: Option<i64> = sqlx::query_scalar("SELECT MIN(c.pts) FROM privchat_commit_log c
+            WHERE c.channel_id=$1 AND c.pts>$2 AND c.message_type IN
+            ('text','voice','image','video','file','system','sticker','contact_card','contact','location','link','forward','red_packet','money_transfer')
+            AND NOT EXISTS (SELECT 1 FROM privchat_messages m WHERE m.channel_id=c.channel_id AND m.message_id=c.server_msg_id)")
+            .bind(channel_id as i64).bind(anchor).fetch_one(self.pool.as_ref()).await.map_err(db)?;
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT m.*, u.username AS sender_username,
+            u.display_name AS sender_display_name,u.avatar_url AS sender_avatar_url
+            FROM privchat_messages m LEFT JOIN privchat_users u ON u.user_id=m.sender_id
+            WHERE m.channel_id=$1 AND m.pts>$2 AND m.pts<$3 ORDER BY m.pts ASC LIMIT $4",
+        )
+        .bind(channel_id as i64)
+        .bind(anchor)
+        .bind(gap.unwrap_or(i64::MAX))
+        .bind(limit.clamp(1, 100) as i64)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(db)?;
+        Ok(rows.into_iter().map(Self::admin_message_json).collect())
+    }
+
+    fn admin_message_json(r: MessageRow) -> serde_json::Value {
+        serde_json::json!({
+            "message_id": r.message_id as u64,
+            "channel_id": r.channel_id as u64,
+            "sender_id": r.sender_id as u64,
+            "pts": r.pts,
+            "local_message_id": r.local_message_id.map(|n| n as u64),
+            "content": r.content,
+            "message_type": privchat_protocol::ContentMessageType::from_u32(r.message_type as u32).map(|t| t.as_str()).unwrap_or("text"),
+            "metadata": r.metadata,
+            "reply_to_message_id": r.reply_to_message_id.map(|id| id as u64),
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+            "deleted": r.deleted,
+            "deleted_at": r.deleted_at,
+            "revoked": r.revoked,
+            "revoked_at": r.revoked_at,
+            "revoked_by": r.revoked_by.map(|id| id as u64),
+            "sender_username": r.sender_username,
+            "sender_display_name": r.sender_display_name,
+            "sender_avatar_url": r.sender_avatar_url,
+        })
     }
 
     /// 获取消息详情（管理 API）

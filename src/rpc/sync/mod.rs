@@ -544,6 +544,27 @@ async fn project_submit_to_message_views(
                     Ok(t) => t,
                     Err(_) => return,
                 };
+            if peer_t == Some(3) && sender_t == Some(0) {
+                match crate::service::assistant_direct::received_event(
+                    channel_service.pool(),
+                    channel_id,
+                    server_msg_id,
+                    sender_id,
+                    peer_id,
+                    server_ts_ms,
+                )
+                .await
+                {
+                    Ok(Some(event)) => {
+                        if let Err(e) = event_client.send(&event).await {
+                            tracing::warn!("assistant event failed: {e}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("assistant event authorization failed: {e}"),
+                }
+                return;
+            }
             if peer_t != Some(1) {
                 return;
             }

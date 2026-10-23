@@ -214,6 +214,28 @@ pub async fn authorize_send_to_channel(
             .find(|id| *id != sender_id);
 
         if let Some(peer_id) = peer_id {
+            let types: Vec<i16> = sqlx::query_scalar(
+                "SELECT user_type FROM privchat_users WHERE user_id IN ($1,$2)",
+            )
+            .bind(sender_id as i64)
+            .bind(peer_id as i64)
+            .fetch_all(deps.channel_service.pool())
+            .await
+            .map_err(|_| SendRefusal::PolicyUnavailable)?;
+            let assistant_pair = if types.contains(&3) {
+                if !crate::service::assistant_direct::authorized_pair(
+                    deps.channel_service.pool(), channel.id, sender_id, peer_id,
+                )
+                .await
+                .map_err(|_| SendRefusal::PolicyUnavailable)?
+                {
+                    return Err(SendRefusal::NotAMember);
+                }
+                true
+            } else {
+                false
+            };
+
             // 🔴 黑名单**先于**好友判定（BLACKLIST_SPEC §5）。
             //
             // 原实现是「好友直接放行，跳过拉黑与隐私」。但拉黑并不解除好友关系，
@@ -235,6 +257,10 @@ pub async fn authorize_send_to_channel(
             }
             if sender_blocks_peer {
                 return Err(SendRefusal::PeerInMyBlacklist);
+            }
+
+            if assistant_pair {
+                return Ok(());
             }
 
             // 好友之间不再看「仅接收好友消息」——那条设置本来就是给非好友用的。

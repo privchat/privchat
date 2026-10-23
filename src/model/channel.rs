@@ -776,6 +776,13 @@ impl Channel {
         sync_version: i64,
     ) -> Self {
         let conv_type = ChannelType::from_i16(channel_type);
+        // Direct participants are a projection, never the membership authority.
+        let mut members = HashMap::new();
+        if conv_type == ChannelType::Direct {
+            for uid in [direct_user1_id, direct_user2_id].into_iter().flatten() {
+                members.insert(uid as u64, ChannelMember::new(uid as u64, MemberRole::Member));
+            }
+        }
         let creator_id = match conv_type {
             ChannelType::Direct => direct_user1_id.map(|id| id as u64).unwrap_or(0),
             ChannelType::Group => 0, // 需要从 group 表查询 owner_id
@@ -786,7 +793,7 @@ impl Channel {
             id: channel_id as u64,
             channel_type: conv_type,
             status: ChannelStatus::Active, // 默认活跃，需要从业务逻辑推断
-            members: HashMap::new(),       // 需要单独查询
+            members,                     // Group/Room participants load separately
             metadata: ChannelMetadata::default(), // 需要从 group 表查询
             creator_id,
             direct_user1_id: direct_user1_id.map(|id| id as u64),

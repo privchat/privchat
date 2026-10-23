@@ -186,6 +186,17 @@ pub fn allows_message_type(scopes: &[String], msg_type: &MessageType) -> bool {
     })
 }
 
+/// Outbound chat uses the same capability matrix as chat synchronization.
+/// Room and Transfer traffic are separate capabilities and must not be suppressed.
+pub fn allows_chat_push(
+    scopes: &[String],
+    push: &privchat_protocol::protocol::PushMessageRequest,
+) -> bool {
+    // PushMessageRequest is the IM delivery envelope, including legacy type=0
+    // notifications. Room has an explicit wire type; Transfer uses another biz_type.
+    push.channel_type == 3 || allows_rpc_route(scopes, routes::sync::GET_DIFFERENCE)
+}
+
 /// 列出某个受限 scope 的全部允许路由（诊断与测试用）
 pub fn list_scope_routes(scope: &str) -> Vec<&'static str> {
     match scope {

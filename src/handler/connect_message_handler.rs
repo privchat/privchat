@@ -308,7 +308,12 @@ impl MessageHandler for ConnectMessageHandler {
         // 6. ✨ 注册设备连接到 ConnectionManager —— spec §1 唯一在线态真源
         if let Err(e) = self
             .connection_manager
-            .register_connection(user_id, device_id.clone(), context.session_id)
+            .register_connection_with_scopes(
+                user_id,
+                device_id.clone(),
+                context.session_id,
+                claims.scope.clone(),
+            )
             .await
         {
             warn!("⚠️ ConnectMessageHandler: 注册设备连接失败: {}", e);

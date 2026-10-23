@@ -1284,6 +1284,7 @@ impl MessageHandler for SendMessageHandler {
                     let pts_for_emit = pts as u64;
                     let mtype_for_emit = content_message_type.as_str().to_string();
                     let occurred_at_ms = message_record.created_at.timestamp_millis();
+                    let assistant_channels = self.channel_service.clone();
                     tokio::spawn(async move {
                         let sender_t = match crate::rpc::helpers::lookup_user_type(
                             sender_id, &user_repo, &cache,
@@ -1317,6 +1318,27 @@ impl MessageHandler for SendMessageHandler {
                                 return;
                             }
                         };
+                        if peer_t == Some(3) && sender_t == Some(0) {
+                            match crate::service::assistant_direct::received_event(
+                                assistant_channels.pool(),
+                                chan_id_for_emit,
+                                msg_id_for_emit,
+                                sender_id,
+                                peer_id,
+                                occurred_at_ms,
+                            )
+                            .await
+                            {
+                                Ok(Some(event)) => {
+                                    if let Err(e) = event_client.send(&event).await {
+                                        warn!("assistant event failed: {e}");
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => warn!("assistant event authorization failed: {e}"),
+                            }
+                            return;
+                        }
                         if peer_t != Some(1) {
                             return; // 对端不是 System User，跳过。
                         }
