@@ -114,29 +114,29 @@ pub async fn handle(
 
     if request.pinned {
         // 4a. 置顶：幂等 upsert
-        sqlx::query(
-            "INSERT INTO privchat_group_pinned_messages \
-             (group_id, message_id, channel_id, pinned_by, pinned_at) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (group_id, message_id) DO NOTHING",
-        )
-        .bind(group_id as i64)
-        .bind(message_id as i64)
-        .bind(message.channel_id as i64)
-        .bind(operator_id as i64)
-        .bind(now)
-        .execute(pool)
-        .await
-        .map_err(|e| RpcError::internal(format!("置顶写入失败: {}", e)))?;
+        let (pinned_by, pinned_at): (i64, i64) = sqlx::query_as(include_str!("pin_insert.sql"))
+            .bind(group_id as i64)
+            .bind(message_id as i64)
+            .bind(message.channel_id as i64)
+            .bind(operator_id as i64)
+            .bind(now)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| RpcError::internal(format!("置顶写入失败: {}", e)))?;
 
-        crate::rpc::group::group::notify::publish_changed(&services, channel.id, "pinned_messages_changed").await;
+        crate::rpc::group::group::notify::publish_changed(
+            &services,
+            channel.id,
+            "pinned_messages_changed",
+        )
+        .await;
         let response = MessagePinResponse {
             success: true,
             group_id,
             message_id,
             pinned: true,
-            pinned_at: Some(now as u64),
-            pinned_by: Some(operator_id),
+            pinned_at: Some(pinned_at as u64),
+            pinned_by: Some(pinned_by as u64),
         };
         serde_json::to_value(response)
             .map_err(|e| RpcError::internal(format!("序列化响应失败: {}", e)))
@@ -180,7 +180,12 @@ pub async fn handle(
         .await
         .map_err(|e| RpcError::internal(format!("取消置顶失败: {}", e)))?;
 
-        crate::rpc::group::group::notify::publish_changed(&services, channel.id, "pinned_messages_changed").await;
+        crate::rpc::group::group::notify::publish_changed(
+            &services,
+            channel.id,
+            "pinned_messages_changed",
+        )
+        .await;
         let response = MessagePinResponse {
             success: true,
             group_id,
