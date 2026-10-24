@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 mod peer;
+mod push;
+pub use push::{
+    CallHttpPushProvider, CallPushNotification, CallPushProvider, CallPushResult, CallPushWorker,
+};
 
 fn db(_: sqlx::Error) -> RpcError {
     RpcError::from_code(
@@ -270,6 +274,7 @@ impl CallService {
         };
         sqlx::query("INSERT INTO privchat_calls(call_id,channel_id,state,document,updated_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(call_id) DO UPDATE SET state=EXCLUDED.state,document=EXCLUDED.document,updated_at=EXCLUDED.updated_at")
             .bind(stored.call.call_id as i64).bind(stored.call.channel_id as i64).bind(state).bind(encode(stored)?).bind(now()).execute(&mut **tx).await.map_err(db)?;
+        push::reconcile(tx, stored).await?;
         if notify {
             Self::effect(tx, &stored.call, "state", json!({})).await?;
         }

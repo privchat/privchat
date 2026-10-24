@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CallConfig {
+    pub push: CallPushSettings,
     pub peer: CallPeerSettings,
     pub enabled: bool,
     pub livekit_url: String,
@@ -18,6 +19,7 @@ pub struct CallConfig {
 impl Default for CallConfig {
     fn default() -> Self {
         Self {
+            push: CallPushSettings::default(),
             peer: CallPeerSettings::default(),
             enabled: false,
             livekit_url: String::new(),
@@ -37,6 +39,10 @@ impl CallConfig {
             return Ok(());
         }
         self.peer.validate()?;
+        anyhow::ensure!(
+            (1..=8).contains(&self.push.max_attempts),
+            "call.push.max_attempts must be 1..8"
+        );
         if !self.livekit_url.is_empty() || !self.peer.enabled {
             let url = url::Url::parse(&self.livekit_url)?;
             anyhow::ensure!(
@@ -69,6 +75,21 @@ impl CallConfig {
             "call participant limits must be 2..128"
         );
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallPushSettings {
+    pub enabled: bool,
+    pub max_attempts: u32,
+}
+impl Default for CallPushSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_attempts: 4,
+        }
     }
 }
 

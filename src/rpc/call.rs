@@ -5,7 +5,10 @@ use super::{
     router::GLOBAL_RPC_ROUTER,
     RpcContext, RpcServiceContext,
 };
-use crate::service::{call_service::CallService, message_service::ServerSendMessageRequest};
+use crate::service::{
+    call_service::{CallPushWorker, CallService},
+    message_service::ServerSendMessageRequest,
+};
 use privchat_protocol::{
     protocol::{MessageType, RpcRequest},
     rpc::{call::*, routes::call as routes},
@@ -33,6 +36,17 @@ pub async fn register_routes(services: RpcServiceContext) {
         }
     };
     let service = Arc::new(service);
+    let push_worker = if service.config.enabled && service.config.push.enabled {
+        match CallPushWorker::from_config((*service).clone(), &services.config.push) {
+            Ok(worker) => Some(Arc::new(worker)),
+            Err(_) => {
+                tracing::error!("Call push provider unavailable; token registration fails closed");
+                None
+            }
+        }
+    } else {
+        None
+    };
     for route in [
         routes::CAPABILITIES,
         routes::INVITE,
@@ -46,12 +60,28 @@ pub async fn register_routes(services: RpcServiceContext) {
         routes::HEARTBEAT,
         routes::PEER_SIGNAL,
         routes::PEER_EVENTS,
+        CALL_PUSH_REGISTER,
+        CALL_PUSH_UNREGISTER,
     ] {
         let service = service.clone();
+        let push_worker = push_worker.clone();
+        let sessions = services.auth_session_manager.clone();
         GLOBAL_RPC_ROUTER
             .register(route, move |params, ctx| {
                 let service = service.clone();
-                async move { handle(&service, route, params, ctx).await }
+                let push_worker = push_worker.clone();
+                let sessions = sessions.clone();
+                async move {
+                    handle(
+                        &service,
+                        route,
+                        params,
+                        ctx,
+                        push_worker.as_deref(),
+                        &sessions,
+                    )
+                    .await
+                }
             })
             .await;
     }
@@ -73,6 +103,18 @@ pub async fn register_routes(services: RpcServiceContext) {
                         }
                     }
                 }
+                if let Some(worker) = &push_worker {
+                    for _ in 0..32 {
+                        match worker.dispatch_one().await {
+                            Ok(true) => (),
+                            Ok(false) => break,
+                            Err(_) => {
+                                tracing::warn!("Call push outbox unavailable; will retry");
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -82,6 +124,8 @@ async fn handle(
     route: &str,
     params: Value,
     ctx: RpcContext,
+    push_worker: Option<&CallPushWorker>,
+    sessions: &crate::infra::SessionManager,
 ) -> RpcResult<Value> {
     let actor = get_current_user_id(&ctx)?;
     let device = ctx
@@ -91,6 +135,48 @@ async fn handle(
         .ok_or_else(|| RpcError::unauthorized("Authenticated device required"))?;
     let invalid = |_| RpcError::validation("Invalid call request");
     match route {
+        CALL_PUSH_REGISTER => {
+            let request: CallPushRegisterRequest =
+                serde_json::from_value(params).map_err(invalid)?;
+            if !push_worker.is_some_and(|w| w.supports(request.platform)) {
+                return Err(RpcError::from_code(
+                    privchat_protocol::ErrorCode::ServiceUnavailable,
+                    "Call push provider unavailable".into(),
+                ));
+            }
+            let raw = ctx
+                .session_id
+                .as_deref()
+                .ok_or_else(|| RpcError::unauthorized("Authenticated session required"))?;
+            let id = raw
+                .strip_prefix("session-")
+                .unwrap_or(raw)
+                .parse::<u64>()
+                .map_err(|_| RpcError::unauthorized("Authenticated session required"))?;
+            let session = sessions
+                .get_session_info(&msgtrans::SessionId::from(id))
+                .await
+                .filter(|s| s.user_id == actor.to_string() && s.device_id == device)
+                .ok_or_else(|| RpcError::unauthorized("Authenticated session required"))?;
+            Ok(json!(
+                service
+                    .register_push_device(
+                        actor,
+                        device,
+                        session.jwt_claims.session_version,
+                        request
+                    )
+                    .await?
+            ))
+        }
+        CALL_PUSH_UNREGISTER => {
+            if params != json!({}) {
+                return Err(RpcError::validation(
+                    "Empty call push unregister body required",
+                ));
+            }
+            Ok(json!(service.unregister_push_device(actor, device).await?))
+        }
         routes::PEER_SIGNAL => Ok(json!(
             service
                 .peer_signal(
