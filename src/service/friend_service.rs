@@ -389,6 +389,10 @@ impl FriendService {
     pub async fn remove_friend(&self, user_id: u64, friend_id: u64) -> Result<()> {
         info!("🗑️ 用户 {} 删除好友 {}", user_id, friend_id);
 
+        let db = |e| ServerError::Database(format!("Failed to remove friendship: {e}"));
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        crate::service::assistant_direct::guard_relationship_removal(&mut tx, user_id, friend_id).await?;
+
         sqlx::query(
             r#"
             UPDATE privchat_friendships
@@ -401,9 +405,11 @@ impl FriendService {
         .bind(user_id as i64)
         .bind(friend_id as i64)
         .bind(chrono::Utc::now().timestamp_millis())
-        .execute(self.pool.as_ref())
+        .execute(&mut *tx)
         .await
         .map_err(|e| ServerError::Database(format!("Failed to remove friendship: {}", e)))?;
+
+        tx.commit().await.map_err(db)?;
 
         info!("✅ 好友关系已删除: {} <-> {}", user_id, friend_id);
         Ok(())

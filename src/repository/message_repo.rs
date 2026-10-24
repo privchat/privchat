@@ -27,6 +27,14 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
+// Once-per-relationship effects must outlive the ordinary seven-day retry window.
+pub const MESSAGE_DEDUP_RETENTION_SQL: &str =
+    "DELETE FROM privchat_message_dedup WHERE dedup_key IN (
+         SELECT dedup_key FROM privchat_message_dedup
+         WHERE created_at < $1 AND dedup_key NOT LIKE 'call-summary:%'
+             AND dedup_key NOT LIKE 'assistant-welcome:%' LIMIT $2
+     )";
+
 /// 消息仓库 trait
 pub trait MessageRepository: Send + Sync {
     /// 根据ID查找消息

@@ -60,7 +60,7 @@ pub async fn handle(
         }
         Err(e) => {
             tracing::error!("❌ 删除好友失败: {}", e);
-            Err(RpcError::internal(format!("删除好友失败: {}", e)))
+            Err(e.into())
         }
     }
 }

@@ -108,6 +108,66 @@ async fn trusted_ensure_is_concurrent_idempotent_owner_only_and_hydrates_real_di
 }
 
 #[tokio::test]
+async fn node_login_notice_direct_does_not_block_owner_claim_or_repair() {
+    let (_db, pool) = fixture("assistant_login_notice").await;
+    let system = privchat::config::SYSTEM_USER_ID;
+    sqlx::query("INSERT INTO privchat_users (user_id,user_type,status,username,qr_key)
+        VALUES ($1,1,0,'assistant_test_system','sys_notice_qr') ON CONFLICT (user_id) DO NOTHING")
+        .bind(system as i64).execute(pool.as_ref()).await.unwrap();
+    let channels = ChannelService::new_with_repository(Arc::new(PgChannelRepository::new(pool.clone())));
+    // Same provisioning call as connect_message_handler::send_login_notice_message_bg after node login.
+    let (notice, _) = channels.get_or_create_direct_channel(
+        71002, system, Some("system_login_notice"), None,
+    ).await.unwrap();
+    let notice_before: (i64, i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT direct_user1_id,direct_user2_id,create_source,sync_version FROM privchat_channels WHERE channel_id=$1")
+        .bind(notice as i64).fetch_one(pool.as_ref()).await.unwrap();
+    let (owner_direct, created) = channels.ensure_assistant_direct(71001,71002).await.unwrap();
+    assert!(created);
+    assert_ne!(owner_direct,notice);
+    assert_eq!(assistant_direct::owner_channel(&pool,71001,71002).await.unwrap(),Some(owner_direct));
+    for _ in 0..3 {
+        assert_eq!(channels.ensure_assistant_direct(71001,71002).await.unwrap(),(owner_direct,false));
+    }
+    let notice_after: (i64, i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT direct_user1_id,direct_user2_id,create_source,sync_version FROM privchat_channels WHERE channel_id=$1")
+        .bind(notice as i64).fetch_one(pool.as_ref()).await.unwrap();
+    assert_eq!(notice_before,notice_after,"login notice must not be adopted as the owner Direct");
+    let friends = privchat::service::FriendService::new(pool.clone());
+    assert_eq!(friends.get_friends(71001).await.unwrap(),vec![71002]);
+    assert_eq!(friends.get_friends(71002).await.unwrap(),vec![71001]);
+    assert!(assistant_direct::ensure(&pool,71003,71002).await.is_err(),"a second human owner is still forbidden");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn login_notice_exclusion_requires_both_system_user_and_exact_source() {
+    let (_db, pool) = fixture("assistant_login_notice_guard").await;
+    let system = privchat::config::SYSTEM_USER_ID;
+    sqlx::query("INSERT INTO privchat_users (user_id,user_type,status,username,qr_key)
+        VALUES ($1,1,0,'assistant_test_system','sys_notice_qr') ON CONFLICT (user_id) DO NOTHING")
+        .bind(system as i64).execute(pool.as_ref()).await.unwrap();
+    for (peer,source) in [
+        (71003,Some("system_login_notice")),
+        (71004,Some("system_login_notice")),
+        (system,Some("unknown_source")),
+        (system,None),
+    ] {
+        let id: i64 = sqlx::query_scalar("INSERT INTO privchat_channels
+            (channel_type,direct_user1_id,direct_user2_id,create_source,created_at,updated_at)
+            VALUES (0,$1,$2,$3,now_millis(),now_millis()) RETURNING channel_id")
+            .bind(peer.min(71002) as i64).bind(peer.max(71002) as i64).bind(source)
+            .fetch_one(pool.as_ref()).await.unwrap();
+        assert!(matches!(assistant_direct::ensure(&pool,71001,71002).await,
+            Err(privchat::error::ServerError::Authorization(_))),"unexpected exemption: peer={peer}, source={source:?}");
+        sqlx::query("DELETE FROM privchat_channels WHERE channel_id=$1")
+            .bind(id).execute(pool.as_ref()).await.unwrap();
+    }
+    assert!(privchat::service::FriendService::new(pool.clone()).get_friends(71001).await.unwrap().is_empty());
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn cursor_orders_by_committed_pts_not_smid_and_stops_at_projection_gap() {
     let (_db, pool) = fixture("assistant_cursor").await;
     let (channel, _) = assistant_direct::ensure(&pool, 71001, 71002).await.unwrap();
@@ -191,6 +251,77 @@ async fn cursor_orders_by_committed_pts_not_smid_and_stops_at_projection_gap() {
             .is_empty(),
         "must not silently advance past a missing committed projection"
     );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn real_friend_repair_sync_privacy_and_removal_are_idempotent() {
+    use privchat::service::{FriendService, BlacklistService};
+    let (_db, pool) = fixture("assistant_friend").await;
+    let channels = ChannelService::new_with_repository(Arc::new(PgChannelRepository::new(pool.clone())));
+    let friends = FriendService::new(pool.clone());
+    let (channel, _) = channels.ensure_assistant_direct(71001, 71002).await.unwrap();
+    channels.hide_channel(71001, channel, true).await.unwrap();
+    let versions = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>("SELECT user_id,friend_id,sync_version FROM privchat_friendships ORDER BY user_id,friend_id")
+            .fetch_all(pool.as_ref()).await.unwrap()
+    };
+    let before = versions().await;
+    let channel_version: i64 = sqlx::query_scalar("SELECT sync_version FROM privchat_channels WHERE channel_id=$1")
+        .bind(channel as i64).fetch_one(pool.as_ref()).await.unwrap();
+    let user_channel_versions = || async {
+        sqlx::query_as::<_,(i64,i64)>("SELECT user_id,sync_version FROM privchat_user_channels WHERE channel_id=$1 ORDER BY user_id")
+            .bind(channel as i64).fetch_all(pool.as_ref()).await.unwrap()
+    };
+    let user_channels_before = user_channel_versions().await;
+    for _ in 0..3 {
+        assert_eq!(channels.ensure_assistant_direct(71001,71002).await.unwrap(), (channel,false));
+    }
+    assert_eq!(before, versions().await);
+    assert_eq!(user_channels_before,user_channel_versions().await);
+    assert_eq!(channel_version, sqlx::query_scalar::<_, i64>("SELECT sync_version FROM privchat_channels WHERE channel_id=$1")
+        .bind(channel as i64).fetch_one(pool.as_ref()).await.unwrap());
+    assert!(channels.is_channel_hidden(71001, channel).await);
+    assert_eq!(friends.get_friends(71001).await.unwrap(), vec![71002]);
+    assert_eq!(friends.get_friends(71002).await.unwrap(), vec![71001]);
+    assert!(friends.get_friends(71003).await.unwrap().is_empty());
+    let cache = Arc::new(privchat::infra::CacheManager::new(privchat::config::CacheConfig::default()).await.unwrap());
+    let users = Arc::new(privchat::repository::UserRepository::new(pool.clone()));
+    let sync = friends.sync_entities_page(71001, None, None, 50, &users, &cache).await.unwrap();
+    assert!(sync.items.iter().any(|item| item.entity_id=="71002" && !item.deleted && item.payload.is_some()));
+    for source in ["search", "qrcode", "group", "card_share"] {
+        assert!(!assistant_direct::owner_can_read_detail(&pool,71001,71002,source,"71002").await.unwrap());
+    }
+    assert!(assistant_direct::owner_can_read_detail(&pool,71001,71002,"friend","71002").await.unwrap());
+    assert!(assistant_direct::owner_can_read_detail(&pool,71001,71002,"conversation",&channel.to_string()).await.unwrap());
+    assert!(!assistant_direct::owner_can_read_detail(&pool,71003,71002,"friend","71002").await.unwrap());
+    assert!(!assistant_direct::owner_can_read_detail(&pool,71003,71002,"conversation",&channel.to_string()).await.unwrap());
+    assert!(!assistant_direct::owner_can_read_detail(&pool,71001,71002,"friend","71003").await.unwrap());
+    let blacklist = BlacklistService::new(pool.clone(), cache);
+    for (a,b) in [(71001,71002),(71002,71001)] {
+        assert!(matches!(friends.remove_friend(a,b).await, Err(privchat::error::ServerError::Authorization(_))));
+        assert!(blacklist.add_to_blacklist(a,b,None).await.is_err());
+    }
+    let (repair, deletion) = tokio::join!(assistant_direct::ensure(&pool,71001,71002),friends.remove_friend(71001,71002));
+    repair.unwrap();
+    assert!(deletion.is_err());
+    assert_eq!(before,versions().await);
+    for (a,b) in [(71001_i64,71002_i64),(71002,71001),(71001,71003),(71003,71002)] {
+        sqlx::query("INSERT INTO privchat_blacklist (user_id,blocked_user_id,created_at) VALUES ($1,$2,now_millis())")
+            .bind(a).bind(b).execute(pool.as_ref()).await.unwrap();
+    }
+    channels.ensure_assistant_direct(71001,71002).await.unwrap();
+    assert!(!blacklist.is_blocked(71001,71002).await.unwrap());
+    assert!(!blacklist.is_blocked(71002,71001).await.unwrap());
+    assert!(blacklist.is_blocked(71001,71003).await.unwrap());
+    assert!(blacklist.is_blocked(71003,71002).await.unwrap());
+    // Repair a pre-existing tombstone without a new UID or Direct; next delta restores the friend.
+    sqlx::query("UPDATE privchat_friendships SET status=2 WHERE user_id=71001 AND friend_id=71002")
+        .execute(pool.as_ref()).await.unwrap();
+    channels.ensure_assistant_direct(71001,71002).await.unwrap();
+    assert!(friends.try_is_friend(71001,71002).await.unwrap());
+    sqlx::query("UPDATE privchat_users SET status=2 WHERE user_id=71002").execute(pool.as_ref()).await.unwrap();
+    assert!(friends.remove_friend(71001,71002).await.is_err());
     pool.close().await;
 }
 
@@ -349,7 +480,7 @@ async fn real_service_commit_and_router_never_deliver_chat_to_same_uid_agent_nod
         "assistant-test",
     ));
     let messages = MessageService::new(
-        channels,
+        channels.clone(),
         repo.clone(),
         Arc::new(privchat::model::pts::UserMessageIndex::new()),
         offline,
@@ -458,6 +589,52 @@ async fn real_service_commit_and_router_never_deliver_chat_to_same_uid_agent_nod
         .unwrap();
     let room_received: PushMessageRequest = privchat_protocol::decode_message(&room_bytes).unwrap();
     assert_eq!(room_received.payload, b"room traffic");
+    let (welcome, concurrent) = tokio::join!(
+        messages.send_assistant_welcome(71001,71002,channel),
+        messages.send_assistant_welcome(71001,71002,channel)
+    );
+    let (welcome, concurrent) = (welcome.unwrap(),concurrent.unwrap());
+    assert_eq!(welcome.message_id,concurrent.message_id);
+    assert_ne!(welcome.inserted,concurrent.inserted);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bytes = full_rx.recv().await.unwrap();
+            let push: PushMessageRequest = privchat_protocol::decode_message(&bytes).unwrap();
+            if push.server_message_id == welcome.message_id {
+                assert!(String::from_utf8_lossy(&push.payload).contains("老板，我是您的私人助理。"));
+                break;
+            }
+        }
+    }).await.unwrap();
+    let key = "assistant-welcome:71002:owner:71001:v1";
+    sqlx::query("UPDATE privchat_message_dedup SET created_at=1 WHERE dedup_key=$1")
+        .bind(key).execute(pool.as_ref()).await.unwrap();
+    sqlx::query(privchat::repository::message_repo::MESSAGE_DEDUP_RETENTION_SQL)
+        .bind(chrono::Utc::now().timestamp_millis()).bind(10000_i64)
+        .execute(pool.as_ref()).await.unwrap();
+    channels.hide_channel(71001,channel,true).await.unwrap();
+    let versions = || async {
+        sqlx::query_as::<_,(i64,i64)>("SELECT user_id,sync_version FROM privchat_user_channels WHERE channel_id=$1 ORDER BY user_id")
+            .bind(channel as i64).fetch_all(pool.as_ref()).await.unwrap()
+    };
+    let before_retry = versions().await;
+    for _ in 0..3 {
+        channels.ensure_assistant_direct(71001,71002).await.unwrap();
+        let retried = messages.send_assistant_welcome(71001,71002,channel).await.unwrap();
+        assert_eq!(welcome.message_id,retried.message_id);
+        assert!(!retried.inserted);
+    }
+    assert!(channels.is_channel_hidden(71001,channel).await);
+    assert_eq!(before_retry,versions().await);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM privchat_messages WHERE channel_id=$1 AND sender_id=71002 AND content=$2")
+        .bind(channel as i64).bind("老板，我是您的私人助理。")
+        .fetch_one(pool.as_ref()).await.unwrap();
+    assert_eq!(count,1);
+    let outbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM privchat_message_dispatch_outbox o JOIN privchat_commit_log c ON c.id=o.event_id WHERE c.server_msg_id=$1")
+        .bind(welcome.message_id as i64).fetch_one(pool.as_ref()).await.unwrap();
+    assert_eq!(outbox_count,1);
+    assert!(messages.send_assistant_welcome(71003,71002,channel).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(250),node_rx.recv()).await.is_err());
     node.disconnect().await.unwrap();
     full.disconnect().await.unwrap();
     server.shutdown_with_timeout(Duration::from_secs(2)).await;
@@ -517,10 +694,10 @@ async fn ordinary_owner_send_bypasses_nonfriend_privacy_but_not_blacklist_or_unt
         authorize_send_to_channel(&deps, &channel, 71003).await,
         Err(SendRefusal::NotAMember)
     );
-    blacklist
-        .add_to_blacklist(71002, 71001, None)
-        .await
-        .unwrap();
+    assert!(blacklist.add_to_blacklist(71002, 71001, None).await.is_err());
+    // Legacy/pre-existing block still applies to send authorization.
+    sqlx::query("INSERT INTO privchat_blacklist (user_id,blocked_user_id,created_at) VALUES (71002,71001,now_millis())")
+        .execute(pool.as_ref()).await.unwrap();
     assert_eq!(
         authorize_send_to_channel(&deps, &channel, 71001).await,
         Err(SendRefusal::BlockedByPeer)

@@ -3699,7 +3699,12 @@ impl ChannelService {
         let (channel_id, created) =
             crate::service::assistant_direct::ensure(self.pool(), owner, assistant).await?;
         self.ensure_user_channel_rows(channel_id, &[owner, assistant]).await?;
-        self.get_or_create_direct_channel(owner, assistant, None, None).await?;
+        // Provisioning/status repair is not an explicit chat-open action. Preserve hidden state.
+        if self.get_channel_opt(channel_id).await.is_none() {
+            self.create_private_chat_with_id(owner, assistant, channel_id).await?;
+        }
+        self.direct_channel_index.write().await
+            .insert(Self::make_direct_key(owner, assistant), channel_id);
         if created {
             self.announce_direct_channel_created(owner, assistant, channel_id).await;
         }

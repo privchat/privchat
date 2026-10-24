@@ -32,7 +32,7 @@ pub async fn handle(
     let request: BlacklistAddRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
-    let user_id = request.user_id;
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
     let blocked_user_id = request.blocked_user_id;
 
     // 添加到黑名单
@@ -61,7 +61,7 @@ pub async fn handle(
                 blocked_user_id,
                 e
             );
-            Err(RpcError::internal(format!("添加黑名单失败: {}", e)))
+            Err(e.into())
         }
     }
 }

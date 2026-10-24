@@ -78,6 +78,9 @@ impl BlacklistService {
             ));
         }
 
+        let mut tx = self.pool.begin().await
+            .map_err(|e| crate::error::ServerError::Database(format!("写入黑名单失败: {e}")))?;
+        crate::service::assistant_direct::guard_relationship_removal(&mut tx, user_id, blocked_user_id).await?;
         sqlx::query(
             r#"
             INSERT INTO privchat_blacklist (user_id, blocked_user_id, reason, created_at)
@@ -88,9 +91,10 @@ impl BlacklistService {
         .bind(user_id as i64)
         .bind(blocked_user_id as i64)
         .bind(reason.as_deref())
-        .execute(self.pool.as_ref())
+        .execute(&mut *tx)
         .await
         .map_err(|e| crate::error::ServerError::Database(format!("写入黑名单失败: {e}")))?;
+        tx.commit().await.map_err(|e| crate::error::ServerError::Database(format!("写入黑名单失败: {e}")))?;
 
         info!("✅ 用户 {} 已将 {} 加入黑名单", user_id, blocked_user_id);
         Ok(BlacklistEntry {

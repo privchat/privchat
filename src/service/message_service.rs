@@ -162,6 +162,26 @@ impl MessageService {
         self
     }
 
+    /// Once-per-relationship ordinary IM; the atomic commit creates its existing dispatch outbox.
+    pub async fn send_assistant_welcome(&self, owner: u64, assistant: u64, channel: u64) -> anyhow::Result<ServerSendMessageResult> {
+        if crate::service::assistant_direct::owner_channel(self.channel_service.pool(), owner, assistant).await?
+            != Some(channel) || !crate::service::FriendService::new(Arc::new(self.channel_service.pool().clone()))
+            .try_is_friend(owner, assistant).await? {
+            return Err(ServerError::Authorization("assistant friendship required".into()).into());
+        }
+        self.send_message(ServerSendMessageRequest {
+            channel_id: channel,
+            sender_id: assistant,
+            content: "老板，我是您的私人助理。".into(),
+            message_type: ContentMessageType::Text,
+            metadata: serde_json::json!({}),
+            channel_type: 1,
+            recipient_user_ids: vec![owner, assistant],
+            dedup_key: Some(format!("assistant-welcome:{assistant}:owner:{owner}:v1")),
+            attachment_refs_override: None,
+        }).await
+    }
+
     /// 服务端发送消息的完整链路
     ///
     /// 完整流程：

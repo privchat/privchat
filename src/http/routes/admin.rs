@@ -2738,6 +2738,14 @@ async fn ensure_assistant_direct(
     verify_service_key(&headers, &state).await?;
     let (channel_id, created) = state.channel_service
         .ensure_assistant_direct(req.owner_user_id, req.assistant_uid).await?;
+    let publisher = crate::service::EntityInvalidationPublisher::new(state.connection_manager.clone());
+    if let Err(error) = publisher.publish_friend_pair_change(
+        req.owner_user_id, req.assistant_uid, privchat_protocol::EntityMutationHint::Upsert,
+    ).await {
+        warn!(%error, "assistant friend invalidation failed; resume sync will recover");
+    }
+    state.message_service.send_assistant_welcome(req.owner_user_id, req.assistant_uid, channel_id)
+        .await.map_err(|e| ServerError::Internal(format!("assistant welcome delivery failed: {e}")))?;
     Ok(ApiEnvelope::ok(
         json!({"channel_id":channel_id,"created":created}),
     ))

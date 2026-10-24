@@ -42,20 +42,9 @@ pub async fn handle(
 
     let searcher_id = request.user_id;
     let user_id = request.target_user_id;
-    let assistant_channel = if user_id != searcher_id {
-        crate::service::assistant_direct::owner_channel(
-            services.channel_service.pool(),
-            searcher_id,
-            user_id,
-        )
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?
-    } else {
-        None
-    };
-    let owner_assistant = request.source == "conversation"
-        && assistant_channel.is_some()
-        && request.source_id.parse::<u64>().ok() == assistant_channel;
+    let owner_assistant = crate::service::assistant_direct::owner_can_read_detail(
+        services.channel_service.pool(), searcher_id, user_id, &request.source, &request.source_id,
+    ).await.map_err(|e| RpcError::internal(e.to_string()))?;
     // 私人助理首版对他人不可达（ACCOUNT_IDENTITY_SPEC §6.5）：先于隐私判定，
     // 免得"无权查看"与"不存在"两种回包暴露它的存在。
     if user_id != searcher_id && !owner_assistant {
@@ -121,7 +110,8 @@ pub async fn handle(
     // 验证访问权限 + 取加好友判定(PROFILE_VISIBILITY §2.5:查看与添加分离)
     let access = if owner_assistant {
         Ok(crate::service::privacy_service::DetailAccessVerdict {
-            is_friend: false,
+            is_friend: services.friend_service.try_is_friend(searcher_id, user_id).await
+                .map_err(|e| RpcError::internal(e.to_string()))?,
             can_add_friend: false,
             deny_reason: Some("personal_assistant"),
             username_unlocked: false,

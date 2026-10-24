@@ -2153,10 +2153,7 @@ impl ChatServer {
                 let mut total: u64 = 0;
                 for _ in 0..20 {
                     match sqlx::query(
-                        "DELETE FROM privchat_message_dedup WHERE dedup_key IN (
-                             SELECT dedup_key FROM privchat_message_dedup
-                             WHERE created_at < $1 AND dedup_key NOT LIKE 'call-summary:%' LIMIT $2
-                         )",
+                        crate::repository::message_repo::MESSAGE_DEDUP_RETENTION_SQL,
                     )
                     .bind(cutoff)
                     .bind(BATCH)
