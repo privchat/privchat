@@ -27,6 +27,7 @@
 //! 历史 `/api/admin/*` 前缀已于 v1.3 移除（spec SERVICE_API_SPEC v1.3）。
 
 pub mod admin;
+pub mod components;
 pub mod auth;
 pub mod auth_jwks;
 pub mod metrics;
