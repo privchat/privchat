@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+pub mod components;
 mod peer;
 mod push;
 pub use push::{
@@ -51,6 +52,15 @@ pub struct CallService {
     turn_secret: Option<String>,
 }
 impl CallService {
+    // Keep local policy available for a later managed enable, while failing closed at startup.
+    pub fn configured(pool: PgPool, config: CallConfig) -> Self {
+        Self::from_environment(pool.clone(), config.clone()).unwrap_or_else(|_| {
+            tracing::error!("Local call configuration unavailable; calls disabled until a valid managed apply");
+            let mut config = config;
+            config.enabled = false;
+            Self { pool, config, credentials: None, turn_secret: None }
+        })
+    }
     pub fn new(
         pool: PgPool,
         config: CallConfig,
@@ -360,9 +370,11 @@ impl CallService {
         device: &str,
         req: CallInviteRequest,
     ) -> RpcResult<Value> {
-        self.enabled()?;
         let mut tx = self.pool.begin().await.map_err(db)?;
-        let (fingerprint, replay) = self
+        let runtime = self.runtime_in(&mut tx).await?;
+        let service = &runtime;
+        service.enabled()?;
+        let (fingerprint, replay) = service
             .command(
                 &mut tx,
                 actor,
@@ -382,7 +394,7 @@ impl CallService {
         if let Some(value) = replay {
             return Ok(value);
         }
-        if kind == 0 && !self.config.peer.enabled {
+        if kind == 0 && !service.config.peer.enabled {
             return Err(RpcError::from_code(
                 privchat_protocol::ErrorCode::ServiceUnavailable,
                 "Direct peer calls unavailable; peer transport must be enabled".into(),
@@ -398,7 +410,7 @@ impl CallService {
                 "This direct call requires a peer-capable client",
             ));
         }
-        if transport == CallTransport::Livekit && self.config.livekit_url.is_empty() {
+        if transport == CallTransport::Livekit && service.config.livekit_url.is_empty() {
             return Err(RpcError::validation("LiveKit is unavailable for this call"));
         }
         let mut targets: BTreeSet<u64> = if req.invitee_ids.is_empty() {
@@ -407,7 +419,7 @@ impl CallService {
             req.invitee_ids.iter().copied().collect()
         };
         targets.remove(&actor);
-        if targets.is_empty() || targets.len() + 1 > self.limit(req.media_kind) {
+        if targets.is_empty() || targets.len() + 1 > service.limit(req.media_kind) {
             return Err(RpcError::validation(
                 "Invitee count exceeds call limit or is empty",
             ));
@@ -461,7 +473,7 @@ impl CallService {
                 created_at_ms: timestamp,
                 answered_at_ms: None,
                 ended_at_ms: None,
-                expires_at_ms: timestamp + i64::from(self.config.ringing_timeout_seconds) * 1000,
+                expires_at_ms: timestamp + i64::from(service.config.ringing_timeout_seconds) * 1000,
                 participants,
             },
             channel_type: kind,
@@ -469,7 +481,7 @@ impl CallService {
                 actor,
                 DeviceClaim {
                     device: device.into(),
-                    lease_until: timestamp + i64::from(self.config.heartbeat_lease_seconds) * 1000,
+                    lease_until: timestamp + i64::from(service.config.heartbeat_lease_seconds) * 1000,
                 },
             )]),
         };
@@ -494,9 +506,11 @@ impl CallService {
         device: &str,
         req: CallMutationRequest,
     ) -> RpcResult<Value> {
-        self.enabled()?;
         let mut tx = self.pool.begin().await.map_err(db)?;
-        let (fingerprint, replay) = self
+        let runtime = self.runtime_in(&mut tx).await?;
+        let service = &runtime;
+        service.enabled()?;
+        let (fingerprint, replay) = service
             .command(
                 &mut tx,
                 actor,
@@ -541,14 +555,14 @@ impl CallService {
                         Self::not_blocked(&mut tx, actor, peer.user_id).await?;
                     }
                 }
-                if stored.call.transport == CallTransport::Webrtc && !self.config.peer.allow_turn {
+                if stored.call.transport == CallTransport::Webrtc && !service.config.peer.allow_turn {
                     // A policy change must also suppress credentials cached by an older command.
-                    response["peer"] = encode(self.peer_config(&stored.call, actor)?)?;
+                    response["peer"] = encode(service.peer_config(&stored.call, actor)?)?;
                 }
             }
             return Ok(response);
         }
-        self.expire(&mut tx, &mut stored).await?;
+        service.expire(&mut tx, &mut stored).await?;
         if stored.call.state == CallState::Ended {
             tx.commit().await.map_err(db)?;
             return Err(RpcError::validation(
@@ -604,7 +618,7 @@ impl CallService {
                     actor,
                     DeviceClaim {
                         device: device.into(),
-                        lease_until: now() + i64::from(self.config.heartbeat_lease_seconds) * 1000,
+                        lease_until: now() + i64::from(service.config.heartbeat_lease_seconds) * 1000,
                     },
                 );
                 if actor != stored.call.initiator_id && stored.call.state == CallState::Ringing {
@@ -619,7 +633,7 @@ impl CallService {
                     ));
                 }
                 stored.claims.get_mut(&actor).unwrap().lease_until =
-                    now() + i64::from(self.config.heartbeat_lease_seconds) * 1000;
+                    now() + i64::from(service.config.heartbeat_lease_seconds) * 1000;
                 notify = false;
             }
             "reject" => {
@@ -683,7 +697,7 @@ impl CallService {
                         &mut tx,
                         &stored.call,
                         "remove_participant",
-                        json!({"identity":self.identity(stored.call.call_id,actor,device)}),
+                        json!({"identity":service.identity(stored.call.call_id,actor,device)}),
                     )
                     .await?;
                 }
@@ -694,21 +708,21 @@ impl CallService {
             stored.call.version += 1;
         }
         let response = if route == "join" {
-            let expires = now() + i64::from(self.config.token_ttl_seconds) * 1000;
+            let expires = now() + i64::from(service.config.token_ttl_seconds) * 1000;
             let peer = if stored.call.transport == CallTransport::Webrtc {
-                Some(self.peer_config(&stored.call, actor)?)
+                Some(service.peer_config(&stored.call, actor)?)
             } else {
                 None
             };
             encode(CallJoinResponse {
                 call: stored.call.clone(),
                 url: if peer.is_none() {
-                    self.config.livekit_url.clone()
+                    service.config.livekit_url.clone()
                 } else {
                     String::new()
                 },
                 token: if peer.is_none() {
-                    self.join_token(&stored.call, actor, device, expires)?
+                    service.join_token(&stored.call, actor, device, expires)?
                 } else {
                     String::new()
                 },
@@ -734,8 +748,10 @@ impl CallService {
         Ok(response)
     }
     pub async fn get(&self, actor: u64, id: u64) -> RpcResult<CallSnapshot> {
-        self.enabled()?;
         let mut tx = self.pool.begin().await.map_err(db)?;
+        let runtime = self.runtime_in(&mut tx).await?;
+        let service = &runtime;
+        service.enabled()?;
         let mut stored = Self::load(&mut tx, id).await?;
         let (_, members) = Self::members(&mut tx, stored.call.channel_id).await?;
         if !members.contains_key(&actor)
@@ -743,7 +759,7 @@ impl CallService {
         {
             return Err(RpcError::forbidden("Call unavailable to this user"));
         }
-        self.expire(&mut tx, &mut stored).await?;
+        service.expire(&mut tx, &mut stored).await?;
         tx.commit().await.map_err(db)?;
         Ok(stored.call)
     }
@@ -842,7 +858,10 @@ impl CallService {
         if call.transport == CallTransport::Webrtc {
             return Ok(());
         }
-        let (key, _) = self
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let runtime = self.runtime_in(&mut tx).await?;
+        let service = &runtime;
+        let (key, _) = service
             .credentials
             .as_ref()
             .ok_or_else(|| RpcError::internal("LiveKit unavailable"))?;
@@ -852,13 +871,13 @@ impl CallService {
             json!({"roomCreate":true})
         };
         let token =
-            self.token(json!({"iss":key,"nbf":now()/1000-5,"exp":now()/1000+60,"video":grant}))?;
+            service.token(json!({"iss":key,"nbf":now()/1000-5,"exp":now()/1000+60,"video":grant}))?;
         let method = if identity.is_some() {
             "RemoveParticipant"
         } else {
             "DeleteRoom"
         };
-        let mut base = url::Url::parse(&self.config.livekit_url)
+        let mut base = url::Url::parse(&service.config.livekit_url)
             .map_err(|_| RpcError::internal("Invalid LiveKit URL"))?;
         let scheme = if base.scheme() == "wss" {
             "https"
@@ -881,10 +900,12 @@ impl CallService {
             .await
             .map_err(|_| RpcError::internal("LiveKit cleanup unavailable"))?;
         if response.status().is_success() {
+            tx.commit().await.map_err(db)?;
             return Ok(());
         }
         // Only Twirp not_found is an idempotent success, not every HTTP 404.
         let body: Value = response.json().await.unwrap_or(Value::Null);
+        tx.commit().await.map_err(db)?;
         if body.get("code").and_then(Value::as_str) == Some("not_found") {
             Ok(())
         } else {

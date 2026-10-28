@@ -18,25 +18,12 @@ use sqlx::Row;
 use std::sync::Arc;
 
 pub async fn register_routes(services: RpcServiceContext) {
-    let service = match CallService::from_environment(
+    let service = CallService::configured(
         services.message_repository.pool().clone(),
         services.config.call.clone(),
-    ) {
-        Ok(service) => service,
-        Err(_) => {
-            tracing::error!(
-                "Call configuration invalid or credentials missing; call capability disabled"
-            );
-            CallService::new(
-                services.message_repository.pool().clone(),
-                Default::default(),
-                None,
-            )
-            .expect("disabled calls")
-        }
-    };
+    );
     let service = Arc::new(service);
-    let push_worker = if service.config.enabled && service.config.push.enabled {
+    let push_worker = if service.config.push.enabled {
         match CallPushWorker::from_config((*service).clone(), &services.config.push) {
             Ok(worker) => Some(Arc::new(worker)),
             Err(_) => {
@@ -47,6 +34,7 @@ pub async fn register_routes(services: RpcServiceContext) {
     } else {
         None
     };
+    super::components::register(&GLOBAL_RPC_ROUTER, service.clone()).await;
     for route in [
         routes::CAPABILITIES,
         routes::INVITE,
@@ -85,13 +73,18 @@ pub async fn register_routes(services: RpcServiceContext) {
             })
             .await;
     }
-    if service.config.enabled {
+    {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                if service.sweep().await.is_err() {
-                    tracing::warn!("Call lease sweep failed; will retry");
+                match service.sweep_for_worker().await {
+                    Ok(true) => (),
+                    Ok(false) => continue,
+                    Err(_) => {
+                        tracing::warn!("Call lease sweep failed; will retry");
+                        continue;
+                    }
                 }
                 for _ in 0..50 {
                     match dispatch_one(&service, &services).await {
@@ -133,6 +126,8 @@ async fn handle(
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| RpcError::unauthorized("Authenticated device required"))?;
+    let runtime = service.runtime().await?;
+    let service = &runtime;
     let invalid = |_| RpcError::validation("Invalid call request");
     match route {
         CALL_PUSH_REGISTER => {
@@ -229,6 +224,8 @@ async fn dispatch_one(service: &CallService, services: &RpcServiceContext) -> an
     // Lock the work item across bounded effects. Crash before completion causes replay;
     // history writes have a permanent dedup key, state consumers use call.version.
     let mut tx = service.pool.begin().await?;
+    let runtime = service.runtime_in(&mut tx).await?;
+    let service = &runtime;
     let row = sqlx::query("SELECT id,call_id,kind,payload FROM privchat_call_effects WHERE NOT completed AND next_attempt_at <= $1 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1")
         .bind(chrono::Utc::now().timestamp_millis()).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {

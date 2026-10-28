@@ -38,6 +38,7 @@
 //! - 统计报表：系统统计数据
 
 use base64::Engine as _;
+use super::components::{get_components, update_rtc_component};
 use crate::auth::service_key_manager::fingerprint;
 use crate::auth::{IssueTokenRequest, IssueTokenResponse};
 use crate::error::{Result, ServerError};
@@ -63,6 +64,8 @@ const ROOM_BROADCAST_MAX_CONCURRENCY: usize = 128;
 /// 创建管理 API 路由（返回相对路径 router，由 caller 决定前缀挂载点）
 pub fn create_route() -> Router<AdminServerState> {
     Router::new()
+        .route("/config/components", get(get_components))
+        .route("/config/components/rtc", put(update_rtc_component))
         // Token 管理
         .route("/token/issue", post(issue_token)) // legacy 别名（v1.0/v1.1），保留向后兼容
         .route(
@@ -207,6 +210,13 @@ pub(crate) async fn verify_service_key(
     headers: &HeaderMap,
     state: &AdminServerState,
 ) -> Result<()> {
+    verify_service_key_with_manager(headers, &state.service_key_manager).await
+}
+
+pub(crate) async fn verify_service_key_with_manager(
+    headers: &HeaderMap,
+    manager: &crate::auth::ServiceKeyManager,
+) -> Result<()> {
     let key = headers
         .get("X-Service-Key")
         .or_else(|| headers.get("x-service-key"))
@@ -221,14 +231,14 @@ pub(crate) async fn verify_service_key(
     })?;
 
     // 验证 service key
-    if !state.service_key_manager.verify(&service_key).await {
+    if !manager.verify(&service_key).await {
         // 🔴 提交的 key 和期望的 key 都只记**指纹**，绝不记原文。
         // 这里曾经直接打 `service_key` 原文 + `display_expected()`（后者当时返回
         // master.clone()），于是每一次错误的 key 尝试都把真实密钥写进日志。
         warn!(
             "❌ 无效的 service key（指纹 {}），期望: {}",
             fingerprint(&service_key),
-            state.service_key_manager.display_expected().await
+            manager.display_expected().await
         );
         return Err(ServerError::Unauthorized("无效的 service key".to_string()));
     }
