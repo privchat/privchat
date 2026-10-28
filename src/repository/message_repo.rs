@@ -2468,7 +2468,7 @@ impl PgMessageRepository {
             .bind(channel_id as i64)
             .bind(anchor_created_at)
             .bind(anchor_message_id)
-            .bind(limit.clamp(1, 50))
+            .bind(limit.clamp(0, 50))
             .fetch_all(self.pool.as_ref())
             .await
             .map_err(|e| DatabaseError::Database(format!("list context failed: {}", e)))?;
@@ -3722,6 +3722,7 @@ mod client_search_tests {
         };
         cleanup_around(&repo).await;
         ensure_channel(&repo, CH_AROUND, USER_D, USER_E).await;
+        ensure_user(&repo, USER_B).await;
         let t0 = 1_780_100_000_000_i64;
         // 五条按时间排开 + 一条与 anchor 同毫秒但 id 更大（验证 tie-break）
         for (i, dt) in [(1, 1000), (2, 2000), (3, 3000), (4, 4000), (5, 5000)] {
@@ -3738,6 +3739,13 @@ mod client_search_tests {
         insert_msg(&repo, MSG_BASE + 19, CH_AROUND, "ctx-tie", t0 + 3000, false).await;
 
         let anchor_id = MSG_BASE + 13; // ctx-3
+        for before in [true, false] {
+            let empty = repo
+                .list_context(CH_AROUND, t0 + 3000, anchor_id, 0, before)
+                .await
+                .expect("zero-width context");
+            assert!(empty.is_empty(), "zero limit must not return a neighbor");
+        }
         let before = repo
             .list_context_before(CH_AROUND, t0 + 3000, anchor_id, 10)
             .await
