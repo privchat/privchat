@@ -1,0 +1,79 @@
+{
+  "state": "candidate-lifecycle-and-real-same-binary-restart-recovery-passed",
+  "baseline": {
+    "runId": "e58e9b37-fcb4-4175-ac3a-9df329564539",
+    "passed": 19,
+    "failed": 1,
+    "failure": "missing required rename history notice; preserved separately",
+    "receipt": "baseline-rpc-handoff.json"
+  },
+  "publishedCandidateTests": {
+    "receipt": "published-candidate-receipt.json",
+    "passed": [
+      9,
+      7,
+      8
+    ],
+    "baseline": "5c09bd609d23f967dc49aeec13bf7b6daec1e7a8"
+  },
+  "candidate": {
+    "runId": "a7f63bc8-bdd6-4393-9b93-dde11739e559",
+    "passed": 21,
+    "failed": 0,
+    "serverPid": 89772,
+    "report": "application-runs/a7f63bc8-bdd6-4393-9b93-dde11739e559/report.json",
+    "reportSha256": "65737c42d3ddeac668ab3ed95495814b87c6d95d1ff4bbefd961b8771869b372",
+    "runnerFrozen": "application-rpc-lifecycle-candidate-frozen.mjs",
+    "renameMessageId": "638455665299537920",
+    "renameDelivery": {
+      "receiver": "member",
+      "messageId": "638455665299537920",
+      "actorId": "100000001",
+      "senderId": "1"
+    }
+  },
+  "afterRestart": {
+    "runId": "4f49cd6b-f8e9-45e4-b23e-c459498d53e4",
+    "passed": 4,
+    "failed": 0,
+    "serverPid": 14099,
+    "report": "application-runs/4f49cd6b-f8e9-45e4-b23e-c459498d53e4/report.json",
+    "reportSha256": "1f90ad0e4bc35890216a30a9152e74e2c6ea72e69585ac120f585e2bcdd1efa8",
+    "runnerFrozen": "application-rpc-lifecycle-recovery-frozen.mjs"
+  },
+  "serverSha256": "baca92cc3822f306f3e60f300a07e413518bc6558097f8f99a88ab5629c9dba4",
+  "sameCandidateBinary": true,
+  "ownedServerRestartsAfterAck": 1,
+  "restartReceipt": "/Users/zoujiaqing/projects/privchat/.artifacts/feature-final-2026-10-29/backend/evidence/server-candidate-same-binary-restart.json",
+  "restartReceiptSha256": "dca3ad0a927f5f64a5b0ade4bd87b938d649ecd3661e14c6e5afaf6a9e00229a",
+  "protectedProcessesUnchanged": {
+    "application": 45815,
+    "peer": 46094,
+    "redis": 36551,
+    "postgres": 49209
+  },
+  "migrationsRun": false,
+  "databasesReset": false,
+  "onlyRegressionGroupMutated": true,
+  "uiGroupAndContactTimelinePreserved": true,
+  "credentialsOrRawResponsesRecorded": false,
+  "cargoCleanup": {
+    "ownedTarget": "/Users/zoujiaqing/projects/privchat/.artifacts/feature-final-2026-10-29/pins-group/cargo-target",
+    "candidatePreservedByAverroes": true,
+    "candidateSha256": "baca92cc3822f306f3e60f300a07e413518bc6558097f8f99a88ab5629c9dba4",
+    "allocatedBytesBefore": 12242907136,
+    "availableBytesBefore": 15245914112,
+    "sharedCacheOrParentTargetRemoved": false,
+    "preserved": [
+      "candidate-bin",
+      "all receipts/logs/patches/frozen source snapshots"
+    ],
+    "status": "complete",
+    "targetExistsAfter": false,
+    "availableBytesAfter": 21895323648,
+    "observedAvailableBytesDelta": 6649409536,
+    "accounting": "allocated directory bytes removed; free-space delta is observational because APFS CoW and concurrent parent work prevent exclusive physical attribution"
+  },
+  "canonicalSourceChanges": [],
+  "acceptanceScope": "real HTTP login + authenticated SDK/RPC lifecycle, actual SDK rename delivery, actual owned IM server restart recovery; not a formal App UI result"
+}

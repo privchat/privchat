@@ -23,7 +23,7 @@ use privchat_protocol::rpc::sync::ServerCommit;
 use privchat_protocol::{
     CanonicalTimelineEvent, FlatBufferMessage, CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
 };
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{Acquire, PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -171,6 +171,18 @@ const ADVANCE_CHANNEL_MESSAGE_HEAD_SQL: &str = r#"
             COALESCE(server_latest_message_id, -1)
           )
 "#;
+
+const FIND_CLIENT_REGISTRY_MESSAGE_SQL: &str = r#"
+            SELECT
+                m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
+                m.content, m.message_type, m.metadata, m.reply_to_message_id,
+                m.created_at, m.updated_at, m.deleted, m.deleted_at,
+                m.revoked, m.revoked_at, m.revoked_by, m.read_detail_expires_at
+            FROM privchat_client_msg_registry r
+            JOIN privchat_messages m ON m.message_id = r.server_msg_id
+            WHERE r.sender_id = $1 AND r.device_id = $2 AND r.local_message_id = $3
+            LIMIT 1
+            "#;
 
 impl PgMessageRepository {
     /// 创建新的消息仓库
@@ -401,19 +413,7 @@ impl PgMessageRepository {
         device_id: &str,
         local_message_id: u64,
     ) -> Result<Option<Message>, DatabaseError> {
-        let row = sqlx::query_as::<_, MessageRow>(
-            r#"
-            SELECT
-                m.message_id, m.channel_id, m.sender_id, m.pts, m.local_message_id,
-                m.content, m.message_type, m.metadata, m.reply_to_message_id,
-                m.created_at, m.updated_at, m.deleted, m.deleted_at,
-                m.revoked, m.revoked_at, m.revoked_by, m.read_detail_expires_at
-            FROM privchat_client_msg_registry r
-            JOIN privchat_messages m ON m.message_id = r.server_msg_id
-            WHERE r.sender_id = $1 AND r.device_id = $2 AND r.local_message_id = $3
-            LIMIT 1
-            "#,
-        )
+        let row = sqlx::query_as::<_, MessageRow>(FIND_CLIENT_REGISTRY_MESSAGE_SQL)
         .bind(sender_id as i64)
         .bind(device_id)
         .bind(local_message_id as i64)
@@ -429,6 +429,26 @@ impl PgMessageRepository {
     /// dedup claim、pts 分配、消息落库、附件绑定和 commit log 写入。
     pub async fn create_message_and_commit_atomic(
         &self,
+        request: AtomicMessageCommitRequest,
+    ) -> Result<AtomicMessageCommitResult, DatabaseError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("Failed to begin message tx: {e}")))?;
+        let result = self.create_message_in_transaction(&mut tx, request).await?;
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::Database(format!("Failed to commit message tx: {e}")))?;
+        Ok(result)
+    }
+
+    /// Writes the canonical message and dispatch snapshot under the caller's transaction.
+    /// A savepoint preserves duplicate-claim rollback without rolling back caller mutations.
+    /// The caller must discard its transaction on error and dispatch only after outer commit.
+    pub(crate) async fn create_message_in_transaction(
+        &self,
+        parent: &mut Transaction<'_, Postgres>,
         request: AtomicMessageCommitRequest,
     ) -> Result<AtomicMessageCommitResult, DatabaseError> {
         if request.dedup_key.is_some() && request.client_registry_claim.is_some() {
@@ -457,10 +477,9 @@ impl PgMessageRepository {
         let canonical_event = request.event.encode_fb().map_err(|error| {
             DatabaseError::Database(format!("canonical event encoding failed: {error}"))
         })?;
-        let mut tx =
-            self.pool.begin().await.map_err(|e| {
-                DatabaseError::Database(format!("Failed to begin message tx: {}", e))
-            })?;
+        let mut tx = parent.begin().await.map_err(|e| {
+            DatabaseError::Database(format!("Failed to begin message savepoint: {e}"))
+        })?;
 
         let created_at = request.message.created_at.timestamp_millis();
 
@@ -774,13 +793,14 @@ impl PgMessageRepository {
 
                 if registered.rows_affected() == 0 {
                     tx.rollback().await.ok();
-                    let existing = self
-                        .find_message_by_client_registry(
-                            message.sender_id,
-                            &claim.device_id,
-                            local_message_id,
-                        )
-                        .await?
+                    let existing = sqlx::query_as::<_, MessageRow>(FIND_CLIENT_REGISTRY_MESSAGE_SQL)
+                        .bind(message.sender_id as i64)
+                        .bind(&claim.device_id)
+                        .bind(local_message_id as i64)
+                        .fetch_optional(&mut **parent)
+                        .await
+                        .map_err(|e| DatabaseError::Database(format!("Failed to query client registry message: {e}")))?
+                        .map(Self::message_from_row)
                         .ok_or_else(|| {
                             DatabaseError::Database(
                                 "client registry conflict without message projection".to_string(),
@@ -2709,7 +2729,7 @@ mod atomic_dispatch_tests {
     fn head_maintenance_is_wired_into_the_commit_path() {
         let src = include_str!("message_repo.rs");
         let fn_start = src
-            .find("pub async fn create_message_and_commit_atomic")
+            .find("pub(crate) async fn create_message_in_transaction")
             .expect("commit fn");
         let fn_end = src[fn_start..]
             .find("\n    pub async fn ")

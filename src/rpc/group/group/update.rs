@@ -9,8 +9,17 @@ use serde_json::Value;
 pub async fn update_profile(
     pool: &sqlx::PgPool,
     operator: u64,
-    mut request: GroupUpdateRequest,
+    request: GroupUpdateRequest,
 ) -> RpcResult<(GroupUpdateResponse, bool)> {
+    let (response, changed, _) = update_profile_with_rename(pool, operator, request).await?;
+    Ok((response, changed))
+}
+
+async fn update_profile_with_rename(
+    pool: &sqlx::PgPool,
+    operator: u64,
+    mut request: GroupUpdateRequest,
+) -> RpcResult<(GroupUpdateResponse, bool, bool)> {
     request
         .profile
         .validate()
@@ -39,7 +48,9 @@ pub async fn update_profile(
     }
     let name = request.profile.name.unwrap_or_else(|| old.0.clone());
     let description = request.profile.description.or_else(|| old.1.clone());
-    let changed = name != old.0 || description != old.1;
+    // Capture the rename under the same row lock as the committed mutation.
+    let renamed = name != old.0;
+    let changed = renamed || description != old.1;
     let (updated_at, sync_version) = if changed {
         sqlx::query_as::<_, (i64, i64)>(
             "UPDATE privchat_groups SET name=$2, description=$3, updated_at=now_millis() \
@@ -54,6 +65,26 @@ pub async fn update_profile(
     } else {
         (old.2, old.3)
     };
+    if renamed {
+        let operator_name: Option<String> = sqlx::query_scalar(
+            "SELECT COALESCE(display_name, username) FROM privchat_users WHERE user_id=$1",
+        )
+        .bind(operator as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let operator_name = operator_name.unwrap_or_else(|| operator.to_string());
+        let repository =
+            crate::repository::PgMessageRepository::new(std::sync::Arc::new(pool.clone()));
+        crate::service::message_service::MessageService::persist_group_system_message_in_transaction(
+            &repository,
+            &mut tx,
+            request.group_id,
+            rename_system_payload(operator, &operator_name, &name).to_string(),
+        )
+        .await
+        .map_err(|error| RpcError::internal(format!("Group rename notice failed: {error}")))?;
+    }
     tx.commit().await.map_err(db_error)?;
     Ok((
         GroupUpdateResponse {
@@ -64,7 +95,19 @@ pub async fn update_profile(
             sync_version: sync_version as u64,
         },
         changed,
+        renamed,
     ))
+}
+
+fn rename_system_payload(operator: u64, operator_name: &str, name: &str) -> Value {
+    serde_json::json!({
+        "message_type": "system",
+        "template": "system.group_name_changed",
+        "refs": [
+            { "type": "user", "target_id": operator.to_string(), "text": operator_name },
+            { "type": "text", "text": name },
+        ],
+    })
 }
 
 fn db_error(error: sqlx::Error) -> RpcError {
@@ -79,8 +122,8 @@ pub async fn handle(
     let request: GroupUpdateRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {e}")))?;
     let operator = crate::rpc::get_current_user_id(&ctx)?;
-    let (response, changed) =
-        update_profile(services.channel_service.pool(), operator, request).await?;
+    let (response, changed, _) =
+        update_profile_with_rename(services.channel_service.pool(), operator, request).await?;
     if changed {
         services
             .channel_service
@@ -121,3 +164,7 @@ pub async fn handle(
     }
     serde_json::to_value(response).map_err(|e| RpcError::internal(e.to_string()))
 }
+
+#[cfg(test)]
+#[path = "update_tests.rs"]
+mod tests;

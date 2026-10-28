@@ -1,0 +1,133 @@
+{
+  "baseline": "5c09bd609d23f967dc49aeec13bf7b6daec1e7a8",
+  "patch": "/Users/zoujiaqing/projects/privchat/.artifacts/feature-final-2026-10-29/pins-group/server-group-rename-published-5c09bd6.patch",
+  "patchSha256": "04725e78dfa49741444853b556f075ae0ea08e90424f78bef718df6dccb5ad05",
+  "checkAgainstExactPublishedBaseline": true,
+  "canonicalOnlyInsertionsExcluded": [
+    {
+      "file": "src/repository/message_repo.rs",
+      "removedCanonicalOnlySha256": "f9d009cdc5d66f7b85e2f9f6144c26e2c18e3875118c9b35b0b699afbfe9a2ad"
+    },
+    {
+      "file": "src/service/message_service.rs",
+      "removedCanonicalOnlySha256": "af25b017b17c8da48d5c2464820363c44132620d91ad61abfcc417a6bdb55f48"
+    }
+  ],
+  "isolatedSourceFiles": [
+    {
+      "path": "src/repository/message_repo.rs",
+      "sha256": "8388ae3f26d989b76b7dc58caa54670ca04e62aa9a9c0ed799933b989ba233df"
+    },
+    {
+      "path": "src/service/message_service.rs",
+      "sha256": "4ed69292a4afba3aa1dc3be9f6e28a7d0c0dfc6e5bf68655891ba5eeabad31e6"
+    },
+    {
+      "path": "src/rpc/group/group/update.rs",
+      "sha256": "9f8e2d4583154b2fa15d8e4e17e5200b4f485787e4cf9c4e3d5fb1ee02fe1de7"
+    },
+    {
+      "path": "tests/group_role_authz_db_test.rs",
+      "sha256": "97e34a254fd5df227d81377a7b126497ed02b25c868764f18cc3141b074fc260"
+    }
+  ],
+  "dependencies": {
+    "privchat-protocol": {
+      "source": "backend/sources/privchat/privchat-protocol",
+      "frozenCopyTreeSha256": "2b41aa56cf27c5ba8b00a7a8541435a99b25103693b05fa8dd72cad9308a1b28"
+    },
+    "msgtrans": {
+      "source": "backend/sources/privchat/msgtrans",
+      "frozenCopyTreeSha256": "1a73df2f631d61258cd44065ffa24bfe0b5e5a1250fa455de68e2cfafffc54b4"
+    }
+  },
+  "tests": {
+    "focusedRename": {
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "realPostgresCases": 8,
+      "log": "published-durable-rename-pg-tests.log"
+    },
+    "existingMessageWriter": {
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "log": "published-existing-message-writer-tests.log"
+    },
+    "existingGroupPermissionSuite": {
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "log": "published-existing-group-role-authz-tests.log",
+      "fixture": "server-existing-profile-fixture.patch"
+    }
+  },
+  "cargoLockSha256": "5cca7ca38a68caaa21476e553accf8e4bf218e588b9a5bf2a3493547a8dab4df",
+  "dependencyCache": "copy-on-write copy of retained backend baseline cache merged into the sole owned target; parent target never modified",
+  "actualBackendSnapshotPatchCheck": "passed",
+  "profile": "baseline-compatible debug=0; incremental=0; jobs=1",
+  "frozenInputsVerified": true,
+  "evidenceSha256": [
+    {
+      "path": "published-durable-rename-pg-tests.log",
+      "sha256": "24a149f6ebef57058e8fa2ed358040c41a0850863643079b9e2f1f1f14fae620"
+    },
+    {
+      "path": "published-existing-message-writer-tests.log",
+      "sha256": "788191236a1efc74e6ccb336777a56694c3d0e74c90d2711a40d0b1e1a617c58"
+    },
+    {
+      "path": "published-build-inputs.sha256",
+      "sha256": "5f4a05b47e95c8a519e69ad5fce3efad32cd80e828183f02dac41486b263d30c"
+    },
+    {
+      "path": "published-test-binary.sha256",
+      "sha256": "a9aa2881bfdb061bd31e651acd4f5ebbcd1945337fa9f083fddea62681cd9e6f"
+    },
+    {
+      "path": "published-existing-group-role-authz-tests.log",
+      "sha256": "ba63729886d35cc0a353fa82fc0ca7592ecda2caefc87d27077b57d03bca6173"
+    },
+    {
+      "path": "published-candidate-server-binary-preserved.sha256",
+      "sha256": "501ec03ef4d74c71e1a63d3cd9f8d4472935f24afd1795405159484a118746f6"
+    },
+    {
+      "path": "baseline-rpc-handoff.json",
+      "sha256": "b3f7cdc36d9b9c6d39f7d7ce4518e5a3a283c84971e5c1b410997d9af830beea"
+    },
+    {
+      "path": "server-existing-profile-fixture.patch",
+      "sha256": "490f007733d6b3930b6c4b973523c623e974bc7527cbd14855a526035d6c5464"
+    }
+  ],
+  "testSummary": "published 5c09bd6: 9 focused + 7 existing writer + 8 existing group permissions; no failures, no skips",
+  "allFrozenInputHashesVerifiedAfterTests": true,
+  "canonicalHeadUnchanged": "075966cbc21f9b8a7e07319b787d8ba5fc92b2ab",
+  "canonicalThreeSourceBytesUnchanged": true,
+  "canonicalScopedDirtyStatus": "clean for the four owned paths; no canonical edit or index write",
+  "migrationScope": "migrations unchanged between 5c09bd6 and 075966c; same disposable PostgreSQL schema",
+  "candidateExecutable": {
+    "path": "/Users/zoujiaqing/projects/privchat/.artifacts/feature-final-2026-10-29/pins-group/candidate-bin/privchat-published-5c09bd6",
+    "sha256": "baca92cc3822f306f3e60f300a07e413518bc6558097f8f99a88ab5629c9dba4",
+    "bytes": 129049856,
+    "origin": "produced by published integration-test build with frozen source/lock/dependencies",
+    "launched": false,
+    "parentMayReuse": "only after parent source/config verification and explicit UI-idle rollout gate"
+  },
+  "liveBaseline": {
+    "report": "baseline-rpc-handoff.json",
+    "passed": 19,
+    "failed": 1,
+    "defect": "required rename system notice missing",
+    "mutations": "regression group only",
+    "restart": false
+  },
+  "cleanup": {
+    "privateTestRedis": "stopped via verified owned Unix socket PID; no TCP port was used",
+    "cargoTarget": "retained pending parent candidate binary preservation/cleanup authorization",
+    "sharedCachesDeleted": false,
+    "canonicalSourcesChanged": false
+  }
+}

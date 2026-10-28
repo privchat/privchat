@@ -162,38 +162,9 @@ impl MessageService {
         self
     }
 
-    /// 服务端发送消息的完整链路
-    ///
-    /// 完整流程：
-    /// 1. 分配 pts
-    /// 2. 写入 DB
-    /// 3. 记录 sync commit
-    /// 4. 写入 user_message_index
-    /// 5. 更新未读计数
-    /// 6. 构建 PushMessageRequest
-    /// 7. 实时推送 + 离线队列
-    /// 8. 更新 last_message
-    pub async fn send_message(
-        &self,
-        req: ServerSendMessageRequest,
-    ) -> anyhow::Result<ServerSendMessageResult> {
-        let sender_type: Option<i16> =
-            sqlx::query_scalar("SELECT user_type FROM privchat_users WHERE user_id=$1")
-                .bind(req.sender_id as i64)
-                .fetch_optional(self.channel_service.pool())
-                .await?;
-        if sender_type == Some(3) {
-            let owner = req.recipient_user_ids.iter().copied().find(|id| *id != req.sender_id)
-                .ok_or_else(|| ServerError::Authorization("assistant reply requires owner recipient".into()))?;
-            if req.channel_type != 1 || crate::service::assistant_direct::owner_channel(
-                self.channel_service.pool(), owner, req.sender_id).await? != Some(req.channel_id)
-                || req.recipient_user_ids.iter().any(|id| *id != owner && *id != req.sender_id) {
-                return Err(ServerError::Authorization("assistant reply requires provisioned owner Direct".into()).into());
-            }
-            if !req.dedup_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
-                return Err(ServerError::Validation("assistant reply requires dedup_key".into()).into());
-            }
-        }
+    fn prepare_server_message(
+        req: &ServerSendMessageRequest,
+    ) -> anyhow::Result<(AtomicMessageCommitRequest, Value)> {
         let now = Utc::now();
         let message_id = crate::infra::next_message_id();
         let typed_metadata = MessageMetadata::from_json_value(req.message_type, &req.metadata);
@@ -235,9 +206,8 @@ impl MessageService {
             // 发送时固定明细截止时间：之后调大配置不会重新开放旧名单（§6.5.4）。
             read_detail_expires_at: None,
         };
-        let tx_result = self
-            .message_repository
-            .create_message_and_commit_atomic(AtomicMessageCommitRequest {
+        Ok((
+            AtomicMessageCommitRequest {
                 message,
                 dedup_key: req.dedup_key.clone(),
                 client_registry_claim: None,
@@ -245,10 +215,75 @@ impl MessageService {
                 channel_type: i16::from(req.channel_type),
                 event: canonical_event,
                 sender_username: None,
-            })
+            },
+            commit_content,
+        ))
+    }
+
+    /// Persists a group notice with the caller's business mutation. No dispatch before commit.
+    pub(crate) async fn persist_group_system_message_in_transaction(
+        repository: &PgMessageRepository,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        group_id: u64,
+        content: String,
+    ) -> anyhow::Result<()> {
+        let (request, _) = Self::prepare_server_message(&ServerSendMessageRequest {
+            channel_id: group_id,
+            sender_id: crate::config::SYSTEM_USER_ID,
+            content,
+            message_type: ContentMessageType::System,
+            metadata: serde_json::json!({}),
+            channel_type: 2,
+            recipient_user_ids: Vec::new(),
+            dedup_key: None,
+            attachment_refs_override: None,
+        })?;
+        repository
+            .create_message_in_transaction(tx, request)
+            .await?;
+        Ok(())
+    }
+
+    /// 服务端发送消息的完整链路
+    ///
+    /// 完整流程：
+    /// 1. 分配 pts
+    /// 2. 写入 DB
+    /// 3. 记录 sync commit
+    /// 4. 写入 user_message_index
+    /// 5. 更新未读计数
+    /// 6. 构建 PushMessageRequest
+    /// 7. 实时推送 + 离线队列
+    /// 8. 更新 last_message
+    pub async fn send_message(
+        &self,
+        req: ServerSendMessageRequest,
+    ) -> anyhow::Result<ServerSendMessageResult> {
+        let sender_type: Option<i16> =
+            sqlx::query_scalar("SELECT user_type FROM privchat_users WHERE user_id=$1")
+                .bind(req.sender_id as i64)
+                .fetch_optional(self.channel_service.pool())
+                .await?;
+        if sender_type == Some(3) {
+            let owner = req.recipient_user_ids.iter().copied().find(|id| *id != req.sender_id)
+                .ok_or_else(|| ServerError::Authorization("assistant reply requires owner recipient".into()))?;
+            if req.channel_type != 1 || crate::service::assistant_direct::owner_channel(
+                self.channel_service.pool(), owner, req.sender_id).await? != Some(req.channel_id)
+                || req.recipient_user_ids.iter().any(|id| *id != owner && *id != req.sender_id) {
+                return Err(ServerError::Authorization("assistant reply requires provisioned owner Direct".into()).into());
+            }
+            if !req.dedup_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                return Err(ServerError::Validation("assistant reply requires dedup_key".into()).into());
+            }
+        }
+        let (request, commit_content) = Self::prepare_server_message(&req)?;
+        let tx_result = self
+            .message_repository
+            .create_message_and_commit_atomic(request)
             .await
             .map_err(|error| anyhow::anyhow!("事务化写入服务端消息失败: {error}"))?;
         let message = tx_result.message;
+        let message_id = message.message_id;
         let pts = message.pts.unwrap_or(0).max(0) as u64;
         if !tx_result.inserted {
             if sender_type == Some(3) {
