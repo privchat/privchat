@@ -83,6 +83,16 @@ async fn seed(pool: &sqlx::PgPool) {
 }
 
 async fn cleanup(pool: &sqlx::PgPool) {
+    for sql in [
+        "DELETE FROM privchat_message_dispatch_recipient WHERE event_id IN (SELECT id FROM privchat_commit_log WHERE channel_id=$1)",
+        "DELETE FROM privchat_message_dispatch_outbox WHERE channel_id=$1",
+        "DELETE FROM privchat_commit_log WHERE channel_id=$1",
+        "DELETE FROM privchat_messages WHERE channel_id=$1",
+        "DELETE FROM privchat_channel_pts WHERE channel_id=$1",
+        "DELETE FROM privchat_channels WHERE channel_id=$1",
+    ] {
+        sqlx::query(sql).bind(GROUP_ID).execute(pool).await.expect("clean timeline fixture");
+    }
     sqlx::query("DELETE FROM privchat_group_members WHERE group_id = $1")
         .bind(GROUP_ID)
         .execute(pool)
@@ -348,6 +358,10 @@ async fn profile_rpc_allows_managers_only_and_preserves_patch_semantics() {
     let _guard = fixture_lock().lock().await;
     let Some((_, pool)) = service().await else { return; };
     seed(&pool).await;
+    sqlx::query("INSERT INTO privchat_users(user_id,username,qr_key) VALUES(1,'system','role-sys-test') ON CONFLICT(user_id) DO NOTHING")
+        .execute(pool.as_ref()).await.expect("system sender");
+    sqlx::query("INSERT INTO privchat_channels(channel_id,channel_type,group_id) VALUES($1,1,$1)")
+        .bind(GROUP_ID).execute(pool.as_ref()).await.expect("real group channel");
     let patch = |name: Option<&str>, description: Option<&str>| GroupUpdateRequest {
         group_id: GROUP_ID as u64,
         profile: GroupProfilePatch { name: name.map(str::to_owned), description: description.map(str::to_owned) },
