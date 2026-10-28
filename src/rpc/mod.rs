@@ -23,6 +23,7 @@ pub mod types;
 // 系统模块
 pub mod account;
 pub mod call;
+pub mod components;
 pub mod channel;
 pub mod channel_broadcast;
 pub mod contact;

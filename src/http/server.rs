@@ -95,6 +95,7 @@ impl UploadAuthenticator for crate::auth::UnifiedTokenService {
 /// 管理 API 服务器共享状态
 #[derive(Clone)]
 pub struct AdminServerState {
+    pub component_config: Arc<crate::service::call_service::CallService>,
     pub service_key_manager: Arc<ServiceKeyManager>,
     pub token_issue_service: Arc<TokenIssueService>,
     pub login_log_repository: Arc<LoginLogRepository>,
@@ -232,6 +233,7 @@ impl AdminHttpServer {
         cache_manager: Arc<crate::infra::CacheManager>,
         account_mode: crate::config::AccountMode,
         room_access: Arc<crate::service::room_access_service::RoomAccessService>,
+        call_config: crate::service::call_config::CallConfig,
         host: String,
         port: u16,
     ) -> Self {
@@ -245,6 +247,9 @@ impl AdminHttpServer {
 
         Self {
             state: AdminServerState {
+                component_config: Arc::new(crate::service::call_service::CallService::configured(
+                    message_repository.pool().clone(), call_config,
+                )),
                 service_key_manager,
                 token_issue_service,
                 login_log_repository,

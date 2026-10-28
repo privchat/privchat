@@ -2500,6 +2500,7 @@ impl ChatServer {
             self.cache_manager.clone(),
             self.config.account.mode,
             self.room_access.clone(),
+            self.config.call.clone(),
             self.config.admin_api_host.clone(),
             self.config.admin_api_port,
         );
