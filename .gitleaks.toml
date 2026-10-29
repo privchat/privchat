@@ -1,0 +1,35 @@
+# Shared gitleaks base config for all repos under ~/projects.
+# - Hooks use a repo's own .gitleaks.toml when present, otherwise this file.
+# - Per-repo .gitleaks.toml files are self-contained copies of this header plus
+#   narrow (path + rule) allowlists for that repo's test fixtures; keep them narrow.
+title = "repo config (extends gitleaks defaults; mirrors ~/projects/.tooling/gitleaks/base.toml)"
+
+[extend]
+useDefault = true
+
+# Placeholders that our own secret-scrubbing writes back into code/docs.
+[[allowlists]]
+description = "scrubbed placeholders"
+regexTarget = "secret"
+regexes = [
+  '''^(REPLACE_ME|\*\*\*REMOVED\*\*\*|<redacted>|YOUR_[A-Z0-9_]+|your[_-][a-z0-9_-]+|changeme|placeholder)$''',
+  '''^SMS_\d+$''',
+]
+
+[[allowlists]]
+description = "dependency lockfiles (integrity hashes)"
+paths = [
+  '''(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|gradle\.lockfile|kotlin-js-store/yarn\.lock)$''',
+]
+
+# ---- repo-specific narrow allowlists (path + rule) ----
+
+[[allowlists]]
+description = "doc-comment examples of QR keys / tokens and demo upload token"
+targetRules = ["generic-api-key", "curl-auth-header"]
+paths = [
+  '''^src/rpc/(user/qrcode|qrcode/[a-z_]+|group/qrcode/[a-z_]+|qr/url)\.rs$''',
+  '''^src/http/routes/admin\.rs$''',
+  '''^tests/qr_unit_test\.rs$''',
+  '''^examples/file_upload_demo\.rs$''',
+]
