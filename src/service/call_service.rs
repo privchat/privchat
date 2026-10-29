@@ -321,6 +321,9 @@ impl CallService {
         let (_, members) = Self::members(tx, stored.call.channel_id).await?;
         for p in &mut stored.call.participants {
             let expired = !members.contains_key(&p.user_id)
+                || (stored.call.state == CallState::Active
+                    && p.state == CallParticipantState::Invited
+                    && current >= stored.call.expires_at_ms)
                 || (p.state == CallParticipantState::Joined
                     && stored
                         .claims
@@ -538,6 +541,9 @@ impl CallService {
         }
         if let Some(mut response) = replay {
             if route == "join" {
+                // Replayed credentials require the whole call to remain live, not
+                // just this device's lease. The peer may have expired since acceptance.
+                service.expire(&mut tx, &mut stored).await?;
                 if stored.call.state == CallState::Ended
                     || (stored.call.state == CallState::Ringing
                         && stored.call.expires_at_ms <= now())
@@ -548,6 +554,7 @@ impl CallService {
                         .is_none_or(|c| c.device != device || c.lease_until <= now())
                     || stored.call.participants[position].state != CallParticipantState::Joined
                 {
+                    tx.commit().await.map_err(db)?;
                     return Err(RpcError::forbidden("Call credential no longer authorized"));
                 }
                 for peer in &stored.call.participants {
@@ -560,6 +567,7 @@ impl CallService {
                     response["peer"] = encode(service.peer_config(&stored.call, actor)?)?;
                 }
             }
+            tx.commit().await.map_err(db)?;
             return Ok(response);
         }
         service.expire(&mut tx, &mut stored).await?;
@@ -591,6 +599,9 @@ impl CallService {
                     participant.state,
                     CallParticipantState::Left | CallParticipantState::Rejected
                 ) {
+                    // A late join may have expired this invitation above. Persist
+                    // its released occupancy and notification even though admission fails.
+                    tx.commit().await.map_err(db)?;
                     return Err(RpcError::forbidden("Participant already left or rejected"));
                 }
                 sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
@@ -612,6 +623,16 @@ impl CallService {
                     {
                         Self::not_blocked(&mut tx, actor, peer.user_id).await?;
                     }
+                }
+                // Occupancy/contact locks may have waited beyond the deadline
+                // checked above. Decide acceptance against the clock at the grant.
+                if stored.call.expires_at_ms <= now()
+                    && (stored.call.state == CallState::Ringing
+                        || stored.call.participants[position].state == CallParticipantState::Invited)
+                {
+                    service.expire(&mut tx, &mut stored).await?;
+                    tx.commit().await.map_err(db)?;
+                    return Err(RpcError::validation("Call invitation expired; reconcile using call/get"));
                 }
                 stored.call.participants[position].state = CallParticipantState::Joined;
                 stored.claims.insert(

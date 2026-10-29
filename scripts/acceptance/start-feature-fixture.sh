@@ -14,7 +14,11 @@ done
 if lsof -nP -iUDP:$((base+2)) -t >/dev/null 2>&1; then
   echo "Fixture QUIC port is in use; choose another base, never stop the owner" >&2; exit 1
 fi
-root=$(mktemp -d /tmp/privchat-features-im.XXXXXX)
+parent="${PRIVCHAT_FEATURE_PARENT:-$repo/.artifacts/feature-acceptance}"
+[[ "$parent" = /* && "$parent" != / && ! -L "$parent" ]] || exit 2
+mkdir -p "$parent"
+chmod 700 "$parent"
+root=$(mktemp -d "$parent/privchat-features-im.XXXXXX")
 chmod 700 "$root"
 trap 'status=$?; echo "Fixture step failed ($status); private diagnostics: $root" >&2; exit "$status"' ERR
 cp -p "$binary" "$root/server-bin"

@@ -810,6 +810,145 @@ async fn timeouts_and_lease_expiry_survive_restart() {
 }
 
 #[tokio::test]
+async fn join_replay_rechecks_peer_lease_and_commits_terminal_effects() {
+    let (_db, s) = setup("call_replay_peer_expiry").await;
+    let id = call_id(&s.invite(1, "a", invite("invite", 100)).await.unwrap());
+    s.mutate("join", 1, "a", command("caller-join", id)).await.unwrap();
+    s.mutate("join", 2, "b", command("callee-join", id)).await.unwrap();
+    sqlx::query("UPDATE privchat_calls SET document=jsonb_set(document,'{claims,1,lease_until}','0') WHERE call_id=$1")
+        .bind(id as i64).execute(&s.pool).await.unwrap();
+    assert!(s.mutate("join", 2, "b", command("callee-join", id)).await.is_err(),
+        "a live callee lease cannot authorize replay when its peer has expired");
+    let state: String = sqlx::query_scalar("SELECT state FROM privchat_calls WHERE call_id=$1")
+        .bind(id as i64).fetch_one(&s.pool).await.unwrap();
+    assert_eq!(state, "ended", "expiry must commit even when replay is rejected");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM privchat_call_effects WHERE call_id=$1 AND kind='history'")
+        .bind(id as i64).fetch_one(&s.pool).await.unwrap();
+    assert_eq!(count, 1);
+    assert!(s.active(2).await.unwrap().calls.is_empty());
+    assert!(s.invite(1, "a", invite("next", 100)).await.is_ok(), "terminal replay releases occupancy");
+}
+
+#[tokio::test]
+async fn join_waiting_on_occupancy_lock_cannot_cross_ringing_deadline() {
+    let (_db, s) = setup("call_join_deadline_lock").await;
+    let id = call_id(&s.invite(1, "a", invite("invite", 100)).await.unwrap());
+    let deadline = chrono::Utc::now().timestamp_millis() + 1500;
+    sqlx::query("UPDATE privchat_calls SET document=jsonb_set(document,'{call,expires_at_ms}',to_jsonb($2::bigint)) WHERE call_id=$1")
+        .bind(id as i64).bind(deadline).execute(&s.pool).await.unwrap();
+    let mut lock = s.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('call-user:2',0))")
+        .execute(&mut *lock).await.unwrap();
+    let service = s.clone();
+    let join = tokio::spawn(async move { service.mutate("join", 2, "b", command("join", id)).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock%')")
+                .fetch_one(&s.pool).await.unwrap();
+            if waiting { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("join must reach the actual occupancy lock before expiry");
+    tokio::time::sleep(std::time::Duration::from_millis((deadline - chrono::Utc::now().timestamp_millis()).max(0) as u64 + 20)).await;
+    lock.rollback().await.unwrap();
+    assert!(join.await.unwrap().is_err(), "lock waits cannot authorize acceptance after the absolute deadline");
+    assert_eq!(s.get(1, id).await.unwrap().end_reason, Some(CallEndReason::Timeout));
+}
+
+#[tokio::test]
+async fn active_group_expires_only_unanswered_invite_and_preserves_joined_authority() {
+    let (_db, s) = setup("call_group_invite_expiry").await;
+    let id = call_id(&s.invite(1, "a", CallInviteRequest {
+        invitee_ids: vec![2, 3], ..invite("group", 200)
+    }).await.unwrap());
+    s.mutate("join", 1, "a", command("caller-join", id)).await.unwrap();
+    s.mutate("join", 2, "b", command("callee-join", id)).await.unwrap();
+    let before = s.get(1, id).await.unwrap();
+    assert_eq!(before.state, CallState::Active);
+    assert!(s.invite(3, "c", CallInviteRequest {
+        invitee_ids: vec![4], ..invite("busy-before-expiry", 200)
+    }).await.is_err());
+    sqlx::query("UPDATE privchat_calls SET document=jsonb_set(document,'{call,expires_at_ms}','0') WHERE call_id=$1")
+        .bind(id as i64).execute(&s.pool).await.unwrap();
+    let late = command("late-join", id);
+    assert!(s.mutate("join", 3, "c", late.clone()).await.is_err());
+    let persisted: Value = sqlx::query_scalar("SELECT document FROM privchat_calls WHERE call_id=$1")
+        .bind(id as i64).fetch_one(&s.pool).await.unwrap();
+    assert_eq!(persisted["call"]["state"], "active");
+    assert_eq!(persisted["call"]["version"], before.version + 1);
+    assert_eq!(persisted["call"]["participants"], json!([
+        {"user_id":1,"state":"joined"}, {"user_id":2,"state":"joined"}, {"user_id":3,"state":"left"}
+    ]));
+    assert!(persisted["claims"].get("3").is_none());
+    let restarted = CallService::with_peer_secret(s.pool.clone(), s.config.clone(),
+        Some(("test-key".into(), "test-secret-at-least-thirty-two-bytes".into())),
+        Some("isolated-turn-secret-not-production".into())).unwrap();
+    restarted.sweep().await.unwrap();
+    assert!(restarted.mutate("join", 3, "c", late).await.is_err());
+    assert!(restarted.mutate("heartbeat", 3, "c", command("late-heartbeat", id)).await.is_err());
+    assert!(restarted.active(3).await.unwrap().calls.is_empty());
+    assert_eq!(restarted.get(1, id).await.unwrap().version, before.version + 1,
+        "restart and repeated rejection must not duplicate the expiry transition");
+    let notification_count: i64 = sqlx::query_scalar("SELECT count(*) FROM privchat_call_effects WHERE call_id=$1 AND kind='state' AND version=$2")
+        .bind(id as i64).bind((before.version + 1) as i64).fetch_one(&s.pool).await.unwrap();
+    assert_eq!(notification_count, 1);
+    let cleanup_count: i64 = sqlx::query_scalar("SELECT count(*) FROM privchat_call_effects WHERE call_id=$1 AND kind IN ('history','delete_room','remove_participant')")
+        .bind(id as i64).fetch_one(&s.pool).await.unwrap();
+    assert_eq!(cleanup_count, 0, "unanswered expiry must not remove joined SFU participants or end the room");
+    for (user, device, replay) in [(1, "a", "caller-join"), (2, "b", "callee-join")] {
+        assert!(restarted.mutate("join", user, device, command(replay, id)).await.is_ok());
+        let heartbeat = restarted.mutate("heartbeat", user, device, command("heartbeat", id)).await.unwrap();
+        assert_eq!(heartbeat["call"]["state"], "active");
+        let renewed = restarted.mutate("join", user, device, command("renew-media", id)).await.unwrap();
+        let claims = jsonwebtoken::decode::<Value>(renewed["token"].as_str().unwrap(),
+            &jsonwebtoken::DecodingKey::from_secret(b"test-secret-at-least-thirty-two-bytes"),
+            &jsonwebtoken::Validation::default()).unwrap().claims;
+        assert_eq!(claims["video"]["room"], format!("pc-200-{id}"));
+        assert_eq!(claims["video"]["roomJoin"], true);
+        assert_eq!(claims["video"]["canPublish"], true);
+        assert_eq!(restarted.active(user).await.unwrap().calls.len(), 1);
+        assert!(restarted.invite(user, device, CallInviteRequest {
+            invitee_ids: vec![5], ..invite("still-busy", 200)
+        }).await.is_err(), "joined UID must retain occupancy");
+    }
+    assert!(restarted.invite(3, "c", CallInviteRequest {
+        invitee_ids: vec![4], ..invite("free-after-expiry", 200)
+    }).await.is_ok(), "only the expired invitee can start a different call");
+}
+
+#[tokio::test]
+async fn active_group_join_waiting_on_occupancy_lock_cannot_cross_invitation_deadline() {
+    let (_db, s) = setup("call_group_deadline_lock").await;
+    let id = call_id(&s.invite(1, "a", CallInviteRequest {
+        invitee_ids: vec![2, 3], ..invite("group", 200)
+    }).await.unwrap());
+    s.mutate("join", 2, "b", command("join", id)).await.unwrap();
+    let deadline = chrono::Utc::now().timestamp_millis() + 1500;
+    sqlx::query("UPDATE privchat_calls SET document=jsonb_set(document,'{call,expires_at_ms}',to_jsonb($2::bigint)) WHERE call_id=$1")
+        .bind(id as i64).bind(deadline).execute(&s.pool).await.unwrap();
+    let mut lock = s.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('call-user:3',0))")
+        .execute(&mut *lock).await.unwrap();
+    let service = s.clone();
+    let join = tokio::spawn(async move { service.mutate("join", 3, "c", command("late-join", id)).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock%')")
+                .fetch_one(&s.pool).await.unwrap();
+            if waiting { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("group invitee must reach actual occupancy lock before expiry");
+    tokio::time::sleep(std::time::Duration::from_millis((deadline - chrono::Utc::now().timestamp_millis()).max(0) as u64 + 20)).await;
+    lock.rollback().await.unwrap();
+    assert!(join.await.unwrap().is_err());
+    let current = s.get(1, id).await.unwrap();
+    assert_eq!(current.state, CallState::Active);
+    assert_eq!(current.participants.iter().find(|p| p.user_id == 3).unwrap().state, CallParticipantState::Left);
+    assert_eq!(current.participants.iter().filter(|p| p.state == CallParticipantState::Joined).count(), 2);
+}
+
+#[tokio::test]
 async fn token_grants_and_disabled_default() {
     let (_db, s) = setup("call_grants").await;
     let disabled = CallService::new(s.pool.clone(), CallConfig::default(), None).unwrap();

@@ -245,14 +245,11 @@ async fn dispatch_one(service: &CallService, services: &RpcServiceContext) -> an
     let result: anyhow::Result<()> = async {
         match kind.as_str() {
             "state" => {
-                let event = RpcRequest {
-                    route: routes::STATE.into(),
-                    body: serde_json::to_vec(&CallResponse {call:call.clone()})?,
-                };
-                let bytes = privchat_protocol::encode_message(&event)?;
                 for participant in &call.participants {
-                    // Recheck channel membership before disclosing the snapshot.
-                    if visible_state_recipient(service.get(participant.user_id,call.call_id).await)?.is_none() { continue; }
+                    // The authority read can expire a lease or advance the call while this
+                    // effect waits. Never send the snapshot read before that check.
+                    let Some(current) = visible_state_recipient(service.get(participant.user_id,call.call_id).await)? else { continue; };
+                    let bytes = state_notification(current)?;
                     for connection in services.connection_manager.get_user_connections(participant.user_id).await {
                         let transport = services.connection_manager.transport_server.read().await;
                         let Some(server) = transport.as_ref() else { anyhow::bail!("Call transport unavailable"); };
@@ -291,6 +288,13 @@ async fn dispatch_one(service: &CallService, services: &RpcServiceContext) -> an
     Ok(true)
 }
 
+fn state_notification(call: CallSnapshot) -> anyhow::Result<Vec<u8>> {
+    Ok(privchat_protocol::encode_message(&RpcRequest {
+        route: routes::STATE.into(),
+        body: serde_json::to_vec(&CallResponse { call })?,
+    })?)
+}
+
 // Only an explicit authorization refusal is a permanent skip. Storage, decoding,
 // and missing-state failures must reach the effect runner's durable retry branch.
 fn visible_state_recipient(
@@ -306,6 +310,24 @@ fn visible_state_recipient(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_serializes_reconciled_terminal_snapshot() {
+        let current: CallSnapshot = serde_json::from_value(json!({
+            "call_id": 1, "channel_id": 2, "initiator_id": 3,
+            "media_kind": "audio", "transport": "webrtc", "state": "ended",
+            "end_reason": "timeout", "version": 7, "created_at_ms": 1,
+            "ended_at_ms": 10, "expires_at_ms": 5, "participants": []
+        })).unwrap();
+        let current = visible_state_recipient(Ok(current)).unwrap().unwrap();
+        let frame = state_notification(current).unwrap();
+        let notification: RpcRequest = privchat_protocol::decode_message(&frame).unwrap();
+        assert_eq!(notification.route, routes::STATE);
+        let body: CallResponse = serde_json::from_slice(&notification.body).unwrap();
+        assert_eq!(body.call.state, CallState::Ended);
+        assert_eq!(body.call.version, 7);
+        assert_eq!(body.call.end_reason, Some(CallEndReason::Timeout));
+    }
 
     #[test]
     fn injected_visibility_read_failure_retries_instead_of_completing_effect() {
