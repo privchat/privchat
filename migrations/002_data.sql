@@ -1,0 +1,22 @@
+-- PrivChat 1.0.0-beta initial data and sequence state.
+SET search_path=public;
+SELECT pg_catalog.setval('public.privchat_attachment_objects_object_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_bot_follow_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_channel_entity_sync_version_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_channel_read_cursor_sync_version_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_channels_channel_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_commit_log_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_file_uploads_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_friend_sync_version_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_group_member_sync_version_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_group_pinned_messages_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_group_sync_version_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_groups_group_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_login_logs_log_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_offline_message_queue_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_user_devices_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_user_entity_sync_version_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_users_user_id_seq',99999999,true);
+SELECT pg_catalog.setval('public.privchat_channel_membership_interval_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_call_effects_id_seq',1,false);
+SELECT pg_catalog.setval('public.privchat_call_push_outbox_id_seq',1,false);

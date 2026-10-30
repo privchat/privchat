@@ -140,6 +140,15 @@ tracking table, and applies every embedded migration not yet recorded:
 This is the **only** supported path for schema changes; never apply SQL by
 hand in production.
 
+For 1.0.0-beta the pre-release migration history is consolidated into
+`001_baseline.sql` (structure) and `002_data.sql` (initial data and sequence
+state). This is a **fresh-database baseline**, not an in-place upgrade from a
+pre-beta database. Back up anything needed, recreate the test database, rebuild
+the binary, then run `privchat migrate`. Never clear just the ledger or bypass
+a checksum mismatch. `migrations/baseline.json` records the replaced files.
+After this release, keep both files immutable and add migrations from `003`.
+Both helper shell scripts delegate to the same binary migration runner.
+
 **Optional – full reset (dev only)**:
 
 ```bash

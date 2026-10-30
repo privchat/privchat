@@ -34,10 +34,7 @@ async fn a_full_run_applies_and_records_every_migration() {
     let recorded = privchat::migrate::applied_migrations(&mut conn)
         .await
         .expect("ledger");
-    assert_eq!(
-        executed, recorded,
-        "跑过的和记下的必须一一对应，顺序也一样"
-    );
+    assert_eq!(executed, recorded, "跑过的和记下的必须一一对应，顺序也一样");
 
     // 再跑一次应该什么都不做——幂等是"能不能安全重跑"的最低要求。
     let again = privchat::migrate::apply_pending(&mut conn, |_| {})
@@ -50,7 +47,10 @@ async fn a_full_run_applies_and_records_every_migration() {
 /// 会把它一起跑了，于是"测过了"证明的是另一件事。两边必须读同一份清单。
 #[tokio::test]
 async fn the_runner_uses_the_same_list_as_production() {
-    let names: Vec<&str> = privchat::migrate::MIGRATIONS.iter().map(|(n, _)| *n).collect();
+    let names: Vec<&str> = privchat::migrate::MIGRATIONS
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
 
     assert!(
         !names.iter().any(|n| n.starts_with("000_")),
@@ -121,9 +121,9 @@ async fn a_rerun_after_the_ledger_was_tampered_with_is_safe() {
     }
 }
 
-/// 记账表被基线迁移删掉之后能自己重建——不然全新库跑完 001 就再也记不了账。
+/// 全新库的结构和数据基线都必须进入同一份迁移账本。
 #[tokio::test]
-async fn the_ledger_survives_the_baseline_rebuilding_the_schema() {
+async fn the_ledger_records_the_schema_and_data_baseline() {
     let db = scratch!("ledger");
     let mut conn = db.connect().await;
 
@@ -136,15 +136,15 @@ async fn the_ledger_survives_the_baseline_rebuilding_the_schema() {
         .expect("ledger");
     assert!(
         recorded.iter().any(|n| n.starts_with("001_")),
-        "基线自己也必须被记上账，否则下次会重跑它、把库清空"
+        "结构基线必须记账，否则下次会重复建表"
     );
+    assert!(recorded.iter().any(|n| n == "002_data"));
 }
 
 /// 🔴 事务只防崩溃，不防两个进程同时跑。
 ///
 /// 滚动部署里两个实例可以在同一瞬间读到同一份"已执行"清单，然后各自执行同一条
-/// 迁移——两次都会"成功"，因为它们各自看到的都是合法状态。对 001 尤其致命：
-/// 它会重建 public schema。
+/// 迁移。基线包含无条件建表，重复执行不可接受。
 ///
 /// 这里让两个 runner 真的并发跑：后到的必须等锁，等到之后重新读账本，一条都不跑。
 #[tokio::test]
@@ -161,9 +161,16 @@ async fn two_concurrent_runners_do_not_both_migrate() {
     let rb = rb.expect("runner b");
 
     // 一个跑完全部，另一个一条不跑。谁先谁后不确定，但绝不能两个都跑。
-    let (full, empty) = if ra.len() >= rb.len() { (ra, rb) } else { (rb, ra) };
+    let (full, empty) = if ra.len() >= rb.len() {
+        (ra, rb)
+    } else {
+        (rb, ra)
+    };
     assert_eq!(full.len(), privchat::migrate::MIGRATIONS.len());
-    assert!(empty.is_empty(), "第二个 runner 不该重跑任何迁移: {empty:?}");
+    assert!(
+        empty.is_empty(),
+        "第二个 runner 不该重跑任何迁移: {empty:?}"
+    );
 
     let recorded = privchat::migrate::applied_migrations(&mut a)
         .await
@@ -185,11 +192,11 @@ async fn a_failure_between_the_sql_and_the_ledger_rolls_the_sql_back() {
     let db = scratch!("rollback");
     let mut conn = db.connect().await;
 
-    // 在最后一条迁移的注入点失败：它必须整个消失（合并成单条基线之后，
-    // "最后一条"就是基线本身，回滚要求不变）。
+    // 结构与数据已拆分；DDL 回滚必须明确在结构基线注入，不能取最后的数据文件。
     let target = privchat::migrate::MIGRATIONS
-        .last()
-        .expect("至少要有一条迁移")
+        .iter()
+        .find(|(name, _)| *name == "001_baseline")
+        .expect("结构基线")
         .0;
     let err = privchat::migrate::apply_pending_with_hook(
         &mut conn,
@@ -357,14 +364,12 @@ async fn the_baseline_refuses_a_database_that_already_has_migrations() {
     .execute(&mut conn)
     .await
     .expect("ledger");
-    sqlx::query(
-        "INSERT INTO public.privchat_migrations (name, content_sha256) VALUES ($1, $2)",
-    )
-    .bind("001_create_tables")
-    .bind("f".repeat(64))
-    .execute(&mut conn)
-    .await
-    .expect("seed an old ledger row");
+    sqlx::query("INSERT INTO public.privchat_migrations (name, content_sha256) VALUES ($1, $2)")
+        .bind("001_create_tables")
+        .bind("f".repeat(64))
+        .execute(&mut conn)
+        .await
+        .expect("seed an old ledger row");
 
     let err = privchat::migrate::apply_pending(&mut conn, |_| {})
         .await

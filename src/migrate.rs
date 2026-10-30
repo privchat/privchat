@@ -33,7 +33,7 @@ include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 ///
 /// 🔴 **事务只防崩溃，不防两个进程同时跑。** 滚动部署里两个实例可以在同一瞬间读到
 /// 同一份"已执行"清单，然后各自执行同一条迁移——事务会让两次都"成功"，因为它们
-/// 各自看到的都是合法状态。对 001 尤其致命：它会重建 public schema。
+/// 各自看到的都是合法状态。基线包含无条件建表，不能被并发重复执行。
 ///
 /// session 级 advisory lock 在读账本**之前**取得、持有到整个序列结束：后到的那个
 /// 进程会等，等到之后重新读账本，看到的是完整的清单，于是一条都不跑。
@@ -46,7 +46,7 @@ const MIGRATION_LOCK_KEY: i64 = 0x7076_6368_6174_0001;
 /// 变成一次明确的失败，运维能看到"谁占着锁"再去处理。
 const LOCK_WAIT: Duration = Duration::from_secs(60);
 
-/// 记账表。基线迁移会重建 public schema、把它一起删掉，所以每次都要确保存在。
+/// 记账表。空库首次执行和后续读取记录都要确保它存在。
 ///
 /// `content_sha256` 是迁移文件内容的摘要：🔴 只按名字记账的话，一条已执行的迁移
 /// 后来被人改了，runner 会照样跳过——两台机器上同名的 `031` 可以是完全不同的 SQL，
@@ -88,7 +88,9 @@ pub async fn applied_migrations(conn: &mut PgConnection) -> Result<Vec<String>> 
 }
 
 /// 已执行的迁移及其内容摘要（老记录没有摘要时为 `None`）。
-pub async fn applied_with_digests(conn: &mut PgConnection) -> Result<Vec<(String, Option<String>)>> {
+pub async fn applied_with_digests(
+    conn: &mut PgConnection,
+) -> Result<Vec<(String, Option<String>)>> {
     ensure_ledger(conn).await?;
     sqlx::query_as("SELECT name, content_sha256 FROM public.privchat_migrations ORDER BY id")
         .fetch_all(&mut *conn)
@@ -208,7 +210,7 @@ async fn apply_pending_locked(
                 None => anyhow::bail!(
                     "迁移 {name} 在账本里没有内容摘要（这台库是在摘要列引入之前建的），\
                      无法证明它执行的就是当前这份文件。本次发布不支持这种库原地升级：\
-                     请用全新数据库执行基线，或人工核对结构后手工补写摘要。"
+                     请备份需要保留的数据，并用全新数据库执行基线；不要手工补写摘要。"
                 ),
             }
             report(&format!("  ⏭ {name} (已执行，跳过)"));
@@ -231,7 +233,7 @@ async fn apply_pending_locked(
             anyhow::bail!(
                 "拒绝在非空数据库上执行基线 {name}：账本里已经有 {} 条记录（{known}）。\
                  基线是全新安装用的结构快照，不能往存量库上补跑。存量库请重建，\
-                 或者先人工把结构对齐到基线再手工写入账本。",
+                 不能通过手工写入账本绕过这个检查。",
                 applied.len()
             );
         }
@@ -255,7 +257,7 @@ async fn apply_pending_locked(
             .await
             .with_context(|| format!("恢复迁移 search_path 失败: {name}"))?;
 
-        // 基线迁移重建 public schema 时会把记账表一起删掉。
+        // 在同一事务中确认记账结构，再写入该迁移的摘要。
         sqlx::query(ENSURE_LEDGER)
             .execute(&mut *tx)
             .await

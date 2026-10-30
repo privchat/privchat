@@ -1,0 +1,60 @@
+{
+  "release": "1.0.0-beta",
+  "fresh_install_only": true,
+  "baseline": [
+    {
+      "file": "001_baseline.sql",
+      "sha256": "5da061b943de7482448c8d64b12709dc521d777416280da904044ff9b58b727a"
+    },
+    {
+      "file": "002_data.sql",
+      "sha256": "b60ca92dd8899ceb8f0a1a14967db0675ecaeecfdcea2552f9da655dab56f52f"
+    }
+  ],
+  "superseded": [
+    {
+      "file": "001_baseline.sql",
+      "sha256": "38f3919ccd4ddd781ff5ba0d152c5be6e0cbd6ec2b995ad76a4b99e6b34ee3c3"
+    },
+    {
+      "file": "002_device_locale.sql",
+      "sha256": "23198b6aeeab90da97286bd1851e3a919b8683af5b6e1b45bc4d81f0840f54a7"
+    },
+    {
+      "file": "003_device_push_sound.sql",
+      "sha256": "80b8bed721745d4d7225ade61a32d41559db93f80fd9cf7d24eec3f9b06f7f01"
+    },
+    {
+      "file": "004_group_read_recipients.sql",
+      "sha256": "8198c2a669f1bef582fbbd7a8763e6c2ac4e285ad9038e647e9b2ed006093677"
+    },
+    {
+      "file": "005_assistant_username.sql",
+      "sha256": "c6830b5254b24967cf08e68b257ed4226fd59fa309b6324fe656d653534614c5"
+    },
+    {
+      "file": "006_user_id_sequence_floor.sql",
+      "sha256": "1a4f0cb566384b865e39d5110b0a1a877d27719fe7e18eb3b1686a9c336f5c09"
+    },
+    {
+      "file": "007_calls.sql",
+      "sha256": "68cf4401f35e928cb0299abbd81cae3e27742667dc6963e356174be5bace81c6"
+    },
+    {
+      "file": "008_call_peer.sql",
+      "sha256": "a2b69330e362f67a46b227eaa228bda42dc91f22966a14fba19eca2a84be5b38"
+    },
+    {
+      "file": "009_room_access.sql",
+      "sha256": "13234667bfe47c7f669797d4d10b23601bdd2484f2373f62501ae7bd55fe7279"
+    },
+    {
+      "file": "010_call_push.sql",
+      "sha256": "2a6262483adb4d23f02e029e607eeca133b534667def65a29a83139e4eb25350"
+    },
+    {
+      "file": "011_component_config.sql",
+      "sha256": "417eecfc5f97356b34a230eb0e44041f9eaf80ff93904c759872880f0b4ae5fd"
+    }
+  ]
+}
