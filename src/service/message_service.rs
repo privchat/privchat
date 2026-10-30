@@ -201,6 +201,8 @@ impl MessageService {
                 message_source: None,
                 // 转发副本自带来源：接收方未必读得到源会话，让客户端回头去查
                 // 源消息是行不通的（可能在别的会话、可能已被删除、可能无权读）。
+                // 页面链接只在服务端发出的消息上：它们能直接打开 App 页面，用户发的不保留。
+                links: privchat_protocol::MessageLink::list_from_metadata(&req.metadata),
             },
         });
         let (_, commit_content) = canonical_event
@@ -847,5 +849,43 @@ mod recall_time_tests {
             format_recall_timeout_message(45),
             "消息发送已超过 45 秒，无法撤回"
         );
+    }
+}
+
+#[cfg(test)]
+mod page_link_tests {
+    use super::{MessageService, ServerSendMessageRequest};
+    use privchat_protocol::{CanonicalTimelineEvent, ContentMessageType};
+
+    fn links_of(metadata: serde_json::Value) -> Vec<privchat_protocol::MessageLink> {
+        let req = ServerSendMessageRequest {
+            channel_id: 1,
+            sender_id: 2,
+            content: "「修复按钮」卡住了".to_string(),
+            message_type: ContentMessageType::Text,
+            metadata,
+            channel_type: 1,
+            recipient_user_ids: vec![3],
+            dedup_key: None,
+            attachment_refs_override: None,
+        };
+        let (commit, _) = MessageService::prepare_server_message(&req).unwrap();
+        match commit.event {
+            CanonicalTimelineEvent::NewMessage(event) => event.payload.links,
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    /// A message the server sends carries its page links to every recipient's push.
+    #[test]
+    fn server_sent_text_messages_keep_their_page_links() {
+        let links = links_of(serde_json::json!({"links": [
+            {"text": "修复按钮", "route": "workspace.task", "params": {"work_item_id": "12"}},
+            {"text": "", "route": "bad"}
+        ]}));
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].route, "workspace.task");
+        assert_eq!(links[0].params["work_item_id"], "12");
+        assert!(links_of(serde_json::json!({})).is_empty());
     }
 }

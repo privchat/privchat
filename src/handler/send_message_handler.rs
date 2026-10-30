@@ -1147,8 +1147,12 @@ impl MessageHandler for SendMessageHandler {
             reply_to_message_id: reply_to_id,
             mentioned_user_ids: mentioned_user_ids.clone(),
             message_source: None,
+            links: Vec::new(),
         });
         canonical_payload.content = content.clone();
+        // 页面链接能直接打开 App 页面，只有服务端发出的消息可以带（message_service）；
+        // 用户发来的一律丢弃，不能借它伪造「任务链接」。
+        canonical_payload.links.clear();
         let canonical_event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
             message_type: content_message_type,
             payload: canonical_payload,
