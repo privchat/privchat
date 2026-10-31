@@ -818,7 +818,14 @@ impl FriendService {
             };
 
             let user_block = FriendSyncUserPayload {
-                username: Some(profile.username.clone()),
+                // A personal assistant has no account to show or search for (§6.5): its generated
+                // username is an internal handle. Sent as empty, not omitted, so a client that
+                // cached it clears it instead of keeping it.
+                username: Some(if profile.user_type == crate::rpc::helpers::USER_TYPE_PERSONAL_ASSISTANT {
+                    String::new()
+                } else {
+                    profile.username.clone()
+                }),
                 nickname: Some(profile.nickname.clone()),
                 name: Some(profile.nickname.clone()),
                 // alias 只在 viewer 是 friend-owner 那一侧有意义（双向 accepted 时

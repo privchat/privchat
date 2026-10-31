@@ -219,3 +219,48 @@ async fn an_unannounced_channel_is_still_found_by_an_unscoped_sync() {
         .await;
     cleanup(&pool, &[viewer, peer]).await;
 }
+
+/// A personal assistant has no account to show (ACCOUNT_IDENTITY_SPEC §6.5): its generated
+/// `_pa_…` username is an internal handle, and the owner's profile page printed it as
+/// "Account: _pa_e26a…". Friend sync is the one path that still carried it. It must arrive
+/// as an empty string — not omitted — so a client that cached the handle clears it.
+#[tokio::test]
+async fn friend_sync_does_not_reveal_a_personal_assistant_username() {
+    let Some(pool) = open_test_pool().await else {
+        eprintln!("skipping: no PRIVCHAT_TEST_DATABASE_URL/DATABASE_URL");
+        return;
+    };
+
+    let owner: i64 = 990_111;
+    let assistant: i64 = 990_112;
+    cleanup(&pool, &[owner, assistant]).await;
+    ensure_user(&pool, owner, "assistantowner", "Owner").await;
+    ensure_user(&pool, assistant, "_pa_testhandle", "Assistant").await;
+    sqlx::query("UPDATE privchat_users SET user_type = $2 WHERE user_id = $1")
+        .bind(assistant)
+        .bind(privchat::rpc::helpers::USER_TYPE_PERSONAL_ASSISTANT)
+        .execute(&pool)
+        .await
+        .expect("mark personal assistant");
+    ensure_friendship(&pool, owner, assistant).await;
+
+    let pool_arc = Arc::new(pool.clone());
+    let user_repository = Arc::new(UserRepository::new(pool_arc.clone()));
+    let cache_manager = Arc::new(CacheManager::new(Default::default()).await.expect("cache manager"));
+    let page = FriendService::new(pool_arc.clone())
+        .sync_entities_page(owner as u64, Some(0), None, 50, &user_repository, &cache_manager)
+        .await
+        .expect("sync page");
+
+    let embedded = page
+        .items
+        .iter()
+        .find(|item| item.entity_id == assistant.to_string())
+        .and_then(|item| item.payload.as_ref())
+        .and_then(|payload| payload.get("user"))
+        .expect("assistant present in the owner's friend sync");
+    assert_eq!(embedded.get("username").and_then(|v| v.as_str()), Some(""));
+    assert_eq!(embedded.get("nickname").and_then(|v| v.as_str()), Some("Assistant"));
+
+    cleanup(&pool, &[owner, assistant]).await;
+}
