@@ -60,6 +60,19 @@ impl ServerStats {
     }
 }
 
+#[derive(Default)]
+struct MessageCounters {
+    sent: std::sync::atomic::AtomicU64,
+    received: std::sync::atomic::AtomicU64,
+}
+
+impl MessageCounters {
+    fn snapshot(&self, stats: &mut ServerStats) {
+        stats.messages_sent = self.sent.load(std::sync::atomic::Ordering::Relaxed);
+        stats.messages_received = self.received.load(std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 const MAX_INBOUND_LOG_PAYLOAD_CHARS: usize = 512;
 
 fn sanitize_inbound_payload_for_log(payload: &str) -> String {
@@ -101,15 +114,22 @@ mod inbound_log_sanitize_tests {
             !logged.contains("8073dba2f608"),
             "帧里的 token 泄漏进了日志: {logged}"
         );
-        assert!(logged.contains("bytes non-json payload"), "应当只报长度: {logged}");
+        assert!(
+            logged.contains("bytes non-json payload"),
+            "应当只报长度: {logged}"
+        );
     }
 
     /// 是 JSON 的照旧走字段级脱敏，可读性不能一起丢掉。
     #[test]
     fn json_payload_keeps_shape_but_redacts_secrets() {
-        let logged =
-            sanitize_inbound_payload_for_log(r#"{"route":"device/push/update","push_token":"abc123"}"#);
-        assert!(logged.contains("device/push/update"), "非敏感字段要保留: {logged}");
+        let logged = sanitize_inbound_payload_for_log(
+            r#"{"route":"device/push/update","push_token":"abc123"}"#,
+        );
+        assert!(
+            logged.contains("device/push/update"),
+            "非敏感字段要保留: {logged}"
+        );
         assert!(!logged.contains("abc123"), "token 必须被脱敏: {logged}");
     }
 }
@@ -227,7 +247,10 @@ mod tests {
         let payload = "x".repeat(MAX_INBOUND_LOG_PAYLOAD_CHARS + 10);
         let safe = sanitize_inbound_payload_for_log(&payload);
 
-        assert!(!safe.contains("xxx"), "非 JSON 帧的原始字节进了日志: {safe}");
+        assert!(
+            !safe.contains("xxx"),
+            "非 JSON 帧的原始字节进了日志: {safe}"
+        );
         assert!(safe.contains(&format!("{} bytes", payload.len())));
     }
 }
@@ -241,6 +264,7 @@ pub struct ChatServer {
     token_auth: Arc<TokenAuth>,
     cache_manager: Arc<CacheManager>,
     stats: Arc<tokio::sync::RwLock<ServerStats>>,
+    message_counters: Arc<MessageCounters>,
     transport: Option<Arc<msgtrans::TransportServer>>,
     message_dispatcher: Arc<MessageDispatcher>,
     /// 频道服务（原会话服务）
@@ -666,11 +690,10 @@ impl ChatServer {
         let friend_service = Arc::new(crate::service::FriendService::new(pool.clone()));
 
         // 创建黑名单服务
-        let blacklist_service =
-            Arc::new(crate::service::BlacklistService::new(
-                pool.clone(),
-                cache_manager.clone(),
-            ));
+        let blacklist_service = Arc::new(crate::service::BlacklistService::new(
+            pool.clone(),
+            cache_manager.clone(),
+        ));
         info!("✅ 黑名单服务初始化完成");
 
         // 创建二维码服务
@@ -1073,7 +1096,9 @@ impl ChatServer {
             match (service_account_path, project_id, access_token) {
                 (Some(path), project_id, _) => {
                     match crate::push::provider::FcmProvider::from_service_account_file(
-                        &path, project_id, fcm_https_proxy.as_deref(),
+                        &path,
+                        project_id,
+                        fcm_https_proxy.as_deref(),
                     ) {
                         Ok(provider) => {
                             info!("✅ FCM Provider 已启用（service account）");
@@ -1719,6 +1744,7 @@ impl ChatServer {
             token_auth,
             cache_manager,
             stats,
+            message_counters: Default::default(),
             transport: None,
             message_dispatcher: Arc::new(message_dispatcher),
             channel_service,
@@ -1808,21 +1834,27 @@ impl ChatServer {
                 .map_err(|e| ServerError::Internal(format!("传输层启动失败: {}", e)))
         };
 
-        tokio::select! {
-            result = serve => {
-                result?;
-            }
+        let serve_result = tokio::select! {
+            result = serve => result,
             signal = Self::wait_for_shutdown_signal() => {
-                info!("🛑 收到停机信号（{signal}），开始 graceful shutdown...");
-                transport.stop().await;
-                if let Err(e) = self.presence_state_store.flush_pending().await {
-                    warn!("graceful shutdown: flush presence 待批失败: {}", e);
-                } else {
-                    info!("✅ presence 待批 last_seen 已刷库");
-                }
-                info!("✅ graceful shutdown 完成");
+                info!("Received shutdown signal: {signal}");
+                Ok(())
             }
+        };
+        let report = transport
+            .shutdown_with_timeout(Duration::from_secs(30))
+            .await;
+        // Disconnect callbacks have drained business work and removed online
+        // bindings before a clean report; only then flush their presence writes.
+        if let Err(e) = self.presence_state_store.flush_pending().await {
+            warn!("shutdown presence flush failed: {e}");
         }
+        if !report.clean {
+            return Err(ServerError::Internal(format!(
+                "transport shutdown incomplete: {report:?}"
+            )));
+        }
+        serve_result?;
 
         Ok(())
     }
@@ -1914,7 +1946,6 @@ impl ChatServer {
         )
     }
 
-
     /// 创建传输层服务器
     async fn create_transport_server(
         &self,
@@ -1992,7 +2023,9 @@ impl ChatServer {
     /// 那样在消费者落后时静默丢掉所有人的消息。
     fn build_session_handler(&self) -> PrivchatSessionHandler {
         PrivchatSessionHandler {
+            session_tasks: Default::default(),
             stats: self.stats.clone(),
+            message_counters: self.message_counters.clone(),
             message_dispatcher: self.message_dispatcher.clone(),
             security_middleware: self.security_middleware.clone(),
             auth_session_manager: self.auth_session_manager.clone(),
@@ -2115,6 +2148,7 @@ impl ChatServer {
     /// 启动统计更新任务
     async fn start_stats_updater(&self) {
         let stats = self.stats.clone();
+        let message_counters = self.message_counters.clone();
         let auth_session_manager = self.auth_session_manager.clone();
         let handler_limiter = self.handler_limiter.clone();
         let event_bus = self.event_bus.clone();
@@ -2152,13 +2186,11 @@ impl ChatServer {
                 let cutoff = chrono::Utc::now().timestamp_millis() - RETENTION_MS;
                 let mut total: u64 = 0;
                 for _ in 0..20 {
-                    match sqlx::query(
-                        crate::repository::message_repo::MESSAGE_DEDUP_RETENTION_SQL,
-                    )
-                    .bind(cutoff)
-                    .bind(BATCH)
-                    .execute(dedup_retention_db.pool())
-                    .await
+                    match sqlx::query(crate::repository::message_repo::MESSAGE_DEDUP_RETENTION_SQL)
+                        .bind(cutoff)
+                        .bind(BATCH)
+                        .execute(dedup_retention_db.pool())
+                        .await
                     {
                         Ok(res) if res.rows_affected() > 0 => {
                             total += res.rows_affected();
@@ -2184,9 +2216,14 @@ impl ChatServer {
             loop {
                 interval.tick().await;
 
-                let mut stats_guard = stats.write().await;
-                stats_guard.active_sessions = auth_session_manager.session_count().await as u64;
-                stats_guard.uptime_seconds += 60;
+                let active = auth_session_manager.session_count().await as u64;
+                let stats_guard = {
+                    let mut snapshot = stats.write().await;
+                    message_counters.snapshot(&mut snapshot);
+                    snapshot.active_sessions = active;
+                    snapshot.uptime_seconds += 60;
+                    snapshot.clone()
+                };
 
                 // Handler 限流指标上报
                 let inflight = handler_limiter.inflight();
@@ -2402,8 +2439,9 @@ impl ChatServer {
 
     /// 获取服务器统计信息
     pub async fn get_stats(&self) -> ServerStats {
-        let stats = self.stats.read().await;
-        stats.clone()
+        let mut stats = self.stats.read().await.clone();
+        self.message_counters.snapshot(&mut stats);
+        stats
     }
 
     /// 停止服务器
@@ -2546,7 +2584,9 @@ impl ChatServer {
 /// actor 驱动这些回调，因此 `on_connected` 一定先于该连接的任何
 /// `on_message`，`on_disconnected` 恰好触发一次。
 pub struct PrivchatSessionHandler {
+    session_tasks: crate::infra::session_tasks::SessionTasks,
     stats: Arc<tokio::sync::RwLock<ServerStats>>,
+    message_counters: Arc<MessageCounters>,
     message_dispatcher: Arc<MessageDispatcher>,
     security_middleware: Arc<crate::middleware::SecurityMiddleware>,
     auth_session_manager: Arc<crate::infra::SessionManager>,
@@ -2568,9 +2608,25 @@ impl PrivchatSessionHandler {
         msg_data: bytes::Bytes,
         responder: Option<msgtrans::Responder>,
     ) {
-        let msg_text = sanitize_inbound_payload_for_log(&String::from_utf8_lossy(&msg_data));
         let user_id = self.auth_session_manager.get_user_id(&session_id).await;
         let msg_type = MessageType::from(biz_type);
+        // Formatting/redaction is lazy: binary payloads must not be copied or
+        // JSON-parsed merely because a disabled log statement references them.
+        let msg_text = || {
+            // Large/binary bodies are summarized without allocation or UTF-8
+            // scanning. Only small JSON-shaped input enters the redactor.
+            if msg_data.len() <= 4096
+                && matches!(
+                    msg_data.iter().find(|b| !b.is_ascii_whitespace()),
+                    Some(b'{') | Some(b'[')
+                )
+            {
+                if let Ok(text) = std::str::from_utf8(&msg_data) {
+                    return sanitize_inbound_payload_for_log(text);
+                }
+            }
+            format!("<{} bytes payload>", msg_data.len())
+        };
 
         if matches!(msg_type, MessageType::PingRequest) {
             if let Some(user_id) = user_id {
@@ -2580,7 +2636,7 @@ impl PrivchatSessionHandler {
                     user_id,
                     biz_type,
                     msg_type,
-                    msg_text
+                    msg_text()
                 );
             } else {
                 trace!(
@@ -2588,25 +2644,31 @@ impl PrivchatSessionHandler {
                     session_id,
                     biz_type,
                     msg_type,
-                    msg_text
+                    msg_text()
                 );
             }
         } else if let Some(user_id) = user_id {
             info!(
                 "📨 收到消息并分发: {}(uid: {}) -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                session_id, user_id, biz_type, msg_type, msg_text
+                session_id,
+                user_id,
+                biz_type,
+                msg_type,
+                msg_text()
             );
         } else {
             info!(
                 "📨 收到消息并分发: {} -> biz_type: {} -> MessageType: {:?} -> \"{}\"",
-                session_id, biz_type, msg_type, msg_text
+                session_id,
+                biz_type,
+                msg_type,
+                msg_text()
             );
         }
 
-        {
-            let mut stats = self.stats.write().await;
-            stats.messages_received += 1;
-        }
+        self.message_counters
+            .received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let dispatch_session_info = self
             .auth_session_manager
@@ -2617,11 +2679,11 @@ impl PrivchatSessionHandler {
         // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop
         match self.handler_limiter.try_acquire() {
             Ok(permit) => {
-                tokio::spawn(async move {
+                self.session_tasks.spawn(session_id, async move {
                     let _permit = permit;
                     let mut request_context = crate::context::RequestContext::new(
                         session_id,
-                        msg_data.to_vec(),
+                        msg_data,
                         "127.0.0.1:0".parse().unwrap(),
                     );
                     if let Some(info) = dispatch_session_info {
@@ -2715,6 +2777,7 @@ impl msgtrans::SessionHandler for PrivchatSessionHandler {
             crate::infra::metrics::record_connection_established_handling,
         );
         info!("🔗 新连接建立: {} ({})", session_id, info.peer_addr);
+        self.session_tasks.open(session_id);
         self.connection_manager.register_connecting(session_id);
 
         // 🔐 安全检查：IP 连接层防护
@@ -2774,10 +2837,9 @@ impl msgtrans::SessionHandler for PrivchatSessionHandler {
         trace!("📤 消息已发送: {} -> {}", session_id, message_id);
 
         // 更新统计信息
-        {
-            let mut stats = self.stats.write().await;
-            stats.messages_sent += 1;
-        }
+        self.message_counters
+            .sent
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn on_disconnected(
@@ -2785,6 +2847,8 @@ impl msgtrans::SessionHandler for PrivchatSessionHandler {
         session_id: msgtrans::SessionId,
         reason: msgtrans::CloseReason,
     ) {
+        self.session_tasks.drain(session_id).await;
+
         info!("🔌 连接关闭: {} (原因: {:?})", session_id, reason);
 
         // 更新统计信息
@@ -2843,7 +2907,6 @@ impl msgtrans::SessionHandler for PrivchatSessionHandler {
     }
 }
 
-
 /// [`PrivchatServer::load_server_tls_material`] 的实现，抽成自由函数以便单测。
 pub(crate) fn load_tls_material(
     cert_path: Option<&str>,
@@ -2858,14 +2921,11 @@ pub(crate) fn load_tls_material(
         )
     })?;
     let key_path = key_path.ok_or_else(|| {
-        ServerError::Internal(
-            "未配置 [gateway.tls].key：证书与私钥必须成对配置".to_string(),
-        )
+        ServerError::Internal("未配置 [gateway.tls].key：证书与私钥必须成对配置".to_string())
     })?;
 
-    let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
-        ServerError::Internal(format!("读取 TLS 证书失败 ({cert_path}): {e}"))
-    })?;
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .map_err(|e| ServerError::Internal(format!("读取 TLS 证书失败 ({cert_path}): {e}")))?;
     let key_pem = std::fs::read_to_string(key_path)
         .map_err(|e| ServerError::Internal(format!("读取 TLS 私钥失败 ({key_path}): {e}")))?;
 
@@ -2969,14 +3029,22 @@ mod tls_material_tests {
     #[test]
     fn garbage_cert_is_rejected() {
         let (_, k_pem) = real_pair("127.0.0.1");
-        let (_d, c, k) = fixture("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n", &k_pem, 0o600);
+        let (_d, c, k) = fixture(
+            "-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n",
+            &k_pem,
+            0o600,
+        );
         assert!(load_tls_material(Some(&c), Some(&k)).is_err());
     }
 
     #[test]
     fn garbage_key_is_rejected() {
         let (c_pem, _) = real_pair("127.0.0.1");
-        let (_d, c, k) = fixture(&c_pem, "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n", 0o600);
+        let (_d, c, k) = fixture(
+            &c_pem,
+            "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n",
+            0o600,
+        );
         assert!(load_tls_material(Some(&c), Some(&k)).is_err());
     }
 

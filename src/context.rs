@@ -25,7 +25,7 @@ pub struct RequestContext {
     /// 会话ID
     pub session_id: SessionId,
     /// 消息数据
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     /// 客户端地址
     pub remote_addr: SocketAddr,
     /// 用户ID (可选)
@@ -40,10 +40,14 @@ pub struct RequestContext {
 
 impl RequestContext {
     /// 创建新的请求上下文
-    pub fn new(session_id: SessionId, data: Vec<u8>, remote_addr: SocketAddr) -> Self {
+    pub fn new(
+        session_id: SessionId,
+        data: impl Into<bytes::Bytes>,
+        remote_addr: SocketAddr,
+    ) -> Self {
         Self {
             session_id,
-            data,
+            data: data.into(),
             remote_addr,
             user_id: None,
             device_id: None,
@@ -163,5 +167,18 @@ impl ErrorResponseBuilder {
     /// 创建服务器错误响应
     pub fn server_error(session_id: SessionId, message: &str) -> Vec<u8> {
         Self::build(session_id, "SERVER_ERROR", message)
+    }
+}
+
+#[cfg(test)]
+mod shared_payload_tests {
+    use super::*;
+    #[test]
+    fn request_context_preserves_the_received_buffer() {
+        let data = bytes::Bytes::from(vec![42; 4096]);
+        let address = data.as_ptr();
+        let context = RequestContext::new(SessionId::new(1), data, "127.0.0.1:1".parse().unwrap());
+        assert_eq!(context.data.as_ptr(), address);
+        assert_eq!(context.clone().data.as_ptr(), address);
     }
 }
