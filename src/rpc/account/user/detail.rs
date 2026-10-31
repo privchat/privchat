@@ -211,8 +211,11 @@ pub async fn handle(
                     // 字段投影(D1/D2):username 仅 本人/好友/by_username 搜索来源;
                     // 其余回空串(滚动兼容:老客户端解析不炸,且天然清洗本地旧缓存)。
                     // phone/email 只有本人可见——此前对任意查看者裸奔,一并收口。
-                    let username_visible =
-                        is_self || verdict.is_friend || verdict.username_unlocked;
+                    let username_visible = username_visible(
+                        is_self,
+                        verdict.is_friend || verdict.username_unlocked,
+                        user_profile.user_type,
+                    );
                     let projected_username = if username_visible {
                         user_profile.username.clone()
                     } else {
@@ -266,5 +269,30 @@ pub async fn handle(
             tracing::warn!("❌ 权限验证失败: {} -> {}: {}", searcher_id, user_id, e);
             Err(RpcError::forbidden(format!("Access denied: {}", e)))
         }
+    }
+}
+
+/// Whether a profile detail shows the account (username): to the user themself, and to a friend or a
+/// viewer who found them by that username (PROFILE_VISIBILITY D1/D2). A personal assistant has no
+/// account to show (ACCOUNT_IDENTITY_SPEC 6.5): its username is a generated internal handle, so even
+/// its owner — who may read its detail and is its friend — gets an empty one.
+fn username_visible(is_self: bool, friend_or_unlocked: bool, user_type: i16) -> bool {
+    is_self || (friend_or_unlocked && user_type != helpers::USER_TYPE_PERSONAL_ASSISTANT)
+}
+
+#[cfg(test)]
+mod username_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn a_personal_assistant_never_shows_its_internal_handle_to_its_owner() {
+        assert!(!username_visible(false, true, helpers::USER_TYPE_PERSONAL_ASSISTANT));
+    }
+
+    #[test]
+    fn friends_and_self_still_see_an_ordinary_username() {
+        assert!(username_visible(false, true, 0));
+        assert!(username_visible(true, false, 0));
+        assert!(!username_visible(false, false, 0));
     }
 }
