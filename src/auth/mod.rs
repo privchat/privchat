@@ -17,6 +17,7 @@
 
 // 认证模块 - 提供JWT签发、验证和设备管理功能
 
+pub mod device_id;
 pub mod device_manager;
 pub mod device_manager_db;
 pub mod models;
@@ -31,6 +32,9 @@ pub mod token_service;
 pub mod unified_token_service;
 
 // 重新导出主要类型
+pub use device_id::{
+    generate_device_id, is_canonical_device_id, parse_device_id, validate_device_id,
+};
 pub use device_manager::{DeviceManager, DeviceStats};
 pub use device_manager_db::DeviceManagerDb;
 pub use models::{

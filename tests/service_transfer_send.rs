@@ -351,6 +351,10 @@ impl TransferSendBackend for ConnectionsBackend {
     }
 }
 
+// Device ids follow the canonical contract: lowercase hyphenated UUID v4.
+const NODE_A: &str = "3f6c2b1a-8d4e-4c7b-9a2f-1e5d6c7b8a90";
+const NODE_B: &str = "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
 fn targeted(device: &str) -> TransferSendRequest {
     let mut r = req(b"x");
     r.target_device_id = Some(device.to_string());
@@ -360,21 +364,21 @@ fn targeted(device: &str) -> TransferSendRequest {
 #[tokio::test]
 async fn targeted_send_reaches_only_the_named_device() {
     let backend = ConnectionsBackend::new(vec![
-        (VALID_TARGET, "node-a", true),
-        (VALID_TARGET, "node-b", true),
-        (VALID_TARGET + 1, "node-a", true),
+        (VALID_TARGET, NODE_A, true),
+        (VALID_TARGET, NODE_B, true),
+        (VALID_TARGET + 1, NODE_A, true),
     ]);
-    match process_app_transfer_send(targeted("node-a"), &backend).await {
+    match process_app_transfer_send(targeted(NODE_A), &backend).await {
         TransferSendOutcome::Ok(ok) => assert_eq!(ok.delivered_sessions, 1),
         other => panic!("expected Ok, got {other:?}"),
     }
-    assert_eq!(*backend.delivered_to.lock().await, vec!["node-a"]);
+    assert_eq!(*backend.delivered_to.lock().await, vec![NODE_A]);
 }
 
 #[tokio::test]
 async fn targeted_send_to_offline_device_never_falls_back_to_other_devices() {
-    let backend = ConnectionsBackend::new(vec![(VALID_TARGET, "node-b", true)]);
-    match process_app_transfer_send(targeted("node-a"), &backend).await {
+    let backend = ConnectionsBackend::new(vec![(VALID_TARGET, NODE_B, true)]);
+    match process_app_transfer_send(targeted(NODE_A), &backend).await {
         TransferSendOutcome::Ok(ok) => {
             assert!(ok.accepted);
             assert_eq!(ok.delivered_sessions, 0, "offline target device must report zero, not broadcast");
@@ -387,10 +391,10 @@ async fn targeted_send_to_offline_device_never_falls_back_to_other_devices() {
 #[tokio::test]
 async fn targeted_send_to_online_unsubscribed_device_is_21500_even_if_others_subscribed() {
     let backend = ConnectionsBackend::new(vec![
-        (VALID_TARGET, "node-a", false),
-        (VALID_TARGET, "node-b", true),
+        (VALID_TARGET, NODE_A, false),
+        (VALID_TARGET, NODE_B, true),
     ]);
-    let outcome = process_app_transfer_send(targeted("node-a"), &backend).await;
+    let outcome = process_app_transfer_send(targeted(NODE_A), &backend).await;
     assert_err(&outcome, privchat_protocol::ErrorCode::ChannelNotSubscribed as u32);
     assert!(backend.delivered_to.lock().await.is_empty());
 }
@@ -410,9 +414,19 @@ async fn untargeted_send_keeps_all_subscribed_sessions() {
 
 #[tokio::test]
 async fn blank_target_device_is_rejected() {
-    let backend = ConnectionsBackend::new(vec![(VALID_TARGET, "node-a", true)]);
+    let backend = ConnectionsBackend::new(vec![(VALID_TARGET, NODE_A, true)]);
     let outcome = process_app_transfer_send(targeted("  "), &backend).await;
     assert_err(&outcome, 10100);
+}
+
+#[tokio::test]
+async fn non_canonical_target_device_is_rejected() {
+    let backend = ConnectionsBackend::new(vec![(VALID_TARGET, NODE_A, true)]);
+    for bad in [NODE_A.to_uppercase(), format!("{{{NODE_A}}}"), NODE_A.replace('-', ""), "node-a".to_string()] {
+        let outcome = process_app_transfer_send(targeted(&bad), &backend).await;
+        assert_err(&outcome, 10100);
+    }
+    assert!(backend.delivered_to.lock().await.is_empty());
 }
 
 #[test]

@@ -145,9 +145,7 @@ async fn refresh_handler(
             "refresh_token 不能为空".to_string(),
         ));
     }
-    if request.device_id.trim().is_empty() {
-        return Err(ServerError::Validation("device_id 不能为空".to_string()));
-    }
+    crate::auth::validate_device_id(&request.device_id)?;
 
     let result = svc
         .refresh(&request.refresh_token, &request.device_id)

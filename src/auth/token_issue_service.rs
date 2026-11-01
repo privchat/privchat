@@ -24,7 +24,6 @@ use crate::error::{Result, ServerError};
 use chrono::Utc;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 /// Token 签发服务（整合所有认证服务）
 pub struct TokenIssueService {
@@ -76,14 +75,12 @@ impl TokenIssueService {
 
         // 3. 处理设备ID：如果客户端提供则使用，否则自动生成
         let device_id = if let Some(ref client_device_id) = request.device_id {
-            // 验证客户端提供的 device_id 必须是 UUID 格式
-            Uuid::parse_str(client_device_id).map_err(|_| {
-                ServerError::Validation("device_id 必须是有效的 UUID 格式".to_string())
-            })?;
+            // A client-supplied device_id must be a canonical lowercase hyphenated UUID v4.
+            crate::auth::validate_device_id(client_device_id)?;
             client_device_id.clone()
         } else {
             // 客户端未提供，服务器自动生成
-            Uuid::new_v4().to_string()
+            crate::auth::generate_device_id()
         };
 
         // 4. 先 UPSERT 设备到 DB，拿到真实 session_version 与 device_created。
@@ -307,5 +304,73 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    fn issue_service() -> (TokenIssueService, Arc<DeviceManager>) {
+        let jwt_service = Arc::new(
+            TokenService::from_config(crate::config::JwtConfig {
+                algorithm: crate::config::JwtAlgorithm::Hs256,
+                secret: "test-secret-key-at-least-32-chars".to_string(),
+                access_ttl_secs: 3600,
+                ..Default::default()
+            })
+            .expect("test TokenService::from_config"),
+        );
+        let service_key_manager =
+            Arc::new(ServiceKeyManager::new_master_key("test-key".to_string()));
+        let device_manager = Arc::new(DeviceManager::new());
+        let service =
+            TokenIssueService::new(jwt_service, service_key_manager, device_manager.clone(), None);
+        (service, device_manager)
+    }
+
+    fn issue_request(device_id: Option<&str>) -> IssueTokenRequest {
+        IssueTokenRequest {
+            user_id: 12345,
+            business_system_id: "ecommerce".to_string(),
+            device_id: device_id.map(str::to_string),
+            device_info: DeviceInfo {
+                app_id: "ios".to_string(),
+                device_name: "iPhone".to_string(),
+                device_model: "iPhone 15".to_string(),
+                os_version: "iOS 17".to_string(),
+                app_version: "1.0.0".to_string(),
+            },
+            ttl: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_rejects_non_canonical_device_id() {
+        let (service, device_manager) = issue_service();
+        for bad in [
+            "550E8400-E29B-41D4-A716-446655440000",
+            "6fa459ea-ee8a-3ca4-894e-db77e160355e",
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "00000000-0000-0000-0000-000000000000",
+            "550e8400e29b41d4a716446655440000",
+            "{550e8400-e29b-41d4-a716-446655440000}",
+            "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+            "",
+        ] {
+            let result = service
+                .issue_token("test-key", issue_request(Some(bad)), "127.0.0.1".to_string())
+                .await;
+            assert!(
+                matches!(result, Err(ServerError::InvalidDeviceId)),
+                "{bad:?} must be rejected, got {result:?}"
+            );
+            assert!(device_manager.get_device(bad).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_generates_canonical_device_id_when_absent() {
+        let (service, _) = issue_service();
+        let response = service
+            .issue_token("test-key", issue_request(None), "127.0.0.1".to_string())
+            .await
+            .unwrap();
+        assert!(crate::auth::is_canonical_device_id(&response.device_id));
     }
 }

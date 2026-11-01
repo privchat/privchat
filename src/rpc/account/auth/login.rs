@@ -20,7 +20,6 @@ use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use privchat_protocol::rpc::auth::AuthLoginRequest;
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 /// 处理 用户登录 请求
 ///
@@ -53,6 +52,10 @@ pub async fn handle(
         return Err(RpcError::validation("用户名不能为空".to_string()));
     }
     let password = &request.password;
+
+    // device_id must be a canonical lowercase hyphenated UUID v4; reject before any
+    // user lookup or password hashing.
+    crate::auth::validate_device_id(&request.device_id)?;
 
     // 1. 从数据库查找用户（支持用户名或邮箱登录，统一按小写比较）
     let user_by_username = services
@@ -93,13 +96,6 @@ pub async fn handle(
 
     let user_id = user.id;
     let device_id = &request.device_id;
-
-    // 验证 device_id 必须是 UUID 格式（与认证时的验证保持一致）
-    if Uuid::parse_str(device_id).is_err() {
-        return Err(RpcError::validation(
-            "device_id 必须是有效的 UUID 格式".to_string(),
-        ));
-    }
 
     // 4. 从 device_info 中提取 app_id 和 device_type
     let (app_id, device_type_str) = request

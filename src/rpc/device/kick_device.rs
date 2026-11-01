@@ -76,6 +76,7 @@ pub async fn handle(
         .as_ref()
         .ok_or_else(|| RpcError::validation("缺少设备ID".to_string()))?;
     let target_device_id = &request.device_id;
+    crate::auth::validate_device_id(target_device_id)?;
 
     // 3. 验证不能踢出自己
     if target_device_id == current_device_id {

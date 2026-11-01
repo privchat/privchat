@@ -368,10 +368,14 @@ pub async fn process_app_transfer_send<B: TransferSendBackend + ?Sized>(
         user_id: req.target_user_id,
         device_id: req.target_device_id.clone(),
     };
-    if target.device_id.as_deref().is_some_and(|d| d.trim().is_empty()) {
+    if target
+        .device_id
+        .as_deref()
+        .is_some_and(|d| !crate::auth::is_canonical_device_id(d))
+    {
         return TransferSendOutcome::err(
             CODE_INVALID_PARAMS,
-            "target_device_id must not be blank",
+            "target_device_id must be a lowercase hyphenated UUID v4",
             StatusCode::BAD_REQUEST,
         );
     }

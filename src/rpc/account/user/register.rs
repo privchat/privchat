@@ -21,7 +21,6 @@ use crate::rpc::error::{RpcError, RpcResult};
 use crate::rpc::RpcServiceContext;
 use privchat_protocol::rpc::auth::UserRegisterRequest;
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 /// 处理用户注册请求
 ///
@@ -64,12 +63,8 @@ pub async fn handle(
         return Err(RpcError::validation("密码至少需要 6 个字符".to_string()));
     }
 
-    // 验证 device_id 必须是 UUID 格式（与认证时的验证保持一致）
-    if Uuid::parse_str(&request.device_id).is_err() {
-        return Err(RpcError::validation(
-            "device_id 必须是有效的 UUID 格式".to_string(),
-        ));
-    }
+    // device_id must be a canonical lowercase hyphenated UUID v4.
+    crate::auth::validate_device_id(&request.device_id)?;
 
     // 1. 检查用户名是否已存在
     if let Ok(Some(_)) = services

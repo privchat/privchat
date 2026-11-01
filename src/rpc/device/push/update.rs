@@ -31,6 +31,8 @@ pub async fn handle(body: Value, services: RpcServiceContext, ctx: RpcContext) -
     let request: DevicePushUpdateRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
+    crate::auth::validate_device_id(&request.device_id)?;
+
     // 2. 获取当前用户 ID
     let user_id = crate::rpc::get_current_user_id(&ctx)?;
 

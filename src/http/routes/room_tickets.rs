@@ -120,12 +120,8 @@ fn validate(req: &IssueTicketRequest) -> Result<(), String> {
     if req.user_id == 0 {
         return Err("user_id must be > 0".to_string());
     }
-    let device = req.device_id.trim();
-    if device.is_empty() {
-        return Err("device_id must not be empty".to_string());
-    }
-    if device.len() > 128 {
-        return Err("device_id too long (max 128)".to_string());
+    if !crate::auth::is_canonical_device_id(&req.device_id) {
+        return Err("device_id must be a lowercase hyphenated UUID v4".to_string());
     }
     if let Some(scope) = req.scope.as_deref() {
         if scope != SCOPE_SUBSCRIBE {
@@ -180,6 +176,8 @@ pub fn create_route() -> Router<AdminServerState> {
 mod tests {
     use super::*;
 
+    const DEV: &str = "550e8400-e29b-41d4-a716-446655440000";
+
     fn req(channel_id: u64, user_id: u64, device_id: &str) -> IssueTicketRequest {
         IssueTicketRequest {
             channel_id,
@@ -193,17 +191,17 @@ mod tests {
 
     #[test]
     fn validate_happy() {
-        assert!(validate(&req(1, 1, "d")).is_ok());
+        assert!(validate(&req(1, 1, DEV)).is_ok());
     }
 
     #[test]
     fn validate_rejects_zero_channel() {
-        assert!(validate(&req(0, 1, "d")).is_err());
+        assert!(validate(&req(0, 1, DEV)).is_err());
     }
 
     #[test]
     fn validate_rejects_zero_user() {
-        assert!(validate(&req(1, 0, "d")).is_err());
+        assert!(validate(&req(1, 0, DEV)).is_err());
     }
 
     #[test]
@@ -213,28 +211,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_long_device() {
-        let long = "x".repeat(129);
-        assert!(validate(&req(1, 1, &long)).is_err());
+    fn validate_rejects_non_canonical_device() {
+        assert!(validate(&req(1, 1, "d")).is_err());
+        assert!(validate(&req(1, 1, &DEV.to_uppercase())).is_err());
+        assert!(validate(&req(1, 1, &format!(" {DEV}"))).is_err());
+        assert!(validate(&req(1, 1, "6fa459ea-ee8a-3ca4-894e-db77e160355e")).is_err());
     }
 
     #[test]
     fn validate_rejects_bad_scope() {
-        let mut r = req(1, 1, "d");
+        let mut r = req(1, 1, DEV);
         r.scope = Some("publish".to_string());
         assert!(validate(&r).is_err());
     }
 
     #[test]
     fn validate_accepts_explicit_subscribe_scope() {
-        let mut r = req(1, 1, "d");
+        let mut r = req(1, 1, DEV);
         r.scope = Some(SCOPE_SUBSCRIBE.to_string());
         assert!(validate(&r).is_ok());
     }
 
     #[test]
     fn validate_rejects_ttl_out_of_range() {
-        let mut r = req(1, 1, "d");
+        let mut r = req(1, 1, DEV);
         r.ttl_secs = Some(10);
         assert!(validate(&r).is_err());
         r.ttl_secs = Some(MAX_TTL_SECS + 1);

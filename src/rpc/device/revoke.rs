@@ -46,6 +46,7 @@ pub async fn handle(ctx: &RpcServiceContext, params: Value) -> RpcResult<Value> 
         .ok_or_else(|| RpcError::validation(
             "缺少 device_id 参数".to_string()
         ))?;
+    crate::auth::validate_device_id(device_id)?;
     
     // 2. 撤销设备
     ctx.token_revocation_service

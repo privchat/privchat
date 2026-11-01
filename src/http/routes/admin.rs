@@ -259,7 +259,7 @@ pub(crate) async fn verify_service_key_with_manager(
 ///
 /// **重要说明**：
 /// 1. `device_id` 是**可选**的：
-///    - 如果客户端提供 `device_id`，必须是有效的 UUID 格式，服务器会使用此 `device_id`
+///    - 如果客户端提供 `device_id`，必须是小写带连字符的 UUID v4，服务器会使用此 `device_id`
 ///    - 如果客户端不提供，服务器会自动生成 UUID 作为 `device_id`
 /// 2. 客户端在连接 WebSocket 时，`ConnectMessage.device_info.device_id` **必须与**返回的 `device_id` 一致
 /// 3. JWT token 中已绑定 `device_id`，连接时验证会检查一致性，不匹配将拒绝连接
@@ -276,7 +276,7 @@ pub(crate) async fn verify_service_key_with_manager(
 /// {
 ///   "user_id": 12345,
 ///   "business_system_id": "ecommerce",
-///   "device_id": "550e8400-e29b-41d4-a716-446655440000",  // 可选，必须是 UUID
+///   "device_id": "550e8400-e29b-41d4-a716-446655440000",  // 可选，必须是小写带连字符的 UUID v4
 ///   "device_info": {
 ///     "app_id": "ios",
 ///     "device_name": "我的 iPhone",
@@ -997,7 +997,11 @@ async fn revoke_room_access(
     Json(payload): Json<dto::RevokeRoomAccessRequest>,
 ) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
-    let device = payload.device_id.as_deref().filter(|d| !d.trim().is_empty());
+    // An absent device_id revokes every device; a supplied one must be canonical.
+    let device = payload.device_id.as_deref();
+    if let Some(d) = device {
+        crate::auth::validate_device_id(d)?;
+    }
     let removed = match payload.revoked_before_ms {
         Some(cutoff) => state.room_access.revoke_before(channel_id, payload.user_id, device, cutoff).await?,
         None => state.room_access.revoke(channel_id, payload.user_id, device).await?,
@@ -1523,6 +1527,7 @@ async fn get_device(
     Path(device_id): Path<String>,
 ) -> ApiResult<Value> {
     verify_service_key(&headers, &state).await?;
+    crate::auth::validate_device_id(&device_id)?;
 
     let device = state
         .device_manager_db
@@ -1864,6 +1869,7 @@ async fn revoke_device(
     Json(request): Json<dto::RevokeDeviceRequest>,
 ) -> ApiResult<dto::RevokeDeviceResponse> {
     verify_service_key(&headers, &state).await?;
+    crate::auth::validate_device_id(&device_id)?;
 
     let reason = request.reason.as_deref().unwrap_or("admin_revoke");
     state
@@ -3088,9 +3094,7 @@ async fn create_qr_scene(
     Json(request): Json<qr_dto::CreateQrSceneRequest>,
 ) -> ApiResult<qr_dto::QrSceneResponse> {
     verify_service_key(&headers, &state).await?;
-    if request.device_id.trim().is_empty() {
-        return Err(ServerError::Validation("device_id 不能为空".to_string()));
-    }
+    crate::auth::validate_device_id(&request.device_id)?;
     let scene = state
         .qr_login_service
         .create_scene(
@@ -3135,6 +3139,7 @@ async fn scan_qr_scene(
     Json(request): Json<qr_dto::ScanQrSceneRequest>,
 ) -> ApiResult<qr_dto::ScanQrSceneResponse> {
     verify_service_key(&headers, &state).await?;
+    crate::auth::validate_device_id(&request.scanner_device_id)?;
     let result = state
         .qr_login_service
         .scan_scene(
@@ -3163,6 +3168,7 @@ async fn confirm_qr_scene(
     Json(request): Json<qr_dto::ConfirmQrSceneRequest>,
 ) -> ApiResult<qr_dto::ConfirmQrSceneResponse> {
     verify_service_key(&headers, &state).await?;
+    crate::auth::validate_device_id(&request.scanner_device_id)?;
     let scene = state
         .qr_login_service
         .confirm_scene(

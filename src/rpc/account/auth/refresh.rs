@@ -30,7 +30,6 @@ use crate::rpc::RpcServiceContext;
 use privchat_protocol::rpc::auth::AuthRefreshRequest;
 use privchat_protocol::ErrorCode;
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 pub async fn handle(
     body: Value,
@@ -54,11 +53,7 @@ pub async fn handle(
     if request.refresh_token.is_empty() {
         return Err(RpcError::validation("refresh_token 不能为空".to_string()));
     }
-    if Uuid::parse_str(&request.device_id).is_err() {
-        return Err(RpcError::validation(
-            "device_id 必须是有效的 UUID 格式".to_string(),
-        ));
-    }
+    crate::auth::validate_device_id(&request.device_id)?;
 
     // 1. 校验 refresh token（签名、typ、过期）
     let claims = match services

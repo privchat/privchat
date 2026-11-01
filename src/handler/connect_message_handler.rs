@@ -136,6 +136,15 @@ impl MessageHandler for ConnectMessageHandler {
             connect_request.device_info.device_id, connect_request.device_info.device_type
         );
 
+        // 0. The connecting device id must be a canonical lowercase hyphenated UUID v4.
+        if let Some((code, message)) = reject_non_canonical_device(&connect_request) {
+            warn!(
+                "❌ ConnectMessageHandler: non-canonical device_id: {}",
+                connect_request.device_info.device_id
+            );
+            return self.create_error_response(code, message);
+        }
+
         // 1. 从连接请求中提取 token（直接从 auth_token 字段获取）
         let token = &connect_request.auth_token;
 
@@ -428,6 +437,21 @@ impl MessageHandler for ConnectMessageHandler {
     }
 }
 
+/// Connect-time device-id gate: rejects any device id that is not a canonical
+/// lowercase hyphenated UUID v4, before the token is even looked at.
+fn reject_non_canonical_device(
+    request: &privchat_protocol::protocol::AuthorizationRequest,
+) -> Option<(ErrorCode, &'static str)> {
+    if crate::auth::is_canonical_device_id(&request.device_info.device_id) {
+        None
+    } else {
+        Some((
+            ErrorCode::InvalidParams,
+            "device_id must be a lowercase hyphenated UUID v4",
+        ))
+    }
+}
+
 impl ConnectMessageHandler {
     /// 创建错误响应
     fn create_error_response(
@@ -469,7 +493,6 @@ impl ConnectMessageHandler {
         context: &RequestContext,
     ) -> anyhow::Result<(bool, bool)> {
         use crate::repository::CreateLoginLogRequest;
-        use uuid::Uuid;
 
         // 1. 检查 token 是否已被记录（防止重复记录）
         let token_jti = &claims.jti;
@@ -484,8 +507,8 @@ impl ConnectMessageHandler {
         );
 
         // 2. 解析设备 ID
-        let device_uuid =
-            Uuid::parse_str(device_id).map_err(|e| anyhow::anyhow!("Invalid device_id: {}", e))?;
+        let device_uuid = crate::auth::parse_device_id(device_id)
+            .map_err(|e| anyhow::anyhow!("Invalid device_id: {}", e))?;
 
         // 2.1 在写入当前条目之前先查 (user, device) 是否有过历史记录——这样查询
         // 不会算上即将写入的这一条。refresh 时该值为 true（已存在），用于跳过提醒。
@@ -659,5 +682,44 @@ impl ConnectMessageHandler {
             .map_err(|e| anyhow::anyhow!("send login notice failed: {}", e))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod device_id_gate_tests {
+    use super::*;
+    use privchat_protocol::protocol::AuthorizationRequest;
+
+    fn decoded_request(device_id: &str) -> AuthorizationRequest {
+        // Round-trip through the wire codec exactly like `handle` does.
+        let mut request = AuthorizationRequest::new();
+        request.auth_token = "token".into();
+        request.device_info.device_id = device_id.into();
+        let bytes = privchat_protocol::encode_message(&request).unwrap();
+        privchat_protocol::decode_message(&bytes).unwrap()
+    }
+
+    #[test]
+    fn connect_accepts_canonical_v4_device_id() {
+        let request = decoded_request("550e8400-e29b-41d4-a716-446655440000");
+        assert!(reject_non_canonical_device(&request).is_none());
+    }
+
+    #[test]
+    fn connect_rejects_non_canonical_device_ids() {
+        for bad in [
+            "550E8400-E29B-41D4-A716-446655440000",
+            "6fa459ea-ee8a-3ca4-894e-db77e160355e",
+            "00000000-0000-0000-0000-000000000000",
+            "550e8400e29b41d4a716446655440000",
+            "{550e8400-e29b-41d4-a716-446655440000}",
+            "",
+            "device-1",
+        ] {
+            let request = decoded_request(bad);
+            let (code, _) = reject_non_canonical_device(&request)
+                .unwrap_or_else(|| panic!("connect must reject {bad:?}"));
+            assert_eq!(code, ErrorCode::InvalidParams);
+        }
     }
 }

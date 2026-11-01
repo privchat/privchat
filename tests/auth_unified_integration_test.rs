@@ -430,7 +430,7 @@ async fn refresh_with_wrong_device_id_fails() {
     let r = post_json(
         &client,
         "/api/service/auth/refresh",
-        json!({ "refresh_token": refresh, "device_id": "00000000-0000-0000-0000-000000000000" }),
+        json!({ "refresh_token": refresh, "device_id": "9b2c6a1e-3f4d-4a5b-8c7d-0e1f2a3b4c5d" }),
         true,
     )
     .await;

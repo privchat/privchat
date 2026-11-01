@@ -51,20 +51,6 @@ impl TokenAuth {
         Err(ServerError::InvalidToken)
     }
 
-    /// 验证设备ID格式
-    pub fn validate_device_id(&self, device_id: &str) -> Result<(), ServerError> {
-        if device_id.is_empty() {
-            return Err(ServerError::InvalidDeviceId);
-        }
-
-        // 简单的设备ID格式验证
-        if device_id.len() < 3 || device_id.len() > 64 {
-            return Err(ServerError::InvalidDeviceId);
-        }
-
-        Ok(())
-    }
-
     /// 验证设备类型
     pub fn validate_device_type(&self, device_type: &str) -> Result<(), ServerError> {
         match device_type {

@@ -20,6 +20,7 @@
 // =====================================================
 
 use crate::auth::models::{Device, DeviceItem, DeviceType};
+use crate::auth::device_id::parse_device_id;
 use crate::auth::{KickedDevice, SessionState, SessionVerifyResult};
 use crate::error::{Result, ServerError};
 use chrono::Utc;
@@ -60,8 +61,7 @@ impl DeviceManagerDb {
         device_id: &str,
         token_session_version: i64,
     ) -> Result<SessionVerifyResult> {
-        let device_uuid = Uuid::parse_str(device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let device_uuid = parse_device_id(device_id)?;
 
         // 查询设备状态和版本
         let device = sqlx::query!(
@@ -149,8 +149,7 @@ impl DeviceManagerDb {
         current_device_id: &str,
         reason: &str,
     ) -> Result<Vec<KickedDevice>> {
-        let current_device_uuid = Uuid::parse_str(current_device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let current_device_uuid = parse_device_id(current_device_id)?;
 
         info!(
             "准备踢出其他设备: user={}, current_device={}",
@@ -245,13 +244,9 @@ impl DeviceManagerDb {
         kicked_by_device_id: Option<&str>,
         reason: &str,
     ) -> Result<()> {
-        let target_uuid = Uuid::parse_str(target_device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let target_uuid = parse_device_id(target_device_id)?;
 
-        let kicked_by_uuid = kicked_by_device_id
-            .map(|id| Uuid::parse_str(id))
-            .transpose()
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let kicked_by_uuid = kicked_by_device_id.map(parse_device_id).transpose()?;
 
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -299,8 +294,7 @@ impl DeviceManagerDb {
         device_id: &str,
         reason: &str,
     ) -> Result<i64> {
-        let device_uuid = Uuid::parse_str(device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let device_uuid = parse_device_id(device_id)?;
 
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -412,8 +406,7 @@ impl DeviceManagerDb {
     /// 被踢或被撤销的设备就此永久报废。要再加恢复入口时，从这里接。
     #[allow(dead_code)]
     pub async fn reactivate_device(&self, user_id: u64, device_id: &str) -> Result<()> {
-        let device_uuid = Uuid::parse_str(device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let device_uuid = parse_device_id(device_id)?;
 
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -454,8 +447,7 @@ impl DeviceManagerDb {
     ///
     /// `(xmax = 0)` 是 PostgreSQL `INSERT ... ON CONFLICT` 中区分新行和更新行的常用技巧。
     pub async fn register_or_update_device(&self, device: &Device) -> Result<(bool, i64)> {
-        let device_uuid = Uuid::parse_str(&device.device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let device_uuid = parse_device_id(&device.device_id)?;
 
         let now = chrono::Utc::now();
 
@@ -551,8 +543,7 @@ impl DeviceManagerDb {
         user_id: u64,
         device_id: &str,
     ) -> Result<Option<(String, i64)>> {
-        let device_uuid = Uuid::parse_str(device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let device_uuid = parse_device_id(device_id)?;
 
         let result = sqlx::query!(
             r#"
@@ -621,8 +612,7 @@ impl DeviceManagerDb {
 
     /// 更新设备最后活跃时间
     pub async fn update_last_active(&self, user_id: u64, device_id: &str, ip: &str) -> Result<()> {
-        let device_uuid = Uuid::parse_str(device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let device_uuid = parse_device_id(device_id)?;
 
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -731,8 +721,7 @@ impl DeviceManagerDb {
 
     /// 获取设备详情（管理 API）
     pub async fn get_device_admin(&self, device_id: &str) -> Result<DeviceItem> {
-        let device_uuid = Uuid::parse_str(device_id)
-            .map_err(|_| ServerError::BadRequest("无效的设备ID".to_string()))?;
+        let device_uuid = parse_device_id(device_id)?;
 
         let device = sqlx::query!(
             r#"

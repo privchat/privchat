@@ -24,7 +24,6 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use uuid::Uuid;
 
 use crate::auth::token_service::{
     IssueClaims, TokenService, VerifyError, TOKEN_TYPE_ACCESS, TOKEN_TYPE_REFRESH,
@@ -154,15 +153,14 @@ impl UnifiedTokenService {
             return Err(ServerError::Validation("user_id 不能为 0".to_string()));
         }
 
-        // 1) 决定 device_id：客户端传入时校验 UUID 格式（与 v1.2 TokenIssueService 行为一致）
+        // 1) device_id: a supplied one (even empty) must be canonical; only an absent one
+        // lets the server generate.
         let device_id = match &params.device_id {
-            Some(d) if !d.trim().is_empty() => {
-                Uuid::parse_str(d).map_err(|_| {
-                    ServerError::Validation("device_id 必须是有效的 UUID 格式".to_string())
-                })?;
+            Some(d) => {
+                crate::auth::validate_device_id(d)?;
                 d.clone()
             }
-            _ => Uuid::new_v4().to_string(),
+            None => crate::auth::generate_device_id(),
         };
 
         // 2) UPSERT 设备拿真值 session_version（**不**孤儿 token：device 必先入表）
@@ -263,6 +261,7 @@ impl UnifiedTokenService {
     /// 完整校验：签名 / typ=refresh / jti 存在 / token_hash 匹配 / 未过期 / 未 revoked /
     /// device_id 一致 / session_version 仍是 DB 当前值。
     pub async fn refresh(&self, refresh_token: &str, device_id: &str) -> Result<IssueResult> {
+        crate::auth::validate_device_id(device_id)?;
         // 1) RS256 验签 + typ=refresh
         // refresh token 本身验不过（过期 / 验签失败 / kid 未知）同样是"会话没了"，
         // 要给会话失效码；`verify_to_error` 那份笼统的 Unauthorized 留给 access token 路径。

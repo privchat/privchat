@@ -44,9 +44,8 @@ pub async fn handle(
     let request: QrLoginCreateSceneRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
-    if request.web_device_id.trim().is_empty() {
-        return Err(RpcError::validation("web_device_id 不能为空".to_string()));
-    }
+    // web_device_id becomes the web client's device id once the scene is authorized.
+    crate::auth::validate_device_id(&request.web_device_id)?;
 
     let session_id = parse_session_id(ctx.session_id.as_deref()).ok_or_else(|| {
         RpcError::internal(

@@ -104,6 +104,9 @@ impl From<crate::error::ServerError> for RpcError {
 
         match err {
             crate::error::ServerError::Validation(msg) => RpcError::validation(msg),
+            crate::error::ServerError::InvalidDeviceId => RpcError::validation(
+                "device_id must be a lowercase hyphenated UUID v4".to_string(),
+            ),
             crate::error::ServerError::Authentication(msg) => RpcError::unauthorized(msg),
             crate::error::ServerError::Unauthorized(msg) => RpcError::unauthorized(msg),
             crate::error::ServerError::Authorization(msg) => RpcError::forbidden(msg),

@@ -40,7 +40,8 @@ fn platform_name(platform: CallPushPlatform) -> &'static str {
     }
 }
 fn device_uuid(device: &str) -> RpcResult<Uuid> {
-    Uuid::parse_str(device).map_err(|_| RpcError::validation("Registered device UUID required"))
+    crate::auth::parse_device_id(device)
+        .map_err(|_| RpcError::validation("Registered device UUID required"))
 }
 
 impl CallService {
