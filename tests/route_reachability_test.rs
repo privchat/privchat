@@ -2,8 +2,8 @@
 //
 // 背景：TS SDK 曾按「协议里有这条路由常量」就给它加了客户端封装，结果发布出去
 // 三个方法打到的 handler 是 `Ok(json!({"status":"success"}))` 的占位实现，
-// 调用方拿到假成功。另有一整个模块（channel_broadcast）定义了 register_routes
-// 却从没被 rpc/mod.rs 调用过，5 条路由不可达。
+// 调用方拿到假成功。另有一整个占位模块（channel_broadcast）定义了 register_routes
+// 却从没被 rpc/mod.rs 调用过，5 条路由不可达（已删除）。
 //
 // 这类问题在客户端侧的测试里永远看不见——那边只能验证自己写下的字符串等于
 // 自己写下的字符串。所以护栏放在 server：直接扫源码，把「假成功 handler」和
@@ -56,15 +56,11 @@ fn 假成功占位_handler_不得增加() {
     // 注意区分两种欠债：
     //   - account/profile/*、account/user/update：**已注册**，客户端调得到，
     //     拿到的是假成功。这类最危险，绝不能有客户端封装。
-    //   - contact/block/*、channel_broadcast/*：register_routes 是空的 / 从没被
-    //     调用，纯死文件。不可达，但留着就有人会照着"协议里有"去接。
+    //   - contact/block/*：register_routes 是空的 / 从没被调用，纯死文件。
+    //     不可达，但留着就有人会照着"协议里有"去接。
     let known: BTreeSet<String> = [
         "account/profile/get.rs",
-        "account/profile/update.rs",
         "account/user/update.rs",
-        "channel_broadcast/channel/create.rs",
-        "channel_broadcast/content/list.rs",
-        "channel_broadcast/content/publish.rs",
         "contact/block/add.rs",
         "contact/block/list.rs",
     ]
@@ -111,11 +107,9 @@ fn 定义了_register_routes_的模块必须被调用() {
         }
     }
 
-    assert_eq!(
-        unreachable,
-        vec!["channel_broadcast".to_string()],
-        "顶层模块的 register_routes 调用情况变了。新增的不可达模块必须接线或删除；\
-         channel_broadcast 是有意不接：create/publish/list 是占位实现，且模块内注册的
-         路由名是 channel/channel/*，和 protocol 的 channel/broadcast/* 对不上"
+    assert!(
+        unreachable.is_empty(),
+        "顶层模块定义了 register_routes 却没有被调用：必须接线或删除，不留不可达的占位模块：{:#?}",
+        unreachable
     );
 }

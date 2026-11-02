@@ -40,10 +40,8 @@ struct DeliverCapture {
 }
 
 struct CannedBackend {
-    resolve_room: Option<u64>,
     is_user_online: bool,
     is_user_subscribed: bool,
-    is_room_member: bool,
     /// What `deliver` should return.
     canned_delivered: usize,
     capture: Mutex<DeliverCapture>,
@@ -52,10 +50,8 @@ struct CannedBackend {
 impl CannedBackend {
     fn happy_path() -> Self {
         Self {
-            resolve_room: Some(90001),
             is_user_online: true,
             is_user_subscribed: true,
-            is_room_member: true,
             canned_delivered: 1,
             capture: Mutex::new(DeliverCapture::default()),
         }
@@ -64,17 +60,11 @@ impl CannedBackend {
 
 #[async_trait]
 impl TransferSendBackend for CannedBackend {
-    async fn resolve_room(&self, _channel_id: u64) -> Option<u64> {
-        self.resolve_room
-    }
     async fn is_user_online(&self, _target: &TransferTarget) -> bool {
         self.is_user_online
     }
     async fn is_user_subscribed(&self, _target: &TransferTarget, _channel_id: u64) -> bool {
         self.is_user_subscribed
-    }
-    async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
-        self.is_room_member
     }
     async fn deliver(&self, target: &TransferTarget, channel_id: u64, encoded_packet: &[u8]) -> usize {
         let mut g = self.capture.lock().await;
@@ -181,14 +171,6 @@ async fn rejects_unsubscribed_target_when_online() {
 }
 
 #[tokio::test]
-async fn rejects_target_not_in_room() {
-    let mut backend = CannedBackend::happy_path();
-    backend.is_room_member = false;
-    let outcome = process_app_transfer_send(req(b"x"), &backend).await;
-    assert_err(&outcome, 10004);
-}
-
-#[tokio::test]
 async fn returns_delivered_zero_when_target_offline() {
     let mut backend = CannedBackend::happy_path();
     // Offline → not subscribed and not online.
@@ -197,9 +179,11 @@ async fn returns_delivered_zero_when_target_offline() {
     let outcome = process_app_transfer_send(req(b"x"), &backend).await;
     match outcome {
         TransferSendOutcome::Ok(TransferSendOk {
+            request_id,
             accepted,
             delivered_sessions,
         }) => {
+            assert_eq!(request_id, VALID_REQ_ID, "the caller's request_id is echoed");
             assert!(accepted, "offline target is still 'accepted' best-effort");
             assert_eq!(delivered_sessions, 0);
         }
@@ -215,6 +199,7 @@ async fn delivers_transfer_request_packet_to_target_sessions() {
 
     match outcome {
         TransferSendOutcome::Ok(ok) => {
+            assert_eq!(ok.request_id, VALID_REQ_ID);
             assert!(ok.accepted);
             assert_eq!(ok.delivered_sessions, 1);
         }
@@ -332,17 +317,11 @@ impl ConnectionsBackend {
 
 #[async_trait]
 impl TransferSendBackend for ConnectionsBackend {
-    async fn resolve_room(&self, channel_id: u64) -> Option<u64> {
-        Some(channel_id)
-    }
     async fn is_user_online(&self, target: &TransferTarget) -> bool {
         self.of(target).next().is_some()
     }
     async fn is_user_subscribed(&self, target: &TransferTarget, _channel_id: u64) -> bool {
         self.of(target).any(|(_, _, sub)| *sub)
-    }
-    async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
-        true
     }
     async fn deliver(&self, target: &TransferTarget, _channel_id: u64, _packet: &[u8]) -> usize {
         let hits: Vec<&'static str> = self.of(target).filter(|(_, _, sub)| *sub).map(|(_, d, _)| *d).collect();
@@ -380,6 +359,7 @@ async fn targeted_send_to_offline_device_never_falls_back_to_other_devices() {
     let backend = ConnectionsBackend::new(vec![(VALID_TARGET, NODE_B, true)]);
     match process_app_transfer_send(targeted(NODE_A), &backend).await {
         TransferSendOutcome::Ok(ok) => {
+            assert_eq!(ok.request_id, VALID_REQ_ID);
             assert!(ok.accepted);
             assert_eq!(ok.delivered_sessions, 0, "offline target device must report zero, not broadcast");
         }

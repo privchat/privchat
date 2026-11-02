@@ -32,7 +32,7 @@
 //!      stays in the HTTP payload, **not** in the wire packet
 //!   6. delivers to all of `target_user_id`'s authenticated sessions that
 //!      are subscribed to `channel_id`
-//!   7. returns an `ApiEnvelope<{accepted, delivered_sessions}>` per the
+//!   7. returns an `ApiEnvelope<{request_id, accepted, delivered_sessions}>` per the
 //!      response envelope spec
 //!
 //! Business outcomes are returned via [`TransferSendOutcome`]; the trait
@@ -115,10 +115,12 @@ impl TransferTarget {
 /// `data` payload of the success envelope (spec §5.2):
 ///
 /// ```json
-/// { "code": 0, "message": "OK", "data": { "accepted": true, "delivered_sessions": N } }
+/// { "code": 0, "message": "OK", "data": { "request_id": "...", "accepted": true, "delivered_sessions": N } }
 /// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferSendOk {
+    /// The caller's `request_id`, echoed (CHANNEL_TRANSFER_SPEC §5.2).
+    pub request_id: String,
     pub accepted: bool,
     pub delivered_sessions: usize,
 }
@@ -170,10 +172,6 @@ impl IntoResponse for TransferSendOutcome {
 /// canned implementation.
 #[async_trait]
 pub trait TransferSendBackend: Send + Sync {
-    /// Resolve `channel_id` → `room_id`. `None` ≡ channel does not exist
-    /// (return `20500 ChannelNotFound`).
-    async fn resolve_room(&self, channel_id: u64) -> Option<u64>;
-
     /// Whether `user_id` has *any* authenticated online session right now.
     /// Used to distinguish "offline → success(0)" from
     /// "online but unsubscribed → 21500".
@@ -182,10 +180,6 @@ pub trait TransferSendBackend: Send + Sync {
     /// Whether `user_id` has at least one authenticated session subscribed
     /// to `channel_id`.
     async fn is_user_subscribed(&self, target: &TransferTarget, channel_id: u64) -> bool;
-
-    /// Whether `user_id` is a member of `room_id`. For Room channels in
-    /// PrivChat's current model this is implied by subscription.
-    async fn is_room_member(&self, user_id: u64, room_id: u64) -> bool;
 
     /// Deliver an already-encoded wire `TransferRequest` packet to all of
     /// `target_user_id`'s authenticated sessions that are subscribed to
@@ -236,15 +230,6 @@ impl DefaultTransferSendBackend {
 
 #[async_trait]
 impl TransferSendBackend for DefaultTransferSendBackend {
-    async fn resolve_room(&self, channel_id: u64) -> Option<u64> {
-        // Current PrivChat model: channel_id IS room_id. We do not query
-        // ChannelService to verify existence here because the subscription
-        // / online checks below are cheaper and equally protective: if the
-        // channel doesn't exist nobody is subscribed to it.
-        // TODO: when room and channel decouple, route through ChannelService.
-        Some(channel_id)
-    }
-
     async fn is_user_online(&self, target: &TransferTarget) -> bool {
         !self.target_connections(target).await.is_empty()
     }
@@ -252,15 +237,6 @@ impl TransferSendBackend for DefaultTransferSendBackend {
     async fn is_user_subscribed(&self, target: &TransferTarget, channel_id: u64) -> bool {
         let sessions = self.target_connections(target).await.into_iter().map(|c| c.session_id).collect();
         !self.room_access.deliverable(channel_id, sessions, false).await.is_empty()
-    }
-
-    async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
-        // Phase 1: subscription presence is treated as proof of membership.
-        // Subscribe-time gates already check Private/Group; Room has no
-        // persistent membership in the current model.
-        // TODO: defense-in-depth via ChannelService.get_channel_members for
-        // the kicked-while-subscribed race.
-        true
     }
 
     async fn deliver(&self, target: &TransferTarget, channel_id: u64, encoded_packet: &[u8]) -> usize {
@@ -355,15 +331,9 @@ pub async fn process_app_transfer_send<B: TransferSendBackend + ?Sized>(
         );
     }
 
-    // 2. Resolve room.
-    let Some(room_id) = backend.resolve_room(req.channel_id).await else {
-        return TransferSendOutcome::err(
-            CODE_CHANNEL_NOT_FOUND,
-            "channel not found",
-            StatusCode::NOT_FOUND,
-        );
-    };
-
+    // 2. There is no persisted Room membership: delivery requires the target session's live, unrevoked
+    //    subscription to this channel (checked below); whether the caller may address it at all is the calling
+    //    business service's authorization (CHANNEL_TRANSFER_SPEC §1.5).
     let target = TransferTarget {
         user_id: req.target_user_id,
         device_id: req.target_device_id.clone(),
@@ -396,18 +366,10 @@ pub async fn process_app_transfer_send<B: TransferSendBackend + ?Sized>(
         }
         // Offline → best-effort success with 0 delivered.
         return TransferSendOutcome::Ok(TransferSendOk {
+            request_id: req.request_id,
             accepted: true,
             delivered_sessions: 0,
         });
-    }
-
-    // 4. Room membership.
-    if !backend.is_room_member(req.target_user_id, room_id).await {
-        return TransferSendOutcome::err(
-            CODE_PERMISSION_DENIED,
-            "room membership required",
-            StatusCode::FORBIDDEN,
-        );
     }
 
     // 5. Encode wire TransferRequest. target_user_id is intentionally NOT
@@ -415,7 +377,7 @@ pub async fn process_app_transfer_send<B: TransferSendBackend + ?Sized>(
     //    target; the wire schema only carries request_id / channel_id /
     //    route / body (server spec §4.2).
     let wire_req = privchat_protocol::TransferRequest {
-        request_id: req.request_id,
+        request_id: req.request_id.clone(),
         channel_id: req.channel_id,
         route: req.route,
         body,
@@ -434,6 +396,7 @@ pub async fn process_app_transfer_send<B: TransferSendBackend + ?Sized>(
     // 6. Deliver and report.
     let delivered = backend.deliver(&target, req.channel_id, &encoded).await;
     TransferSendOutcome::Ok(TransferSendOk {
+        request_id: req.request_id,
         accepted: true,
         delivered_sessions: delivered,
     })

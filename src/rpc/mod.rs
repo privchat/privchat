@@ -25,7 +25,6 @@ pub mod account;
 pub mod call;
 pub mod components;
 pub mod channel;
-pub mod channel_broadcast;
 pub mod contact;
 pub mod device;
 pub mod entity;

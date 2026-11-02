@@ -96,8 +96,6 @@ pub const CODE_CHANNEL_NOT_SUBSCRIBED: i32 =
 #[async_trait]
 pub trait ChannelTransferLookups: Send + Sync {
     async fn is_subscribed(&self, user_id: u64, channel_id: u64) -> bool;
-    async fn resolve_room(&self, channel_id: u64) -> Option<u64>;
-    async fn is_room_member(&self, user_id: u64, room_id: u64) -> bool;
 }
 
 pub struct DefaultChannelTransferLookups {
@@ -128,14 +126,6 @@ impl ChannelTransferLookups for DefaultChannelTransferLookups {
             }
         }
         false
-    }
-
-    async fn resolve_room(&self, channel_id: u64) -> Option<u64> {
-        Some(channel_id)
-    }
-
-    async fn is_room_member(&self, _user_id: u64, _room_id: u64) -> bool {
-        true
     }
 }
 
@@ -280,27 +270,9 @@ pub async fn process_transfer_request(
 
     // 4. Subscription — **不**校验（spec CHANNEL_TRANSFER_SPEC §1.5）
 
-    // 5. channel_id → room_id
-    let Some(room_id) = lookups.resolve_room(req.channel_id).await else {
-        return encode_response(
-            &req.request_id,
-            req.channel_id,
-            CODE_CHANNEL_NOT_FOUND,
-            "channel not found",
-            &[],
-        );
-    };
-
-    // 6. Room membership
-    if !lookups.is_room_member(caller.user_id, room_id).await {
-        return encode_response(
-            &req.request_id,
-            req.channel_id,
-            CODE_PERMISSION_DENIED,
-            "room membership required",
-            &[],
-        );
-    }
+    // 5. Room 成员资格不在此校验：服务端没有持久化的 Room 成员关系，channel_id 即 room_id；
+    //    是否有权对该频道发起上行由下游业务 handler 按自己的授权判定
+    //    （CHANNEL_TRANSFER_SPEC §1.5）。这里只保证调用者身份来自认证会话。
 
     // 7. 包装成 ServerEvent(event_type=transfer.requested) 投递给下游
     let occurred_at_ms = chrono::Utc::now().timestamp_millis();
@@ -308,7 +280,8 @@ pub async fn process_transfer_request(
         req.request_id.clone(),
         &caller,
         req.channel_id,
-        room_id,
+        // channel_id is the room id in the current model (§5 above).
+        req.channel_id,
         req.route.clone(),
         req.body.clone(),
         occurred_at_ms,
