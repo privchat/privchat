@@ -3295,3 +3295,21 @@ async fn update_privacy_config(
         .await?;
     Ok(ApiEnvelope::ok(json!({ "username_searchable": enabled })))
 }
+
+#[cfg(test)]
+mod service_key_gate_tests {
+    use super::*;
+
+    /// Room create / broadcast / revoke, room ticket issue and Transfer send all pass this gate:
+    /// only the business service holding the service key reaches them.
+    #[tokio::test]
+    async fn room_and_transfer_service_routes_require_the_service_key() {
+        let manager = crate::auth::ServiceKeyManager::new_master_key("the-service-key".into());
+        let mut headers = HeaderMap::new();
+        assert!(verify_service_key_with_manager(&headers, &manager).await.is_err(), "missing");
+        headers.insert("X-Service-Key", "wrong".parse().unwrap());
+        assert!(verify_service_key_with_manager(&headers, &manager).await.is_err(), "wrong");
+        headers.insert("X-Service-Key", "the-service-key".parse().unwrap());
+        assert!(verify_service_key_with_manager(&headers, &manager).await.is_ok());
+    }
+}

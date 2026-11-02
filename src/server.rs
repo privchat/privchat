@@ -988,6 +988,11 @@ impl ChatServer {
             connection_manager.clone(),
         ));
         room_access.spawn_sweeper(std::time::Duration::from_secs(15));
+        if config.room_ticket.is_none() {
+            warn!(
+                "⚠️ [room_ticket] is not configured: every Room subscribe is refused (ROOM_CHANNEL_SPEC §4.6 has no open mode)"
+            );
+        }
         message_dispatcher.register_handler(
             MessageType::SubscribeRequest,
             Box::new(SubscribeMessageHandler::new(
@@ -2674,6 +2679,15 @@ impl PrivchatSessionHandler {
             .auth_session_manager
             .get_session_info(&session_id)
             .await;
+        // Token scope is enforced here, after authentication and before any handler (the capability
+        // matrix used to be declared but never applied to inbound message types).
+        if !crate::middleware::auth_middleware::inbound_allowed(dispatch_session_info.as_ref(), &msg_type) {
+            warn!(
+                "⛔ inbound {:?} outside the token scope: session={}; dropped",
+                msg_type, session_id
+            );
+            return;
+        }
         let message_dispatcher = self.message_dispatcher.clone();
 
         // try_acquire: 非阻塞获取 permit，不阻塞连接层 read loop

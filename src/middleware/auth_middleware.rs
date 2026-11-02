@@ -22,6 +22,17 @@ use privchat_protocol::protocol::MessageType;
 use privchat_protocol::ErrorCode;
 use std::sync::Arc;
 
+/// Whether an inbound message of `msg_type` may be dispatched for this session: an authenticated
+/// session only within its token scope (token_capability matrix), e.g. an `agent_node` session never
+/// sends chat messages and no session publishes Room events. Unauthenticated sessions are left to
+/// each handler, which refuses them itself (auth required).
+pub fn inbound_allowed(
+    session: Option<&crate::infra::session_manager::SessionInfo>,
+    msg_type: &MessageType,
+) -> bool {
+    session.is_none_or(|info| token_capability::allows_message_type(&info.jwt_claims.scope, msg_type))
+}
+
 /// 认证结果类型
 pub type AuthResult<T> = std::result::Result<T, ErrorCode>;
 
@@ -299,6 +310,39 @@ mod tests {
     }
 
     /// 受限 scope 的会话（能力矩阵在中间件里真正生效，而不只是矩阵单测通过）
+    #[tokio::test]
+    async fn inbound_messages_are_held_to_the_session_token_scope() {
+        let manager = Arc::new(SessionManager::new(24));
+        let bind = |id: u64, scope: &str| {
+            let manager = manager.clone();
+            let scope = scope.to_string();
+            async move {
+                let mut claims = create_test_claims(id, "device-x");
+                claims.scope = vec![scope];
+                let session = SessionId::new(id);
+                manager.bind_session(session.clone(), id.to_string(), "device-x".into(), claims).await;
+                manager.get_session_info(&session).await.unwrap()
+            }
+        };
+        let node = bind(31, crate::auth::token_capability::SCOPE_AGENT_NODE).await;
+        let visitor = bind(32, crate::auth::token_capability::SCOPE_MESSAGING).await;
+        let user = bind(33, "im").await;
+        // A node only subscribes and transfers; it never speaks or publishes as an IM user.
+        assert!(inbound_allowed(Some(&node), &MessageType::TransferRequest));
+        assert!(inbound_allowed(Some(&node), &MessageType::SubscribeRequest));
+        assert!(!inbound_allowed(Some(&node), &MessageType::SendMessageRequest));
+        assert!(!inbound_allowed(Some(&node), &MessageType::PublishRequest));
+        // A visitor converses but does not subscribe, transfer or publish.
+        assert!(inbound_allowed(Some(&visitor), &MessageType::SendMessageRequest));
+        assert!(!inbound_allowed(Some(&visitor), &MessageType::SubscribeRequest));
+        assert!(!inbound_allowed(Some(&visitor), &MessageType::TransferRequest));
+        // Full scope: everything a client sends, but never a Room publish.
+        assert!(inbound_allowed(Some(&user), &MessageType::SubscribeRequest));
+        assert!(!inbound_allowed(Some(&user), &MessageType::PublishRequest));
+        // Unauthenticated: each handler refuses on its own.
+        assert!(inbound_allowed(None, &MessageType::TransferRequest));
+    }
+
     async fn bind_messaging_session(
         session_manager: &Arc<SessionManager>,
         session_id: &SessionId,
@@ -404,9 +448,17 @@ mod tests {
             .await
             .is_ok());
         assert!(auth_middleware
-            .check_message_type(&MessageType::PublishRequest, &session_id)
+            .check_message_type(&MessageType::SubscribeRequest, &session_id)
             .await
             .is_ok());
+        // Clients never publish Room events, full scope included (ROOM_CHANNEL_SPEC §5).
+        assert_eq!(
+            auth_middleware
+                .check_message_type(&MessageType::PublishRequest, &session_id)
+                .await
+                .unwrap_err(),
+            ErrorCode::PermissionDenied
+        );
     }
 
     #[tokio::test]

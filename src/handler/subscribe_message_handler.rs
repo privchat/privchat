@@ -45,6 +45,33 @@ const REASON_ROOM_CLOSED: u8 = 12;
 /// 该 UID／设备在此 Room 的访问已被撤销，且票据签发早于撤权（ROOM_CHANNEL_SPEC §4.8）。
 const REASON_ACCESS_REVOKED: u8 = 13;
 
+/// Whether a session may subscribe to Room `channel_id` (ROOM_CHANNEL_SPEC §4.6): only with a ticket the
+/// business service signed for exactly this channel, device and authenticated user. No ticket
+/// configuration means no Room is subscribable. Revocation is checked by the caller against the store.
+pub(crate) fn admit_room(
+    cfg: Option<&RoomTicketConfig>,
+    token: &str,
+    channel_id: u64,
+    device_id: &str,
+    user_id: Option<u64>,
+) -> std::result::Result<room_ticket::RoomTicketClaims, u8> {
+    let user_id = user_id.ok_or(REASON_NOT_AUTHENTICATED)?;
+    let cfg = cfg.ok_or(REASON_TICKET_INVALID)?;
+    room_ticket::verify(cfg, token, channel_id, device_id, user_id).map_err(|e| match e {
+        TicketErr::Missing => REASON_TICKET_MISSING,
+        TicketErr::Expired => REASON_TICKET_EXPIRED,
+        TicketErr::MalformedHeader
+        | TicketErr::InvalidSignature
+        | TicketErr::BadScope
+        | TicketErr::BadChannelType
+        | TicketErr::ChannelMismatch
+        | TicketErr::DeviceMismatch
+        | TicketErr::SubjectMismatch
+        | TicketErr::UnknownKid
+        | TicketErr::Other => REASON_TICKET_INVALID,
+    })
+}
+
 pub struct SubscribeMessageHandler {
     subscribe_manager: Arc<SubscribeManager>,
     channel_service: Arc<crate::service::ChannelService>,
@@ -245,100 +272,50 @@ impl MessageHandler for SubscribeMessageHandler {
                 // 1) authenticated（拿到 user_id / device_id 才能比对 ticket.did）
                 // 2) `[room_ticket]` 配过：解码 + 校验签名 + exp + cid + ct + did + scope
                 // 3) 未配 `[room_ticket]`：v1 兼容模式 — "已认证即放行"，warn 告警
+                // Room：只凭业务签发的入场票据（spec ROOM_CHANNEL_SPEC §4.6）。channel_type 由客户端自报，
+                // 没有票据就等于任何人都能把任意频道 ID 当 Room 订阅——所以未配置 `[room_ticket]` 时一律拒绝，
+                // 不存在“已认证即放行”的兼容模式。
                 Some(crate::model::channel::ChannelType::Room) => {
-                    if context.user_id.is_none() {
-                        warn!(
-                            "📡 SubscribeMessageHandler: 未认证的会话 {} 尝试订阅 Room {}",
-                            context.session_id, channel_id
-                        );
-                        REASON_NOT_AUTHENTICATED
-                    } else {
-                        match self.room_ticket.as_deref() {
-                            Some(cfg) => {
-                                let token = subscribe_request.param.as_str();
-                                // 当前连接的 device_id（spec §4.3 ticket.did 必须匹配）
-                                let dev = context.device_id.as_deref().unwrap_or("");
-                                let uid = context
-                                    .user_id
-                                    .as_deref()
-                                    .and_then(|s| s.parse::<u64>().ok())
-                                    .unwrap_or(0);
-                                match room_ticket::verify(cfg, token, channel_id, dev, uid) {
-                                    Ok(claims)
-                                        if self
-                                            .room_access
-                                            .is_revoked(channel_id, uid, dev, claims.iat)
-                                            .await =>
-                                    {
-                                        warn!(
-                                            "📡 SubscribeMessageHandler: Room {} access revoked for user={} dev={} (ticket iat={})",
-                                            channel_id, uid, dev, claims.iat
-                                        );
-                                        REASON_ACCESS_REVOKED
-                                    }
-                                    Ok(claims) => {
-                                        info!(
-                                            "📡 SubscribeMessageHandler: Room {} ticket verified user={} dev={}",
-                                            channel_id, claims.sub, claims.did
-                                        );
-                                        room_grant =
-                                            Some(crate::service::room_access_service::RoomGrant {
-                                                user_id: uid,
-                                                device_id: dev.to_string(),
-                                                expires_at: claims.exp,
-                                                issued_at: claims.iat,
-                                            });
-                                        REASON_OK
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "📡 SubscribeMessageHandler: Room {} ticket rejected: {} (session={}, dev='{}')",
-                                            channel_id, e, context.session_id, dev
-                                        );
-                                        match e {
-                                            TicketErr::Missing => REASON_TICKET_MISSING,
-                                            TicketErr::Expired => REASON_TICKET_EXPIRED,
-                                            TicketErr::MalformedHeader
-                                            | TicketErr::InvalidSignature
-                                            | TicketErr::BadScope
-                                            | TicketErr::BadChannelType
-                                            | TicketErr::ChannelMismatch
-                                            | TicketErr::DeviceMismatch
-                                            | TicketErr::SubjectMismatch
-                                            | TicketErr::UnknownKid
-                                            | TicketErr::Other => REASON_TICKET_INVALID,
-                                        }
-                                    }
-                                }
-                            }
-                            None if self.room_access.ticket_required(channel_id).await => {
-                                // 声明必须持票的 Room（如工作空间）不接受兼容模式：fail-closed。
-                                warn!(
-                                    "📡 SubscribeMessageHandler: Room {} requires a ticket but [room_ticket] is not configured; subscribe rejected",
-                                    channel_id
-                                );
-                                REASON_TICKET_INVALID
-                            }
-                            None => {
-                                // v1 兼容模式：spec §4 要求 ticket，但未配 secret 时退化
-                                // 为"已认证即放行"。直播 / 游戏开启 ticket 校验前必须配
-                                // `[room_ticket]`，否则 Room 实际无访问控制。
-                                warn!(
-                                    "📡 SubscribeMessageHandler: [room_ticket] not configured; Room {} subscribe is open to any authenticated user (spec §4 ticket gate disabled — v1 compat mode)",
-                                    channel_id
-                                );
-                                room_grant = Some(crate::service::room_access_service::RoomGrant {
-                                    user_id: context
-                                        .user_id
-                                        .as_deref()
-                                        .and_then(|v| v.parse().ok())
-                                        .unwrap_or(0),
-                                    device_id: context.device_id.clone().unwrap_or_default(),
-                                    expires_at: u64::MAX,
-                                    issued_at: 0,
-                                });
-                                REASON_OK
-                            }
+                    let uid = context.user_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+                    let dev = context.device_id.as_deref().unwrap_or("");
+                    match admit_room(
+                        self.room_ticket.as_deref(),
+                        subscribe_request.param.as_str(),
+                        channel_id,
+                        dev,
+                        uid,
+                    ) {
+                        Ok(claims)
+                            if self
+                                .room_access
+                                .is_revoked(channel_id, uid.unwrap_or_default(), dev, claims.iat)
+                                .await =>
+                        {
+                            warn!(
+                                "📡 SubscribeMessageHandler: Room {} access revoked for user={} dev={} (ticket iat={})",
+                                channel_id, claims.sub, dev, claims.iat
+                            );
+                            REASON_ACCESS_REVOKED
+                        }
+                        Ok(claims) => {
+                            info!(
+                                "📡 SubscribeMessageHandler: Room {} ticket verified user={} dev={}",
+                                channel_id, claims.sub, claims.did
+                            );
+                            room_grant = Some(crate::service::room_access_service::RoomGrant {
+                                user_id: uid.unwrap_or_default(),
+                                device_id: dev.to_string(),
+                                expires_at: claims.exp,
+                                issued_at: claims.iat,
+                            });
+                            REASON_OK
+                        }
+                        Err(reason) => {
+                            warn!(
+                                "📡 SubscribeMessageHandler: Room {} subscribe refused reason={} (session={}, dev='{}')",
+                                channel_id, reason, context.session_id, dev
+                            );
+                            reason
                         }
                     }
                 }
@@ -484,5 +461,55 @@ impl MessageHandler for SubscribeMessageHandler {
 
     fn name(&self) -> &'static str {
         "SubscribeMessageHandler"
+    }
+}
+
+#[cfg(test)]
+mod room_admission_tests {
+    use super::*;
+    use crate::security::room_ticket::{sign_default, RoomTicketClaims};
+    use std::collections::HashMap;
+
+    const DEV: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn cfg(secret: &str) -> RoomTicketConfig {
+        RoomTicketConfig { secret: Some(secret.into()), keys: HashMap::new(), default_kid: "v1".into(), leeway_secs: 30 }
+    }
+
+    fn ticket(cfg: &RoomTicketConfig, user: u64, dev: &str, channel: u64, ttl: u64) -> String {
+        sign_default(cfg, &RoomTicketClaims::for_subscribe(user, dev, channel, ttl)).unwrap()
+    }
+
+    #[test]
+    fn a_valid_ticket_for_this_channel_device_and_user_is_admitted() {
+        let c = cfg("room-secret");
+        let t = ticket(&c, 7, DEV, 900, 300);
+        let claims = admit_room(Some(&c), &t, 900, DEV, Some(7)).unwrap();
+        assert_eq!((claims.cid, claims.sub.as_str()), (900, "7"));
+    }
+
+    #[test]
+    fn without_ticket_configuration_no_room_is_subscribable() {
+        // channel_type is client-declared: an open fallback would let anyone subscribe any channel id as a Room.
+        assert_eq!(admit_room(None, "anything", 900, DEV, Some(7)).unwrap_err(), REASON_TICKET_INVALID);
+        assert_eq!(admit_room(None, "", 900, DEV, Some(7)).unwrap_err(), REASON_TICKET_INVALID);
+    }
+
+    #[test]
+    fn missing_wrong_or_forged_tickets_are_refused() {
+        let c = cfg("room-secret");
+        let good = ticket(&c, 7, DEV, 900, 300);
+        assert_eq!(admit_room(Some(&c), &good, 900, DEV, None).unwrap_err(), REASON_NOT_AUTHENTICATED);
+        assert_eq!(admit_room(Some(&c), "", 900, DEV, Some(7)).unwrap_err(), REASON_TICKET_MISSING);
+        assert_eq!(admit_room(Some(&c), &good, 900, DEV, Some(8)).unwrap_err(), REASON_TICKET_INVALID, "wrong sub");
+        assert_eq!(admit_room(Some(&c), &good, 901, DEV, Some(7)).unwrap_err(), REASON_TICKET_INVALID, "wrong channel");
+        let other_dev = "6fa459ea-ee8a-3ca4-894e-db77e160355e";
+        assert_eq!(admit_room(Some(&c), &good, 900, other_dev, Some(7)).unwrap_err(), REASON_TICKET_INVALID, "wrong device");
+        let forged = ticket(&cfg("attacker"), 7, DEV, 900, 300);
+        assert_eq!(admit_room(Some(&c), &forged, 900, DEV, Some(7)).unwrap_err(), REASON_TICKET_INVALID, "forged");
+        let mut stale = RoomTicketClaims::for_subscribe(7, DEV, 900, 0);
+        stale.exp = stale.iat.saturating_sub(3600);
+        let expired = sign_default(&c, &stale).unwrap();
+        assert_eq!(admit_room(Some(&c), &expired, 900, DEV, Some(7)).unwrap_err(), REASON_TICKET_EXPIRED);
     }
 }

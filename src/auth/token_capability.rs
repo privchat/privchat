@@ -170,6 +170,11 @@ pub fn allows_rpc_route(scopes: &[String], route: &str) -> bool {
 
 /// token 的 scope 列表是否允许发送该消息类型
 pub fn allows_message_type(scopes: &[String], msg_type: &MessageType) -> bool {
+    // Room events are published only by the business service through the service API
+    // (ROOM_CHANNEL_SPEC §5): no client or node session ever publishes, whatever its scope.
+    if *msg_type == MessageType::PublishRequest {
+        return false;
+    }
     if scopes.is_empty() {
         return true;
     }
@@ -237,10 +242,17 @@ mod tests {
     }
 
     #[test]
+    fn no_session_scope_may_publish_room_events() {
+        for scopes in [vec![], vec!["im".to_string()], vec![SCOPE_MESSAGING.to_string()], vec![SCOPE_AGENT_NODE.to_string()]] {
+            assert!(!allows_message_type(&scopes, &MessageType::PublishRequest), "{scopes:?}");
+        }
+    }
+
+    #[test]
     fn empty_scope_is_backward_compatible() {
         let scopes: Vec<String> = vec![];
         assert!(allows_rpc_route(&scopes, routes::group::CREATE));
-        assert!(allows_message_type(&scopes, &MessageType::PublishRequest));
+        assert!(allows_message_type(&scopes, &MessageType::SubscribeRequest));
     }
 
     #[test]
