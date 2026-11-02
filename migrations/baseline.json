@@ -55,6 +55,10 @@
     {
       "file": "011_component_config.sql",
       "sha256": "417eecfc5f97356b34a230eb0e44041f9eaf80ff93904c759872880f0b4ae5fd"
+    },
+    {
+      "file": "003_personal_assistant_username_resync.sql",
+      "sha256": "c7f4ed1be6261e8612da7d0a53027d9578a96642eef571166ca885eccdf18c3e"
     }
   ]
 }
