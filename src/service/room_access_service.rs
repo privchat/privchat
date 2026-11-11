@@ -532,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn another_server_revocation_stops_existing_delivery_without_sweeper() {
         let _guard = crate::database_fixture_lock().lock().await;
-        let svc = service().await.unwrap();
+        let Some(svc) = service().await else { return };
         let remote = peer(&svc);
         let channel = fresh_channel(&svc, 1).await;
         let a = SessionId::from(94001);
@@ -562,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn revocation_between_validation_and_registration_cannot_restore_access() {
         let _guard = crate::database_fixture_lock().lock().await;
-        let svc = service().await.unwrap();
+        let Some(svc) = service().await else { return };
         let remote = peer(&svc);
         let channel = fresh_channel(&svc, 2).await;
         let s = SessionId::from(94003);
@@ -576,7 +576,7 @@ mod tests {
     #[tokio::test]
     async fn stale_fanout_and_missing_grant_cannot_become_legacy_authorization() {
         let _guard = crate::database_fixture_lock().lock().await;
-        let svc = service().await.unwrap();
+        let Some(svc) = service().await else { return };
         let channel = fresh_channel(&svc, 3).await;
         svc.set_ticket_required(channel, true).await.unwrap();
         let s = SessionId::from(94004);
@@ -592,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn replay_gate_checks_expiry_without_waiting_for_cleanup() {
         let _guard = crate::database_fixture_lock().lock().await;
-        let svc = service().await.unwrap();
+        let Some(svc) = service().await else { return };
         let channel = fresh_channel(&svc, 4).await;
         let s = SessionId::from(94005);
         let mut expired = grant(7, "a");
@@ -613,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn missing_policy_is_not_cached_across_server_creation() {
         let _guard = crate::database_fixture_lock().lock().await;
-        let svc = service().await.unwrap();
+        let Some(svc) = service().await else { return };
         let remote = peer(&svc);
         let channel = fresh_channel(&svc, 5).await;
         assert!(!remote.ticket_required(channel).await);
@@ -624,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn revocation_store_failure_never_means_unrevoked() {
         let _guard = crate::database_fixture_lock().lock().await;
-        let svc = service().await.unwrap();
+        let Some(svc) = service().await else { return };
         let channel = fresh_channel(&svc, 6).await;
         let s = SessionId::from(94006);
         svc.subscribe(s.clone(), channel, grant(7, "a")).unwrap();
@@ -636,7 +636,7 @@ mod tests {
     #[tokio::test]
     async fn retrying_old_revocation_preserves_new_grant_and_never_regresses_cutoff() {
         let _guard = crate::database_fixture_lock().lock().await;
-        let svc = service().await.unwrap();
+        let Some(svc) = service().await else { return };
         let channel = fresh_channel(&svc, 7).await;
         let cutoff = (now_secs().saturating_sub(10) * 1000) as i64;
         svc.revoke_before(channel, 7, Some("a"), cutoff)

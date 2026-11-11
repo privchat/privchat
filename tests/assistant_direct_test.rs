@@ -195,6 +195,7 @@ async fn cursor_orders_by_committed_pts_not_smid_and_stops_at_projection_gap() {
                     reply_to_message_id: None,
                     mentioned_user_ids: vec![],
                     message_source: None,
+                    links: Vec::new(),
                 },
             },
         );
