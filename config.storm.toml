@@ -17,6 +17,10 @@ connection_timeout = 300
 heartbeat_interval = 60
 handler_max_inflight = 2000
 
+[gateway.tls]
+cert = "./certs/server.crt"
+key = "./certs/server.key"
+
 [account]
 mode = "BUILTIN"
 
