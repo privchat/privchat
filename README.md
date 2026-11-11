@@ -621,8 +621,11 @@ Scoped to what is genuinely absent — pieces that exist but are unfinished live
 - **Backup / DR** (P2): backup, restore and disaster-recovery runbooks.
   Load testing is *partially* covered — `scripts/pre-loadtest-check.sh` and
   `scripts/ci_gate.sh` exist and gate results are tracked in
-  `privchat-docs/spec/06-ops/RELEASE_GATE.md`; the remaining gaps are the long-run
-  isolation soaks and socket-stall scenarios, not the harness itself.
+  `privchat-docs/spec/06-ops/RELEASE_GATE.md`; the socket-stall harness is
+  implemented (`privchat-load` `SocketStallProxy`, true TCP zero-window) and
+  first ran 2026-11-12 — it exposed a `sync/submit` hot-row lock convoy
+  (sender p99/tps FAIL, tracked as 闭环 TODO P0-5). The remaining gaps are that
+  fix plus the long-run isolated-host soaks, not the harness itself.
 
 **Not on this list by design**: connection quality / reconnect / backoff / weak-network
 handling. Those live in the client SDK (`privchat-sdk`), not here — the server side is
