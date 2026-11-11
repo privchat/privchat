@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use crate::rpc::error::{RpcError, RpcResult};
-use crate::rpc::RpcServiceContext;
+use crate::rpc::{helpers, RpcServiceContext};
 use serde_json::{json, Value};
 
 /// 处理 审批加群请求 请求
@@ -117,6 +117,14 @@ pub async fn handle(
 
     // 5. 根据 action 执行审批
     if action == "approve" {
+        // §10.5 兜底：存量 pending 申请若来自 System User，审批也不得放行（不允许任何 RPC 绕过）。
+        helpers::ensure_group_joinable(
+            request.user_id,
+            &services.user_repository,
+            &services.cache_manager,
+        )
+        .await?;
+
         // 5.1. #72A.1 原子审批：CAS 置 approved + 同事务加群成员（消除「approved 但非成员」孤儿，
         //      并发/重复审批由 DB CAS 裁决，多实例安全）。
         let now = chrono::Utc::now();

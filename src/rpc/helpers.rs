@@ -118,6 +118,9 @@ pub async fn get_user_profile_fresh_versioned(
 /// 私人助理（ACCOUNT_IDENTITY_SPEC §6.5）。
 pub const USER_TYPE_PERSONAL_ASSISTANT: i16 = 3;
 
+/// System User（CHANNEL_SPEC §10.1）。
+pub const USER_TYPE_SYSTEM: i16 = 1;
+
 /// 首版私人助理对**所有其他用户（含 owner）**不可达：搜索、资料、二维码、加好友、
 /// 私聊、入群一律按"用户不存在"处理，不暴露"该 uid 是私人助理"（§6.5 可达性）。
 pub fn is_unreachable_user_type(user_type: i16) -> bool {
@@ -150,6 +153,37 @@ pub async fn ensure_reachable_user(
             tracing::error!("校验目标用户可达性失败 user_id={}: {}", user_id, e);
             Err(crate::rpc::error::RpcError::internal(
                 "校验用户身份失败".to_string(),
+            ))
+        }
+    }
+}
+
+/// 群成员资格闸口（CHANNEL_SPEC §10.5 强不变量 + ACCOUNT_IDENTITY_SPEC §6.5）：
+/// System User（user_type=1，含内置区段与 DB-resident）禁止入群 → `21001`；
+/// 私人助理与不存在的用户返回同一"不存在"回包；查询失败拒绝（fail-closed）。
+/// 供扫码加群 / 审批兜底等入口共用，与 group/create、group/member/add 的内联守卫同语义。
+pub async fn ensure_group_joinable(
+    user_id: u64,
+    user_repository: &crate::repository::UserRepository,
+    cache_manager: &crate::infra::CacheManager,
+) -> crate::rpc::error::RpcResult<()> {
+    match lookup_user_type(user_id, user_repository, cache_manager).await {
+        Ok(Some(t)) if t == USER_TYPE_SYSTEM => Err(crate::rpc::error::RpcError::from_code(
+            privchat_protocol::error_code::ErrorCode::SystemUserNotGroupInvitable,
+            format!("user {} is a system user and cannot join a group", user_id),
+        )),
+        Ok(None) => Err(crate::rpc::error::RpcError::not_found(format!(
+            "User '{}' not found",
+            user_id
+        ))),
+        Ok(Some(t)) if is_unreachable_user_type(t) => Err(crate::rpc::error::RpcError::not_found(
+            format!("User '{}' not found", user_id),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::error!("校验入群资格 user_type 失败 user_id={}: {}", user_id, e);
+            Err(crate::rpc::error::RpcError::internal(
+                "校验成员身份失败".to_string(),
             ))
         }
     }
@@ -248,6 +282,99 @@ mod personal_assistant_reachability_tests {
             .unwrap());
         sqlx::query("DELETE FROM privchat_users WHERE user_id = ANY($1)")
             .bind(vec![NORMAL_UID as i64, ASSISTANT_UID as i64])
+            .execute(pool.as_ref())
+            .await
+            .expect("cleanup");
+    }
+}
+
+#[cfg(test)]
+mod group_joinable_gate_tests {
+    use super::*;
+    use crate::config::CacheConfig;
+    use crate::infra::CacheManager;
+    use crate::repository::UserRepository;
+    use privchat_protocol::ErrorCode;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    const NORMAL_UID: u64 = 93_001_001;
+    const BOT_UID: u64 = 93_001_002;
+    const SYSTEM_UID: u64 = 93_001_003;
+    const ASSISTANT_UID: u64 = 93_001_004;
+    const MISSING_UID: u64 = 93_001_999;
+
+    /// CHANNEL_SPEC §10.5：DB-resident System User 扫码/审批入群必须 21001；
+    /// 普通用户与机器人放行；私人助理与不存在用户同一"不存在"回包（§6.5 不可区分）。
+    #[tokio::test]
+    async fn group_joinable_gate_covers_system_assistant_and_missing() {
+        let _guard = crate::database_fixture_lock().lock().await;
+        let Some(url) = crate::require_test_database_url() else {
+            return;
+        };
+        let pool = Arc::new(
+            PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&url)
+                .await
+                .expect("connect"),
+        );
+        let cache = CacheManager::new(CacheConfig::default())
+            .await
+            .expect("cache");
+        let repo = UserRepository::new(pool.clone());
+        for (uid, username, user_type) in [
+            (NORMAL_UID, "gj_normal", 0i16),
+            (BOT_UID, "gj_bot", 2i16),
+            (SYSTEM_UID, "gj_system", 1i16),
+            (ASSISTANT_UID, "_gj_assistant", USER_TYPE_PERSONAL_ASSISTANT),
+        ] {
+            sqlx::query(
+                "INSERT INTO privchat_users (user_id, username, display_name, qr_key, user_type)
+                 VALUES ($1, $2, $2, $3, $4)
+                 ON CONFLICT (user_id) DO UPDATE SET user_type = EXCLUDED.user_type",
+            )
+            .bind(uid as i64)
+            .bind(username)
+            .bind(crate::rpc::qr::generate_qr_key())
+            .bind(user_type)
+            .execute(pool.as_ref())
+            .await
+            .expect("seed user");
+        }
+
+        assert!(ensure_group_joinable(NORMAL_UID, &repo, &cache)
+            .await
+            .is_ok());
+        assert!(ensure_group_joinable(BOT_UID, &repo, &cache).await.is_ok());
+
+        let system_err = ensure_group_joinable(SYSTEM_UID, &repo, &cache)
+            .await
+            .expect_err("system user must be rejected");
+        assert_eq!(system_err.code, ErrorCode::SystemUserNotGroupInvitable);
+        assert_eq!(system_err.code_value(), 21001);
+
+        let assistant_err = ensure_group_joinable(ASSISTANT_UID, &repo, &cache)
+            .await
+            .expect_err("assistant must be rejected");
+        let missing_err = ensure_group_joinable(MISSING_UID, &repo, &cache)
+            .await
+            .expect_err("missing user must be rejected");
+        assert_eq!(assistant_err.code, ErrorCode::ResourceNotFound);
+        assert_eq!(missing_err.code, ErrorCode::ResourceNotFound);
+        // 私人助理与不存在用户回包不可区分（除 uid 本身）。
+        assert_eq!(
+            assistant_err.message.replace(&ASSISTANT_UID.to_string(), "UID"),
+            missing_err.message.replace(&MISSING_UID.to_string(), "UID")
+        );
+
+        sqlx::query("DELETE FROM privchat_users WHERE user_id = ANY($1)")
+            .bind(vec![
+                NORMAL_UID as i64,
+                BOT_UID as i64,
+                SYSTEM_UID as i64,
+                ASSISTANT_UID as i64,
+            ])
             .execute(pool.as_ref())
             .await
             .expect("cleanup");

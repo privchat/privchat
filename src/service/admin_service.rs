@@ -197,6 +197,14 @@ impl AdminService {
         Ok(revoked_count)
     }
 
+    fn system_user_not_group_invitable(user_id: u64) -> ServerError {
+        ServerError::Coded {
+            code: privchat_protocol::ErrorCode::SystemUserNotGroupInvitable,
+            status: 403,
+            message: format!("user {} is a system user and cannot join a group", user_id),
+        }
+    }
+
     /// 添加用户到群组并发送系统公告
     ///
     /// 1. 验证用户存在
@@ -207,6 +215,11 @@ impl AdminService {
         group_id: u64,
         user_id: u64,
     ) -> Result<AddGroupMemberResult> {
+        // §10.5 强不变量：System User 禁入群，admin 端点也不例外（内置区段可能无 DB 行，先判）。
+        if crate::config::is_system_user(user_id) {
+            return Err(Self::system_user_not_group_invitable(user_id));
+        }
+
         // 1. 查找用户（获取用户名用于公告）
         let user = self
             .user_repository
@@ -214,6 +227,10 @@ impl AdminService {
             .await
             .map_err(|e| ServerError::Database(format!("查询用户失败: {}", e)))?
             .ok_or_else(|| ServerError::NotFound(format!("用户 {} 不存在", user_id)))?;
+
+        if user.user_type == crate::rpc::helpers::USER_TYPE_SYSTEM {
+            return Err(Self::system_user_not_group_invitable(user_id));
+        }
 
         // 群公告里需要一个可读名字；display_name → username → "用户{uid}"。
         // 这里只用于**公告文案**（不是 wire username 字段），所以保留兜底是 OK 的。

@@ -79,15 +79,10 @@ pub async fn handle(
         group_id
     );
 
-    // 2. 验证用户存在（与历史 invite/qrcode 流程一致）
-    let _user_profile = helpers::get_user_profile_with_fallback(
-        user_id,
-        &services.user_repository,
-        &services.cache_manager,
-    )
-    .await
-    .map_err(|e| RpcError::internal(format!("获取用户信息失败: {}", e)))?
-    .ok_or_else(|| RpcError::not_found(format!("用户不存在: {}", user_id)))?;
+    // 2. 入群资格校验（CHANNEL_SPEC §10.5）：System User 禁入群 → 21001；
+    //    私人助理与不存在的用户同一"不存在"回包；同时完成用户存在性校验。
+    helpers::ensure_group_joinable(user_id, &services.user_repository, &services.cache_manager)
+        .await?;
 
     // 3. 拉群信息
     let channel = services
