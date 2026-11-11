@@ -261,7 +261,7 @@ impl PgMessageRepository {
     ) -> Result<(), DatabaseError> {
         let channel = sqlx::query(
             r#"
-            SELECT channel_type, membership_version
+            SELECT channel_type, membership_version, direct_user1_id, direct_user2_id
             FROM privchat_channels
             WHERE channel_id = $1
             FOR UPDATE
@@ -315,44 +315,66 @@ impl PgMessageRepository {
         // Direct membership is stored on the channel row; group membership is
         // authoritative in group_members. Room-like channels retain the
         // participant-table fallback until their membership model is frozen.
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO privchat_message_dispatch_recipient
-                (event_id, user_id, state, attempts, next_attempt_at)
-            SELECT $1, recipients.user_id, 0, 0, $3
-            FROM (
-                SELECT direct_user1_id AS user_id
-                FROM privchat_channels
-                WHERE channel_id = $2 AND channel_type = 0 AND direct_user1_id IS NOT NULL
-                UNION
-                SELECT direct_user2_id AS user_id
-                FROM privchat_channels
-                WHERE channel_id = $2 AND channel_type = 0 AND direct_user2_id IS NOT NULL
-                UNION
-                SELECT user_id
+        //
+        // P0-5：channel_type 已在上面同一把 FOR UPDATE 锁下读出并校验，按类型走
+        // 单分支快照，替代原 4 分支 UNION + EXISTS 重扫 channels 的写法——语义
+        // 不变（仍是 MESSAGE_SPEC D6 的「同一锁下 commit-time 快照」），但热行锁
+        // 内的查询规划与执行开销显著下降（同 channel 高并发发送不再互相等全写集）。
+        let inserted = match channel_type {
+            0 => {
+                let mut users = Vec::with_capacity(2);
+                if let Some(u) = channel.get::<Option<i64>, _>("direct_user1_id") {
+                    users.push(u);
+                }
+                if let Some(u) = channel.get::<Option<i64>, _>("direct_user2_id") {
+                    users.push(u);
+                }
+                sqlx::query(
+                    r#"
+                    INSERT INTO privchat_message_dispatch_recipient
+                        (event_id, user_id, state, attempts, next_attempt_at)
+                    SELECT $1, u, 0, 0, $3
+                    FROM unnest($2::bigint[]) AS u
+                    ON CONFLICT (event_id, user_id) DO NOTHING
+                    "#,
+                )
+                .bind(event_id)
+                .bind(&users)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+            }
+            1 => sqlx::query(
+                r#"
+                INSERT INTO privchat_message_dispatch_recipient
+                    (event_id, user_id, state, attempts, next_attempt_at)
+                SELECT $1, user_id, 0, 0, $3
                 FROM privchat_group_members
                 WHERE group_id = $2 AND left_at IS NULL
-                  AND EXISTS (
-                    SELECT 1 FROM privchat_channels
-                    WHERE channel_id = $2 AND channel_type = 1
-                  )
-                UNION
-                SELECT user_id
+                ON CONFLICT (event_id, user_id) DO NOTHING
+                "#,
+            )
+            .bind(event_id)
+            .bind(channel_id)
+            .bind(now)
+            .execute(&mut **tx)
+            .await,
+            _ => sqlx::query(
+                r#"
+                INSERT INTO privchat_message_dispatch_recipient
+                    (event_id, user_id, state, attempts, next_attempt_at)
+                SELECT $1, user_id, 0, 0, $3
                 FROM privchat_channel_participants
                 WHERE channel_id = $2 AND left_at IS NULL
-                  AND EXISTS (
-                    SELECT 1 FROM privchat_channels
-                    WHERE channel_id = $2 AND channel_type NOT IN (0, 1)
-                  )
-            ) recipients
-            ON CONFLICT (event_id, user_id) DO NOTHING
-            "#,
-        )
-        .bind(event_id)
-        .bind(channel_id)
-        .bind(now)
-        .execute(&mut **tx)
-        .await
+                ON CONFLICT (event_id, user_id) DO NOTHING
+                "#,
+            )
+            .bind(event_id)
+            .bind(channel_id)
+            .bind(now)
+            .execute(&mut **tx)
+            .await,
+        }
         .map_err(|e| {
             DatabaseError::Database(format!("Failed to snapshot dispatch recipients: {e}"))
         })?;
@@ -434,7 +456,7 @@ impl PgMessageRepository {
     }
 
     /// 普通客户端消息的权威写入路径：在同一个 DB transaction 内完成
-    /// dedup claim、pts 分配、消息落库、附件绑定和 commit log 写入。
+    /// dedup claim、附件绑定、pts 分配、消息落库和 commit log 写入。
     pub async fn create_message_and_commit_atomic(
         &self,
         request: AtomicMessageCommitRequest,
@@ -547,6 +569,63 @@ impl PgMessageRepository {
         }
 
         let now = chrono::Utc::now().timestamp_millis();
+
+        // P0-5：附件绑定放在 pts 分配之前。business_id 无外键、不依赖 pts/message
+        // 行，先做完这些写再取 privchat_channel_pts 热行锁，缩短同频道提交串行化的
+        // 锁持有窗口；失败仍走 savepoint 回滚，语义不变。
+        let bind_file_ids =
+            crate::service::legacy_media_refs::unique_file_ids_of(&request.attachment_refs);
+        for file_id in bind_file_ids {
+            // P1-19 归属守卫：file_id 来自客户端可控的 metadata，必须校验
+            // ① 上传者就是发送者（不能引用他人的 file）
+            // ② 未绑定到其它业务（不能把已绑定的附件重绑劫持；同消息重绑幂等放行）
+            let updated = sqlx::query(
+                r#"
+                UPDATE privchat_file_uploads
+                SET business_type = $1, business_id = $2
+                WHERE file_id = $3
+                  AND uploader_id = $4
+                  AND (
+                    business_type IS NULL
+                    OR business_type = ''
+                    -- 上传 token 会预设 business_type='message'（业务分类），但此时
+                    -- business_id 仍为空 —— 文件还没附着到任何具体消息，可以绑定。
+                    -- 归属守卫真正要防的是「已指向其它 business_id」的劫持，判据应看
+                    -- business_id 是否已落到具体实体，而非 business_type 是否已分类。
+                    OR business_id IS NULL
+                    OR business_id = ''
+                    OR (business_type = $1 AND business_id = $2)
+                  )
+                "#,
+            )
+            .bind("message")
+            .bind(request.message.message_id.to_string())
+            .bind(file_id as i64)
+            .bind(request.message.sender_id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                DatabaseError::Database(format!(
+                    "Failed to bind attachment file_id={} to message_id={}: {}",
+                    file_id, request.message.message_id, e
+                ))
+            })?;
+
+            if updated.rows_affected() == 0 {
+                // 终局判定，不是数据库故障：文件不存在 / 不属于发送者 / 已被别的消息占用，
+                // 三种情形重试多少次都是同一个结果。走 ATTACHMENT_BINDING_REJECTED 哨兵
+                // 映射到不可重试码（见 error.rs::subcode_from_message），客户端据此把
+                // outbox 置为 failed 让用户重发；用 Database 会落进可重试段，客户端将
+                // 每十几秒重试一次直到天荒地老。
+                return Err(DatabaseError::Validation(format!(
+                    "ATTACHMENT_BINDING_REJECTED attachment file_id={} rejected while binding \
+                     message_id={}: not found, not uploaded by sender {}, or already bound to \
+                     another business",
+                    file_id, request.message.message_id, request.message.sender_id
+                )));
+            }
+        }
+
         let pts_row = sqlx::query(
             r#"
             INSERT INTO privchat_channel_pts
@@ -623,59 +702,6 @@ impl PgMessageRepository {
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to create message: {}", e)))?;
 
-        let bind_file_ids =
-            crate::service::legacy_media_refs::unique_file_ids_of(&request.attachment_refs);
-        for file_id in bind_file_ids {
-            // P1-19 归属守卫：file_id 来自客户端可控的 metadata，必须校验
-            // ① 上传者就是发送者（不能引用他人的 file）
-            // ② 未绑定到其它业务（不能把已绑定的附件重绑劫持；同消息重绑幂等放行）
-            let updated = sqlx::query(
-                r#"
-                UPDATE privchat_file_uploads
-                SET business_type = $1, business_id = $2
-                WHERE file_id = $3
-                  AND uploader_id = $4
-                  AND (
-                    business_type IS NULL
-                    OR business_type = ''
-                    -- 上传 token 会预设 business_type='message'（业务分类），但此时
-                    -- business_id 仍为空 —— 文件还没附着到任何具体消息，可以绑定。
-                    -- 归属守卫真正要防的是「已指向其它 business_id」的劫持，判据应看
-                    -- business_id 是否已落到具体实体，而非 business_type 是否已分类。
-                    OR business_id IS NULL
-                    OR business_id = ''
-                    OR (business_type = $1 AND business_id = $2)
-                  )
-                "#,
-            )
-            .bind("message")
-            .bind(message.message_id.to_string())
-            .bind(file_id as i64)
-            .bind(message.sender_id as i64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                DatabaseError::Database(format!(
-                    "Failed to bind attachment file_id={} to message_id={}: {}",
-                    file_id, message.message_id, e
-                ))
-            })?;
-
-            if updated.rows_affected() == 0 {
-                // 终局判定，不是数据库故障：文件不存在 / 不属于发送者 / 已被别的消息占用，
-                // 三种情形重试多少次都是同一个结果。走 ATTACHMENT_BINDING_REJECTED 哨兵
-                // 映射到不可重试码（见 error.rs::subcode_from_message），客户端据此把
-                // outbox 置为 failed 让用户重发；用 Database 会落进可重试段，客户端将
-                // 每十几秒重试一次直到天荒地老。
-                return Err(DatabaseError::Validation(format!(
-                    "ATTACHMENT_BINDING_REJECTED attachment file_id={} rejected while binding \
-                     message_id={}: not found, not uploaded by sender {}, or already bound to \
-                     another business",
-                    file_id, message.message_id, message.sender_id
-                )));
-            }
-        }
-
         // 引用表双写（MEDIA_REFERENCE_AND_FORWARD_SPEC §10 第 4 步）。
         //
         // 与上面的 business_id 绑定**同事务**：两者一致是后续「按引用存在性授权」
@@ -683,6 +709,7 @@ impl PgMessageRepository {
         // 回填补齐存量，校验零缺口之后才切读。
         //
         // 冲突即幂等：同一条消息重试提交（同 message_id/role/ordinal）不该报错。
+        // 必须留在 messages INSERT 之后：(message_id, message_created_at) 有外键。
         for media_ref in &request.attachment_refs {
             sqlx::query(
                 r#"
