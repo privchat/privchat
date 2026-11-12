@@ -43,11 +43,10 @@ pub async fn register_routes(services: RpcServiceContext) {
         })
         .await;
 
-    let services_update = services.clone();
+    // update 是扁平的废弃拒绝，不读服务上下文，闭包无需捕获 services。
     GLOBAL_RPC_ROUTER
         .register(routes::account_user::UPDATE, move |body, ctx| {
-            let services = services_update.clone();
-            async move { update::handle(body, services, ctx).await }
+            async move { update::handle(body, ctx).await }
         })
         .await;
 

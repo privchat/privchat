@@ -53,14 +53,13 @@ fn 假成功占位_handler_不得增加() {
 
     // 已知欠债，逐条清理时从这里删。**只减不增**。
     //
-    // 注意区分两种欠债：
-    //   - account/profile/*、account/user/update：**已注册**，客户端调得到，
-    //     拿到的是假成功。这类最危险，绝不能有客户端封装。
-    //   - contact/block/*：register_routes 是空的 / 从没被调用，纯死文件。
-    //     不可达，但留着就有人会照着"协议里有"去接。
+    // P1-4（R10）已清理：account/user/update 改为显式废弃拒绝（不再假成功），
+    // account/profile/get 死文件已删除。本人资料写入的唯一 IM RPC 入口是
+    // account/profile/update（真实实现，仅 BUILTIN 部署）。
+    //
+    // 剩余欠债：contact/block/* —— register_routes 是空的 / 从没被调用，纯死文件。
+    // 不可达，但留着就有人会照着"协议里有"去接。
     let known: BTreeSet<String> = [
-        "account/profile/get.rs",
-        "account/user/update.rs",
         "contact/block/add.rs",
         "contact/block/list.rs",
     ]
