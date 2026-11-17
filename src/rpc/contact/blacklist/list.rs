@@ -29,10 +29,10 @@ pub async fn handle(
     tracing::debug!("🔧 处理 获取黑名单列表 请求: {:?}", body);
 
     // ✨ 使用协议层类型自动反序列化
-    let request: BlacklistListRequest = serde_json::from_value(body)
+    let _: BlacklistListRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
-    let user_id = request.user_id;
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
 
     // 获取黑名单列表
     match services.blacklist_service.get_blacklist(user_id).await {

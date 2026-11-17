@@ -32,7 +32,7 @@ pub async fn handle(
     let request: BlacklistCheckRequest = serde_json::from_value(body)
         .map_err(|e| RpcError::validation(format!("请求参数格式错误: {}", e)))?;
 
-    let user_id = request.user_id;
+    let user_id = crate::rpc::get_current_user_id(&ctx)?;
     let target_user_id = request.target_user_id;
 
     // 检查黑名单
