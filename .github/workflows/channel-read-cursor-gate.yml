@@ -36,6 +36,9 @@ jobs:
   read-cursor-gate:
     name: channel-read-cursor-gate
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: privchat-server
     services:
       postgres:
         image: postgres:16
@@ -57,12 +60,26 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: privchat-server
+      - uses: actions/checkout@v4
+        with:
+          repository: zoujiaqing/msgtrans
+          ref: 2c3086dc3b12da75aa20f0fbec448620b9a126e9
+          path: msgtrans
+      - uses: actions/checkout@v4
+        with:
+          repository: privchat/privchat-protocol
+          ref: 213b99c6a2a3a7ea31821df21a850720939e648e
+          path: privchat-protocol
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: privchat-server
 
       - name: Apply schema migrations
         run: |
@@ -89,3 +106,11 @@ jobs:
 
       - name: Protocol non-db gate tests
         run: RUSTC_WRAPPER= cargo test --test protocol_non_db_gate_test -- --nocapture
+
+      - name: Committed timeline delivery database tests
+        run: RUSTC_WRAPPER= cargo test --lib service::committed_timeline_delivery_service::tests -- --nocapture
+
+      - name: Atomic revoke and PostgreSQL readiness
+        run: |
+          RUSTC_WRAPPER= cargo test --lib a_revoked_message_stops_counting_as_a_live_reference -- --nocapture
+          RUSTC_WRAPPER= cargo test --lib postgres_readiness_rejects_a_closed_pool -- --nocapture

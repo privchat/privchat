@@ -1051,14 +1051,12 @@ mod tests {
     }
 
     async fn open_store() -> Option<DispatchOutboxStore> {
-        let url = std::env::var("PRIVCHAT_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .ok()?;
+        let url = crate::require_test_database_url()?;
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .connect(&url)
             .await
-            .ok()?;
+            .expect("connect to dispatch outbox test database");
         Some(DispatchOutboxStore::new(Arc::new(pool)))
     }
 

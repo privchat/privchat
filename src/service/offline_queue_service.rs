@@ -257,36 +257,15 @@ impl OfflineQueueService {
             .await
             .map_err(|e| ServerError::Internal(format!("LRANGE 失败: {}", e)))?;
 
-        let mut found = false;
-        let mut filtered_values = Vec::new();
-
-        // 过滤掉匹配的消息
-        for value in values {
-            if let Ok(msg) = serde_json::from_str::<PushMessageRequest>(&value) {
-                if msg.server_message_id == message_id {
-                    found = true;
-                    info!(
-                        "🗑️ 从离线队列删除消息: user={}, message_id={}",
-                        user_id, message_id
-                    );
-                    continue; // 跳过这条消息
-                }
-            }
-            filtered_values.push(value);
-        }
-
-        if found {
-            self.redis_client
-                .replace_list_ltrim_expire(
-                    &key,
-                    &filtered_values,
-                    self.max_queue_size,
-                    self.expire_seconds,
-                )
-                .await
-                .map_err(|e| ServerError::Internal(format!("离线队列重建失败: {}", e)))?;
-        }
-
+        let matching_values: Vec<_> = values
+            .into_iter()
+            .filter(|value| {
+                serde_json::from_str::<PushMessageRequest>(value)
+                    .is_ok_and(|msg| msg.server_message_id == message_id)
+            })
+            .collect();
+        let found = !matching_values.is_empty();
+        self.redis_client.remove_list_values(&key, &matching_values).await?;
         Ok(found)
     }
 
@@ -331,7 +310,8 @@ mod tests {
 
     async fn test_service() -> OfflineQueueService {
         let redis_config = RedisConfig {
-            url: "redis://127.0.0.1:6379".to_string(),
+            url: std::env::var("PRIVCHAT_TEST_REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
             pool_size: 10,
             min_idle: 1,
             connection_timeout_secs: 5,
@@ -344,6 +324,23 @@ mod tests {
                 .expect("连接 Redis 失败"),
         );
         OfflineQueueService::new(redis_client)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Redis"]
+    async fn removing_a_list_entry_preserves_an_append_after_the_read() {
+        let service = test_service().await;
+        let user_id = 900003;
+        let key = OfflineQueueService::queue_key(user_id);
+        service.clear(user_id).await.unwrap();
+        service.add(user_id, &build_push_message(1, user_id, 101)).await.unwrap();
+        let selected = service.redis_client.lrange(&key, 0, -1).await.unwrap();
+        service.add(user_id, &build_push_message(2, user_id, 102)).await.unwrap();
+        service.redis_client.remove_list_values(&key, &selected).await.unwrap();
+        let remaining = service.get_all(user_id).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].server_message_id, 2);
+        service.clear(user_id).await.unwrap();
     }
 
     // 注意：这些测试需要 Redis 运行在 localhost:6379

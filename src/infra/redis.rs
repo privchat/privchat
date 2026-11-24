@@ -791,39 +791,25 @@ impl RedisClient {
         .await
     }
 
-    /// 用给定列表替换 key，并重新应用 LTRIM + EXPIRE。
-    ///
-    /// values 约定为 Redis LRANGE 的顺序（最新 -> 最旧）。
-    pub async fn replace_list_ltrim_expire(
+    /// Remove only these entries, leaving concurrent appends and the list TTL intact.
+    pub async fn remove_list_values(
         &self,
         key: &str,
         values: &[String],
-        limit: usize,
-        ttl_seconds: usize,
     ) -> Result<(), crate::error::ServerError> {
+        if values.is_empty() {
+            return Ok(());
+        }
         self.with_timeout(async {
             let mut conn = self.get_conn().await?;
             let mut pipe = redis::pipe();
-            pipe.del(key).ignore();
-
-            if !values.is_empty() && limit > 0 {
-                for value in values.iter().rev() {
-                    pipe.lpush(key, value).ignore();
-                }
-                pipe.ltrim(key, 0, limit.saturating_sub(1) as isize)
-                    .ignore();
-                if ttl_seconds > 0 {
-                    pipe.expire(key, ttl_seconds as i64).ignore();
-                }
+            pipe.atomic();
+            for value in values {
+                pipe.cmd("LREM").arg(key).arg(0).arg(value).ignore();
             }
-
             pipe.query_async::<()>(&mut *conn).await.map_err(|e| {
-                crate::error::ServerError::Internal(format!(
-                    "Redis list replace pipeline failed: {}",
-                    e
-                ))
-            })?;
-            Ok(())
+                crate::error::ServerError::Internal(format!("Redis LREM failed: {e}"))
+            })
         })
         .await
     }

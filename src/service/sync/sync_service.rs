@@ -294,10 +294,15 @@ impl SyncService {
                 server_timestamp: chrono::Utc::now().timestamp_millis(),
             })
             .await
-            .map_err(|e| crate::error::ServerError::Database(e.to_string()))?;
-        self.pts_generator.set_pts(channel_id, commit.pts).await;
-        self.cache.cache_pts(channel_id, commit.pts).await?;
-        self.cache.cache_commit(&commit).await?;
+            .map_err(|e| match e {
+                crate::error::DatabaseError::Validation(message) => {
+                    crate::error::ServerError::Validation(message)
+                }
+                other => crate::error::ServerError::Database(other.to_string()),
+            })?;
+        if let Err(error) = self.cache_committed_commit(&commit).await {
+            tracing::warn!(channel_id, %error, "failed to refresh committed timeline cache");
+        }
         if let Some(event_id) = commit.event_id {
             let delivery = self.delivery_service.clone();
             tokio::spawn(async move {

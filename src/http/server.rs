@@ -95,6 +95,8 @@ impl UploadAuthenticator for crate::auth::UnifiedTokenService {
 /// 管理 API 服务器共享状态
 #[derive(Clone)]
 pub struct AdminServerState {
+    pub readiness_db: sqlx::PgPool,
+    pub started_at: std::time::Instant,
     pub component_config: Arc<crate::service::call_service::CallService>,
     pub service_key_manager: Arc<ServiceKeyManager>,
     pub token_issue_service: Arc<TokenIssueService>,
@@ -247,6 +249,8 @@ impl AdminHttpServer {
 
         Self {
             state: AdminServerState {
+                readiness_db: message_repository.pool().clone(),
+                started_at: std::time::Instant::now(),
                 component_config: Arc::new(crate::service::call_service::CallService::configured(
                     message_repository.pool().clone(), call_config,
                 )),

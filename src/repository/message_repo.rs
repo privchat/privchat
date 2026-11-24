@@ -78,13 +78,6 @@ pub trait MessageRepository: Send + Sync {
         pts: i64,
     ) -> Result<Option<Message>, DatabaseError>;
 
-    /// 撤回消息（标记为已撤回，但保留内容）
-    async fn revoke_message(
-        &self,
-        message_id: u64,
-        revoker_id: u64,
-    ) -> Result<Message, DatabaseError>;
-
     /// 搜索消息（管理 API）
     async fn search_messages(
         &self,
@@ -905,6 +898,25 @@ impl PgMessageRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| DatabaseError::Database(format!("Failed to allocate event pts: {e}")))?;
+        if let CanonicalTimelineEvent::Revoke(revoke) = &request.event {
+            let updated = sqlx::query(
+                "UPDATE privchat_messages
+                 SET revoked = true, revoked_at = $1, revoked_by = $2, updated_at = $1
+                 WHERE message_id = $3 AND channel_id = $4 AND NOT revoked AND NOT deleted",
+            )
+            .bind(revoke.revoked_at)
+            .bind(revoke.revoked_by as i64)
+            .bind(revoke.target_server_message_id as i64)
+            .bind(request.channel_id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::Database(format!("Failed to revoke message: {e}")))?;
+            if updated.rows_affected() != 1 {
+                return Err(DatabaseError::Validation(
+                    "Message no longer available for revocation".to_string(),
+                ));
+            }
+        }
         let event_id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO privchat_commit_log
@@ -2061,63 +2073,6 @@ impl MessageRepository for PgMessageRepository {
         }
     }
 
-    /// 撤回消息（标记为已撤回，但保留内容）
-    async fn revoke_message(
-        &self,
-        message_id: u64,
-        revoker_id: u64,
-    ) -> Result<Message, DatabaseError> {
-        let revoked_at = chrono::Utc::now().timestamp_millis();
-
-        // 先查询消息是否存在
-        let message = self
-            .find_by_id(message_id)
-            .await?
-            .ok_or_else(|| DatabaseError::NotFound(format!("Message {} not found", message_id)))?;
-
-        // 检查是否已经撤回
-        if message.revoked {
-            return Err(DatabaseError::Validation(
-                "Message already revoked".to_string(),
-            ));
-        }
-
-        // 更新消息状态（只更新 revoked 相关字段，保留 content）
-        let rows_affected = sqlx::query(
-            r#"
-            UPDATE privchat_messages
-            SET revoked = true,
-                revoked_at = $1,
-                revoked_by = $2,
-                updated_at = $1
-            WHERE message_id = $3
-            "#,
-        )
-        .bind(revoked_at)
-        .bind(revoker_id as i64)
-        .bind(message_id as i64)
-        .execute(self.pool.as_ref())
-        .await
-        .map_err(|e| DatabaseError::Database(format!("Failed to revoke message: {}", e)))?;
-
-        if rows_affected.rows_affected() == 0 {
-            return Err(DatabaseError::NotFound(format!(
-                "Message {} not found",
-                message_id
-            )));
-        }
-
-        // 返回更新后的消息
-        let mut revoked_message = message;
-        revoked_message.revoked = true;
-        revoked_message.revoked_at =
-            Some(chrono::DateTime::from_timestamp_millis(revoked_at).unwrap());
-        revoked_message.revoked_by = Some(revoker_id);
-        revoked_message.updated_at = chrono::DateTime::from_timestamp_millis(revoked_at).unwrap();
-
-        Ok(revoked_message)
-    }
-
     async fn search_messages(
         &self,
         keyword: &str,
@@ -3027,7 +2982,7 @@ mod atomic_dispatch_tests {
             revoked_by: None,
             read_detail_expires_at: None,
         };
-        repo.create_message_and_commit_atomic(AtomicMessageCommitRequest {
+        let original = repo.create_message_and_commit_atomic(AtomicMessageCommitRequest {
             message,
             dedup_key: Some("test:p2:group-snapshot".to_string()),
             client_registry_claim: None,
@@ -3061,11 +3016,46 @@ mod atomic_dispatch_tests {
             Some((GROUP_ID as u64, true)),
         );
 
-        sqlx::query("UPDATE privchat_messages SET revoked = true WHERE message_id = $1")
-            .bind(MESSAGE_ID as i64)
+        let revoke_id = MESSAGE_ID + 1;
+        let revoke = |channel_type| AtomicTimelineEventRequest {
+            server_msg_id: revoke_id,
+            channel_id: GROUP_ID as u64,
+            channel_type,
+            event: CanonicalTimelineEvent::Revoke(privchat_protocol::RevokeEvent {
+                target_server_message_id: MESSAGE_ID,
+                revoked_by: OWNER_ID as u64,
+                revoked_at: now.timestamp_millis(),
+            }),
+            sender_id: OWNER_ID as u64,
+            sender_username: None,
+            server_timestamp: now.timestamp_millis(),
+        };
+
+        // Dispatch validates the type after the update and commit insert, so this
+        // forces a failure late enough to exercise transaction rollback.
+        let error = repo.append_timeline_event_atomic(revoke(1)).await.unwrap_err();
+        assert!(error.to_string().contains("channel type mismatch"), "{error}");
+        let counts = || {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT COUNT(*), COUNT(o.event_id) FROM privchat_commit_log c
+                 LEFT JOIN privchat_message_dispatch_outbox o ON o.event_id = c.id
+                 WHERE c.server_msg_id = $1",
+            )
+            .bind(revoke_id as i64)
+            .fetch_one(repo.pool())
+        };
+        assert_eq!(counts().await.unwrap(), (0, 0));
+        assert!(!repo.find_by_id(MESSAGE_ID).await.unwrap().unwrap().revoked);
+
+        let committed = repo.append_timeline_event_atomic(revoke(2)).await.unwrap();
+        assert_eq!(committed.pts, original.message.pts.unwrap() as u64 + 1, "failure must not consume a pts");
+        assert!(repo.append_timeline_event_atomic(revoke(2)).await.is_err());
+        assert_eq!(counts().await.unwrap(), (1, 1));
+        sqlx::query("DELETE FROM privchat_commit_log WHERE server_msg_id = $1")
+            .bind(revoke_id as i64)
             .execute(repo.pool())
             .await
-            .expect("revoke message");
+            .unwrap();
 
         assert_eq!(
             repo.file_reference_channels(4242).await.expect("refs"),

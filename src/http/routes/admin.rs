@@ -186,6 +186,7 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/messages/search", get(search_messages))
         // === P0: 系统运维 ===
         .route("/system/health", get(health_check))
+        .route("/system/ready", get(readiness_check))
         // === QR Login（spec QR_API §4）===
         .route("/qr-login/scenes", post(create_qr_scene))
         .route("/qr-login/scenes/{scene_id}", get(get_qr_scene))
@@ -2335,6 +2336,28 @@ async fn get_online_count(
 
 /// 健康检查
 ///
+/// Fail readiness without restarting a live process during a database outage.
+async fn readiness_check(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+) -> ApiResult<dto::HealthCheckResponse> {
+    verify_service_key(&headers, &state).await?;
+    check_postgres_readiness(&state.readiness_db).await?;
+    Ok(health_response(&state).await)
+}
+
+async fn check_postgres_readiness(pool: &sqlx::PgPool) -> Result<()> {
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool),
+    )
+    .await;
+    if !matches!(probe, Ok(Ok(1))) {
+        return Err(ServerError::ServiceUnavailable("PostgreSQL not ready".to_string()));
+    }
+    Ok(())
+}
+
 /// GET /api/service/system/health
 async fn health_check(
     State(state): State<AdminServerState>,
@@ -2342,14 +2365,18 @@ async fn health_check(
 ) -> ApiResult<dto::HealthCheckResponse> {
     verify_service_key(&headers, &state).await?;
 
+    Ok(health_response(&state).await)
+}
+
+async fn health_response(state: &AdminServerState) -> ApiEnvelope<dto::HealthCheckResponse> {
     let connections = state.connection_manager.get_connection_count().await;
 
-    Ok(ApiEnvelope::ok(dto::HealthCheckResponse {
+    ApiEnvelope::ok(dto::HealthCheckResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        uptime_secs: 0,
+        uptime_secs: state.started_at.elapsed().as_secs(),
         connections,
-    }))
+    })
 }
 
 // =====================================================
@@ -3311,5 +3338,22 @@ mod service_key_gate_tests {
         assert!(verify_service_key_with_manager(&headers, &manager).await.is_err(), "wrong");
         headers.insert("X-Service-Key", "the-service-key".parse().unwrap());
         assert!(verify_service_key_with_manager(&headers, &manager).await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn postgres_readiness_rejects_a_closed_pool() {
+        let Some(url) = crate::require_test_database_url() else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.expect("connect probe database");
+        check_postgres_readiness(&pool).await.expect("database is ready");
+        pool.close().await;
+        let error = check_postgres_readiness(&pool).await.unwrap_err();
+        assert_eq!(error.http_status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }

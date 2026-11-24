@@ -511,6 +511,10 @@ impl MessageService {
             .map_err(|e| ServerError::Database(format!("查询消息失败: {}", e)))?
             .ok_or_else(|| ServerError::NotFound("消息不存在".to_string()))?;
 
+        if message.channel_id != channel_id {
+            return Err(ServerError::NotFound("消息不存在".to_string()));
+        }
+
         if message.revoked {
             return Err(ServerError::Validation("消息已被撤回".to_string()));
         }
@@ -543,8 +547,7 @@ impl MessageService {
             }
         }
 
-        self.revoke_message_core(message_id, message.channel_id, user_id)
-            .await
+        self.revoke_message_core(message, user_id).await
     }
 
     /// Admin 入口——跳过发送者/时限校验，仅做"消息存在且未撤回"前置。
@@ -572,51 +575,50 @@ impl MessageService {
             return Err(ServerError::Validation("消息已被撤回".to_string()));
         }
 
-        self.revoke_message_core(message_id, message.channel_id, admin_revoker_id)
+        self.revoke_message_core(message, admin_revoker_id)
             .await
     }
 
-    /// 撤回的完整副作用编排——**唯一**写点，供 `_with_auth` / `_admin` 共享。
-    ///
-    /// 步骤：
-    /// 1. DB 标记撤回
-    /// 2. 发 `DomainEvent::MessageRevoked` 到 event_bus
-    /// 3. 更新 `message_history_service` 内存缓存
-    /// 4. 写 sync `message.revoke` commit（PTS）
-    /// 5. 推送撤回事件给所有参与者
-    /// 6. 从所有参与者的离线队列中删除该消息
+    /// Commit the revoke before running best-effort cache and notification work.
     async fn revoke_message_core(
         &self,
-        message_id: u64,
-        channel_id: u64,
+        message: crate::model::message::Message,
         revoker_id: u64,
     ) -> std::result::Result<RevokedMessageSummary, ServerError> {
-        // 1. DB 标记撤回
-        let revoked_msg = self
-            .message_repository
-            .revoke_message(message_id, revoker_id)
-            .await
-            .map_err(|e| match e {
-                crate::error::DatabaseError::NotFound(msg) => ServerError::NotFound(msg),
-                crate::error::DatabaseError::Validation(msg) => ServerError::Validation(msg),
-                _ => ServerError::Database(format!("撤回消息失败: {}", e)),
-            })?;
-
-        tracing::debug!(
-            "✅ 消息已在数据库中标记为撤回: message_id={}, revoked_by={}",
-            message_id,
-            revoker_id
-        );
+        let message_id = message.message_id;
+        let channel_id = message.channel_id;
+        let channel_type = self
+            .channel_service
+            .get_channel(&channel_id)
+            .await?
+            .channel_type
+            .to_wire_u8();
+        let sync_service = get_global_sync_service().ok_or_else(|| {
+            ServerError::ServiceUnavailable("Timeline service unavailable".to_string())
+        })?;
+        let revoked_at_ms = Utc::now().timestamp_millis();
+        sync_service
+            .append_server_event_commit(
+                channel_id,
+                channel_type,
+                CanonicalTimelineEvent::Revoke(RevokeEvent {
+                    target_server_message_id: message_id,
+                    revoked_by: revoker_id,
+                    revoked_at: revoked_at_ms,
+                }),
+                revoker_id,
+            )
+            .await?;
 
         // 撤回的消息不再占未读角标。这里是两个撤回入口（用户撤回 / admin 撤回）的公共
         // 收口，而两边都先校验过 `message.revoked` 才进来，所以这段每条消息只会跑一次，
         // 不会重复扣。
         //
         // 没有 pts 的消息从未进入过时间线，也就从未被计入谁的未读，跳过。
-        if let Some(pts) = revoked_msg.pts {
+        if let Some(pts) = message.pts {
             if let Err(e) = self
                 .channel_service
-                .discount_unread_for_revoked_message(channel_id, pts, revoked_msg.sender_id)
+                .discount_unread_for_revoked_message(channel_id, pts, message.sender_id)
                 .await
             {
                 // 角标没扣成不该让撤回失败：消息已经标成撤回了，硬失败只会让客户端重试
@@ -656,42 +658,6 @@ impl MessageService {
             }
         }
 
-        // 解析 channel_type —— sync commit 要的是 **wire** 编号（Direct=1/
-        // Group=2/Room=3），不是 DB 编号（0/1/2）。此处曾直接把 DB 值当 wire 用
-        // （只把 0 特判成 1），于是 Group(DB 1) 被当成 Direct(wire 1)、
-        // Room(DB 2) 被当成 Group(wire 2)，revoke 的 pts commit 被
-        // message_repo 的类型校验拒写，只留一条 WARN——客户端因此永远收不到
-        // 撤回事件（私聊恰好因为 0→1 的特判而侥幸正确）。
-        let channel_type = self
-            .channel_service
-            .get_channel(&channel_id)
-            .await
-            .ok()
-            .map(|ch| ch.channel_type.to_wire_u8())
-            .unwrap_or_else(|| crate::model::channel::ChannelType::Direct.to_wire_u8());
-
-        // 4. 写 sync commit
-        let revoke_ts_ms = Utc::now().timestamp_millis();
-        if let Some(sync_service) = get_global_sync_service() {
-            if let Err(e) = sync_service
-                .append_server_event_commit(
-                    channel_id,
-                    channel_type,
-                    CanonicalTimelineEvent::Revoke(RevokeEvent {
-                        target_server_message_id: message_id,
-                        revoked_by: revoker_id,
-                        revoked_at: revoke_ts_ms,
-                    }),
-                    revoker_id,
-                )
-                .await
-            {
-                warn!("⚠️ 写入 revoke pts commit 失败: {}", e);
-            }
-        } else {
-            warn!("⚠️ SyncService 未初始化，跳过 revoke pts commit");
-        }
-
         // 5. 清理原消息的旧离线队列项；撤回事件自身由 dispatch outbox
         // 进入在线/离线统一投递，不再由本服务手工 fanout。
         match self
@@ -719,11 +685,6 @@ impl MessageService {
         }
 
         tracing::debug!("✅ 消息撤回完成: message_id={}", message_id);
-
-        let revoked_at_ms = revoked_msg
-            .revoked_at
-            .map(|dt| dt.timestamp_millis())
-            .unwrap_or(revoke_ts_ms);
 
         Ok(RevokedMessageSummary {
             message_id,
