@@ -322,6 +322,49 @@ impl DispatchOutboxStore {
             .collect())
     }
 
+    /// A dead worker cannot finish its final attempt, and another worker
+    /// must not claim attempt nine. Expire only after the lease is gone.
+    async fn expire_exhausted_leases(&self, now_ms: i64, limit: i64) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            WITH expired AS (
+                SELECT event_id, user_id
+                FROM privchat_message_dispatch_recipient
+                WHERE state = 0 AND attempts >= $1
+                  AND (lease_until IS NULL OR lease_until < $2)
+                ORDER BY event_id, user_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT $3
+            )
+            UPDATE privchat_message_dispatch_recipient r
+            SET state = 3, lease_owner = NULL, lease_until = NULL,
+                last_error = 'final delivery lease expired',
+                next_attempt_at = 0
+            FROM expired e
+            WHERE r.event_id = e.event_id AND r.user_id = e.user_id
+            "#,
+        )
+        .bind(MAX_ATTEMPTS)
+        .bind(now_ms)
+        .bind(limit.clamp(1, 1_000))
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("expire final dispatch leases failed: {e}")))?;
+        let expired = result.rows_affected();
+        if expired != 0 {
+            crate::infra::metrics::record_dispatch_dead("lease_expired", expired);
+            warn!(expired, "exhausted dispatch leases marked DEAD");
+        }
+        Ok(expired)
+    }
+
+    async fn maintain_outbox(&self, limit: i64) -> Result<()> {
+        self.expire_exhausted_leases(chrono::Utc::now().timestamp_millis(), limit)
+            .await?;
+        self.reconcile_terminal_parents(limit).await?;
+        Ok(())
+    }
+
     pub async fn reconcile_terminal_parents(&self, limit: i64) -> Result<u64> {
         let now = chrono::Utc::now().timestamp_millis();
         let result = sqlx::query(
@@ -475,10 +518,10 @@ impl CommittedTimelineDeliveryService {
             if last_parent_reconcile.elapsed() >= PARENT_RECONCILE_INTERVAL {
                 if let Err(error) = self
                     .store
-                    .reconcile_terminal_parents(DEFAULT_CHUNK_SIZE)
+                    .maintain_outbox(DEFAULT_CHUNK_SIZE)
                     .await
                 {
-                    warn!(%error, "dispatch outbox parent reconciliation failed");
+                    warn!(%error, "dispatch outbox maintenance failed");
                 }
                 last_parent_reconcile = tokio::time::Instant::now();
             }
@@ -550,6 +593,7 @@ impl CommittedTimelineDeliveryService {
             .zip(delivery_outcomes)
             .map(|(completion, outcome)| {
                 if matches!(outcome, RecipientDeliveryOutcome::Dead { .. }) {
+                    crate::infra::metrics::record_dispatch_dead("delivery_failed", 1);
                     warn!(
                         event_id = completion.claim.event_id,
                         user_id = completion.claim.user_id,
@@ -1318,6 +1362,54 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, 1);
+        cleanup(&store).await;
+    }
+
+    #[tokio::test]
+    async fn a_crash_on_the_last_attempt_reaches_dead_and_fences_late_completion() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
+        let Some(store) = open_store().await else { return };
+        seed_outbox(&store).await;
+        sqlx::query("UPDATE privchat_message_dispatch_recipient SET attempts = $2 WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .bind(MAX_ATTEMPTS - 1)
+            .execute(store.pool.as_ref())
+            .await
+            .unwrap();
+        let claims = store.claim_event("crashing-worker", EVENT_ID as u64).await.unwrap();
+        assert_eq!(claims.len(), 2);
+        assert!(claims.iter().all(|claim| claim.attempts == MAX_ATTEMPTS));
+        store.maintain_outbox(100).await.unwrap();
+        let states = || {
+            sqlx::query_scalar::<_, i16>(
+                "SELECT state FROM privchat_message_dispatch_recipient WHERE event_id = $1 ORDER BY user_id",
+            )
+            .bind(EVENT_ID)
+            .fetch_all(store.pool.as_ref())
+        };
+        assert_eq!(states().await.unwrap(), [0, 0], "live leases must not be expired");
+
+        sqlx::query("UPDATE privchat_message_dispatch_recipient SET lease_until = 0 WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(store.pool.as_ref())
+            .await
+            .unwrap();
+        store.maintain_outbox(1).await.unwrap();
+        assert_eq!(states().await.unwrap(), [3, 0], "maintenance must be bounded");
+        store.maintain_outbox(1).await.unwrap();
+        assert_eq!(states().await.unwrap(), [3, 3]);
+        store.maintain_outbox(100).await.unwrap();
+        assert!(store.claim_event("replacement", EVENT_ID as u64).await.unwrap().is_empty());
+        assert_eq!(
+            store.complete(&claims[0], Some(DispatchRecipientState::OnlineSent), None).await.unwrap(),
+            RecipientDeliveryOutcome::Fenced
+        );
+        let status: i16 = sqlx::query_scalar("SELECT status FROM privchat_message_dispatch_outbox WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .fetch_one(store.pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(status, 2);
         cleanup(&store).await;
     }
 

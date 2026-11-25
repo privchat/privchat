@@ -85,6 +85,7 @@ const COUNTER_DELIVERY_ZERO_SUCCESS: &str = "privchat_delivery_zero_success_tota
 const COUNTER_OFFLINE_ENQUEUE: &str = "privchat_offline_enqueue_total";
 /// 累计被 A→B 二次校验过滤掉的 session 次数（带 reason label）
 const COUNTER_DELIVERY_FILTERED: &str = "privchat_delivery_filtered_total";
+const COUNTER_DISPATCH_DEAD: &str = "privchat_timeline_dispatch_dead_total";
 /// Session-level delivery failures by bounded classification.
 const COUNTER_DELIVERY_FAILURE_SESSIONS: &str = "privchat_delivery_failure_sessions_total";
 
@@ -109,7 +110,13 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .set(handle)
         .map_err(|_| "metrics already initialized")?;
     preregister_rpc_result();
+    record_dispatch_dead("delivery_failed", 0);
+    record_dispatch_dead("lease_expired", 0);
     Ok(())
+}
+
+pub(crate) fn record_dispatch_dead(reason: &'static str, count: u64) {
+    metrics::counter!(COUNTER_DISPATCH_DEAD, "reason" => reason).increment(count);
 }
 
 /// 是否已初始化（可供 /metrics 使用）

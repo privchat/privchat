@@ -77,3 +77,16 @@ short-lived signed part URLs.
 binding the same port immediately after fails with `Address already in use`
 even though nothing holds it by the time you look. Wait a few seconds and
 start nginx again; it is a release window, not a configuration error.
+
+### Timeline delivery DEAD alert
+
+Load `prometheus/timeline-dispatch.rules.yml` through the monitoring deployment's
+`rule_files` and route `PrivChatTimelineDeliveryDead` through the existing
+Alertmanager. Scrape the PrivChat `/metrics` listener, not the management liveness
+endpoint. The counter has only a bounded cause label:
+`delivery_failed` or `lease_expired`. Check structured logs and the committed
+timeline before deciding whether client catch-up is sufficient. Do not replay
+raw historical envelopes or reset attempts directly in PostgreSQL.
+
+The rule file does not configure Alertmanager or prove that notifications arrive.
+Verify firing, routing and resolution in the deployment environment.

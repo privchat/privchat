@@ -1,0 +1,10 @@
+groups:
+  - name: privchat-timeline-dispatch
+    rules:
+      - alert: PrivChatTimelineDeliveryDead
+        expr: sum by (job) (increase(privchat_timeline_dispatch_dead_total[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: PrivChat timeline delivery entered DEAD
+          description: Check dispatch logs and client catch-up before attempting operator recovery.
