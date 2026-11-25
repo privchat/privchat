@@ -137,6 +137,15 @@ fn partition_dispatch_resolutions(
     (completions, offline_by_event)
 }
 
+#[derive(sqlx::FromRow)]
+pub(crate) struct RecoveryAudit {
+    pub(crate) event_id: i64,
+    pub(crate) user_id: i64,
+    pub(crate) channel_id: i64,
+    pub(crate) wire_channel_type: i16,
+    pub(crate) notified_sessions: Option<i32>,
+}
+
 #[derive(Clone)]
 pub struct DispatchOutboxStore {
     pool: Arc<PgPool>,
@@ -145,6 +154,74 @@ pub struct DispatchOutboxStore {
 impl DispatchOutboxStore {
     pub fn new(pool: Arc<PgPool>) -> Self {
         Self { pool }
+    }
+
+    pub(crate) async fn claim_recovery_hint(
+        &self,
+        request_id: uuid::Uuid,
+        event_id: i64,
+        user_id: i64,
+        key_fingerprint: &str,
+    ) -> Result<(RecoveryAudit, bool)> {
+        let inserted = sqlx::query_as::<_, RecoveryAudit>(
+            r#"
+            INSERT INTO privchat_timeline_recovery_audit
+              (request_id, event_id, user_id, channel_id, wire_channel_type, service_key_fingerprint, created_at)
+            SELECT $1, r.event_id, r.user_id, c.channel_id, c.channel_type + 1, $4, $5
+            FROM privchat_message_dispatch_recipient r
+            JOIN privchat_message_dispatch_outbox o ON o.event_id = r.event_id
+            JOIN privchat_channels c ON c.channel_id = o.channel_id
+            WHERE r.event_id = $2 AND r.user_id = $3 AND r.state = 3
+              AND ( (c.channel_type = 0 AND r.user_id IN (c.direct_user1_id, c.direct_user2_id))
+                 OR (c.channel_type = 1 AND EXISTS (
+                     SELECT 1 FROM privchat_group_members gm
+                     WHERE gm.group_id = c.group_id AND gm.user_id = r.user_id AND gm.left_at IS NULL
+                 )))
+            ON CONFLICT (request_id) DO NOTHING
+            RETURNING event_id, user_id, channel_id, wire_channel_type, notified_sessions
+            "#,
+        )
+        .bind(request_id)
+        .bind(event_id)
+        .bind(user_id)
+        .bind(key_fingerprint)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("record timeline recovery: {e}")))?;
+        if let Some(audit) = inserted {
+            return Ok((audit, true));
+        }
+        let previous = sqlx::query_as::<_, RecoveryAudit>(
+            "SELECT event_id, user_id, channel_id, wire_channel_type, notified_sessions
+             FROM privchat_timeline_recovery_audit WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("read timeline recovery audit: {e}")))?
+        .ok_or_else(|| ServerError::NotFound("Eligible dead recipient not found".into()))?;
+        if previous.event_id != event_id || previous.user_id != user_id {
+            return Err(ServerError::Duplicate("Recovery request ID already used".into()));
+        }
+        Ok((previous, false))
+    }
+
+    pub(crate) async fn record_recovery_result(
+        &self,
+        request_id: uuid::Uuid,
+        notified_sessions: i32,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE privchat_timeline_recovery_audit SET notified_sessions = $2
+             WHERE request_id = $1 AND notified_sessions IS NULL",
+        )
+        .bind(request_id)
+        .bind(notified_sessions)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| ServerError::Database(format!("complete timeline recovery audit: {e}")))?;
+        Ok(())
     }
 
     pub async fn claim_pending(
@@ -1362,6 +1439,64 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, 1);
+        cleanup(&store).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_only_claims_a_dead_current_recipient_once() {
+        let _fixture_guard = crate::database_fixture_lock().lock().await;
+        let Some(store) = open_store().await else { return };
+        seed_outbox(&store).await;
+
+        let id = uuid::Uuid::new_v4();
+        let claim = || store.claim_recovery_hint(id, EVENT_ID, RECIPIENT_ID, "test-fingerprint");
+        assert!(matches!(claim().await, Err(ServerError::NotFound(_))));
+        sqlx::query("UPDATE privchat_message_dispatch_recipient SET state = 3 WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(store.pool.as_ref())
+            .await
+            .unwrap();
+
+        // Two concurrent callers cannot both publish the same request.
+        let (a, b) = tokio::join!(claim(), claim());
+        let (row, first_a) = a.unwrap();
+        let (_, first_b) = b.unwrap();
+        assert_ne!(first_a, first_b);
+        assert_eq!((row.channel_id, row.wire_channel_type), (CHANNEL_ID, 1));
+        assert_eq!(row.notified_sessions, None);
+        store.record_recovery_result(id, 0).await.unwrap();
+        assert_eq!(claim().await.unwrap().0.notified_sessions, Some(0));
+        assert!(matches!(
+            store.claim_recovery_hint(id, EVENT_ID, SENDER_ID, "test-fingerprint").await,
+            Err(ServerError::Duplicate(_))
+        ));
+        // Keep the old DEAD row but change current channel membership.
+        sqlx::query("INSERT INTO privchat_users (user_id, username, display_name, qr_key) VALUES ($1, 'dispatch-other', 'Other', 'dispatch-other') ON CONFLICT (user_id) DO NOTHING")
+            .bind(RECIPIENT_ID + 9)
+            .execute(store.pool.as_ref())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE privchat_channels SET direct_user2_id = $2 WHERE channel_id = $1")
+            .bind(CHANNEL_ID)
+            .bind(RECIPIENT_ID + 9)
+            .execute(store.pool.as_ref())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.claim_recovery_hint(uuid::Uuid::new_v4(), EVENT_ID, RECIPIENT_ID, "test-fingerprint").await,
+            Err(ServerError::NotFound(_))
+        ));
+        let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM privchat_message_dispatch_recipient WHERE event_id = $1 AND state = 3")
+            .bind(EVENT_ID)
+            .fetch_one(store.pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(dead, 2, "hint recovery must not reset outbox state");
+        sqlx::query("DELETE FROM privchat_timeline_recovery_audit WHERE request_id = $1")
+            .bind(id)
+            .execute(store.pool.as_ref())
+            .await
+            .unwrap();
         cleanup(&store).await;
     }
 

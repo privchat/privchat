@@ -90,3 +90,25 @@ raw historical envelopes or reset attempts directly in PostgreSQL.
 
 The rule file does not configure Alertmanager or prove that notifications arrive.
 Verify firing, routing and resolution in the deployment environment.
+
+#### Targeted timeline recovery
+
+After the timeline dead-letter alert, locate the exact `event_id` and
+`user_id` in the dispatch log or database. Use the authenticated management
+listener and send `POST /api/service/messages/dispatch/recover`:
+
+```json
+{
+  "request_id": "2bb8c763-eecf-414d-8c41-64d093d85c8a",
+  "event_id": "9876505",
+  "user_id": "9876502"
+}
+```
+
+Use a new UUID for each deliberate attempt and the same UUID when retrying
+an uncertain HTTP response. `notified_sessions` counts online handoffs,
+not repaired messages; zero means none, and null means the result was not
+recorded. The DEAD row remains for diagnosis. Rust SDKs with timeline-hint
+support re-run normal authorized difference sync; other clients still use
+the regular catch-up path. This operation does not reconstruct an already
+corrupt or incorrectly advanced local cursor.

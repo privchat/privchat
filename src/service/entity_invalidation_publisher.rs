@@ -36,32 +36,8 @@ impl EntityInvalidationPublisher {
         if recipients.is_empty() || items.is_empty() {
             return Ok(());
         }
-        let notification_id = crate::infra::snowflake::next_message_id();
-        let committed_at_ms = chrono::Utc::now().timestamp_millis();
-        let batch = EntityInvalidationBatch::new_v1(notification_id, items, committed_at_ms)
-            .map_err(|error| crate::error::ServerError::Protocol(error.to_string()))?;
-        let payload = encode_message(&batch)
-            .map_err(|error| crate::error::ServerError::Protocol(error.to_string()))?;
-        let push = PushMessageRequest {
-            setting: MessageSetting::default(),
-            msg_key: format!("entity_invalidation_{notification_id}"),
-            server_message_id: notification_id,
-            message_seq: 0,
-            local_message_id: 0,
-            stream_no: String::new(),
-            stream_seq: 0,
-            stream_flag: 0,
-            timestamp: (committed_at_ms / 1_000).max(0) as u32,
-            channel_id: 0,
-            channel_type: 0,
-            message_type: ContentMessageType::System.as_u32(),
-            expire: 0,
-            topic: ENTITY_INVALIDATION_PUSH_TOPIC_V1.to_string(),
-            from_uid: 0,
-            payload,
-            deleted: false,
-        };
-
+        let push = Self::build_push(items)?;
+        let notification_id = push.server_message_id;
         let connection_manager = self.connection_manager.clone();
         stream::iter(recipients)
             .for_each_concurrent(50, |user_id| {
@@ -80,6 +56,52 @@ impl EntityInvalidationPublisher {
             })
             .await;
         Ok(())
+    }
+
+    fn build_push(items: Vec<EntityInvalidation>) -> Result<PushMessageRequest> {
+        let notification_id = crate::infra::snowflake::next_message_id();
+        let committed_at_ms = chrono::Utc::now().timestamp_millis();
+        let batch = EntityInvalidationBatch::new_v1(notification_id, items, committed_at_ms)
+            .map_err(|error| crate::error::ServerError::Protocol(error.to_string()))?;
+        let payload = encode_message(&batch)
+            .map_err(|error| crate::error::ServerError::Protocol(error.to_string()))?;
+        Ok(PushMessageRequest {
+            setting: MessageSetting::default(),
+            msg_key: format!("entity_invalidation_{notification_id}"),
+            server_message_id: notification_id,
+            message_seq: 0,
+            local_message_id: 0,
+            stream_no: String::new(),
+            stream_seq: 0,
+            stream_flag: 0,
+            timestamp: (committed_at_ms / 1_000).max(0) as u32,
+            channel_id: 0,
+            channel_type: 0,
+            message_type: ContentMessageType::System.as_u32(),
+            expire: 0,
+            topic: ENTITY_INVALIDATION_PUSH_TOPIC_V1.to_string(),
+            from_uid: 0,
+            payload,
+            deleted: false,
+        })
+    }
+
+    pub(crate) async fn publish_timeline_recovery(
+        &self,
+        user_id: u64,
+        channel_id: u64,
+        wire_type: i16,
+    ) -> Result<usize> {
+        let push = Self::build_push(vec![EntityInvalidation {
+            entity_type: "message_timeline".into(),
+            entity_id: None,
+            target_version: 0,
+            scope: Some(format!("{wire_type}:{channel_id}")),
+            mutation_hint: EntityMutationHint::Unknown,
+        }])?;
+        let report = self.connection_manager.send_push_to_user(user_id, &push).await
+            .map_err(|e| crate::error::ServerError::ServiceUnavailable(format!("Recovery hint dispatch failed: {e}")))?;
+        Ok(report.successful_sessions.len())
     }
 
     pub async fn publish_friend_change(

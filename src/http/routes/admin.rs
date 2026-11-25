@@ -185,6 +185,7 @@ pub fn create_route() -> Router<AdminServerState> {
         .route("/messages/broadcast", post(broadcast_message))
         .route("/messages/search", get(search_messages))
         // === P0: 系统运维 ===
+        .route("/messages/dispatch/recover", post(recover_timeline_recipient))
         .route("/system/health", get(health_check))
         .route("/system/ready", get(readiness_check))
         // === QR Login（spec QR_API §4）===
@@ -2333,6 +2334,57 @@ async fn get_online_count(
 // =====================================================
 // P0: 系统运维
 // =====================================================
+
+#[derive(Deserialize)]
+struct TimelineRecoveryRequest {
+    request_id: uuid::Uuid,
+    event_id: String,
+    user_id: String,
+}
+
+async fn recover_timeline_recipient(
+    State(state): State<AdminServerState>,
+    headers: HeaderMap,
+    Json(request): Json<TimelineRecoveryRequest>,
+) -> ApiResult<Value> {
+    verify_service_key(&headers, &state).await?;
+    let parse_id = |value: &str| {
+        value.parse::<i64>().ok().filter(|id| *id > 0)
+            .ok_or_else(|| ServerError::Validation("Invalid timeline recovery identifier".into()))
+    };
+    let event_id = parse_id(&request.event_id)?;
+    let user_id = parse_id(&request.user_id)?;
+    if request.request_id.is_nil() {
+        return Err(ServerError::Validation("Invalid timeline recovery request".into()));
+    }
+    let key_fingerprint = fingerprint(
+        headers.get("X-Service-Key").and_then(|key| key.to_str().ok())
+            .ok_or_else(|| ServerError::Unauthorized("Missing service key".into()))?,
+    );
+    let store = crate::service::committed_timeline_delivery_service::DispatchOutboxStore::new(
+        std::sync::Arc::new(state.readiness_db.clone()),
+    );
+    let (audit, fresh) = store.claim_recovery_hint(
+        request.request_id, event_id, user_id, &key_fingerprint,
+    ).await?;
+    let mut notified = audit.notified_sessions;
+    if fresh {
+        let publisher = crate::service::entity_invalidation_publisher::EntityInvalidationPublisher::new(
+            state.connection_manager.clone(),
+        );
+        let count = publisher.publish_timeline_recovery(
+            audit.user_id as u64, audit.channel_id as u64, audit.wire_channel_type,
+        ).await?;
+        let count = i32::try_from(count)
+            .map_err(|_| ServerError::Internal("Notification count exceeds range".into()))?;
+        store.record_recovery_result(request.request_id, count).await?;
+        notified = Some(count);
+    }
+    Ok(ApiEnvelope::ok(json!({
+        "request_id": request.request_id,
+        "notified_sessions": notified,
+    })))
+}
 
 /// 健康检查
 ///

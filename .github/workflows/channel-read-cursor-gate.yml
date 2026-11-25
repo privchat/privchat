@@ -84,6 +84,16 @@ jobs:
           ref: 213b99c6a2a3a7ea31821df21a850720939e648e
           path: privchat-protocol
 
+      - uses: actions/checkout@v4
+        with:
+          repository: google/flatbuffers
+          ref: v24.3.25
+          path: flatbuffers
+      - name: Build pinned FlatBuffers compiler
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/flatbuffers" -B "$RUNNER_TEMP/flatc-build" -DFLATBUFFERS_BUILD_TESTS=OFF
+          cmake --build "$RUNNER_TEMP/flatc-build" --target flatc --parallel 2
+          echo "$RUNNER_TEMP/flatc-build" >> "$GITHUB_PATH"
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
