@@ -71,6 +71,11 @@ jobs:
         with:
           workspaces: privchat-server
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+
       - name: Apply compile schema and build Server
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE privchat_sd06_gate;'
@@ -97,9 +102,8 @@ jobs:
           fetch alertmanager 0.35.0 6c7752a903c40c8a749e0b29df9240437e4fbb8228068d0af8807377db32addd
           echo "PROMETHEUS_BIN=$RUNNER_TEMP/prometheus-3.16.0.linux-amd64/prometheus" >>"$GITHUB_ENV"
           echo "ALERTMANAGER_BIN=$RUNNER_TEMP/alertmanager-0.35.0.linux-amd64/alertmanager" >>"$GITHUB_ENV"
-          id=$(docker create quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z)
-          trap 'docker rm "$id" >/dev/null' EXIT
-          docker cp "$id:/usr/bin/minio" "$RUNNER_TEMP/minio"
+          GOBIN="$RUNNER_TEMP" GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
+            go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648
           echo "$RUNNER_TEMP" >>"$GITHUB_PATH"
       - name: Verify independent dependency outages and notifications
         run: |
