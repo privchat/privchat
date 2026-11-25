@@ -11,6 +11,13 @@ for offset in 0 1 2 3 4 5; do
     echo "Fixture port is in use; choose another base, never stop the owner" >&2; exit 1
   fi
 done
+download_port="${PRIVCHAT_FEATURE_DOWNLOAD_PORT:-}"
+if [[ -n "$download_port" ]]; then
+  [[ "$download_port" =~ ^[0-9]+$ ]] && (( download_port >= 30000 && download_port <= 65535 ))
+  if (( download_port >= base && download_port <= base+5 )) || lsof -nP -iTCP:"$download_port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+    echo "Fixture download port is in use; choose another port" >&2; exit 1
+  fi
+fi
 if lsof -nP -iUDP:$((base+2)) -t >/dev/null 2>&1; then
   echo "Fixture QUIC port is in use; choose another base, never stop the owner" >&2; exit 1
 fi
@@ -29,6 +36,7 @@ psql="${PSQL:-/opt/homebrew/opt/postgresql@16/bin/psql}"
 "$psql" postgres -X -v ON_ERROR_STOP=1 -c "CREATE DATABASE $database" > "$root/create.log"
 printf '%s\n' "$database" > "$root/db-name"
 export FEATURE_ROOT="$root" FEATURE_BASE="$base" FEATURE_DATABASE="$database"
+export FEATURE_DOWNLOAD_PORT="$download_port"
 (cd "$root" && "$binary" generate-config "$root/config.toml") > "$root/generate.log" 2>&1
 node - <<'JS'
 const fs=require('node:fs'), path=require('node:path');
@@ -51,6 +59,9 @@ key('admin','host','"127.0.0.1"');key('admin','port',String(base+4));
 key('file','server_host','"127.0.0.1"');key('file','server_port',String(base+3));
 key('file','server_api_base_url',JSON.stringify(`http://127.0.0.1:${base+3}/api/app`));
 text=text.replace(/^storage_root\s*=.*$/gm,'storage_root = '+JSON.stringify(path.join(root,'storage')));
+if (process.env.FEATURE_DOWNLOAD_PORT) {
+  text=text.replace(/^base_url\s*=.*$/m, 'base_url = '+JSON.stringify('http://127.0.0.1:'+process.env.FEATURE_DOWNLOAD_PORT));
+}
 key('logging','file',JSON.stringify(path.join(root,'logs/server.log')));
 key('system_message','auto_create_channel','false');key('system_message','auto_send_welcome','false');
 key('call','enabled','true');key('call.peer','enabled','true');key('call.peer','allow_turn','false');
