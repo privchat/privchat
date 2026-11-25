@@ -1,0 +1,115 @@
+name: observability-gate
+
+on:
+  pull_request:
+    paths: &gate_paths
+      - "src/**"
+      - "deploy/prometheus/dependencies.rules.yml"
+      - "scripts/acceptance/observability-*"
+      - ".github/workflows/observability-gate.yml"
+      - "migrations/**"
+      - "Cargo.*"
+      - "build.rs"
+  push:
+    branches: [main]
+    paths: *gate_paths
+
+jobs:
+  observability-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: privchat-server
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: privchat_sd06_compile
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d privchat_sd06_compile"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/privchat_sd06_compile
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: privchat-server
+      - uses: actions/checkout@v4
+        with:
+          repository: zoujiaqing/msgtrans
+          ref: 2c3086dc3b12da75aa20f0fbec448620b9a126e9
+          path: msgtrans
+      - uses: actions/checkout@v4
+        with:
+          repository: privchat/privchat-protocol
+          ref: 213b99c6a2a3a7ea31821df21a850720939e648e
+          path: privchat-protocol
+
+      - uses: actions/checkout@v4
+        with:
+          repository: google/flatbuffers
+          ref: v24.3.25
+          path: flatbuffers
+      - name: Build pinned FlatBuffers compiler
+        run: |
+          cmake -S "$GITHUB_WORKSPACE/flatbuffers" -B "$RUNNER_TEMP/flatc-build" -DFLATBUFFERS_BUILD_TESTS=OFF
+          cmake --build "$RUNNER_TEMP/flatc-build" --target flatc --parallel 2
+          echo "$RUNNER_TEMP/flatc-build" >> "$GITHUB_PATH"
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: privchat-server
+
+      - name: Apply compile schema and build Server
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE privchat_sd06_gate;'
+          for schema in migrations/*.sql; do
+            case "$schema" in migrations/000_*) continue ;; esac
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$schema"
+          done
+          cargo build --bin privchat
+      - name: Install fixture and monitoring binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server postgresql-client
+          command -v aws
+          cd "$RUNNER_TEMP"
+          fetch() {
+            local repo=$1 version=$2 checksum=$3 archive
+            archive="$repo-$version.linux-amd64.tar.gz"
+            curl --fail --silent --show-error --location --retry 2 --max-time 120 \
+              "https://github.com/prometheus/$repo/releases/download/v$version/$archive" -o "$archive"
+            echo "$checksum  $archive" | sha256sum -c -
+            tar -xzf "$archive"
+          }
+          fetch prometheus 3.16.0 68727009472a2c02e1ff7f062fd5b3e637285bffc8fc2d340c76fb449d6e0f34
+          fetch alertmanager 0.35.0 6c7752a903c40c8a749e0b29df9240437e4fbb8228068d0af8807377db32addd
+          echo "PROMETHEUS_BIN=$RUNNER_TEMP/prometheus-3.16.0.linux-amd64/prometheus" >>"$GITHUB_ENV"
+          echo "ALERTMANAGER_BIN=$RUNNER_TEMP/alertmanager-0.35.0.linux-amd64/alertmanager" >>"$GITHUB_ENV"
+          id=$(docker create quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z)
+          trap 'docker rm "$id" >/dev/null' EXIT
+          docker cp "$id:/usr/bin/minio" "$RUNNER_TEMP/minio"
+          echo "$RUNNER_TEMP" >>"$GITHUB_PATH"
+      - name: Verify independent dependency outages and notifications
+        run: |
+          export DATABASE_URL="${DATABASE_URL%/*}/privchat_sd06_gate"
+          export TMPDIR="$RUNNER_TEMP/observability-gate"
+          mkdir "$TMPDIR"
+          bash scripts/acceptance/observability-gate.sh target/debug/privchat
+      - name: Show process diagnostics on failure
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP"/observability-gate/*/{migrate,minio,prometheus,alertmanager,webhook}.log; do
+            if [[ -f "$log" ]]; then echo "== $log =="; tail -15 "$log"; fi
+          done

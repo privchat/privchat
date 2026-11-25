@@ -88,6 +88,16 @@ impl RedisClient {
         self.pool.state()
     }
 
+    pub(crate) async fn probe(&self) -> bool {
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let reply: redis::RedisResult<String> = conn.ping().await;
+            Ok(matches!(reply.as_deref(), Ok("PONG")))
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// 从连接池获取连接
     async fn get_conn(
         &self,

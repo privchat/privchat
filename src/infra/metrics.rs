@@ -86,6 +86,7 @@ const COUNTER_OFFLINE_ENQUEUE: &str = "privchat_offline_enqueue_total";
 /// 累计被 A→B 二次校验过滤掉的 session 次数（带 reason label）
 const COUNTER_DELIVERY_FILTERED: &str = "privchat_delivery_filtered_total";
 const COUNTER_DISPATCH_DEAD: &str = "privchat_timeline_dispatch_dead_total";
+const DEPENDENCY_DURATION: &str = "privchat_dependency_probe_duration_seconds";
 /// Session-level delivery failures by bounded classification.
 const COUNTER_DELIVERY_FAILURE_SESSIONS: &str = "privchat_delivery_failure_sessions_total";
 
@@ -105,6 +106,11 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             CONN_AUTH_BUCKETS,
         )
         .map_err(|e| format!("authenticate bucket config: {e}"))?
+        .set_buckets_for_metric(
+            Matcher::Full(DEPENDENCY_DURATION.to_string()),
+            CONN_AUTH_BUCKETS,
+        )
+        .map_err(|e| format!("dependency probe bucket config: {e}"))?
         .install_recorder()?;
     HANDLE
         .set(handle)
@@ -117,6 +123,49 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 pub(crate) fn record_dispatch_dead(reason: &'static str, count: u64) {
     metrics::counter!(COUNTER_DISPATCH_DEAD, "reason" => reason).increment(count);
+}
+
+pub(crate) async fn observe_dependency(
+    dependency: &'static str,
+    probe: impl std::future::Future<Output = bool>,
+) {
+    let started = std::time::Instant::now();
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+        Ok(true) => "ok",
+        Ok(false) => "error",
+        Err(_) => "timeout",
+    };
+    metrics::gauge!("privchat_dependency_up", "dependency" => dependency)
+        .set(if result == "ok" { 1.0 } else { 0.0 });
+    metrics::counter!("privchat_dependency_probes_total", "dependency" => dependency, "result" => result)
+        .increment(1);
+    metrics::histogram!(DEPENDENCY_DURATION, "dependency" => dependency)
+        .record(started.elapsed().as_secs_f64());
+}
+
+pub(crate) async fn sample_dispatch_backlog(pool: &sqlx::PgPool) {
+    // Match the (status, created_at) index and bound the work even during a backlog.
+    let sample = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT count(*), min(created_at) FROM (
+                SELECT created_at FROM privchat_message_dispatch_outbox
+                WHERE status = 0 ORDER BY created_at LIMIT 1000
+            ) AS pending",
+        )
+        .fetch_one(pool),
+    )
+    .await;
+    let up = metrics::gauge!("privchat_timeline_dispatch_backlog_sample_ok");
+    match sample {
+        Ok(Ok((count, oldest))) => {
+            let age = oldest.map_or(0, |ts| (chrono::Utc::now().timestamp_millis() - ts).max(0));
+            metrics::gauge!("privchat_timeline_dispatch_pending_events").set(count as f64);
+            metrics::gauge!("privchat_timeline_dispatch_oldest_pending_seconds").set(age as f64 / 1000.);
+            up.set(1.);
+        }
+        _ => up.set(0.),
+    }
 }
 
 /// 是否已初始化（可供 /metrics 使用）

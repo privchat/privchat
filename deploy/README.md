@@ -91,7 +91,36 @@ raw historical envelopes or reset attempts directly in PostgreSQL.
 The rule file does not configure Alertmanager or prove that notifications arrive.
 Verify firing, routing and resolution in the deployment environment.
 
-#### Targeted timeline recovery
+### Dependency and dispatch observability
+
+Load `prometheus/dependencies.rules.yml` with the existing Prometheus rules.
+`PrivChatDependencyUnavailable` fires after 30s of failed probes and identifies
+`redis` or `object_storage` independently. Configure `send_resolved: true` in the
+actual receiver integration. Verify that the same alert reaches the normal
+on-call destination in both states; an Alertmanager UI status or a successful
+test webhook does not establish delivery to that destination. Use a staging
+target or a scheduled, clearly labeled canary through the actual routing tree.
+Do not suspend production Redis or S3 to test notifications.
+
+The management `/api/service/system/ready` endpoint still tests PostgreSQL
+only. It can return 200 while either dependency is degraded. Scrape `/metrics`
+internally, and monitor Prometheus `up` for lost scrapes separately; a missing
+probe series is not a healthy probe.
+
+| Signal | Interpretation |
+| --- | --- |
+| `privchat_dependency_up`, `privchat_dependency_probes_total` | Last outcome and counts by dependency and bounded result (`ok`, `error`, `timeout`). Probes run every 15s with a 2s deadline. |
+| `privchat_dependency_probe_duration_seconds_bucket` | Redis PING and default S3 list latency. Use `histogram_quantile(0.95, sum by (dependency, le) (rate(privchat_dependency_probe_duration_seconds_bucket[5m])))` for a fleet view. |
+| `privchat_timeline_dispatch_pending_events`, `privchat_timeline_dispatch_oldest_pending_seconds` | Durable pending outbox events and age of oldest, not recipient count. Depth caps at 1,000; at that value read it as 1,000+. Check `privchat_timeline_dispatch_backlog_sample_ok == 1` before using either value. Replicas sampling the same database should use max, not sum. |
+| `privchat_offline_queue_depth`, `privchat_offline_fallback_total`, `privchat_rpc_requests_total{result="error"}`, `privchat_delivery_failure_sessions_total` | Existing process-local backlog and error indicators; they do not replace the durable outbox gauges. |
+
+The S3 probe uses a read-only one-entry list through the configured default
+OpenDAL source and requires list access to that prefix. It is not emitted for
+local storage and does not prove write, CDN, resume, or secondary-source
+availability. No bucket names, object keys, credentials or request errors are
+used as labels.
+
+### Targeted timeline recovery
 
 After the timeline dead-letter alert, locate the exact `event_id` and
 `user_id` in the dispatch log or database. Use the authenticated management

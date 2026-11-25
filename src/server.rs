@@ -2465,6 +2465,31 @@ impl ChatServer {
             info!("📊 Prometheus 指标已启用，GET /metrics 可用");
             // G10 soak 需要：每 5s 采一次 tokio 存活 task 数写入 gauge。
             crate::infra::metrics::spawn_tokio_task_sampler(5);
+
+            let redis = self.redis_client.clone();
+            let files = self.file_service.clone();
+            let database = self.database.clone();
+            tokio::spawn(async move {
+                use crate::infra::metrics::{observe_dependency, sample_dispatch_backlog};
+                let mut interval = tokio::time::interval(Duration::from_secs(15));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    tokio::join!(
+                        async {
+                            if let Some(redis) = &redis {
+                                observe_dependency("redis", redis.probe()).await;
+                            }
+                        },
+                        async {
+                            if files.default_source_is_s3() {
+                                observe_dependency("object_storage", files.probe_default_object_store()).await;
+                            }
+                        },
+                        sample_dispatch_backlog(database.pool()),
+                    );
+                }
+            });
         }
 
         // ---- 文件服务（对外） ----

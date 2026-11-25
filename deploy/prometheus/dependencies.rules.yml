@@ -1,0 +1,11 @@
+groups:
+  - name: privchat-dependencies
+    rules:
+      - alert: PrivChatDependencyUnavailable
+        expr: privchat_dependency_up == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: 'PrivChat {{ $labels.dependency }} probe failed'
+          description: Check the dependency probe error and latency metrics and confirm recovery.

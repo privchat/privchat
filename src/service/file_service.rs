@@ -742,6 +742,26 @@ impl FileService {
         self.s3_direct.read().unwrap().clone()
     }
 
+    pub(crate) fn default_source_is_s3(&self) -> bool {
+        self.sources_by_id
+            .get(&self.default_storage_source_id)
+            .is_some_and(|source| source.storage_type == "s3")
+    }
+
+    pub(crate) async fn probe_default_object_store(&self) -> bool {
+        use futures::TryStreamExt as _;
+
+        let Ok(operator) = self.operator_for_source(self.default_storage_source_id).await else {
+            return false;
+        };
+        // A one-entry list exercises actual bucket credentials and the configured prefix.
+        // An empty bucket is healthy; a missing bucket or denied listing is not.
+        match operator.lister_with("/").limit(1).await {
+            Ok(mut entries) => entries.try_next().await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
     /// 测试钩子：替换接线里的后端/探测为 fake（生产接线的构建逻辑仍走 `init`，
     /// 测试只替换执行体，不改判定路径）。
     pub fn install_s3_direct(&self, wiring: S3DirectUploadWiring) {
