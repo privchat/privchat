@@ -93,17 +93,61 @@ long-run soak testing, backup/DR runbooks, message-body E2EE, voice/video. See
 
 ## 🚀 Quick Start
 
-### 1. Dependencies
+### 1. Tools and source checkout
+
+Install Git, Rust (stable via [rustup](https://rustup.rs/)), a C/C++ toolchain,
+OpenSSL (`openssl` CLI), `curl`, PostgreSQL 16 with `psql` and `createdb`, and Redis 7.
+For protocol code generation, use `flatc` **24.3.25** on `PATH`
+(`flatc --version`). If you need to build it, use CMake and the
+[v24.3.25 FlatBuffers release](https://github.com/google/flatbuffers/tree/v24.3.25):
 
 ```bash
-# Install Rust (if needed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Clone and build (the produced binary is named `privchat`)
-git clone <repository-url>
-cd privchat
-cargo build --release          # → ./target/release/privchat
+git clone --depth 1 --branch v24.3.25 https://github.com/google/flatbuffers.git
+cmake -S flatbuffers -B flatbuffers/build -DFLATBUFFERS_BUILD_TESTS=OFF
+cmake --build flatbuffers/build --target flatc --parallel 2
+export PATH="$PWD/flatbuffers/build:$PATH"
 ```
+
+From an empty source directory, check out three sibling repositories. The
+dependency commits below are the ones used by Server CI; do not substitute
+the latest branch heads.
+
+```bash
+git clone --depth 1 https://github.com/privchat/privchat.git
+git init -q msgtrans
+git -C msgtrans fetch --depth 1 https://github.com/zoujiaqing/msgtrans.git 2c3086dc3b12da75aa20f0fbec448620b9a126e9
+git -C msgtrans checkout --detach FETCH_HEAD
+git init -q privchat-protocol
+git -C privchat-protocol fetch --depth 1 https://github.com/privchat/privchat-protocol.git 213b99c6a2a3a7ea31821df21a850720939e648e
+git -C privchat-protocol checkout --detach FETCH_HEAD
+cd privchat
+```
+
+### 2. Prepare the compile schema and build
+
+Start local PostgreSQL and Redis first. Set `PG_BASE` to your local PostgreSQL
+URI **without a database name**; use a role that can create databases. Use two
+fresh databases: SQLx checks queries against `privchat_build` during compilation,
+while `privchat` stays empty until the binary runs its migrations.
+
+```bash
+PG_BASE=${PG_BASE:-postgresql://127.0.0.1:5432}
+createdb --maintenance-db="$PG_BASE/postgres" privchat_build
+createdb --maintenance-db="$PG_BASE/postgres" privchat
+BUILD_DATABASE_URL="$PG_BASE/privchat_build"
+(
+  set -e
+  for migration in migrations/*.sql; do
+    case "$migration" in migrations/000_*) continue ;; esac
+    psql "$BUILD_DATABASE_URL" -X -v ON_ERROR_STOP=1 -f "$migration"
+  done
+  DATABASE_URL="$BUILD_DATABASE_URL" cargo build --bin privchat
+)
+```
+
+The SQL loop is only for the disposable build database. For an optimized
+binary, add `--release` to the same Cargo command and use `target/release/privchat`
+instead of `target/debug/privchat` below.
 
 > **Migrations are embedded into the binary at build time.** `build.rs`
 > scans `migrations/*.sql` (skipping `000_`-prefixed reset scripts), sorts
@@ -111,15 +155,27 @@ cargo build --release          # → ./target/release/privchat
 > new migration therefore requires a rebuild before `privchat migrate` can
 > apply it — there is no runtime SQL-directory read.
 
-### 2. Configure .env
+### 3. Configure local services
 
-Copy the template and fill in real values (`.env` is git-ignored; see
+Create a local `.env` with fresh secrets (git ignores it; see
 [`SECRETS.md`](SECRETS.md) for the full key list and rotation rules):
 
 ```bash
-cp .env.example .env
-# edit .env: DATABASE_URL, PRIVCHAT_JWT_SECRET, SERVICE_MASTER_KEY, REDIS_URL
+umask 077
+cat > .env <<EOF
+DATABASE_URL=$PG_BASE/privchat
+REDIS_URL=${LOCAL_REDIS_URL:-redis://127.0.0.1:6379}
+PRIVCHAT_JWT_SECRET=$(openssl rand -hex 32)
+SERVICE_MASTER_KEY=$(openssl rand -hex 32)
+EOF
+./target/debug/privchat generate-config quickstart.toml
+awk '{gsub(/0\.0\.0\.0/, "127.0.0.1"); print}
+     /^\[admin\]$/ {print "host = \"127.0.0.1\""}' quickstart.toml > config.toml
 ```
+
+This is for a fresh development checkout. The example binds to loopback and
+uses the default ports (9001, 9080, 9083, 9090); leave them free or edit
+`config.toml` and update the smoke check below.
 
 Hard-required (startup aborts if any is empty — see `Config::validate`):
 `DATABASE_URL`, `SERVICE_MASTER_KEY`, `REDIS_URL`. JWT signing config is also
@@ -127,14 +183,14 @@ needed for auth — `PRIVCHAT_JWT_SECRET` for HS256, or
 `PRIVCHAT_JWT_PRIVATE_KEY_PATH` / `PRIVCHAT_JWT_PUBLIC_KEY_PATH` for RS256
 (production uses RS256 + JWKS).
 
-### 3. Initialize database
+### 4. Initialize the runtime database
 
 Schema changes run through the binary's own `migrate` subcommand — **not**
 sqlx-cli. It connects with `DATABASE_URL`, creates a `privchat_migrations`
 tracking table, and applies every embedded migration not yet recorded:
 
 ```bash
-./target/release/privchat migrate
+./target/debug/privchat --config-file config.toml migrate
 ```
 
 This is the **only** supported path for schema changes; never apply SQL by
@@ -155,15 +211,23 @@ Both helper shell scripts delegate to the same binary migration runner.
 set -a && source .env && set +a                              # load DATABASE_URL for psql
 psql "$DATABASE_URL" -f migrations/000_drop_all_tables.sql   # 000_ is skipped by migrate; dev reset only
 psql "$DATABASE_URL" -c "DROP TABLE IF EXISTS privchat_migrations;"
-./target/release/privchat migrate
+./target/debug/privchat --config-file config.toml migrate
 ```
 
-### 4. Start server
+### 5. Start and smoke-check the server
 
 ```bash
-./target/release/privchat                                      # default config.toml
-./target/release/privchat --dev
-./target/release/privchat --config-file /etc/privchat/config.toml
+./target/debug/privchat --config-file config.toml
+```
+
+In another terminal, from the same checkout, verify PostgreSQL readiness and
+the metrics listener:
+
+```bash
+(set -a; . ./.env; set +a
+ curl --fail --silent --show-error -H "X-Service-Key: $SERVICE_MASTER_KEY" \
+   http://127.0.0.1:9090/api/service/system/ready)
+curl --fail --silent --show-error http://127.0.0.1:9083/metrics
 ```
 
 Graceful shutdown: `SIGINT` (Ctrl-C) or `SIGTERM` stops accepting new

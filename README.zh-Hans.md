@@ -89,48 +89,97 @@ PrivChat 致力于打造一个**安全、高性能、功能完整**的现代即�
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 1. 安装工具并检出源码
+
+安装 Git、Rust（通过 [rustup](https://rustup.rs/) 安装 stable）、C/C++ 工具链、
+OpenSSL（`openssl` 命令）、`curl`、PostgreSQL 16（含 `psql`、`createdb`）和 Redis 7。
+协议代码生成需要在 `PATH` 上使用 `flatc` **24.3.25**（用 `flatc --version` 确认）。
+如需自行构建，使用 CMake 和 [FlatBuffers v24.3.25](https://github.com/google/flatbuffers/tree/v24.3.25)：
 
 ```bash
-# 安装 Rust (如果还没有安装)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# 克隆项目（产物二进制名为 privchat）
-git clone <repository-url>
-cd privchat
-
-# 构建项目 → ./target/release/privchat
-cargo build --release
+git clone --depth 1 --branch v24.3.25 https://github.com/google/flatbuffers.git
+cmake -S flatbuffers -B flatbuffers/build -DFLATBUFFERS_BUILD_TESTS=OFF
+cmake --build flatbuffers/build --target flatc --parallel 2
+export PATH="$PWD/flatbuffers/build:$PATH"
 ```
+
+从空的源码目录开始，把三个仓库检出到同一层。下列依赖提交与 Server CI 一致，
+不要替换为依赖仓库的最新分支头。
+
+```bash
+git clone --depth 1 https://github.com/privchat/privchat.git
+git init -q msgtrans
+git -C msgtrans fetch --depth 1 https://github.com/zoujiaqing/msgtrans.git 2c3086dc3b12da75aa20f0fbec448620b9a126e9
+git -C msgtrans checkout --detach FETCH_HEAD
+git init -q privchat-protocol
+git -C privchat-protocol fetch --depth 1 https://github.com/privchat/privchat-protocol.git 213b99c6a2a3a7ea31821df21a850720939e648e
+git -C privchat-protocol checkout --detach FETCH_HEAD
+cd privchat
+```
+
+### 2. 准备编译用库并构建
+
+先启动本地 PostgreSQL 和 Redis。将 `PG_BASE` 设为**不含库名**的本地 PostgreSQL
+连接地址，使用可建库的角色。准备两个新库：SQLx 在编译时查询 `privchat_build` 的
+表结构，运行库 `privchat` 保持为空，由二进制执行正式迁移。
+
+```bash
+PG_BASE=${PG_BASE:-postgresql://127.0.0.1:5432}
+createdb --maintenance-db="$PG_BASE/postgres" privchat_build
+createdb --maintenance-db="$PG_BASE/postgres" privchat
+BUILD_DATABASE_URL="$PG_BASE/privchat_build"
+(
+  set -e
+  for migration in migrations/*.sql; do
+    case "$migration" in migrations/000_*) continue ;; esac
+    psql "$BUILD_DATABASE_URL" -X -v ON_ERROR_STOP=1 -f "$migration"
+  done
+  DATABASE_URL="$BUILD_DATABASE_URL" cargo build --bin privchat
+)
+```
+
+SQL 循环仅用于临时编译库。如需优化构建，给同一条 Cargo 命令加 `--release`，
+并把后续的 `target/debug/privchat` 换为 `target/release/privchat`。
 
 > **迁移在构建期被编译进二进制。** `build.rs` 扫描 `migrations/*.sql`
 > （跳过 `000_` 前缀的重置脚本），按文件名排序后生成 `MIGRATIONS` 常量。
 > 新增迁移文件后必须重新 `cargo build`，`privchat migrate` 才能应用它——
 > 运行期不会读取 SQL 目录。
 
-### 2. 配置 .env
+### 3. 配置本地服务
 
-复制模板并填入真实值（`.env` 已被 git 忽略；完整 key 列表与轮换规则见
+生成本地 `.env` 和随机密钥（`.env` 已被 git 忽略；完整 key 列表与轮换规则见
 [`SECRETS.md`](SECRETS.md)）：
 
 ```bash
-cp .env.example .env
-# 编辑 .env：DATABASE_URL、PRIVCHAT_JWT_SECRET、SERVICE_MASTER_KEY、REDIS_URL
+umask 077
+cat > .env <<EOF
+DATABASE_URL=$PG_BASE/privchat
+REDIS_URL=${LOCAL_REDIS_URL:-redis://127.0.0.1:6379}
+PRIVCHAT_JWT_SECRET=$(openssl rand -hex 32)
+SERVICE_MASTER_KEY=$(openssl rand -hex 32)
+EOF
+./target/debug/privchat generate-config quickstart.toml
+awk '{gsub(/0\.0\.0\.0/, "127.0.0.1"); print}
+     /^\[admin\]$/ {print "host = \"127.0.0.1\""}' quickstart.toml > config.toml
 ```
+
+以上命令适用于新检出的开发目录。示例仅监听回环地址，使用默认端口
+（9001、9080、9083、9090）；请保证端口可用，或修改 `config.toml` 和下方检查命令。
 
 强制必填（任一为空则启动中止，见 `Config::validate`）：`DATABASE_URL`、
 `SERVICE_MASTER_KEY`、`REDIS_URL`。此外鉴权需要 JWT 签名配置——HS256 用
 `PRIVCHAT_JWT_SECRET`，RS256 用 `PRIVCHAT_JWT_PRIVATE_KEY_PATH` /
 `PRIVCHAT_JWT_PUBLIC_KEY_PATH`（生产使用 RS256 + JWKS）。
 
-### 3. 初始化数据库
+### 4. 初始化运行库
 
 表结构变更走二进制自带的 `migrate` 子命令——**不是** sqlx-cli。它用
 `DATABASE_URL` 连接，创建 `privchat_migrations` 跟踪表，并应用每一条尚未
 记录的内嵌迁移：
 
 ```bash
-./target/release/privchat migrate
+./target/debug/privchat --config-file config.toml migrate
 ```
 
 这是**唯一**受支持的表结构变更方式；生产环境严禁手工执行 SQL。
@@ -148,20 +197,22 @@ cp .env.example .env
 set -a && source .env && set +a                              # 为 psql 加载 DATABASE_URL
 psql "$DATABASE_URL" -f migrations/000_drop_all_tables.sql   # 000_ 被 migrate 跳过，仅供开发重置
 psql "$DATABASE_URL" -c "DROP TABLE IF EXISTS privchat_migrations;"
-./target/release/privchat migrate
+./target/debug/privchat --config-file config.toml migrate
 ```
 
-### 4. 启动服务
+### 5. 启动并验证服务
 
 ```bash
-# 使用默认配置启动
-./target/release/privchat
+./target/debug/privchat --config-file config.toml
+```
 
-# 启用开发模式（调试日志 + 漂亮输出）
-./target/release/privchat --dev
+在另一个终端进入同一检出目录，检查 PostgreSQL 就绪状态和指标接口：
 
-# 指定配置文件
-./target/release/privchat --config-file /etc/privchat/config.toml
+```bash
+(set -a; . ./.env; set +a
+ curl --fail --silent --show-error -H "X-Service-Key: $SERVICE_MASTER_KEY" \
+   http://127.0.0.1:9090/api/service/system/ready)
+curl --fail --silent --show-error http://127.0.0.1:9083/metrics
 ```
 
 > 优雅关闭：`SIGINT`（Ctrl-C）或 `SIGTERM` 会停止接受新连接、刷写待落盘的
