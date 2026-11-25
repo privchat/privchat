@@ -614,128 +614,12 @@ impl SyncService {
         Ok(response)
     }
 
-    /// 处理获取差异请求 ⭐
-    ///
     /// RPC: sync/get_difference
-    ///
-    /// 流程：
-    /// 1. 先查 Redis 缓存
-    /// 2. Cache Miss 时查数据库
-    /// 3. 获取当前 pts
-    /// 4. 检查是否还有更多
-    /// 5. 返回响应
     pub async fn handle_get_difference(
         &self,
         req: GetDifferenceRequest,
     ) -> Result<GetDifferenceResponse> {
-        let limit = req.limit.unwrap_or(100);
-
-        info!(
-            "收到差异拉取请求: channel_id={}, channel_type={}, last_pts={}, limit={}",
-            req.channel_id, req.channel_type, req.last_pts, limit
-        );
-
-        // 1. 获取当前 pts，用于 recoverability 判断 ⭐
-        let current_pts = match self.cache.get_pts_from_cache(req.channel_id).await? {
-            Some(cached_pts) => cached_pts,
-            None => {
-                let db_pts = self.pts_dao.get_current_pts(req.channel_id).await?;
-                self.cache.cache_pts(req.channel_id, db_pts).await?;
-                db_pts
-            }
-        };
-
-        if req.last_pts > current_pts {
-            return Err(crate::error::ServerError::ChannelResyncRequired(format!(
-                "client last_pts {} is ahead of server current_pts {} for channel {}",
-                req.last_pts, current_pts, req.channel_id
-            )));
-        }
-
-        // 2. 先查 Redis 缓存（快）⭐
-        let commits = match self
-            .cache
-            .query_commits_from_cache(req.channel_id, req.last_pts, limit)
-            .await?
-        {
-            Some(cached_commits)
-                if !cached_commits.is_empty() && cached_commits[0].pts == req.last_pts + 1 =>
-            {
-                // 缓存命中且连续：第一条 pts 紧接 last_pts
-                info!("✅ 缓存命中: 返回 {} 条 commits", cached_commits.len());
-                cached_commits
-            }
-            Some(cached_commits) => {
-                // 缓存 partial hit：有数据但不连续（被淘汰了旧条目），回退数据库
-                info!(
-                    "⚠️  缓存 partial hit: 返回 {} 条但首条 pts={} != expected {}，回退数据库",
-                    cached_commits.len(),
-                    cached_commits.first().map(|c| c.pts).unwrap_or(0),
-                    req.last_pts + 1
-                );
-                self.commit_dao
-                    .query_commits(req.channel_id, req.last_pts, limit)
-                    .await?
-            }
-            None => {
-                // 2. Cache Miss，查数据库 ⭐
-                info!("⚠️  缓存未命中，查询数据库");
-                let db_commits = self
-                    .commit_dao
-                    .query_commits(req.channel_id, req.last_pts, limit)
-                    .await?;
-
-                // 异步更新缓存（可选）
-                if !db_commits.is_empty() {
-                    let cache = self.cache.clone();
-                    let commits_clone = db_commits.clone();
-                    tokio::spawn(async move {
-                        let _ = cache.batch_cache_commits(&commits_clone).await;
-                    });
-                }
-
-                db_commits
-            }
-        };
-
-        let expected_next_pts = req.last_pts.saturating_add(1);
-        if current_pts > req.last_pts {
-            if commits.is_empty() {
-                return Err(crate::error::ServerError::ChannelResyncRequired(format!(
-                    "message history window unavailable: channel={} last_pts={} current_pts={}",
-                    req.channel_id, req.last_pts, current_pts
-                )));
-            }
-            if let Some(first_commit) = commits.first() {
-                if first_commit.pts != expected_next_pts {
-                    return Err(crate::error::ServerError::ChannelResyncRequired(format!(
-                        "non-contiguous difference: channel={} last_pts={} first_pts={} expected={}",
-                        req.channel_id, req.last_pts, first_commit.pts, expected_next_pts
-                    )));
-                }
-            }
-        }
-
-        // 3. 检查是否还有更多 ⭐
-        let has_more = if let Some(last_commit) = commits.last() {
-            last_commit.pts < current_pts
-        } else {
-            false
-        };
-
-        info!(
-            "✅ 差异拉取完成: 返回 {} 条 commits, has_more={}, current_pts={}",
-            commits.len(),
-            has_more,
-            current_pts
-        );
-
-        // 4. 返回响应
-        Ok(GetDifferenceResponse {
-            commits,
-            current_pts,
-            has_more,
-        })
+        load_difference_page(&self.pts_dao, &self.commit_dao, &self.cache, &req).await
     }
 
     /// 处理获取频道 pts 请求 ⭐
@@ -745,15 +629,7 @@ impl SyncService {
         &self,
         req: GetChannelPtsRequest,
     ) -> Result<GetChannelPtsResponse> {
-        // 先查缓存
-        let current_pts = match self.cache.get_pts_from_cache(req.channel_id).await? {
-            Some(cached_pts) => cached_pts,
-            None => {
-                let db_pts = self.pts_dao.get_current_pts(req.channel_id).await?;
-                self.cache.cache_pts(req.channel_id, db_pts).await?;
-                db_pts
-            }
-        };
+        let current_pts = self.pts_dao.get_current_pts(req.channel_id).await?;
 
         debug!(
             "获取频道 pts: channel_id={}, channel_type={}, pts={}",
@@ -823,6 +699,79 @@ impl SyncService {
     }
 }
 
+fn continuous_page_end(req: &GetDifferenceRequest, commits: &[ServerCommit]) -> Option<u64> {
+    commits.iter().try_fold(req.last_pts, |previous, commit| {
+        (previous.checked_add(1) == Some(commit.pts)
+            && commit.channel_id == req.channel_id
+            && commit.channel_type == req.channel_type)
+            .then_some(commit.pts)
+    })
+}
+
+async fn load_difference_page(
+    pts_dao: &ChannelPtsDao,
+    commit_dao: &CommitLogDao,
+    cache: &SyncCache,
+    req: &GetDifferenceRequest,
+) -> Result<GetDifferenceResponse> {
+    use crate::error::ServerError;
+
+    let limit = req.limit.unwrap_or(100).max(1);
+    let current_pts = pts_dao.get_current_pts(req.channel_id).await?;
+    if req.last_pts > current_pts {
+        return Err(ServerError::ChannelResyncRequired(format!(
+            "client last_pts {} is ahead of server current_pts {} for channel {}",
+            req.last_pts, current_pts, req.channel_id
+        )));
+    }
+
+    let cached = if req.last_pts == current_pts {
+        None
+    } else {
+        match cache.query_commits_from_cache(req.channel_id, req.last_pts, limit).await {
+            Ok(page) => page,
+            Err(error) => {
+                warn!(channel_id = req.channel_id, %error, "difference cache unavailable; using PostgreSQL");
+                None
+            }
+        }
+    };
+    let commits = match cached {
+        Some(page)
+            if !page.is_empty()
+                && continuous_page_end(req, &page).is_some_and(|end| end <= current_pts) =>
+        {
+            page
+        }
+        _ if req.last_pts == current_pts => Vec::new(),
+        _ => commit_dao.query_commits(req.channel_id, req.last_pts, limit).await?,
+    };
+
+    if current_pts > req.last_pts
+        && commits.first().is_none_or(|first| Some(first.pts) != req.last_pts.checked_add(1))
+    {
+        if commit_dao.has_commit_at_or_before(req.channel_id, req.last_pts).await? {
+            warn!(channel_id = req.channel_id, last_pts = req.last_pts, "gap inside retained timeline");
+            return Err(ServerError::ServiceUnavailable("Gap inside retained timeline".into()));
+        }
+        return Err(ServerError::ChannelResyncRequired(format!(
+            "message history window unavailable: channel={} last_pts={} current_pts={}",
+            req.channel_id, req.last_pts, current_pts
+        )));
+    }
+    let end = continuous_page_end(req, &commits).ok_or_else(|| {
+        warn!(channel_id = req.channel_id, last_pts = req.last_pts, "invalid authoritative difference page");
+        ServerError::ServiceUnavailable("Invalid authoritative difference page".into())
+    })?;
+    // PostgreSQL can commit between its watermark read and its page query.
+    let current_pts = current_pts.max(end);
+    Ok(GetDifferenceResponse {
+        commits,
+        current_pts,
+        has_more: end < current_pts,
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -869,8 +818,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_get_difference() {
-        // 测试获取差异
+    #[ignore = "requires isolated PostgreSQL and Redis"]
+    async fn difference_recovers_a_missing_cached_revoke_from_postgres() {
+        use super::*;
+        use crate::infra::{redis::RedisClient, Database};
+
+        let url = crate::require_test_database_url().expect("isolated PostgreSQL required");
+        let db = Arc::new(Database::new(&url).await.unwrap());
+        let redis_url = std::env::var("PRIVCHAT_TEST_REDIS_URL").expect("isolated Redis required");
+        let redis = Arc::new(RedisClient::new(&crate::config::RedisConfig {
+            url: redis_url,
+            pool_size: 2,
+            min_idle: 1,
+            connection_timeout_secs: 3,
+            command_timeout_ms: 3000,
+            idle_timeout_secs: 30,
+        }).await.unwrap());
+        let cache = SyncCache::new(redis.clone());
+        let dao = CommitLogDao::new(db.clone());
+        let pts_dao = ChannelPtsDao::new(db.clone());
+        let channel_id = 987_678_321u64;
+        let sender = 987_678_322i64;
+        let key = format!("commit_log:{channel_id}");
+        redis.del(&key).await.unwrap();
+        sqlx::query("DELETE FROM privchat_commit_log WHERE channel_id = $1")
+            .bind(channel_id as i64).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO privchat_users (user_id, username, display_name, qr_key) VALUES ($1, 'gap-test', 'Gap Test', 'gap-test') ON CONFLICT (user_id) DO NOTHING")
+            .bind(sender).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO privchat_channel_pts (channel_id, current_pts, created_at, updated_at) VALUES ($1, 103, 0, 0) ON CONFLICT (channel_id) DO UPDATE SET current_pts = 103")
+            .bind(channel_id as i64).execute(db.pool()).await.unwrap();
+
+        for pts in [101, 102, 103] {
+            let commit = ServerCommit {
+                event_id: None, pts, server_msg_id: pts, local_message_id: None,
+                channel_id, channel_type: 1, sender_id: sender as u64, sender_info: None,
+                message_type: if pts == 102 { "message.revoke" } else { "text" }.into(),
+                content: if pts == 102 {
+                    serde_json::json!({"message_id": 101, "revoked_by": sender, "revoke": true})
+                } else {
+                    serde_json::json!({"content": "message"})
+                },
+                server_timestamp: 1000, event_schema_version: None, canonical_event: None,
+            };
+            dao.save_commit(&commit).await.unwrap();
+            if pts != 102 {
+                cache.cache_commit(&commit).await.unwrap();
+            }
+        }
+        cache.cache_pts(channel_id, 101).await.unwrap();
+        let cached = cache.query_commits_from_cache(channel_id, 100, 200).await.unwrap().unwrap();
+        assert_eq!(cached.iter().map(|c| c.pts).collect::<Vec<_>>(), [101, 103]);
+        let req = GetDifferenceRequest { channel_id, channel_type: 1, last_pts: 100, limit: Some(200) };
+        let page = load_difference_page(&pts_dao, &dao, &cache, &req).await.unwrap();
+        assert_eq!(page.commits.iter().map(|c| c.pts).collect::<Vec<_>>(), [101, 102, 103]);
+        assert!(matches!(page.commits[1].resolve_canonical_event().event, Some(CanonicalTimelineEvent::Revoke(_))));
+        assert!(!page.has_more);
+        // Redis may survive a PostgreSQL restore. It cannot move the server watermark.
+        cache.cache_commit(&page.commits[1]).await.unwrap();
+        let mut future = page.commits[2].clone();
+        future.pts = 104;
+        future.server_msg_id = 104;
+        cache.cache_commit(&future).await.unwrap();
+        let restored = load_difference_page(&pts_dao, &dao, &cache, &req).await.unwrap();
+        assert_eq!(restored.current_pts, 103);
+        assert_eq!(restored.commits.last().unwrap().pts, 103);
+        redis.del(&key).await.unwrap();
+        for commit in [&page.commits[0], &page.commits[2]] {
+            cache.cache_commit(commit).await.unwrap();
+        }
+
+        sqlx::query("DELETE FROM privchat_commit_log WHERE channel_id = $1 AND pts = 102")
+            .bind(channel_id as i64).execute(db.pool()).await.unwrap();
+        assert!(matches!(
+            load_difference_page(&pts_dao, &dao, &cache, &req).await,
+            Err(crate::error::ServerError::ServiceUnavailable(_))
+        ));
+        let next_page = GetDifferenceRequest { last_pts: 101, ..req };
+        assert!(matches!(
+            load_difference_page(&pts_dao, &dao, &cache, &next_page).await,
+            Err(crate::error::ServerError::ServiceUnavailable(_))
+        ));
+        redis.del(&key).await.unwrap();
+        sqlx::query("DELETE FROM privchat_commit_log WHERE channel_id = $1")
+            .bind(channel_id as i64).execute(db.pool()).await.unwrap();
+        sqlx::query("DELETE FROM privchat_channel_pts WHERE channel_id = $1")
+            .bind(channel_id as i64).execute(db.pool()).await.unwrap();
+        sqlx::query("DELETE FROM privchat_users WHERE user_id = $1")
+            .bind(sender).execute(db.pool()).await.unwrap();
     }
 
     #[tokio::test]

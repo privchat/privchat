@@ -304,6 +304,18 @@ impl CommitLogDao {
         Ok(true)
     }
 
+    /// Distinguish a retained timeline gap from a cursor older than retention.
+    pub async fn has_commit_at_or_before(&self, channel_id: u64, pts: u64) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM privchat_commit_log WHERE channel_id = $1 AND pts <= $2)",
+        )
+        .bind(channel_id as i64)
+        .bind(pts as i64)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(|error| crate::error::ServerError::Database(format!("Check retained commits: {error}")))
+    }
+
     /// 查询 Commits（pts > last_pts）
     ///
     /// SELECT * FROM privchat_commit_log

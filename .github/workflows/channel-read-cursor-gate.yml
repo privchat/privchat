@@ -54,9 +54,20 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/privchat_test
       PRIVCHAT_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/privchat_test
+      PRIVCHAT_TEST_REDIS_URL: redis://127.0.0.1:6379
 
     steps:
       - uses: actions/checkout@v4
@@ -114,3 +125,6 @@ jobs:
         run: |
           RUSTC_WRAPPER= cargo test --lib a_revoked_message_stops_counting_as_a_live_reference -- --nocapture
           RUSTC_WRAPPER= cargo test --lib postgres_readiness_rejects_a_closed_pool -- --nocapture
+
+      - name: Difference page gap with real PostgreSQL and Redis
+        run: RUSTC_WRAPPER= cargo test --lib difference_recovers_a_missing_cached_revoke_from_postgres -- --ignored --nocapture
