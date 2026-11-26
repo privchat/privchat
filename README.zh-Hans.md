@@ -92,12 +92,12 @@ PrivChat 致力于打造一个**安全、高性能、功能完整**的现代即�
 ### 1. 安装工具并检出源码
 
 安装 Git、Rust（通过 [rustup](https://rustup.rs/) 安装 stable）、C/C++ 工具链、
-OpenSSL（`openssl` 命令）、`curl`、PostgreSQL 16（含 `psql`、`createdb`）和 Redis 7。
-协议代码生成需要在 `PATH` 上使用 `flatc` **24.3.25**（用 `flatc --version` 确认）。
-如需自行构建，使用 CMake 和 [FlatBuffers v24.3.25](https://github.com/google/flatbuffers/tree/v24.3.25)：
+`curl`、PostgreSQL 16（含 `psql`、`createdb`）和 Redis 7。示例部署脚本使用 `openssl` 命令生成密钥和证书；服务端程序使用 rustls，不链接 OpenSSL。
+协议代码生成需要在 `PATH` 上使用 `flatc` **25.12.19**（用 `flatc --version` 确认）。
+如需自行构建，使用 CMake 和 [FlatBuffers v25.12.19-2026-02-06-03fffb2](https://github.com/google/flatbuffers/releases/tag/v25.12.19-2026-02-06-03fffb2)：
 
 ```bash
-git clone --depth 1 --branch v24.3.25 https://github.com/google/flatbuffers.git
+git clone --depth 1 --branch v25.12.19-2026-02-06-03fffb2 https://github.com/google/flatbuffers.git
 cmake -S flatbuffers -B flatbuffers/build -DFLATBUFFERS_BUILD_TESTS=OFF
 cmake --build flatbuffers/build --target flatc --parallel 2
 export PATH="$PWD/flatbuffers/build:$PATH"
@@ -112,7 +112,7 @@ git init -q msgtrans
 git -C msgtrans fetch --depth 1 https://github.com/zoujiaqing/msgtrans.git 2c3086dc3b12da75aa20f0fbec448620b9a126e9
 git -C msgtrans checkout --detach FETCH_HEAD
 git init -q privchat-protocol
-git -C privchat-protocol fetch --depth 1 https://github.com/privchat/privchat-protocol.git 213b99c6a2a3a7ea31821df21a850720939e648e
+git -C privchat-protocol fetch --depth 1 https://github.com/privchat/privchat-protocol.git c5cbe557090deeb8b9f41d53ff0414ce949bb8ef
 git -C privchat-protocol checkout --detach FETCH_HEAD
 cd privchat
 ```

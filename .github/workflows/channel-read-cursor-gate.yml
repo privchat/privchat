@@ -81,13 +81,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: privchat/privchat-protocol
-          ref: 213b99c6a2a3a7ea31821df21a850720939e648e
+          ref: c5cbe557090deeb8b9f41d53ff0414ce949bb8ef
           path: privchat-protocol
 
       - uses: actions/checkout@v4
         with:
           repository: google/flatbuffers
-          ref: v24.3.25
+          ref: v25.12.19-2026-02-06-03fffb2
           path: flatbuffers
       - name: Build pinned FlatBuffers compiler
         run: |

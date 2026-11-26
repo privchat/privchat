@@ -96,13 +96,13 @@ long-run soak testing, backup/DR runbooks, message-body E2EE, voice/video. See
 ### 1. Tools and source checkout
 
 Install Git, Rust (stable via [rustup](https://rustup.rs/)), a C/C++ toolchain,
-OpenSSL (`openssl` CLI), `curl`, PostgreSQL 16 with `psql` and `createdb`, and Redis 7.
-For protocol code generation, use `flatc` **24.3.25** on `PATH`
+`curl`, PostgreSQL 16 with `psql` and `createdb`, and Redis 7. The example provisioning scripts use the `openssl` CLI for keys and certificates; the server binary uses rustls, not OpenSSL.
+For protocol code generation, use `flatc` **25.12.19** on `PATH`
 (`flatc --version`). If you need to build it, use CMake and the
-[v24.3.25 FlatBuffers release](https://github.com/google/flatbuffers/tree/v24.3.25):
+[v25.12.19-2026-02-06-03fffb2 FlatBuffers release](https://github.com/google/flatbuffers/releases/tag/v25.12.19-2026-02-06-03fffb2):
 
 ```bash
-git clone --depth 1 --branch v24.3.25 https://github.com/google/flatbuffers.git
+git clone --depth 1 --branch v25.12.19-2026-02-06-03fffb2 https://github.com/google/flatbuffers.git
 cmake -S flatbuffers -B flatbuffers/build -DFLATBUFFERS_BUILD_TESTS=OFF
 cmake --build flatbuffers/build --target flatc --parallel 2
 export PATH="$PWD/flatbuffers/build:$PATH"
@@ -118,7 +118,7 @@ git init -q msgtrans
 git -C msgtrans fetch --depth 1 https://github.com/zoujiaqing/msgtrans.git 2c3086dc3b12da75aa20f0fbec448620b9a126e9
 git -C msgtrans checkout --detach FETCH_HEAD
 git init -q privchat-protocol
-git -C privchat-protocol fetch --depth 1 https://github.com/privchat/privchat-protocol.git 213b99c6a2a3a7ea31821df21a850720939e648e
+git -C privchat-protocol fetch --depth 1 https://github.com/privchat/privchat-protocol.git c5cbe557090deeb8b9f41d53ff0414ce949bb8ef
 git -C privchat-protocol checkout --detach FETCH_HEAD
 cd privchat
 ```
