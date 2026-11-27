@@ -1053,8 +1053,60 @@ async fn livekit_real_join_and_delete_room() {
     );
     let connection = upgrade.upgrade().await.unwrap();
     let call = s.get(1, id).await.unwrap();
+    let room = format!("pc-200-{id}");
+    let list_token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &json!({
+            "iss": key.trim().trim_matches(['\"', '\'']),
+            "exp": chrono::Utc::now().timestamp() + 60,
+            "video": {"roomList": true}
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(
+            secret.trim().trim_matches(['\"', '\'']).as_bytes(),
+        ),
+    )
+    .unwrap();
+    let list_client = reqwest::Client::new();
+    let room_exists = || async {
+        let response = list_client
+            .post(format!(
+                "http://127.0.0.1:{port}/twirp/livekit.RoomService/ListRooms"
+            ))
+            .bearer_auth(&list_token)
+            .json(&json!({ "names": [&room] }))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert!(response.is_object(), "invalid LiveKit ListRooms response");
+        match response.get("rooms") {
+            None | Some(Value::Null) => false,
+            Some(rooms) => rooms
+                .as_array()
+                .expect("LiveKit rooms must be an array")
+                .iter()
+                .any(|entry| entry["name"].as_str() == Some(room.as_str())),
+        }
+    };
+    assert!(
+        room_exists().await,
+        "the actual SFU room must exist before cleanup"
+    );
     s.media_cleanup(&call, None).await.unwrap();
+    assert!(
+        !room_exists().await,
+        "cleanup must delete the actual SFU room"
+    );
     s.media_cleanup(&call, None).await.unwrap();
+    assert!(
+        !room_exists().await,
+        "repeated cleanup must leave the room absent"
+    );
     drop(connection);
 }
 
