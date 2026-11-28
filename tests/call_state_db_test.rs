@@ -90,6 +90,25 @@ fn call_id(value: &Value) -> u64 {
     value["call"]["call_id"].as_u64().unwrap()
 }
 
+#[tokio::test]
+async fn livekit_claiming_device_renews_credentials_without_rejoining() {
+    let (_db, service) = setup("call_livekit_renew").await;
+    let id = call_id(&service.invite(1, "host", CallInviteRequest {
+        invitee_ids: vec![2], ..invite("invite", 200)
+    }).await.unwrap());
+    let joined = service.mutate("join", 2, "callee", command("accept", id)).await.unwrap();
+    assert_eq!(joined["call"]["state"], "active");
+    assert!(service.mutate("join", 2, "other-device", command("wrong-device", id)).await.is_err());
+    let renewed = service.mutate("join", 2, "callee", command("media-recovery", id)).await.unwrap();
+    assert_eq!(renewed["call"], joined["call"]);
+    assert_eq!(renewed["url"], joined["url"]);
+    assert!(!renewed["token"].as_str().unwrap().is_empty());
+    assert_eq!(
+        service.mutate("join", 2, "callee", command("media-recovery", id)).await.unwrap(),
+        renewed,
+    );
+}
+
 async fn peer_setup(name: &str) -> (common::ScratchDatabase, CallService) {
     let (db, old) = setup(name).await;
     let mut config = old.config.clone();

@@ -595,6 +595,14 @@ impl CallService {
                 if claimed_elsewhere {
                     return Err(RpcError::forbidden("Call accepted on another device"));
                 }
+                // Joining an already active SFU call on the claiming device only
+                // renews its lease and media credentials, not its membership.
+                if owns && participant.state == CallParticipantState::Joined
+                    && stored.call.state == CallState::Active
+                    && stored.call.transport == CallTransport::Livekit
+                {
+                    notify = false;
+                }
                 if matches!(
                     participant.state,
                     CallParticipantState::Left | CallParticipantState::Rejected
